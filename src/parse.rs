@@ -313,6 +313,10 @@ impl VariableDefinition {
             }
         }))
     }
+
+    pub fn raw_value(&self) -> Option<String> {
+        self.syntax().children().find(|it| it.kind() == EXPR).map(|it| it.text().to_string())
+    }
 }
 
 impl Makefile {
@@ -451,6 +455,7 @@ rule: dependency
     assert_eq!(variables.len(), 1);
     let variable = variables.pop().unwrap();
     assert_eq!(variable.name(), Some("VARIABLE".to_string()));
+    assert_eq!(variable.raw_value(), Some("value".to_string()));
 }
 
 #[test]
