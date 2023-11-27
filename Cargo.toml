@@ -1,0 +1,17 @@
+[package]
+name = "makefile-lossless"
+repository = "https://github.com/jelmer/makefile-lossless-rs"
+description = "Lossless Parser for Makefiles"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [ "Jelmer Vernooij <jelmer@jelmer.uk>",]
+
+[dependencies]
+lazy-regex = "3.0.2"
+log = "0.4"
+rowan = "0.15.11"
+
+[dev-dependencies]
+maplit = "1.0.2"
