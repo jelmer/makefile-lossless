@@ -47,7 +47,6 @@ pub enum SyntaxKind {
 
     // composite nodes
     ROOT,  // The entire file
-    ASSIGNMENT,  // A variable assignment
     RULE, // A single rule
     PREREQUISITES,
     RECIPE,

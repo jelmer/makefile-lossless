@@ -159,7 +159,7 @@ fn parse(text: &str) -> Parse {
         }
 
         fn parse_assignment(&mut self) {
-            self.builder.start_node(ASSIGNMENT.into());
+            self.builder.start_node(VARIABLE.into());
             self.skip_ws();
             self.expect(IDENTIFIER);
             self.skip_ws();
@@ -301,6 +301,19 @@ macro_rules! ast_node {
 ast_node!(Makefile, ROOT);
 ast_node!(Rule, RULE);
 ast_node!(Identifier, IDENTIFIER);
+ast_node!(VariableDefinition, VARIABLE);
+
+impl VariableDefinition {
+    pub fn name(&self) -> Option<String> {
+        self.syntax().children_with_tokens().find_map(|it| it.as_token().and_then(|it| {
+            if it.kind() == IDENTIFIER {
+                Some(it.text().to_string())
+            } else {
+                None
+            }
+        }))
+    }
+}
 
 impl Makefile {
     pub fn new() -> Makefile {
@@ -332,6 +345,12 @@ impl Makefile {
         self.syntax()
             .children()
             .filter_map(Rule::cast)
+    }
+
+    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
+        self.syntax()
+            .children()
+            .filter_map(VariableDefinition::cast)
     }
 
     pub fn add_rule(&mut self, target: &str) -> Rule {
@@ -397,7 +416,7 @@ rule: dependency
     assert_eq!(
         format!("{:#?}", node),
         r#"ROOT@0..44
-  ASSIGNMENT@0..17
+  VARIABLE@0..17
     IDENTIFIER@0..8 "VARIABLE"
     WHITESPACE@8..9 " "
     OPERATOR@9..10 "="
@@ -427,6 +446,11 @@ rule: dependency
     let rule = rules.pop().unwrap();
     assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
     assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+
+    let mut variables = root.variable_definitions().collect::<Vec<_>>();
+    assert_eq!(variables.len(), 1);
+    let variable = variables.pop().unwrap();
+    assert_eq!(variable.name(), Some("VARIABLE".to_string()));
 }
 
 #[test]
