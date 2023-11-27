@@ -11,11 +11,11 @@
 //! all: build
 //!
 //! build:
-//!     $(PYTHON) setup.py build
+//! 	$(PYTHON) setup.py build
 //! "#;
-//! //let makefile: makefile_lossless::Makefile = contents.parse().unwrap();
+//! let makefile: makefile_lossless::Makefile = contents.parse().unwrap();
 //!
-//! //assert_eq!(makefile.rules().count(), 3);
+//! assert_eq!(makefile.rules().count(), 3);
 //! ```
 
 mod lex;

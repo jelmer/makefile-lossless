@@ -30,7 +30,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_'
+        c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
     }
 
     fn read_while<F>(&mut self, predicate: F) -> String
