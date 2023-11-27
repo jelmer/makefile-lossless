@@ -333,6 +333,20 @@ impl Makefile {
             .children()
             .filter_map(Rule::cast)
     }
+
+    pub fn add_rule(&mut self, target: &str) -> Rule {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RULE.into());
+        builder.token(IDENTIFIER.into(), target);
+        builder.token(OPERATOR.into(), ":");
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+        let pos = self.0.children().count();
+        self.0.splice_children(pos..pos, vec![syntax.clone().into()]);
+        Rule(syntax)
+    }
 }
 
 impl Rule {
@@ -450,4 +464,14 @@ fn test_parse_multiple_prerequisites() {
         rule.prerequisites().collect::<Vec<_>>(),
         vec!["dependency1", "dependency2"]
     );
+}
+
+#[test]
+fn test_add_rule() {
+    let mut makefile = Makefile::new();
+    let rule = makefile.add_rule("rule");
+    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), Vec::<String>::new());
+
+    assert_eq!(makefile.to_string(), "rule:\n");
 }
