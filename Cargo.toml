@@ -1,6 +1,6 @@
 [package]
 name = "makefile-lossless"
-repository = "https://github.com/jelmer/makefile-lossless-rs"
+repository = "https://github.com/jelmer/makefile-lossless"
 description = "Lossless Parser for Makefiles"
 version = "0.1.2"
 edition = "2021"
