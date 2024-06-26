@@ -133,7 +133,7 @@ fn parse(text: &str) -> Parse {
             self.skip_ws();
             self.expect(IDENTIFIER);
             self.skip_ws();
-            if self.tokens.pop().map(|(k, t)| (k, t)) == Some((OPERATOR, ":".to_string())) {
+            if self.tokens.pop() == Some((OPERATOR, ":".to_string())) {
                 self.builder.token(OPERATOR.into(), ":");
             } else {
                 self.error("expected ':'".into());
