@@ -1,3 +1,5 @@
+#![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
+
 //! A lossless parser for Makefiles
 //!
 //! Example:
