@@ -23,7 +23,7 @@
 mod lex;
 mod parse;
 
-pub use parse::Makefile;
+pub use parse::{Identifier, Makefile, Rule, VariableDefinition};
 
 /// Let's start with defining all kinds of tokens and
 /// composite nodes.
