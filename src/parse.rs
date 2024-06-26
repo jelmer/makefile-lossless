@@ -414,6 +414,23 @@ impl Rule {
                 })
             })
     }
+
+    pub fn recipes(&self) -> impl Iterator<Item = String> {
+        self.syntax()
+            .children()
+            .filter(|it| it.kind() == RECIPE)
+            .flat_map(|it| {
+                it.children_with_tokens().filter_map(|it| {
+                    it.as_token().and_then(|t| {
+                        if t.kind() == TEXT {
+                            Some(t.text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+    }
 }
 
 impl Default for Makefile {
@@ -482,6 +499,7 @@ rule: dependency
         let rule = rules.pop().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
         assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
 
         let mut variables = root.variable_definitions().collect::<Vec<_>>();
         assert_eq!(variables.len(), 1);
@@ -526,6 +544,7 @@ rule: dependency
             rule.prerequisites().collect::<Vec<_>>(),
             vec!["dependency1", "dependency2"]
         );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
     #[test]
