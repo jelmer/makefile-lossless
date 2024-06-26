@@ -435,19 +435,23 @@ impl FromStr for Makefile {
     }
 }
 
-#[test]
-fn test_parse_simple() {
-    const SIMPLE: &str = r#"VARIABLE = value
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple() {
+        const SIMPLE: &str = r#"VARIABLE = value
 
 rule: dependency
 	command
 "#;
-    let parsed = parse(SIMPLE);
-    assert_eq!(parsed.errors, Vec::<String>::new());
-    let node = parsed.syntax();
-    assert_eq!(
-        format!("{:#?}", node),
-        r#"ROOT@0..44
+        let parsed = parse(SIMPLE);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..44
   VARIABLE@0..17
     IDENTIFIER@0..8 "VARIABLE"
     WHITESPACE@8..9 " "
@@ -469,35 +473,35 @@ rule: dependency
       TEXT@36..43 "command"
       NEWLINE@43..44 "\n"
 "#
-    );
+        );
 
-    let root = parsed.root().clone_for_update();
+        let root = parsed.root().clone_for_update();
 
-    let mut rules = root.rules().collect::<Vec<_>>();
-    assert_eq!(rules.len(), 1);
-    let rule = rules.pop().unwrap();
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        let mut rules = root.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        let rule = rules.pop().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
 
-    let mut variables = root.variable_definitions().collect::<Vec<_>>();
-    assert_eq!(variables.len(), 1);
-    let variable = variables.pop().unwrap();
-    assert_eq!(variable.name(), Some("VARIABLE".to_string()));
-    assert_eq!(variable.raw_value(), Some("value".to_string()));
-}
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        assert_eq!(variable.name(), Some("VARIABLE".to_string()));
+        assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
 
-#[test]
-fn test_parse_multiple_prerequisites() {
-    const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
+    #[test]
+    fn test_parse_multiple_prerequisites() {
+        const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
 	command
 
 "#;
-    let parsed = parse(MULTIPLE_PREREQUISITES);
-    assert_eq!(parsed.errors, Vec::<String>::new());
-    let node = parsed.syntax();
-    assert_eq!(
-        format!("{:#?}", node),
-        r#"ROOT@0..40
+        let parsed = parse(MULTIPLE_PREREQUISITES);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..40
   RULE@0..40
     IDENTIFIER@0..4 "rule"
     OPERATOR@4..5 ":"
@@ -513,26 +517,27 @@ fn test_parse_multiple_prerequisites() {
       NEWLINE@38..39 "\n"
     NEWLINE@39..40 "\n"
 "#
-    );
-    let root = parsed.root().clone_for_update();
+        );
+        let root = parsed.root().clone_for_update();
 
-    let rule = root.rules().next().unwrap();
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(
-        rule.prerequisites().collect::<Vec<_>>(),
-        vec!["dependency1", "dependency2"]
-    );
-}
+        let rule = root.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dependency1", "dependency2"]
+        );
+    }
 
-#[test]
-fn test_add_rule() {
-    let mut makefile = Makefile::new();
-    let rule = makefile.add_rule("rule");
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(
-        rule.prerequisites().collect::<Vec<_>>(),
-        Vec::<String>::new()
-    );
+    #[test]
+    fn test_add_rule() {
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("rule");
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
 
-    assert_eq!(makefile.to_string(), "rule:\n");
+        assert_eq!(makefile.to_string(), "rule:\n");
+    }
 }

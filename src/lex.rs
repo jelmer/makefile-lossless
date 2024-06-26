@@ -144,22 +144,23 @@ pub(crate) fn lex(input: &str) -> Vec<(SyntaxKind, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use crate::SyntaxKind::*;
+
     #[test]
     fn test_empty() {
-        assert_eq!(super::lex(""), vec![]);
+        assert_eq!(lex(""), vec![]);
     }
 
     #[test]
     fn test_simple() {
         assert_eq!(
-            super::lex(
-                r#"VARIABLE = value
+            lex(r#"VARIABLE = value
 
 rule: prerequisite
 	recipe
-"#
-            )
+"#)
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -186,12 +187,10 @@ rule: prerequisite
     #[test]
     fn test_multiple_prerequisites() {
         assert_eq!(
-            super::lex(
-                r#"rule: prerequisite1 prerequisite2
+            lex(r#"rule: prerequisite1 prerequisite2
 	recipe
 
-"#
-            )
+"#)
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -214,7 +213,7 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            super::lex("VARIABLE ?= value\n")
+            lex("VARIABLE ?= value\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -232,11 +231,9 @@ rule: prerequisite
     #[test]
     fn test_conditional() {
         assert_eq!(
-            super::lex(
-                r#"ifneq (a, b)
+            lex(r#"ifneq (a, b)
 endif
-"#
-            )
+"#)
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -259,7 +256,7 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)\n")
+            lex("VARIABLE = $(value)\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -280,7 +277,7 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)$(value2)\n")
+            lex("VARIABLE = $(value)$(value2)\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
