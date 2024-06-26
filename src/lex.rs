@@ -69,7 +69,10 @@ impl<'a> Lexer<'a> {
                     return Some((SyntaxKind::NEWLINE, self.input.next()?.to_string()));
                 }
                 '#' => {
-                    return Some((SyntaxKind::COMMENT, self.read_while(|c| !Self::is_newline(c))));
+                    return Some((
+                        SyntaxKind::COMMENT,
+                        self.read_while(|c| !Self::is_newline(c)),
+                    ));
                 }
                 _ => {}
             }
@@ -82,12 +85,14 @@ impl<'a> Lexer<'a> {
                     c if Self::is_whitespace(c) => {
                         Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
                     }
-                    c if Self::is_valid_identifier_char(c) => {
-                        Some((SyntaxKind::IDENTIFIER, self.read_while(Self::is_valid_identifier_char)))
-                    }
-                    ':' | '=' | '?'| '+' => {
-                        Some((SyntaxKind::OPERATOR, self.read_while(|c| c == ':' || c == '=' || c == '?')))
-                    }
+                    c if Self::is_valid_identifier_char(c) => Some((
+                        SyntaxKind::IDENTIFIER,
+                        self.read_while(Self::is_valid_identifier_char),
+                    )),
+                    ':' | '=' | '?' | '+' => Some((
+                        SyntaxKind::OPERATOR,
+                        self.read_while(|c| c == ':' || c == '=' || c == '?'),
+                    )),
                     '(' => {
                         self.input.next();
                         Some((SyntaxKind::LPAREN, "(".to_string()))
@@ -116,7 +121,7 @@ impl<'a> Lexer<'a> {
                         self.input.next();
                         Some((SyntaxKind::ERROR, c.to_string()))
                     }
-                }
+                },
             }
         } else {
             None
@@ -185,7 +190,8 @@ rule: prerequisite
                 r#"rule: prerequisite1 prerequisite2
 	recipe
 
-"#            )
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -208,7 +214,10 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            super::lex("VARIABLE ?= value\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            super::lex("VARIABLE ?= value\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -223,9 +232,14 @@ rule: prerequisite
     #[test]
     fn test_conditional() {
         assert_eq!(
-            super::lex(r#"ifneq (a, b)
+            super::lex(
+                r#"ifneq (a, b)
 endif
-"#).iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+"#
+            )
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "ifneq"),
                 (WHITESPACE, " "),
@@ -245,7 +259,10 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            super::lex("VARIABLE = $(value)\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -263,7 +280,10 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)$(value2)\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            super::lex("VARIABLE = $(value)$(value2)\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),

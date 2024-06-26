@@ -46,7 +46,7 @@ pub enum SyntaxKind {
     ERROR,
 
     // composite nodes
-    ROOT,  // The entire file
+    ROOT, // The entire file
     RULE, // A single rule
     PREREQUISITES,
     RECIPE,

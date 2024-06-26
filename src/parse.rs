@@ -177,7 +177,13 @@ fn parse(text: &str) -> Parse {
                     Some((OPERATOR, ":")) => {
                         self.parse_rule();
                     }
-                    Some((OPERATOR, "?=")) | Some((OPERATOR, "=")) | Some((OPERATOR, ":=")) | Some((OPERATOR, "::=")) | Some((OPERATOR, ":::=")) | Some((OPERATOR, "+=")) | Some((OPERATOR, "!=")) => {
+                    Some((OPERATOR, "?="))
+                    | Some((OPERATOR, "="))
+                    | Some((OPERATOR, ":="))
+                    | Some((OPERATOR, "::="))
+                    | Some((OPERATOR, ":::="))
+                    | Some((OPERATOR, "+="))
+                    | Some((OPERATOR, "!=")) => {
                         self.parse_assignment();
                     }
                     Some((NEWLINE, _)) => {
@@ -214,8 +220,15 @@ fn parse(text: &str) -> Parse {
             self.tokens.last().map(|(kind, _)| *kind)
         }
 
-        fn find(&self, finder: impl FnMut(&&(SyntaxKind, String)) -> bool) -> Option<(SyntaxKind, &str)> {
-            self.tokens.iter().rev().find(finder).map(|(kind, text)| (*kind, text.as_str()))
+        fn find(
+            &self,
+            finder: impl FnMut(&&(SyntaxKind, String)) -> bool,
+        ) -> Option<(SyntaxKind, &str)> {
+            self.tokens
+                .iter()
+                .rev()
+                .find(finder)
+                .map(|(kind, text)| (*kind, text.as_str()))
         }
 
         fn expect(&mut self, expected: SyntaxKind) {
@@ -305,17 +318,22 @@ ast_node!(VariableDefinition, VARIABLE);
 
 impl VariableDefinition {
     pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| it.as_token().and_then(|it| {
-            if it.kind() == IDENTIFIER {
-                Some(it.text().to_string())
-            } else {
-                None
-            }
-        }))
+        self.syntax().children_with_tokens().find_map(|it| {
+            it.as_token().and_then(|it| {
+                if it.kind() == IDENTIFIER {
+                    Some(it.text().to_string())
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn raw_value(&self) -> Option<String> {
-        self.syntax().children().find(|it| it.kind() == EXPR).map(|it| it.text().to_string())
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == EXPR)
+            .map(|it| it.text().to_string())
     }
 }
 
@@ -346,9 +364,7 @@ impl Makefile {
     }
 
     pub fn rules(&self) -> impl Iterator<Item = Rule> {
-        self.syntax()
-            .children()
-            .filter_map(Rule::cast)
+        self.syntax().children().filter_map(Rule::cast)
     }
 
     pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
@@ -367,7 +383,8 @@ impl Makefile {
 
         let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
         let pos = self.0.children().count();
-        self.0.splice_children(pos..pos, vec![syntax.clone().into()]);
+        self.0
+            .splice_children(pos..pos, vec![syntax.clone().into()]);
         Rule(syntax)
     }
 }
@@ -384,7 +401,18 @@ impl Rule {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
-            .into_iter().flat_map(|it| it.children_with_tokens().filter_map(|it| it.as_token().and_then(|t| if t.kind() == IDENTIFIER { Some(t.text().to_string()) } else { None })))
+            .into_iter()
+            .flat_map(|it| {
+                it.children_with_tokens().filter_map(|it| {
+                    it.as_token().and_then(|t| {
+                        if t.kind() == IDENTIFIER {
+                            Some(t.text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
     }
 }
 
@@ -484,7 +512,8 @@ fn test_parse_multiple_prerequisites() {
       TEXT@31..38 "command"
       NEWLINE@38..39 "\n"
     NEWLINE@39..40 "\n"
-"#);
+"#
+    );
     let root = parsed.root().clone_for_update();
 
     let rule = root.rules().next().unwrap();
@@ -500,7 +529,10 @@ fn test_add_rule() {
     let mut makefile = Makefile::new();
     let rule = makefile.add_rule("rule");
     assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), Vec::<String>::new());
+    assert_eq!(
+        rule.prerequisites().collect::<Vec<_>>(),
+        Vec::<String>::new()
+    );
 
     assert_eq!(makefile.to_string(), "rule:\n");
 }
