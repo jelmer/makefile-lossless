@@ -303,9 +303,9 @@ macro_rules! ast_node {
             }
         }
 
-        impl ToString for $ast {
-            fn to_string(&self) -> String {
-                self.0.text().to_string()
+        impl core::fmt::Display for $ast {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+                write!(f, "{}", self.0.text())
             }
         }
     };
