@@ -1,3 +1,5 @@
+#![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
+
 //! A lossless parser for Makefiles
 //!
 //! Example:
@@ -21,7 +23,7 @@
 mod lex;
 mod parse;
 
-pub use parse::Makefile;
+pub use parse::{Identifier, Makefile, Rule, VariableDefinition};
 
 /// Let's start with defining all kinds of tokens and
 /// composite nodes.
@@ -46,7 +48,7 @@ pub enum SyntaxKind {
     ERROR,
 
     // composite nodes
-    ROOT,  // The entire file
+    ROOT, // The entire file
     RULE, // A single rule
     PREREQUISITES,
     RECIPE,

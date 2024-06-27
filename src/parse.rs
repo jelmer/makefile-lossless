@@ -133,7 +133,7 @@ fn parse(text: &str) -> Parse {
             self.skip_ws();
             self.expect(IDENTIFIER);
             self.skip_ws();
-            if self.tokens.pop().map(|(k, t)| (k, t)) == Some((OPERATOR, ":".to_string())) {
+            if self.tokens.pop() == Some((OPERATOR, ":".to_string())) {
                 self.builder.token(OPERATOR.into(), ":");
             } else {
                 self.error("expected ':'".into());
@@ -177,7 +177,13 @@ fn parse(text: &str) -> Parse {
                     Some((OPERATOR, ":")) => {
                         self.parse_rule();
                     }
-                    Some((OPERATOR, "?=")) | Some((OPERATOR, "=")) | Some((OPERATOR, ":=")) | Some((OPERATOR, "::=")) | Some((OPERATOR, ":::=")) | Some((OPERATOR, "+=")) | Some((OPERATOR, "!=")) => {
+                    Some((OPERATOR, "?="))
+                    | Some((OPERATOR, "="))
+                    | Some((OPERATOR, ":="))
+                    | Some((OPERATOR, "::="))
+                    | Some((OPERATOR, ":::="))
+                    | Some((OPERATOR, "+="))
+                    | Some((OPERATOR, "!=")) => {
                         self.parse_assignment();
                     }
                     Some((NEWLINE, _)) => {
@@ -214,8 +220,15 @@ fn parse(text: &str) -> Parse {
             self.tokens.last().map(|(kind, _)| *kind)
         }
 
-        fn find(&self, finder: impl FnMut(&&(SyntaxKind, String)) -> bool) -> Option<(SyntaxKind, &str)> {
-            self.tokens.iter().rev().find(finder).map(|(kind, text)| (*kind, text.as_str()))
+        fn find(
+            &self,
+            finder: impl FnMut(&&(SyntaxKind, String)) -> bool,
+        ) -> Option<(SyntaxKind, &str)> {
+            self.tokens
+                .iter()
+                .rev()
+                .find(finder)
+                .map(|(kind, text)| (*kind, text.as_str()))
         }
 
         fn expect(&mut self, expected: SyntaxKind) {
@@ -290,9 +303,9 @@ macro_rules! ast_node {
             }
         }
 
-        impl ToString for $ast {
-            fn to_string(&self) -> String {
-                self.0.text().to_string()
+        impl core::fmt::Display for $ast {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+                write!(f, "{}", self.0.text())
             }
         }
     };
@@ -305,17 +318,22 @@ ast_node!(VariableDefinition, VARIABLE);
 
 impl VariableDefinition {
     pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| it.as_token().and_then(|it| {
-            if it.kind() == IDENTIFIER {
-                Some(it.text().to_string())
-            } else {
-                None
-            }
-        }))
+        self.syntax().children_with_tokens().find_map(|it| {
+            it.as_token().and_then(|it| {
+                if it.kind() == IDENTIFIER {
+                    Some(it.text().to_string())
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn raw_value(&self) -> Option<String> {
-        self.syntax().children().find(|it| it.kind() == EXPR).map(|it| it.text().to_string())
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == EXPR)
+            .map(|it| it.text().to_string())
     }
 }
 
@@ -346,9 +364,7 @@ impl Makefile {
     }
 
     pub fn rules(&self) -> impl Iterator<Item = Rule> {
-        self.syntax()
-            .children()
-            .filter_map(Rule::cast)
+        self.syntax().children().filter_map(Rule::cast)
     }
 
     pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
@@ -367,7 +383,8 @@ impl Makefile {
 
         let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
         let pos = self.0.children().count();
-        self.0.splice_children(pos..pos, vec![syntax.clone().into()]);
+        self.0
+            .splice_children(pos..pos, vec![syntax.clone().into()]);
         Rule(syntax)
     }
 }
@@ -384,7 +401,35 @@ impl Rule {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
-            .into_iter().flat_map(|it| it.children_with_tokens().filter_map(|it| it.as_token().and_then(|t| if t.kind() == IDENTIFIER { Some(t.text().to_string()) } else { None })))
+            .into_iter()
+            .flat_map(|it| {
+                it.children_with_tokens().filter_map(|it| {
+                    it.as_token().and_then(|t| {
+                        if t.kind() == IDENTIFIER {
+                            Some(t.text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+    }
+
+    pub fn recipes(&self) -> impl Iterator<Item = String> {
+        self.syntax()
+            .children()
+            .filter(|it| it.kind() == RECIPE)
+            .flat_map(|it| {
+                it.children_with_tokens().filter_map(|it| {
+                    it.as_token().and_then(|t| {
+                        if t.kind() == TEXT {
+                            Some(t.text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
     }
 }
 
@@ -407,19 +452,23 @@ impl FromStr for Makefile {
     }
 }
 
-#[test]
-fn test_parse_simple() {
-    const SIMPLE: &str = r#"VARIABLE = value
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple() {
+        const SIMPLE: &str = r#"VARIABLE = value
 
 rule: dependency
 	command
 "#;
-    let parsed = parse(SIMPLE);
-    assert_eq!(parsed.errors, Vec::<String>::new());
-    let node = parsed.syntax();
-    assert_eq!(
-        format!("{:#?}", node),
-        r#"ROOT@0..44
+        let parsed = parse(SIMPLE);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..44
   VARIABLE@0..17
     IDENTIFIER@0..8 "VARIABLE"
     WHITESPACE@8..9 " "
@@ -441,35 +490,36 @@ rule: dependency
       TEXT@36..43 "command"
       NEWLINE@43..44 "\n"
 "#
-    );
+        );
 
-    let root = parsed.root().clone_for_update();
+        let root = parsed.root().clone_for_update();
 
-    let mut rules = root.rules().collect::<Vec<_>>();
-    assert_eq!(rules.len(), 1);
-    let rule = rules.pop().unwrap();
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        let mut rules = root.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        let rule = rules.pop().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
 
-    let mut variables = root.variable_definitions().collect::<Vec<_>>();
-    assert_eq!(variables.len(), 1);
-    let variable = variables.pop().unwrap();
-    assert_eq!(variable.name(), Some("VARIABLE".to_string()));
-    assert_eq!(variable.raw_value(), Some("value".to_string()));
-}
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        assert_eq!(variable.name(), Some("VARIABLE".to_string()));
+        assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
 
-#[test]
-fn test_parse_multiple_prerequisites() {
-    const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
+    #[test]
+    fn test_parse_multiple_prerequisites() {
+        const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
 	command
 
 "#;
-    let parsed = parse(MULTIPLE_PREREQUISITES);
-    assert_eq!(parsed.errors, Vec::<String>::new());
-    let node = parsed.syntax();
-    assert_eq!(
-        format!("{:#?}", node),
-        r#"ROOT@0..40
+        let parsed = parse(MULTIPLE_PREREQUISITES);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..40
   RULE@0..40
     IDENTIFIER@0..4 "rule"
     OPERATOR@4..5 ":"
@@ -484,23 +534,29 @@ fn test_parse_multiple_prerequisites() {
       TEXT@31..38 "command"
       NEWLINE@38..39 "\n"
     NEWLINE@39..40 "\n"
-"#);
-    let root = parsed.root().clone_for_update();
+"#
+        );
+        let root = parsed.root().clone_for_update();
 
-    let rule = root.rules().next().unwrap();
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(
-        rule.prerequisites().collect::<Vec<_>>(),
-        vec!["dependency1", "dependency2"]
-    );
-}
+        let rule = root.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dependency1", "dependency2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    }
 
-#[test]
-fn test_add_rule() {
-    let mut makefile = Makefile::new();
-    let rule = makefile.add_rule("rule");
-    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), Vec::<String>::new());
+    #[test]
+    fn test_add_rule() {
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("rule");
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
 
-    assert_eq!(makefile.to_string(), "rule:\n");
+        assert_eq!(makefile.to_string(), "rule:\n");
+    }
 }

@@ -69,7 +69,10 @@ impl<'a> Lexer<'a> {
                     return Some((SyntaxKind::NEWLINE, self.input.next()?.to_string()));
                 }
                 '#' => {
-                    return Some((SyntaxKind::COMMENT, self.read_while(|c| !Self::is_newline(c))));
+                    return Some((
+                        SyntaxKind::COMMENT,
+                        self.read_while(|c| !Self::is_newline(c)),
+                    ));
                 }
                 _ => {}
             }
@@ -82,12 +85,14 @@ impl<'a> Lexer<'a> {
                     c if Self::is_whitespace(c) => {
                         Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
                     }
-                    c if Self::is_valid_identifier_char(c) => {
-                        Some((SyntaxKind::IDENTIFIER, self.read_while(Self::is_valid_identifier_char)))
-                    }
-                    ':' | '=' | '?'| '+' => {
-                        Some((SyntaxKind::OPERATOR, self.read_while(|c| c == ':' || c == '=' || c == '?')))
-                    }
+                    c if Self::is_valid_identifier_char(c) => Some((
+                        SyntaxKind::IDENTIFIER,
+                        self.read_while(Self::is_valid_identifier_char),
+                    )),
+                    ':' | '=' | '?' | '+' => Some((
+                        SyntaxKind::OPERATOR,
+                        self.read_while(|c| c == ':' || c == '=' || c == '?'),
+                    )),
                     '(' => {
                         self.input.next();
                         Some((SyntaxKind::LPAREN, "(".to_string()))
@@ -116,7 +121,7 @@ impl<'a> Lexer<'a> {
                         self.input.next();
                         Some((SyntaxKind::ERROR, c.to_string()))
                     }
-                }
+                },
             }
         } else {
             None
@@ -139,22 +144,23 @@ pub(crate) fn lex(input: &str) -> Vec<(SyntaxKind, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use crate::SyntaxKind::*;
+
     #[test]
     fn test_empty() {
-        assert_eq!(super::lex(""), vec![]);
+        assert_eq!(lex(""), vec![]);
     }
 
     #[test]
     fn test_simple() {
         assert_eq!(
-            super::lex(
-                r#"VARIABLE = value
+            lex(r#"VARIABLE = value
 
 rule: prerequisite
 	recipe
-"#
-            )
+"#)
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -181,11 +187,10 @@ rule: prerequisite
     #[test]
     fn test_multiple_prerequisites() {
         assert_eq!(
-            super::lex(
-                r#"rule: prerequisite1 prerequisite2
+            lex(r#"rule: prerequisite1 prerequisite2
 	recipe
 
-"#            )
+"#)
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -208,7 +213,10 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            super::lex("VARIABLE ?= value\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            lex("VARIABLE ?= value\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -223,9 +231,12 @@ rule: prerequisite
     #[test]
     fn test_conditional() {
         assert_eq!(
-            super::lex(r#"ifneq (a, b)
+            lex(r#"ifneq (a, b)
 endif
-"#).iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+"#)
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "ifneq"),
                 (WHITESPACE, " "),
@@ -245,7 +256,10 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            lex("VARIABLE = $(value)\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -263,7 +277,10 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            super::lex("VARIABLE = $(value)$(value2)\n").iter().map(|(kind, text)| (*kind, text.as_str())).collect::<Vec<_>>(),
+            lex("VARIABLE = $(value)$(value2)\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
