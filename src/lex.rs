@@ -185,6 +185,56 @@ rule: prerequisite
     }
 
     #[test]
+    fn test_bare_export() {
+        assert_eq!(
+            lex(r#"export
+"#)
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect::<Vec<_>>(),
+            vec![(IDENTIFIER, "export"), (NEWLINE, "\n"),]
+        );
+    }
+
+    #[test]
+    fn test_export() {
+        assert_eq!(
+            lex(r#"export VARIABLE
+"#)
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "export"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "VARIABLE"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_export_assignment() {
+        assert_eq!(
+            lex(r#"export VARIABLE := value
+"#)
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "export"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "VARIABLE"),
+                (WHITESPACE, " "),
+                (OPERATOR, ":="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "value"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_multiple_prerequisites() {
         assert_eq!(
             lex(r#"rule: prerequisite1 prerequisite2

@@ -161,6 +161,10 @@ fn parse(text: &str) -> Parse {
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
             self.skip_ws();
+            if self.tokens.last() == Some(&(IDENTIFIER, "export".to_string())) {
+                self.expect(IDENTIFIER);
+                self.skip_ws();
+            }
             self.expect(IDENTIFIER);
             self.skip_ws();
             self.expect(OPERATOR);
@@ -320,7 +324,7 @@ impl VariableDefinition {
     pub fn name(&self) -> Option<String> {
         self.syntax().children_with_tokens().find_map(|it| {
             it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER {
+                if it.kind() == IDENTIFIER && it.text() != "export" {
                     Some(it.text().to_string())
                 } else {
                     None
@@ -500,6 +504,38 @@ rule: dependency
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
         assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        let mut variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        let variable = variables.pop().unwrap();
+        assert_eq!(variable.name(), Some("VARIABLE".to_string()));
+        assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_export_assign() {
+        const EXPORT: &str = r#"export VARIABLE := value
+"#;
+        let parsed = parse(EXPORT);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..25
+  VARIABLE@0..25
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..15 "VARIABLE"
+    WHITESPACE@15..16 " "
+    OPERATOR@16..18 ":="
+    WHITESPACE@18..19 " "
+    EXPR@19..24
+      IDENTIFIER@19..24 "value"
+    NEWLINE@24..25 "\n"
+"#
+        );
+
+        let root = parsed.root().clone_for_update();
 
         let mut variables = root.variable_definitions().collect::<Vec<_>>();
         assert_eq!(variables.len(), 1);
