@@ -371,6 +371,11 @@ impl Makefile {
         self.syntax().children().filter_map(Rule::cast)
     }
 
+    pub fn rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
+        self.rules()
+            .filter(move |rule| rule.targets().any(|t| t == target))
+    }
+
     pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
         self.syntax()
             .children()
@@ -386,7 +391,7 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
-        let pos = self.0.children().count();
+        let pos = self.0.children_with_tokens().count();
         self.0
             .splice_children(pos..pos, vec![syntax.clone().into()]);
         Rule(syntax)
@@ -434,6 +439,52 @@ impl Rule {
                     })
                 })
             })
+    }
+
+    pub fn replace_command(&self, i: usize, line: &str) {
+        // Find the RECIPE with index i, then replace the line in it
+        let index = self
+            .syntax()
+            .children()
+            .filter(|it| it.kind() == RECIPE)
+            .nth(i)
+            .expect("index out of bounds")
+            .index();
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+        builder.token(INDENT.into(), "\t");
+        builder.token(TEXT.into(), line);
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+        self.0
+            .splice_children(index..index + 1, vec![syntax.into()]);
+    }
+
+    pub fn push_command(&self, line: &str) {
+        // Find the latest RECIPE entry, then append the new line after it.
+        let index = self
+            .0
+            .children_with_tokens()
+            .filter(|it| it.kind() == RECIPE)
+            .last();
+
+        let index = index.map_or_else(
+            || self.0.children_with_tokens().count(),
+            |it| it.index() + 1,
+        );
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+        builder.token(INDENT.into(), "\t");
+        builder.token(TEXT.into(), line);
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+
+        self.0.splice_children(index..index, vec![syntax.into()]);
     }
 }
 
@@ -594,5 +645,43 @@ rule: dependency
         );
 
         assert_eq!(makefile.to_string(), "rule:\n");
+    }
+
+    #[test]
+    fn test_push_command() {
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("rule");
+        rule.push_command("command");
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n");
+
+        rule.push_command("command2");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2"]
+        );
+
+        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n\tcommand2\n");
+    }
+
+    #[test]
+    fn test_replace_command() {
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("rule");
+        rule.push_command("command");
+        rule.push_command("command2");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2"]
+        );
+
+        rule.replace_command(0, "new command");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["new command", "command2"]
+        );
+
+        assert_eq!(makefile.to_string(), "rule:\n\tnew command\n\tcommand2\n");
     }
 }
