@@ -129,7 +129,7 @@ fn parse(text: &str) -> Parse {
             self.builder.start_node(RECIPE.into());
             self.expect(INDENT);
             self.expect(TEXT);
-            self.expect(NEWLINE);
+            self.expect_eol();
             self.builder.finish_node();
         }
 
@@ -145,7 +145,7 @@ fn parse(text: &str) -> Parse {
             }
             self.skip_ws();
             self.parse_expr();
-            self.expect(NEWLINE);
+            self.expect_eol();
             loop {
                 match self.current() {
                     Some(INDENT) => {
@@ -175,7 +175,7 @@ fn parse(text: &str) -> Parse {
             self.expect(OPERATOR);
             self.skip_ws();
             self.parse_expr();
-            self.expect(NEWLINE);
+            self.expect_eol();
             self.builder.finish_node();
         }
 
@@ -238,6 +238,18 @@ fn parse(text: &str) -> Parse {
                 .rev()
                 .find(finder)
                 .map(|(kind, text)| (*kind, text.as_str()))
+        }
+
+        fn expect_eol(&mut self) {
+            match self.current() {
+                Some(NEWLINE) => {
+                    self.bump();
+                }
+                None => {}
+                n => {
+                    self.error(format!("expected newline, got {:?}", n));
+                }
+            }
         }
 
         fn expect(&mut self, expected: SyntaxKind) {
@@ -421,8 +433,7 @@ impl Makefile {
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
         let pos = self.0.children_with_tokens().count();
-        self.0
-            .splice_children(pos..pos, vec![syntax.into()]);
+        self.0.splice_children(pos..pos, vec![syntax.into()]);
         Rule(self.0.children().nth(pos).unwrap())
     }
 }
@@ -433,7 +444,7 @@ impl FromStr for Rule {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parsed = parse(s);
         let rules = parsed.root().rules().collect::<Vec<_>>();
-        if parsed.errors.is_empty() {
+        if !parsed.errors.is_empty() {
             Err(ParseError(parsed.errors))
         } else if rules.len() == 1 {
             Ok(rules.into_iter().next().unwrap())
@@ -772,5 +783,23 @@ rule: dependency
         );
 
         assert_eq!(makefile.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+    }
+
+    #[test]
+    fn test_parse_rule_without_newline() {
+        let rule = "rule: dependency\n\tcommand".parse::<Rule>().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+        let rule = "rule: dependency".parse::<Rule>().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_parse_makefile_without_newline() {
+        let makefile = "rule: dependency\n\tcommand".parse::<Makefile>().unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+        let makefile = "rule: dependency".parse::<Makefile>().unwrap();
+        assert_eq!(makefile.rules().count(), 1);
     }
 }
