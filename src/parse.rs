@@ -5,8 +5,12 @@ use rowan::ast::AstNode;
 use std::str::FromStr;
 
 #[derive(Debug)]
+/// An error that can occur when parsing a makefile
 pub enum Error {
+    /// An I/O error occurred
     Io(std::io::Error),
+
+    /// A parse error occurred
     Parse(ParseError),
 }
 
@@ -28,6 +32,7 @@ impl From<std::io::Error> for Error {
 impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// An error that occurred while parsing a makefile
 pub struct ParseError(Vec<String>);
 
 impl std::fmt::Display for ParseError {
@@ -273,7 +278,7 @@ type SyntaxElement = rowan::NodeOrToken<SyntaxNode, SyntaxToken>;
 
 impl Parse {
     fn syntax(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green_node.clone())
+        SyntaxNode::new_root_mut(self.green_node.clone())
     }
 
     fn root(&self) -> Makefile {
@@ -285,6 +290,7 @@ macro_rules! ast_node {
     ($ast:ident, $kind:ident) => {
         #[derive(PartialEq, Eq, Hash)]
         #[repr(transparent)]
+        /// An AST node for $ast
         pub struct $ast(SyntaxNode);
 
         impl AstNode for $ast {
@@ -321,6 +327,7 @@ ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 
 impl VariableDefinition {
+    /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
         self.syntax().children_with_tokens().find_map(|it| {
             it.as_token().and_then(|it| {
@@ -333,6 +340,7 @@ impl VariableDefinition {
         })
     }
 
+    /// Get the raw value of the variable definition
     pub fn raw_value(&self) -> Option<String> {
         self.syntax()
             .children()
@@ -342,14 +350,15 @@ impl VariableDefinition {
 }
 
 impl Makefile {
+    /// Create a new empty makefile
     pub fn new() -> Makefile {
         let mut builder = GreenNodeBuilder::new();
 
         builder.start_node(ROOT.into());
         builder.finish_node();
 
-        let syntax = SyntaxNode::new_root(builder.finish());
-        Makefile(syntax.clone_for_update())
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        Makefile(syntax)
     }
 
     /// Read a changelog file from a reader
@@ -359,29 +368,49 @@ impl Makefile {
         Ok(buf.parse()?)
     }
 
+    /// Read makefile from a reader, but allow syntax errors
     pub fn read_relaxed<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
 
         let parsed = parse(&buf);
-        Ok(parsed.root().clone_for_update())
+        Ok(parsed.root())
     }
 
+    /// Retrieve the rules in the makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "rule: dependency\n\tcommand\n".parse().unwrap();
+    /// assert_eq!(makefile.rules().count(), 1);
+    /// ```
     pub fn rules(&self) -> impl Iterator<Item = Rule> {
         self.syntax().children().filter_map(Rule::cast)
     }
 
+    /// Get all rules that have a specific target
     pub fn rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
         self.rules()
             .filter(move |rule| rule.targets().any(|t| t == target))
     }
 
+    /// Get all variable definitions in the makefile
     pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
         self.syntax()
             .children()
             .filter_map(VariableDefinition::cast)
     }
 
+    /// Add a new rule to the makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile = Makefile::new();
+    /// makefile.add_rule("rule");
+    /// assert_eq!(makefile.to_string(), "rule:\n");
+    /// ```
     pub fn add_rule(&mut self, target: &str) -> Rule {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RULE.into());
@@ -390,15 +419,40 @@ impl Makefile {
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
         let pos = self.0.children_with_tokens().count();
         self.0
-            .splice_children(pos..pos, vec![syntax.clone().into()]);
-        Rule(syntax)
+            .splice_children(pos..pos, vec![syntax.into()]);
+        Rule(self.0.children().nth(pos).unwrap())
+    }
+}
+
+impl FromStr for Rule {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parsed = parse(s);
+        let rules = parsed.root().rules().collect::<Vec<_>>();
+        if parsed.errors.is_empty() {
+            Err(ParseError(parsed.errors))
+        } else if rules.len() == 1 {
+            Ok(rules.into_iter().next().unwrap())
+        } else {
+            Err(ParseError(vec!["expected a single rule".to_string()]))
+        }
     }
 }
 
 impl Rule {
+    /// Targets of this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    ///
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+    /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> {
         self.syntax()
             .children_with_tokens()
@@ -406,6 +460,14 @@ impl Rule {
             .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
     }
 
+    /// Get the prerequisites in the rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+    /// ```
     pub fn prerequisites(&self) -> impl Iterator<Item = String> {
         self.syntax()
             .children()
@@ -424,6 +486,14 @@ impl Rule {
             })
     }
 
+    /// Get the commands in the rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    /// ```
     pub fn recipes(&self) -> impl Iterator<Item = String> {
         self.syntax()
             .children()
@@ -441,6 +511,16 @@ impl Rule {
             })
     }
 
+    /// Replace the command at index i with a new line
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// rule.replace_command(0, "new command");
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
+    /// assert_eq!(rule.to_string(), "rule: dependency\n\tnew command\n");
+    /// ```
     pub fn replace_command(&self, i: usize, line: &str) {
         // Find the RECIPE with index i, then replace the line in it
         let index = self
@@ -458,11 +538,20 @@ impl Rule {
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
         self.0
             .splice_children(index..index + 1, vec![syntax.into()]);
     }
 
+    /// Add a new command to the rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// rule.push_command("command2");
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
+    /// ```
     pub fn push_command(&self, line: &str) {
         // Find the latest RECIPE entry, then append the new line after it.
         let index = self
@@ -482,7 +571,7 @@ impl Rule {
         builder.token(TEXT.into(), line);
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
 
         self.0.splice_children(index..index, vec![syntax.into()]);
     }
@@ -500,7 +589,7 @@ impl FromStr for Makefile {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parsed = parse(s);
         if parsed.errors.is_empty() {
-            Ok(parsed.root().clone_for_update())
+            Ok(parsed.root())
         } else {
             Err(ParseError(parsed.errors))
         }
@@ -547,7 +636,7 @@ rule: dependency
 "#
         );
 
-        let root = parsed.root().clone_for_update();
+        let root = parsed.root();
 
         let mut rules = root.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
@@ -586,7 +675,7 @@ rule: dependency
 "#
         );
 
-        let root = parsed.root().clone_for_update();
+        let root = parsed.root();
 
         let mut variables = root.variable_definitions().collect::<Vec<_>>();
         assert_eq!(variables.len(), 1);
@@ -623,7 +712,7 @@ rule: dependency
     NEWLINE@39..40 "\n"
 "#
         );
-        let root = parsed.root().clone_for_update();
+        let root = parsed.root();
 
         let rule = root.rules().next().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
