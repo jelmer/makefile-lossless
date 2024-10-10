@@ -1,4 +1,5 @@
 #![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
+#![deny(missing_docs)]
 
 //! A lossless parser for Makefiles
 //!
@@ -30,6 +31,7 @@ pub use parse::{Identifier, Makefile, Rule, VariableDefinition};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(non_camel_case_types)]
 #[repr(u16)]
+#[allow(missing_docs)]
 pub enum SyntaxKind {
     IDENTIFIER = 0,
     INDENT,
@@ -50,7 +52,6 @@ pub enum SyntaxKind {
     // composite nodes
     ROOT, // The entire file
     RULE, // A single rule
-    PREREQUISITES,
     RECIPE,
     VARIABLE,
     EXPR,
