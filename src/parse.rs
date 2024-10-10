@@ -5,8 +5,12 @@ use rowan::ast::AstNode;
 use std::str::FromStr;
 
 #[derive(Debug)]
+/// An error that can occur when parsing a makefile
 pub enum Error {
+    /// An I/O error occurred
     Io(std::io::Error),
+
+    /// A parse error occurred
     Parse(ParseError),
 }
 
@@ -28,6 +32,7 @@ impl From<std::io::Error> for Error {
 impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// An error that occurred while parsing a makefile
 pub struct ParseError(Vec<String>);
 
 impl std::fmt::Display for ParseError {

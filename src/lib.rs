@@ -24,10 +24,8 @@
 mod lex;
 mod parse;
 
-pub use parse::{Identifier, Makefile, Rule, VariableDefinition};
+pub use parse::{Identifier, Makefile, Rule, VariableDefinition, ParseError, Error};
 
-/// Let's start with defining all kinds of tokens and
-/// composite nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(non_camel_case_types)]
 #[repr(u16)]
