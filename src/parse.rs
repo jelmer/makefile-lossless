@@ -436,6 +436,13 @@ impl Makefile {
         self.0.splice_children(pos..pos, vec![syntax.into()]);
         Rule(self.0.children().nth(pos).unwrap())
     }
+
+    /// Read the makefile
+    pub fn from_reader<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
+        let mut buf = String::new();
+        r.read_to_string(&mut buf)?;
+        Ok(buf.parse()?)
+    }
 }
 
 impl FromStr for Rule {
@@ -800,6 +807,12 @@ rule: dependency
         let makefile = "rule: dependency\n\tcommand".parse::<Makefile>().unwrap();
         assert_eq!(makefile.rules().count(), 1);
         let makefile = "rule: dependency".parse::<Makefile>().unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_from_reader() {
+        let makefile = Makefile::from_reader("rule: dependency\n\tcommand".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 }
