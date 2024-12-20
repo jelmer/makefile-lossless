@@ -89,10 +89,13 @@ impl<'a> Lexer<'a> {
                         SyntaxKind::IDENTIFIER,
                         self.read_while(Self::is_valid_identifier_char),
                     )),
-                    ':' | '=' | '?' | '+' => Some((
-                        SyntaxKind::OPERATOR,
-                        self.read_while(|c| c == ':' || c == '=' || c == '?'),
-                    )),
+                    ':' | '=' | '?' | '+' => {
+                        let text = self.input.next().unwrap().to_string()
+                            + self
+                                .read_while(|c| c == ':' || c == '=' || c == '?')
+                                .as_str();
+                        Some((SyntaxKind::OPERATOR, text))
+                    }
                     '(' => {
                         self.input.next();
                         Some((SyntaxKind::LPAREN, "(".to_string()))
@@ -347,5 +350,41 @@ endif
                 (NEWLINE, "\n"),
             ]
         );
+    }
+
+    #[test]
+    fn test_oom() {
+        let text = r#"
+#!/usr/bin/make -f
+#
+# debhelper-7 [debian/rules] for cups-pdf
+#
+# COPYRIGHT © 2003-2021 Martin-Éric Racine <martin-eric.racine@iki.fi>
+#
+# LICENSE
+# GPLv2+: GNU GPL version 2 or later <http://gnu.org/licenses/gpl.html>
+#
+export CC       := $(shell dpkg-architecture --query DEB_HOST_GNU_TYPE)-gcc
+export CPPFLAGS := $(shell dpkg-buildflags --get CPPFLAGS)
+export CFLAGS   := $(shell dpkg-buildflags --get CFLAGS)
+export LDFLAGS  := $(shell dpkg-buildflags --get LDFLAGS)
+#export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-bindnow,-pie
+# Append flags for Long File Support (LFS)
+# LFS_CPPFLAGS does not exist
+export DEB_CFLAGS_MAINT_APPEND  +=$(shell getconf LFS_CFLAGS) $(HARDENING_CFLAGS)
+export DEB_LDFLAGS_MAINT_APPEND +=$(shell getconf LFS_LDFLAGS) $(HARDENING_LDFLAGS)
+
+override_dh_auto_build-arch:
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o src/cups-pdf src/cups-pdf.c -lcups
+
+override_dh_auto_clean:
+	rm -f src/cups-pdf src/*.o
+
+%:
+	dh $@
+#EOF
+    "#;
+
+        let _lexed = lex(text);
     }
 }
