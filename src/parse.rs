@@ -128,7 +128,17 @@ fn parse(text: &str) -> Parse {
         fn parse_recipe_line(&mut self) {
             self.builder.start_node(RECIPE.into());
             self.expect(INDENT);
-            self.expect(TEXT);
+            match self.current() {
+                Some(TEXT) => {
+                    self.bump();
+                }
+                None => {}
+                Some(got) => {
+                    self.bump();
+                    self.error(format!("expected {:?}, got {:?}", TEXT, got));
+                }
+            }
+
             self.expect_eol();
             self.builder.finish_node();
         }
@@ -163,6 +173,11 @@ fn parse(text: &str) -> Parse {
             self.builder.finish_node();
         }
 
+        fn parse_comment(&mut self) {
+            self.expect(COMMENT);
+            self.expect_eol();
+        }
+
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
             self.skip_ws();
@@ -182,7 +197,7 @@ fn parse(text: &str) -> Parse {
         fn parse(mut self) -> Parse {
             self.builder.start_node(ROOT.into());
             loop {
-                match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN) {
+                match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
                     Some((OPERATOR, ":")) => {
                         self.parse_rule();
                     }
@@ -198,11 +213,15 @@ fn parse(text: &str) -> Parse {
                     Some((NEWLINE, _)) => {
                         self.bump();
                     }
-                    Some(_) | None => {
-                        self.error(format!("unexpected token {:?}", self.current()));
-                        if self.current().is_some() {
-                            self.bump();
-                        }
+                    Some((COMMENT, _)) => {
+                        self.parse_comment();
+                    }
+                    Some(got) => {
+                        self.error(format!("unexpected token {:?}", got));
+                        self.bump();
+                    }
+                    None => {
+                        self.error("unexpected EOF".into());
                     }
                 }
 
@@ -229,6 +248,15 @@ fn parse(text: &str) -> Parse {
             self.tokens.last().map(|(kind, _)| *kind)
         }
 
+        /// Find the first token that satisfies the predicate
+        ///
+        /// # Arguments
+        /// * `finder` - A closure that takes a token and returns a boolean indicating if the token
+        /// is the one we are looking for.
+        ///
+        /// # Returns
+        /// The first token that satisfies the predicate, or None if no token satisfies the
+        /// predicate.
         fn find(
             &self,
             finder: impl FnMut(&&(SyntaxKind, String)) -> bool,
@@ -813,6 +841,18 @@ rule: dependency
     #[test]
     fn test_from_reader() {
         let makefile = Makefile::from_reader("rule: dependency\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_whitespace_after_last_newline() {
+        let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n\t".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_comment_after_last_newline() {
+        let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n#comment".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 }
