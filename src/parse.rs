@@ -845,8 +845,14 @@ rule: dependency
     }
 
     #[test]
-    fn test_parse_with_whitespace_after_last_newline() {
+    fn test_parse_with_tab_after_last_newline() {
         let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n\t".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_space_after_last_newline() {
+        let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n ".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 
