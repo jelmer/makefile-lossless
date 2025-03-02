@@ -861,4 +861,16 @@ rule: dependency
         let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n#comment".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
+
+    #[test]
+    fn test_parse_with_variable_rule() {
+        let makefile = Makefile::from_reader("RULE := rule\n$(RULE): dependency\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_variable_dependency() {
+        let makefile = Makefile::from_reader("DEP := dependency\nrule: (DEP)\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
 }
