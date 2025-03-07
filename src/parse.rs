@@ -593,11 +593,35 @@ impl Rule {
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
     /// ```
-    pub fn targets(&self) -> impl Iterator<Item = String> {
-        self.syntax()
+    pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
+        let mut result = Vec::new();
+        let mut tokens = self.syntax()
             .children_with_tokens()
             .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
-            .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
+            .peekable();
+        
+        while let Some(token) = tokens.next() {
+            if let Some(t) = token.as_token() {
+                if t.kind() == DOLLAR {
+                    // Start of a variable reference - collect all tokens until )
+                    let mut var_ref = String::new();
+                    var_ref.push_str(t.text());
+                    
+                    while let Some(next_token) = tokens.next() {
+                        if let Some(nt) = next_token.as_token() {
+                            var_ref.push_str(nt.text());
+                            if nt.kind() == RPAREN {
+                                break;
+                            }
+                        }
+                    }
+                    result.push(var_ref);
+                } else if t.kind() == IDENTIFIER {
+                    result.push(t.text().to_string());
+                }
+            }
+        }
+        result.into_iter()
     }
 
     /// Get the prerequisites in the rule
@@ -608,21 +632,37 @@ impl Rule {
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
-    pub fn prerequisites(&self) -> impl Iterator<Item = String> {
+    pub fn prerequisites(&self) -> impl Iterator<Item = String> + '_ {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
             .into_iter()
             .flat_map(|it| {
-                it.children_with_tokens().filter_map(|it| {
-                    it.as_token().and_then(|t| {
-                        if t.kind() == IDENTIFIER {
-                            Some(t.text().to_string())
-                        } else {
-                            None
+                let mut tokens = it.children_with_tokens().peekable();
+                let mut result = Vec::new();
+                
+                while let Some(token) = tokens.next() {
+                    if let Some(t) = token.as_token() {
+                        if t.kind() == DOLLAR {
+                            // Start of a variable reference - collect all tokens until )
+                            let mut var_ref = String::new();
+                            var_ref.push_str(t.text());
+                            
+                            while let Some(next_token) = tokens.next() {
+                                if let Some(nt) = next_token.as_token() {
+                                    var_ref.push_str(nt.text());
+                                    if nt.kind() == RPAREN {
+                                        break;
+                                    }
+                                }
+                            }
+                            result.push(var_ref);
+                        } else if t.kind() == IDENTIFIER {
+                            result.push(t.text().to_string());
                         }
-                    })
-                })
+                    }
+                }
+                result.into_iter()
             })
     }
 
