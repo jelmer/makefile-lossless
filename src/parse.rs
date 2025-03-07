@@ -234,17 +234,11 @@ fn parse(text: &str) -> Parse {
                     Some(DOLLAR) => {
                         // Look ahead to check if this is a rule pattern
                         let pos = self.tokens.len() - 1;
-                        let mut is_rule = false;
-                        
-                        // Simple scan to find a colon after the variable reference
-                        for i in (0..pos).rev() {
-                            if let Some((kind, text)) = self.tokens.get(i) {
-                                if *kind == OPERATOR && text == ":" {
-                                    is_rule = true;
-                                    break;
-                                }
-                            }
-                        }
+                        let is_rule = self.tokens[..pos]
+                            .iter()
+                            .rev()
+                            .find(|(kind, text)| *kind == OPERATOR && text == ":")
+                            .is_some();
                         
                         if is_rule {
                             self.parse_rule();
