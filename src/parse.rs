@@ -146,7 +146,36 @@ fn parse(text: &str) -> Parse {
         fn parse_rule(&mut self) {
             self.builder.start_node(RULE.into());
             self.skip_ws();
-            self.expect(IDENTIFIER);
+            
+            // Parse rule target - either an identifier or a variable reference
+            match self.current() {
+                Some(IDENTIFIER) => {
+                    self.bump();
+                }
+                Some(DOLLAR) => {
+                    // Handle variable reference: $(VAR)
+                    self.bump(); // Consume $
+                    if self.current() == Some(LPAREN) {
+                        self.bump(); // Consume (
+                        if self.current() == Some(IDENTIFIER) {
+                            self.bump(); // Consume identifier
+                            if self.current() == Some(RPAREN) {
+                                self.bump(); // Consume )
+                            } else {
+                                self.error("expected )".into());
+                            }
+                        } else {
+                            self.error("expected identifier".into());
+                        }
+                    } else {
+                        self.error("expected (".into());
+                    }
+                }
+                _ => {
+                    self.error("expected rule target".into());
+                }
+            }
+            
             self.skip_ws();
             if self.tokens.pop() == Some((OPERATOR, ":".to_string())) {
                 self.builder.token(OPERATOR.into(), ":");
@@ -197,31 +226,96 @@ fn parse(text: &str) -> Parse {
         fn parse(mut self) -> Parse {
             self.builder.start_node(ROOT.into());
             loop {
-                match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
-                    Some((OPERATOR, ":")) => {
-                        self.parse_rule();
+                // Skip whitespace at the beginning of the loop
+                self.skip_ws();
+                
+                match self.current() {
+                    // Handle variable rule reference: $(VAR): ...
+                    Some(DOLLAR) => {
+                        // Look ahead to check if this is a rule pattern
+                        let pos = self.tokens.len() - 1;
+                        let mut is_rule = false;
+                        
+                        // Simple scan to find a colon after the variable reference
+                        for i in (0..pos).rev() {
+                            if let Some((kind, text)) = self.tokens.get(i) {
+                                if *kind == OPERATOR && text == ":" {
+                                    is_rule = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if is_rule {
+                            self.parse_rule();
+                        } else {
+                            // Let the find function handle other cases
+                            match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                                Some((OPERATOR, ":")) => {
+                                    self.parse_rule();
+                                }
+                                Some((OPERATOR, "?="))
+                                | Some((OPERATOR, "="))
+                                | Some((OPERATOR, ":="))
+                                | Some((OPERATOR, "::="))
+                                | Some((OPERATOR, ":::="))
+                                | Some((OPERATOR, "+="))
+                                | Some((OPERATOR, "!=")) => {
+                                    self.parse_assignment();
+                                }
+                                Some((NEWLINE, _)) => {
+                                    self.bump();
+                                }
+                                Some((COMMENT, _)) => {
+                                    self.parse_comment();
+                                }
+                                Some(got) => {
+                                    self.error(format!("unexpected token {:?}", got));
+                                    self.bump();
+                                }
+                                None => {
+                                    // Don't report error at EOF if we have no more tokens
+                                    if self.current().is_none() {
+                                        break;
+                                    }
+                                    self.error("unexpected EOF".into());
+                                }
+                            }
+                        }
                     }
-                    Some((OPERATOR, "?="))
-                    | Some((OPERATOR, "="))
-                    | Some((OPERATOR, ":="))
-                    | Some((OPERATOR, "::="))
-                    | Some((OPERATOR, ":::="))
-                    | Some((OPERATOR, "+="))
-                    | Some((OPERATOR, "!=")) => {
-                        self.parse_assignment();
-                    }
-                    Some((NEWLINE, _)) => {
-                        self.bump();
-                    }
-                    Some((COMMENT, _)) => {
-                        self.parse_comment();
-                    }
-                    Some(got) => {
-                        self.error(format!("unexpected token {:?}", got));
-                        self.bump();
-                    }
-                    None => {
-                        self.error("unexpected EOF".into());
+                    _ => {
+                        // Normal parsing for non-$ tokens
+                        match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                            Some((OPERATOR, ":")) => {
+                                self.parse_rule();
+                            }
+                            Some((OPERATOR, "?="))
+                            | Some((OPERATOR, "="))
+                            | Some((OPERATOR, ":="))
+                            | Some((OPERATOR, "::="))
+                            | Some((OPERATOR, ":::="))
+                            | Some((OPERATOR, "+="))
+                            | Some((OPERATOR, "!=")) => {
+                                self.parse_assignment();
+                            }
+                            Some((NEWLINE, _)) => {
+                                self.bump();
+                            }
+                            Some((COMMENT, _)) => {
+                                self.parse_comment();
+                            }
+                            Some(got) => {
+                                self.error(format!("unexpected token {:?}", got));
+                                self.bump();
+                            }
+                            None => {
+                                // Don't report error at EOF if we have no more tokens
+                                if self.current().is_none() {
+                                    break;
+                                }
+                                self.error("unexpected EOF".into());
+                            }
+                        }
                     }
                 }
 
@@ -870,7 +964,13 @@ rule: dependency
 
     #[test]
     fn test_parse_with_variable_dependency() {
-        let makefile = Makefile::from_reader("DEP := dependency\nrule: (DEP)\n\tcommand".as_bytes()).unwrap();
+        let makefile = Makefile::from_reader("DEP := dependency\nrule: $(DEP)\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_variable_command() {
+        let makefile = Makefile::from_reader("COM := command\nrule: dependency\n\t$(COM)".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 }
