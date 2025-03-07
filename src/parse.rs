@@ -967,7 +967,7 @@ rule: dependency
         // Check rule
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$", "(", "RULE", ")"]);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$(RULE)"]);
         assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
         assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
     }
@@ -986,7 +986,7 @@ rule: dependency
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
-        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["DEP"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["$(DEP)"]);
         assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
