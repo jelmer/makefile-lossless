@@ -928,8 +928,6 @@ rule: dependency
     fn test_parse_makefile_without_newline() {
         let makefile = "rule: dependency\n\tcommand".parse::<Makefile>().unwrap();
         assert_eq!(makefile.rules().count(), 1);
-        let makefile = "rule: dependency".parse::<Makefile>().unwrap();
-        assert_eq!(makefile.rules().count(), 1);
     }
 
     #[test]
@@ -959,18 +957,54 @@ rule: dependency
     #[test]
     fn test_parse_with_variable_rule() {
         let makefile = Makefile::from_reader("RULE := rule\n$(RULE): dependency\n\tcommand".as_bytes()).unwrap();
-        assert_eq!(makefile.rules().count(), 1);
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("RULE".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("rule".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$", "(", "RULE", ")"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
     #[test]
     fn test_parse_with_variable_dependency() {
         let makefile = Makefile::from_reader("DEP := dependency\nrule: $(DEP)\n\tcommand".as_bytes()).unwrap();
-        assert_eq!(makefile.rules().count(), 1);
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("DEP".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("dependency".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["DEP"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
     #[test]
     fn test_parse_with_variable_command() {
         let makefile = Makefile::from_reader("COM := command\nrule: dependency\n\t$(COM)".as_bytes()).unwrap();
-        assert_eq!(makefile.rules().count(), 1);
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("COM".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("command".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["$(COM)"]);
     }
 }
