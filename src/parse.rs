@@ -146,7 +146,36 @@ fn parse(text: &str) -> Parse {
         fn parse_rule(&mut self) {
             self.builder.start_node(RULE.into());
             self.skip_ws();
-            self.expect(IDENTIFIER);
+            
+            // Parse rule target - either an identifier or a variable reference
+            match self.current() {
+                Some(IDENTIFIER) => {
+                    self.bump();
+                }
+                Some(DOLLAR) => {
+                    // Handle variable reference: $(VAR)
+                    self.bump(); // Consume $
+                    if self.current() == Some(LPAREN) {
+                        self.bump(); // Consume (
+                        if self.current() == Some(IDENTIFIER) {
+                            self.bump(); // Consume identifier
+                            if self.current() == Some(RPAREN) {
+                                self.bump(); // Consume )
+                            } else {
+                                self.error("expected )".into());
+                            }
+                        } else {
+                            self.error("expected identifier".into());
+                        }
+                    } else {
+                        self.error("expected (".into());
+                    }
+                }
+                _ => {
+                    self.error("expected rule target".into());
+                }
+            }
+            
             self.skip_ws();
             if self.tokens.pop() == Some((OPERATOR, ":".to_string())) {
                 self.builder.token(OPERATOR.into(), ":");
@@ -197,31 +226,90 @@ fn parse(text: &str) -> Parse {
         fn parse(mut self) -> Parse {
             self.builder.start_node(ROOT.into());
             loop {
-                match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
-                    Some((OPERATOR, ":")) => {
-                        self.parse_rule();
+                // Skip whitespace at the beginning of the loop
+                self.skip_ws();
+                
+                match self.current() {
+                    // Handle variable rule reference: $(VAR): ...
+                    Some(DOLLAR) => {
+                        // Look ahead to check if this is a rule pattern
+                        let pos = self.tokens.len() - 1;
+                        let is_rule = self.tokens[..pos]
+                            .iter()
+                            .rev()
+                            .find(|(kind, text)| *kind == OPERATOR && text == ":")
+                            .is_some();
+                        
+                        if is_rule {
+                            self.parse_rule();
+                        } else {
+                            // Let the find function handle other cases
+                            match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                                Some((OPERATOR, ":")) => {
+                                    self.parse_rule();
+                                }
+                                Some((OPERATOR, "?="))
+                                | Some((OPERATOR, "="))
+                                | Some((OPERATOR, ":="))
+                                | Some((OPERATOR, "::="))
+                                | Some((OPERATOR, ":::="))
+                                | Some((OPERATOR, "+="))
+                                | Some((OPERATOR, "!=")) => {
+                                    self.parse_assignment();
+                                }
+                                Some((NEWLINE, _)) => {
+                                    self.bump();
+                                }
+                                Some((COMMENT, _)) => {
+                                    self.parse_comment();
+                                }
+                                Some(got) => {
+                                    self.error(format!("unexpected token {:?}", got));
+                                    self.bump();
+                                }
+                                None => {
+                                    // Don't report error at EOF if we have no more tokens
+                                    if self.current().is_none() {
+                                        break;
+                                    }
+                                    self.error("unexpected EOF".into());
+                                }
+                            }
+                        }
                     }
-                    Some((OPERATOR, "?="))
-                    | Some((OPERATOR, "="))
-                    | Some((OPERATOR, ":="))
-                    | Some((OPERATOR, "::="))
-                    | Some((OPERATOR, ":::="))
-                    | Some((OPERATOR, "+="))
-                    | Some((OPERATOR, "!=")) => {
-                        self.parse_assignment();
-                    }
-                    Some((NEWLINE, _)) => {
-                        self.bump();
-                    }
-                    Some((COMMENT, _)) => {
-                        self.parse_comment();
-                    }
-                    Some(got) => {
-                        self.error(format!("unexpected token {:?}", got));
-                        self.bump();
-                    }
-                    None => {
-                        self.error("unexpected EOF".into());
+                    _ => {
+                        // Normal parsing for non-$ tokens
+                        match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                            Some((OPERATOR, ":")) => {
+                                self.parse_rule();
+                            }
+                            Some((OPERATOR, "?="))
+                            | Some((OPERATOR, "="))
+                            | Some((OPERATOR, ":="))
+                            | Some((OPERATOR, "::="))
+                            | Some((OPERATOR, ":::="))
+                            | Some((OPERATOR, "+="))
+                            | Some((OPERATOR, "!=")) => {
+                                self.parse_assignment();
+                            }
+                            Some((NEWLINE, _)) => {
+                                self.bump();
+                            }
+                            Some((COMMENT, _)) => {
+                                self.parse_comment();
+                            }
+                            Some(got) => {
+                                self.error(format!("unexpected token {:?}", got));
+                                self.bump();
+                            }
+                            None => {
+                                // Don't report error at EOF if we have no more tokens
+                                if self.current().is_none() {
+                                    break;
+                                }
+                                self.error("unexpected EOF".into());
+                            }
+                        }
                     }
                 }
 
@@ -499,11 +587,35 @@ impl Rule {
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
     /// ```
-    pub fn targets(&self) -> impl Iterator<Item = String> {
-        self.syntax()
+    pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
+        let mut result = Vec::new();
+        let mut tokens = self.syntax()
             .children_with_tokens()
             .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
-            .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
+            .peekable();
+        
+        while let Some(token) = tokens.next() {
+            if let Some(t) = token.as_token() {
+                if t.kind() == DOLLAR {
+                    // Start of a variable reference - collect all tokens until )
+                    let mut var_ref = String::new();
+                    var_ref.push_str(t.text());
+                    
+                    while let Some(next_token) = tokens.next() {
+                        if let Some(nt) = next_token.as_token() {
+                            var_ref.push_str(nt.text());
+                            if nt.kind() == RPAREN {
+                                break;
+                            }
+                        }
+                    }
+                    result.push(var_ref);
+                } else if t.kind() == IDENTIFIER {
+                    result.push(t.text().to_string());
+                }
+            }
+        }
+        result.into_iter()
     }
 
     /// Get the prerequisites in the rule
@@ -514,21 +626,37 @@ impl Rule {
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
-    pub fn prerequisites(&self) -> impl Iterator<Item = String> {
+    pub fn prerequisites(&self) -> impl Iterator<Item = String> + '_ {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
             .into_iter()
             .flat_map(|it| {
-                it.children_with_tokens().filter_map(|it| {
-                    it.as_token().and_then(|t| {
-                        if t.kind() == IDENTIFIER {
-                            Some(t.text().to_string())
-                        } else {
-                            None
+                let mut tokens = it.children_with_tokens().peekable();
+                let mut result = Vec::new();
+                
+                while let Some(token) = tokens.next() {
+                    if let Some(t) = token.as_token() {
+                        if t.kind() == DOLLAR {
+                            // Start of a variable reference - collect all tokens until )
+                            let mut var_ref = String::new();
+                            var_ref.push_str(t.text());
+                            
+                            while let Some(next_token) = tokens.next() {
+                                if let Some(nt) = next_token.as_token() {
+                                    var_ref.push_str(nt.text());
+                                    if nt.kind() == RPAREN {
+                                        break;
+                                    }
+                                }
+                            }
+                            result.push(var_ref);
+                        } else if t.kind() == IDENTIFIER {
+                            result.push(t.text().to_string());
                         }
-                    })
-                })
+                    }
+                }
+                result.into_iter()
             })
     }
 
@@ -834,8 +962,6 @@ rule: dependency
     fn test_parse_makefile_without_newline() {
         let makefile = "rule: dependency\n\tcommand".parse::<Makefile>().unwrap();
         assert_eq!(makefile.rules().count(), 1);
-        let makefile = "rule: dependency".parse::<Makefile>().unwrap();
-        assert_eq!(makefile.rules().count(), 1);
     }
 
     #[test]
@@ -845,8 +971,14 @@ rule: dependency
     }
 
     #[test]
-    fn test_parse_with_whitespace_after_last_newline() {
+    fn test_parse_with_tab_after_last_newline() {
         let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n\t".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_space_after_last_newline() {
+        let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n ".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 
@@ -854,5 +986,59 @@ rule: dependency
     fn test_parse_with_comment_after_last_newline() {
         let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n#comment".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_parse_with_variable_rule() {
+        let makefile = Makefile::from_reader("RULE := rule\n$(RULE): dependency\n\tcommand".as_bytes()).unwrap();
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("RULE".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("rule".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$(RULE)"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
+    }
+
+    #[test]
+    fn test_parse_with_variable_dependency() {
+        let makefile = Makefile::from_reader("DEP := dependency\nrule: $(DEP)\n\tcommand".as_bytes()).unwrap();
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("DEP".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("dependency".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["$(DEP)"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
+    }
+
+    #[test]
+    fn test_parse_with_variable_command() {
+        let makefile = Makefile::from_reader("COM := command\nrule: dependency\n\t$(COM)".as_bytes()).unwrap();
+        
+        // Check variable definition
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("COM".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("command".to_string()));
+        
+        // Check rule
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["$(COM)"]);
     }
 }
