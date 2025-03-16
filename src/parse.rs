@@ -1193,4 +1193,168 @@ rule: dependency
                     "Context should include the tab character");
         }
     }
+
+    #[test]
+    fn test_parse_small_makefile() {
+        const SMALL: &str = r#"
+# tool macros
+CXX := g++
+CXXFLAGS :=
+DBGFLAGS := -g
+CCOBJFLAGS := $(CXXFLAGS) -c
+
+# path macros
+BIN_PATH := bin
+OBJ_PATH := obj
+SRC_PATH := src
+DBG_PATH := debug
+
+project_name := makefile-template
+
+# compile macros
+TARGET_NAME := main
+ifeq ($(OS),Windows_NT)
+	TARGET_NAME := $(addsuffix .exe,$(TARGET_NAME))
+endif
+TARGET := $(BIN_PATH)/$(TARGET_NAME)
+TARGET_DEBUG := $(DBG_PATH)/$(TARGET_NAME)
+
+# src files & obj files
+SRC := $(foreach x, $(SRC_PATH), $(wildcard $(addprefix $(x)/*,.c*)))
+OBJ := $(addprefix $(OBJ_PATH)/, $(addsuffix .o, $(notdir $(basename $(SRC)))))
+OBJ_DEBUG := $(addprefix $(DBG_PATH)/, $(addsuffix .o, $(notdir $(basename $(SRC)))))
+
+# clean files list
+DISTCLEAN_LIST := $(OBJ) \
+                  $(OBJ_DEBUG)
+CLEAN_LIST := $(TARGET) \
+			  $(TARGET_DEBUG) \
+			  $(DISTCLEAN_LIST)
+
+# default rule
+default: makedir all
+
+builder-build :
+	docker build -f builder.Dockerfile -t $(project_name)-builder:latest .
+
+builder-run :
+	docker run \
+		--rm \
+		-it \
+		--platform linux/amd64 \
+		--workdir /builder/mnt \
+		-v ${PWD}:/builder/mnt \
+		$(project_name)-builder:latest \
+		/bin/bash
+
+
+# non-phony targets
+$(TARGET): $(OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJ)
+
+$(OBJ_PATH)/%.o: $(SRC_PATH)/%.c*
+	$(CXX) $(CCOBJFLAGS) -o $@ $<
+
+$(DBG_PATH)/%.o: $(SRC_PATH)/%.c*
+	$(CXX) $(CCOBJFLAGS) $(DBGFLAGS) -o $@ $<
+
+$(TARGET_DEBUG): $(OBJ_DEBUG)
+	$(CXX) $(CXXFLAGS) $(DBGFLAGS) $(OBJ_DEBUG) -o $@
+
+# phony rules
+.PHONY: makedir
+makedir:
+	@mkdir -p $(BIN_PATH) $(OBJ_PATH) $(DBG_PATH)
+
+.PHONY: all
+all: $(TARGET)
+
+.PHONY: debug
+debug: $(TARGET_DEBUG)
+
+.PHONY: clean
+clean:
+	@echo CLEAN $(CLEAN_LIST)
+	@rm -f $(CLEAN_LIST)
+
+.PHONY: distclean
+distclean:
+	@echo CLEAN $(CLEAN_LIST)
+	@rm -f $(DISTCLEAN_LIST)
+"#;
+        let parsed = parse(SMALL);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..1000"#
+        );
+    }
+
+    #[test]
+    fn test_parse_medium_makefile() {
+        const SMALL: &str = r#"
+# target macros
+TARGET := medium.exe
+MAIN_SRC := main.cpp
+
+# compile macros
+DIRS := src1 src2 src3
+OBJS := main.o
+
+# intermedia compile macros
+ALL_OBJS := $(OBJS)
+CLEAN_FILES := $(TARGET) $(OBJS)
+DIST_CLEAN_FILES := $(OBJS)
+
+# recursive wildcard
+rwildcard=$(foreach d,$(wildcard $(addsuffix *,$(1))),$(call rwildcard,$(d)/,$(2))$(filter $(subst *,%,$(2)),$(d)))
+
+# default target
+default: show-info all
+
+# non-phony targets
+$(TARGET): build-subdirs $(OBJS) find-all-objs
+	@echo -e "\t" CXX $(CXXFLAGS) $(ALL_OBJS) -o $@
+	@$(CXX) $(CXXFLAGS) $(ALL_OBJS) -o $@
+
+# phony targets
+.PHONY: all
+all: $(TARGET)
+	@echo Target $(TARGET) build finished.
+
+.PHONY: clean
+clean: clean-subdirs
+	@echo CLEAN $(CLEAN_FILES)
+	@rm -f $(CLEAN_FILES)
+
+.PHONY: distclean
+distclean: clean-subdirs
+	@echo CLEAN $(DIST_CLEAN_FILES)
+	@rm -f $(DIST_CLEAN_FILES)
+
+# phony funcs
+.PHONY: find-all-objs
+find-all-objs:
+	$(eval ALL_OBJS += $(call rwildcard,$(DIRS),*.o))
+
+.PHONY: show-info
+show-info:
+	@echo Building Project
+
+# need to be placed at the end of the file
+mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST)))
+export PROJECT_PATH := $(patsubst %/,%,$(dir $(mkfile_path)))
+export MAKE_INCLUDE=$(PROJECT_PATH)/config/make.global
+export SUB_MAKE_INCLUDE=$(PROJECT_PATH)/config/submake.global
+include $(MAKE_INCLUDE)
+"#;
+        let parsed = parse(SMALL);
+        assert_eq!(parsed.errors, Vec::<String>::new());
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r#"ROOT@0..1000"#
+        );
+    }
 }
