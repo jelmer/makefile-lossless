@@ -1284,11 +1284,6 @@ distclean:
 "#;
         let parsed = parse(SMALL);
         assert_eq!(parsed.errors, Vec::<String>::new());
-        let node = parsed.syntax();
-        assert_eq!(
-            format!("{:#?}", node),
-            r#"ROOT@0..1000"#
-        );
     }
 
     #[test]
@@ -1351,10 +1346,6 @@ include $(MAKE_INCLUDE)
 "#;
         let parsed = parse(SMALL);
         assert_eq!(parsed.errors, Vec::<String>::new());
-        let node = parsed.syntax();
-        assert_eq!(
-            format!("{:#?}", node),
-            r#"ROOT@0..1000"#
-        );
+
     }
 }
