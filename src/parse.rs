@@ -33,12 +33,23 @@ impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// An error that occurred while parsing a makefile
-pub struct ParseError(Vec<String>);
+pub struct ParseError {
+    errors: Vec<ErrorInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Information about a specific parsing error
+pub struct ErrorInfo {
+    message: String,
+    line: usize,
+    context: String,
+}
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for err in &self.0 {
-            writeln!(f, "{}", err)?;
+        for err in &self.errors {
+            writeln!(f, "Error at line {}: {}", err.line, err.message)?;
+            writeln!(f, "{}| {}", err.line, err.context)?;
         }
         Ok(())
     }
@@ -82,7 +93,7 @@ use rowan::GreenNodeBuilder;
 struct Parse {
     green_node: GreenNode,
     #[allow(unused)]
-    errors: Vec<String>,
+    errors: Vec<ErrorInfo>,
 }
 
 fn parse(text: &str) -> Parse {
@@ -94,17 +105,59 @@ fn parse(text: &str) -> Parse {
         builder: GreenNodeBuilder<'static>,
         /// the list of syntax errors we've accumulated
         /// so far.
-        errors: Vec<String>,
+        errors: Vec<ErrorInfo>,
+        /// The original text
+        original_text: String,
     }
 
     impl Parser {
         fn error(&mut self, msg: String) {
             self.builder.start_node(ERROR.into());
+            
+            let line = self.get_line_number_for_position(self.tokens.len());
+            let context = self.get_context_for_line(line);
+            
+            self.errors.push(ErrorInfo {
+                message: msg,
+                line,
+                context,
+            });
+            
             if self.current().is_some() {
                 self.bump();
             }
-            self.errors.push(msg);
             self.builder.finish_node();
+        }
+        
+        fn get_line_number_for_position(&self, position: usize) -> usize {
+            if let Some((kind, _)) = self.tokens.last() {
+                if *kind == INDENT {
+                    let lines: Vec<&str> = self.original_text.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if line.starts_with('\t') {
+                            return i + 1;
+                        }
+                    }
+                }
+            }
+            
+            let processed_tokens_len = self.tokens.len().saturating_sub(position);
+            let processed_text = self.tokens
+                .iter()
+                .take(processed_tokens_len)
+                .map(|(_, text)| text.as_str())
+                .collect::<String>();
+            
+            processed_text.matches('\n').count() + 1
+        }
+        
+        fn get_context_for_line(&self, line_number: usize) -> String {
+            let line_index = line_number.saturating_sub(1);
+            self.original_text
+                .lines()
+                .nth(line_index)
+                .unwrap_or("")
+                .to_string()
         }
 
         fn parse_expr(&mut self) {
@@ -244,7 +297,7 @@ fn parse(text: &str) -> Parse {
                             self.parse_rule();
                         } else {
                             // Let the find function handle other cases
-                            match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                            match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT || k == INDENT) {
                                 Some((OPERATOR, ":")) => {
                                     self.parse_rule();
                                 }
@@ -263,6 +316,10 @@ fn parse(text: &str) -> Parse {
                                 Some((COMMENT, _)) => {
                                     self.parse_comment();
                                 }
+                                Some((INDENT, _)) => {
+                                    self.error("indented line not part of a rule".into());
+                                    self.bump();
+                                }
                                 Some(got) => {
                                     self.error(format!("unexpected token {:?}", got));
                                     self.bump();
@@ -279,7 +336,7 @@ fn parse(text: &str) -> Parse {
                     }
                     _ => {
                         // Normal parsing for non-$ tokens
-                        match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT) {
+                        match self.find(|&&(k, _)| k == OPERATOR || k == NEWLINE || k == LPAREN || k == COMMENT || k == INDENT) {
                             Some((OPERATOR, ":")) => {
                                 self.parse_rule();
                             }
@@ -297,6 +354,10 @@ fn parse(text: &str) -> Parse {
                             }
                             Some((COMMENT, _)) => {
                                 self.parse_comment();
+                            }
+                            Some((INDENT, _)) => {
+                                self.error("indented line not part of a rule".into());
+                                self.bump();
                             }
                             Some(got) => {
                                 self.error(format!("unexpected token {:?}", got));
@@ -317,10 +378,8 @@ fn parse(text: &str) -> Parse {
                     break;
                 }
             }
-            // Close the root node.
             self.builder.finish_node();
 
-            // Turn the builder into a GreenNode
             Parse {
                 green_node: self.builder.finish(),
                 errors: self.errors,
@@ -388,6 +447,7 @@ fn parse(text: &str) -> Parse {
         tokens,
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
+        original_text: text.to_string(),
     }
     .parse()
 }
@@ -557,7 +617,13 @@ impl Makefile {
     pub fn from_reader<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
-        Ok(buf.parse()?)
+        
+        let parsed = parse(&buf);
+        if !parsed.errors.is_empty() {
+            Err(Error::Parse(ParseError { errors: parsed.errors }))
+        } else {
+            Ok(parsed.root())
+        }
     }
 }
 
@@ -566,13 +632,35 @@ impl FromStr for Rule {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parsed = parse(s);
-        let rules = parsed.root().rules().collect::<Vec<_>>();
+        
         if !parsed.errors.is_empty() {
-            Err(ParseError(parsed.errors))
-        } else if rules.len() == 1 {
+            return Err(ParseError { errors: parsed.errors });
+        }
+        
+        let rules = parsed.root().rules().collect::<Vec<_>>();
+        if rules.len() == 1 {
             Ok(rules.into_iter().next().unwrap())
         } else {
-            Err(ParseError(vec!["expected a single rule".to_string()]))
+            Err(ParseError { 
+                errors: vec![ErrorInfo {
+                    message: "expected a single rule".to_string(),
+                    line: 1,
+                    context: s.lines().next().unwrap_or("").to_string(),
+                }]
+            })
+        }
+    }
+}
+
+impl FromStr for Makefile {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parsed = parse(s);
+        if parsed.errors.is_empty() {
+            Ok(parsed.root())
+        } else {
+            Err(ParseError { errors: parsed.errors })
         }
     }
 }
@@ -757,19 +845,6 @@ impl Default for Makefile {
     }
 }
 
-impl FromStr for Makefile {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parsed = parse(s);
-        if parsed.errors.is_empty() {
-            Ok(parsed.root())
-        } else {
-            Err(ParseError(parsed.errors))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,7 +857,7 @@ rule: dependency
 	command
 "#;
         let parsed = parse(SIMPLE);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
             format!("{:#?}", node),
@@ -831,7 +906,7 @@ rule: dependency
         const EXPORT: &str = r#"export VARIABLE := value
 "#;
         let parsed = parse(EXPORT);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
             format!("{:#?}", node),
@@ -865,7 +940,7 @@ rule: dependency
 
 "#;
         let parsed = parse(MULTIPLE_PREREQUISITES);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
             format!("{:#?}", node),
@@ -1040,5 +1115,82 @@ rule: dependency
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
         assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
         assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["$(COM)"]);
+    }
+
+    #[test]
+    fn test_regular_line_error_reporting() {
+        let input = "rule target\n\tcommand";
+        
+        // Test both APIs with one input
+        let parsed = parse(input);
+        let direct_error = &parsed.errors[0];
+        
+        // Verify error is detected with correct details
+        assert_eq!(direct_error.line, 2);
+        assert_eq!(direct_error.message, "indented line not part of a rule");
+        assert_eq!(direct_error.context, "\tcommand");
+        
+        // Check public API
+        let reader_result = Makefile::from_reader(input.as_bytes());
+        let parse_error = match reader_result {
+            Err(Error::Parse(err)) => err,
+            _ => panic!("Expected Parse error from from_reader"),
+        };
+        
+        // Verify formatting includes line number and context
+        let error_text = parse_error.to_string();
+        assert!(error_text.contains("Error at line 2:"));
+        assert!(error_text.contains("2| \tcommand"));
+    }
+
+    #[test]
+    fn test_parsing_error_context_with_bad_syntax() {
+        // Test with unusual characters to ensure they're preserved
+        let input = "#begin comment\n\t(╯°□°)╯︵ ┻━┻\n#end comment";
+        
+        let reader_error = match Makefile::from_reader(input.as_bytes()) {
+            Ok(_) => panic!("Expected error"),
+            Err(Error::Parse(error)) => error,
+            Err(_) => panic!("Expected Parse error"),
+        };
+        
+        assert_eq!(reader_error.errors[0].line, 2);
+        assert_eq!(reader_error.errors[0].context, "\t(╯°□°)╯︵ ┻━┻");
+    }
+
+    #[test]
+    fn test_error_message_format() {
+        // Test the error formatter directly
+        let parse_error = ParseError { 
+            errors: vec![ErrorInfo {
+                message: "test error".to_string(),
+                line: 42,
+                context: "some problematic code".to_string(),
+            }]
+        };
+        
+        let error_text = parse_error.to_string();
+        assert!(error_text.contains("Error at line 42: test error"));
+        assert!(error_text.contains("42| some problematic code"));
+    }
+
+    #[test]
+    fn test_line_number_calculation() {
+        // Test various locations for errors
+        let test_cases = [
+            ("rule dependency\n\tcommand", 2),
+            ("#comment\n\t(╯°□°)╯︵ ┻━┻", 2),
+            ("var = value\n#comment\n\tindented line", 3),
+        ];
+        
+        for (input, expected_line) in test_cases {
+            let parse_error = match input.parse::<Makefile>() {
+                Ok(_) => panic!("Expected parse error"),
+                Err(err) => err,
+            };
+            assert_eq!(parse_error.errors[0].line, expected_line);
+            assert!(parse_error.errors[0].context.starts_with('\t'), 
+                    "Context should include the tab character");
+        }
     }
 }
