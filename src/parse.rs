@@ -1283,7 +1283,7 @@ distclean:
 	@rm -f $(DISTCLEAN_LIST)
 "#;
         let parsed = parse(SMALL);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]
@@ -1345,7 +1345,7 @@ export SUB_MAKE_INCLUDE=$(PROJECT_PATH)/config/submake.global
 include $(MAKE_INCLUDE)
 "#;
         let parsed = parse(SMALL);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
 
     }
 
@@ -1373,7 +1373,7 @@ help:
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 "#;
         let parsed = parse(SMALL);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]
@@ -1416,6 +1416,6 @@ uninstall:
 .PHONY: all install uninstall
 "#;
         let parsed = parse(SMALL);
-        assert_eq!(parsed.errors, Vec::<String>::new());
+        assert!(parsed.errors.is_empty());
     }
 }
