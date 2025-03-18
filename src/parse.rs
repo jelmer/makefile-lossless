@@ -207,24 +207,6 @@ fn parse(text: &str) -> Parse {
                 .to_string()
         }
 
-        fn parse_expr(&mut self) {
-            self.builder.start_node(EXPR.into());
-            loop {
-                match self.current() {
-                    Some(NEWLINE) => {
-                        break;
-                    }
-                    Some(_t) => {
-                        self.bump();
-                    }
-                    None => {
-                        break;
-                    }
-                }
-            }
-            self.builder.finish_node();
-        }
-
         fn parse_recipe_line(&mut self) {
             self.builder.start_node(RECIPE.into());
             self.expect(INDENT);
@@ -483,26 +465,33 @@ fn parse(text: &str) -> Parse {
             }
             
             // Process the conditional body until endif/else/elif
-            let mut conditional_depth = 1;
+            let mut depth = 1;
             
-            while conditional_depth > 0 && self.current().is_some() {
+            while depth > 0 && self.current().is_some() {
                 if self.current() == Some(IDENTIFIER) {
                     // Clone the identifier text to avoid borrowing issues
                     let ident = self.tokens.last().unwrap().1.clone();
                     
                     if ident.starts_with("if") {
-                        // Handle nested conditionals
+                        // Handle nested conditionals - increase depth
+                        depth += 1;
                         self.parse_conditional();
+                        // After parsing nested conditional, decrement depth as it's handled
+                        depth -= 1;
                     } else if ident == "endif" {
                         // End of this conditional
-                        // Decrement depth when we find an endif
-                        conditional_depth -= 1;
+                        depth -= 1;
                         self.bump();  // Consume endif
                         self.skip_ws(); // Skip any whitespace
                         self.expect_eol();
-                        break;
+                        if depth > 0 {
+                            // If we're still in a nested conditional after an endif
+                            continue;
+                        } else {
+                            break;
+                        }
                     } else if ident == "else" || ident == "elif" {
-                        if conditional_depth == 1 {
+                        if depth == 1 {
                             // Handle else/elif branch
                             self.bump();  // Consume else/elif
                             
@@ -781,26 +770,6 @@ fn parse(text: &str) -> Parse {
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
             self.tokens.last().map(|(kind, _)| *kind)
-        }
-
-        /// Find the first token that satisfies the predicate
-        ///
-        /// # Arguments
-        /// * `finder` - A closure that takes a token and returns a boolean indicating if the token
-        /// is the one we are looking for.
-        ///
-        /// # Returns
-        /// The first token that satisfies the predicate, or None if no token satisfies the
-        /// predicate.
-        fn find(
-            &self,
-            finder: impl FnMut(&&(SyntaxKind, String)) -> bool,
-        ) -> Option<(SyntaxKind, &str)> {
-            self.tokens
-                .iter()
-                .rev()
-                .find(finder)
-                .map(|(kind, text)| (*kind, text.as_str()))
         }
 
         fn expect_eol(&mut self) {
