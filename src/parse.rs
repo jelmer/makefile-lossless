@@ -170,31 +170,23 @@ fn parse(text: &str) -> Parse {
                 return self.original_text.matches('\n').count() + 1;
             }
             
-            // We need to reconstruct position information from tokens
-            // Approach: Rebuild the text up to the position to count newlines
-            
-            // Special case: if the current token is INDENT, this is an indented line error
+            // Special case: if the current token is INDENT, find the first indented line
             if self.tokens[position].0 == INDENT {
-                // For indent, we need to count lines until we find one with a tab character
-                let lines: Vec<&str> = self.original_text.lines().collect();
-                for (i, line) in lines.iter().enumerate() {
-                    if line.starts_with('\t') {
-                        return i + 1; // 1-indexed line number
-                    }
-                }
-                return 1; // Default to line 1 if no indented line found
+                return self.original_text
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| line.starts_with('\t'))
+                    .map(|(i, _)| i + 1)
+                    .unwrap_or(1);
             }
             
-            // For other tokens, we need to build the text up to this token position
-            let mut reconstructed = String::new();
-            // Only consider tokens up to the position
-            for i in 0..position {
-                reconstructed.push_str(&self.tokens[i].1);
-            }
+            // For other tokens, just count newlines in the processed text
+            let processed_text: String = self.tokens[0..position]
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect();
             
-            // Count newlines in the reconstructed text
-            let line_number = reconstructed.matches('\n').count() + 1;
-            line_number
+            processed_text.matches('\n').count() + 1
         }
         
         fn get_context_for_line(&self, line_number: usize) -> String {
@@ -417,183 +409,136 @@ fn parse(text: &str) -> Parse {
             // Skip any whitespace after the conditional keyword
             self.skip_ws();
             
+            // Process the condition part
             if token == "ifdef" || token == "ifndef" {
-                // Handle ifdef/ifndef which take a simple variable name
+                // Simple variable name for ifdef/ifndef
                 if self.current() == Some(IDENTIFIER) {
                     self.builder.start_node(EXPR.into());
-                    self.bump();  // Consume the variable name
+                    self.bump();
                     self.builder.finish_node();
                 } else {
                     self.error("expected variable name".into());
                 }
-                
                 self.expect_eol();
             } else if token == "ifeq" || token == "ifneq" {
-                // Handle ifeq/ifneq which take arguments in parentheses
-                if self.current() == Some(LPAREN) {
-                    self.builder.start_node(EXPR.into());
-                    self.bump();  // Consume the opening paren
-                    
-                    // Parse the expression within the parentheses
-                    let mut paren_count = 1;
-                    while paren_count > 0 && self.current().is_some() {
-                        match self.current() {
-                            Some(LPAREN) => {
-                                paren_count += 1;
-                                self.bump();
-                            }
-                            Some(RPAREN) => {
-                                paren_count -= 1;
-                                self.bump();
-                            }
-                            _ => self.bump(),
-                        }
-                    }
-                    
-                    self.builder.finish_node();
-                    
-                    // Skip any whitespace and expect EOL
-                    self.skip_ws();
-                    self.expect_eol();
-                } else {
-                    self.error("expected opening parenthesis after conditional".into());
-                    self.skip_until_newline();
-                }
+                // Parse parenthesized expression for ifeq/ifneq
+                self.parse_parenthesized_expr();
             } else {
                 self.error(format!("unknown conditional directive: {}", token));
                 self.skip_until_newline();
+                self.builder.finish_node();
+                return;
             }
             
-            // Process the conditional body until endif/else/elif
+            // Process the conditional body
+            self.parse_conditional_body();
+            
+            self.builder.finish_node();
+        }
+
+        // Helper method to parse a parenthesized expression
+        fn parse_parenthesized_expr(&mut self) {
+            if self.current() == Some(LPAREN) {
+                self.builder.start_node(EXPR.into());
+                self.bump();  // Consume the opening paren
+                
+                // Parse the expression within the parentheses
+                let mut paren_count = 1;
+                while paren_count > 0 && self.current().is_some() {
+                    match self.current() {
+                        Some(LPAREN) => {
+                            paren_count += 1;
+                            self.bump();
+                        }
+                        Some(RPAREN) => {
+                            paren_count -= 1;
+                            self.bump();
+                        }
+                        _ => self.bump(),
+                    }
+                }
+                
+                self.builder.finish_node();
+                
+                // Skip any whitespace and expect EOL
+                self.skip_ws();
+                self.expect_eol();
+            } else {
+                self.error("expected opening parenthesis after conditional".into());
+                self.skip_until_newline();
+            }
+        }
+
+        // Helper method to parse conditional body (including nested conditionals)
+        fn parse_conditional_body(&mut self) {
+            // Store initial depth for this conditional
             let mut depth = 1;
             
             while depth > 0 && self.current().is_some() {
-                if self.current() == Some(IDENTIFIER) {
-                    // Clone the identifier text to avoid borrowing issues
-                    let ident = self.tokens.last().unwrap().1.clone();
-                    
-                    if ident.starts_with("if") {
-                        // Handle nested conditionals - increase depth
-                        depth += 1;
-                        self.parse_conditional();
-                        // After parsing nested conditional, decrement depth as it's handled
-                        depth -= 1;
-                    } else if ident == "endif" {
-                        // End of this conditional
-                        depth -= 1;
-                        self.bump();  // Consume endif
-                        self.skip_ws(); // Skip any whitespace
-                        self.expect_eol();
-                        if depth > 0 {
-                            // If we're still in a nested conditional after an endif
-                            continue;
-                        } else {
-                            break;
-                        }
-                    } else if ident == "else" || ident == "elif" {
-                        if depth == 1 {
-                            // Handle else/elif branch
-                            self.bump();  // Consume else/elif
+                match self.current() {
+                    Some(IDENTIFIER) => {
+                        let ident = self.tokens.last().unwrap().1.clone();
+                        
+                        if ident.starts_with("if") {
+                            // Parse nested conditional
+                            self.parse_conditional();
+                        } else if ident == "endif" {
+                            // Found endif - decrement depth and exit if we're at the right level
+                            depth -= 1;
+                            self.bump();
+                            self.skip_ws();
+                            self.expect_eol();
+                            if depth == 0 {
+                                break;
+                            }
+                        } else if (ident == "else" || ident == "elif") && depth == 1 {
+                            // Parse else/elif branch at the current level
+                            self.bump();
                             
                             if ident == "elif" {
-                                // Parse the new condition for elif
                                 self.skip_ws();
-                                
                                 if self.current() == Some(IDENTIFIER) {
                                     self.builder.start_node(EXPR.into());
-                                    self.bump();  // Consume the variable name
+                                    self.bump();
                                     self.builder.finish_node();
                                 } else if self.current() == Some(LPAREN) {
-                                    self.builder.start_node(EXPR.into());
-                                    self.bump();  // Consume the opening paren
-                                    
-                                    // Parse the expression within the parentheses
-                                    let mut paren_count = 1;
-                                    while paren_count > 0 && self.current().is_some() {
-                                        match self.current() {
-                                            Some(LPAREN) => {
-                                                paren_count += 1;
-                                                self.bump();
-                                            }
-                                            Some(RPAREN) => {
-                                                paren_count -= 1;
-                                                self.bump();
-                                            }
-                                            _ => self.bump(),
-                                        }
-                                    }
-                                    
-                                    self.builder.finish_node();
+                                    self.parse_parenthesized_expr();
                                 }
                             }
                             
                             self.skip_ws();
                             self.expect_eol();
                         } else {
-                            // This else/elif belongs to a nested conditional
-                            break;
-                        }
-                    } else {
-                        // Regular content in the conditional - try to handle assignments
-                        self.skip_ws();
-                        
-                        // Check if this could be a variable assignment
-                        let pos = self.tokens.len() - 1;
-                        let is_assignment = self.tokens[..pos]
-                            .iter()
-                            .rev()
-                            .find(|(kind, _)| *kind == OPERATOR)
-                            .is_some();
-                        
-                        if is_assignment {
-                            self.parse_assignment();
-                        } else {
-                            // Try to handle as a rule
-                            self.parse_rule();
+                            // Regular content - parse as assignment or rule
+                            self.parse_normal_content();
                         }
                     }
-                } else if self.current() == Some(INDENT) {
-                    // Handle indented command lines
-                    self.parse_recipe_line();
-                } else if self.current() == Some(WHITESPACE) {
-                    // Skip leading whitespace
-                    self.bump();
-                } else if self.current() == Some(COMMENT) {
-                    // Handle comments
-                    self.parse_comment();
-                } else if self.current() == Some(NEWLINE) {
-                    // Skip empty lines
-                    self.bump();
-                } else if self.current() == Some(DOLLAR) {
-                    // Handle variable references like $(VAR)
-                    // Check if it might be a rule target
-                    let pos = self.tokens.len() - 1;
-                    let is_rule = self.tokens[..pos]
-                        .iter()
-                        .rev()
-                        .find(|(kind, text)| *kind == OPERATOR && text == ":")
-                        .is_some();
-                    
-                    if is_rule {
-                        self.parse_rule();
-                    } else {
-                        // Probably an assignment with $(VAR) on the left
-                        self.parse_assignment();
+                    Some(INDENT) => self.parse_recipe_line(),
+                    Some(WHITESPACE) => self.bump(),
+                    Some(COMMENT) => self.parse_comment(),
+                    Some(NEWLINE) => self.bump(),
+                    Some(DOLLAR) => self.parse_normal_content(),
+                    Some(_) => {
+                        self.error(format!("unexpected token in conditional block: {:?}", self.current()));
+                        self.bump();
                     }
-                } else {
-                    // Skip any unrecognized tokens with a warning
-                    self.error(format!("unexpected token in conditional block: {:?}", self.current()));
-                    self.bump();
-                }
-                
-                // Check if we've reached the end of the file
-                if self.current().is_none() {
-                    self.error("unterminated conditional (missing endif)".into());
-                    break;
+                    None => {
+                        self.error("unterminated conditional (missing endif)".into());
+                        break;
+                    }
                 }
             }
-            
-            self.builder.finish_node(); // Finish the conditional node
+        }
+
+        // Helper to parse normal content (either assignment or rule)
+        fn parse_normal_content(&mut self) {
+            // Check if this could be a variable assignment
+            if self.is_assignment_line() {
+                self.parse_assignment();
+            } else {
+                // Try to handle as a rule
+                self.parse_rule();
+            }
         }
 
         fn parse_include(&mut self) {
@@ -696,66 +641,52 @@ fn parse(text: &str) -> Parse {
             }
         }
         
-        // Helper method to determine if the current line is an assignment
+        // Simplify the is_assignment_line method by making it more direct
         fn is_assignment_line(&self) -> bool {
-            // Scan ahead for assignment operators
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
             
-            // Get the position of the current token
-            let start_pos = self.tokens.len() - 1;
+            // Scan through tokens in one pass, keeping track of positions
+            let mut assign_pos = usize::MAX;
+            let mut colon_pos = usize::MAX;
             
-            // Scan through tokens until we reach a newline
+            // Get the position of the current token and scan backwards
+            let start_pos = self.tokens.len() - 1;
             let mut pos = start_pos;
-            let mut found_assignment = false;
-            let mut found_colon = false;
             
             while pos > 0 {
                 let (kind, text) = &self.tokens[pos];
                 
-                // If we hit a newline, stop looking
+                // If we hit a newline, stop looking (we're only examining one line)
                 if *kind == NEWLINE {
                     break;
                 }
                 
-                // Check for assignment operators
+                // Check for operators and record their positions
                 if *kind == OPERATOR {
-                    if assignment_ops.contains(&text.as_str()) {
-                        found_assignment = true;
-                    } else if text == ":" {
-                        found_colon = true;
+                    if assignment_ops.contains(&text.as_str()) && assign_pos == usize::MAX {
+                        assign_pos = pos;
+                    } else if text == ":" && colon_pos == usize::MAX {
+                        colon_pos = pos;
                     }
                 }
                 
                 pos -= 1;
             }
             
-            // If we found an assignment operator and no colon, it's definitely an assignment
-            if found_assignment && !found_colon {
+            // If we found neither, it's not an assignment
+            if assign_pos == usize::MAX && colon_pos == usize::MAX {
+                return false;
+            }
+            
+            // If we found an assignment operator but no colon, it's an assignment
+            if assign_pos != usize::MAX && colon_pos == usize::MAX {
                 return true;
             }
             
-            // If we found both, check which comes first (closer to the start)
-            if found_assignment && found_colon {
-                // Scan again to see which appears first
-                pos = start_pos;
-                
-                while pos > 0 {
-                    let (kind, text) = &self.tokens[pos];
-                    
-                    if *kind == NEWLINE {
-                        break;
-                    }
-                    
-                    if *kind == OPERATOR {
-                        if assignment_ops.contains(&text.as_str()) {
-                            return true; // Assignment op found first
-                        } else if text == ":" {
-                            return false; // Colon found first, it's a rule
-                        }
-                    }
-                    
-                    pos -= 1;
-                }
+            // If we found both, the one that appears first (closer to the beginning of the line) determines the type
+            // (comparing positions - smaller position means closer to the beginning)
+            if assign_pos != usize::MAX && colon_pos != usize::MAX {
+                return assign_pos < colon_pos;
             }
             
             // Default to false (treat as rule)
