@@ -30,7 +30,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
+        c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '%'
     }
 
     fn read_while<F>(&mut self, predicate: F) -> String
@@ -386,5 +386,22 @@ override_dh_auto_clean:
     "#;
 
         let _lexed = lex(text);
+    }
+
+    #[test]
+    fn test_pattern_rule() {
+        assert_eq!(
+            lex("%.o: %.c\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "%.o"),
+                (OPERATOR, ":"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "%.c"),
+                (NEWLINE, "\n"),
+            ]
+        );
     }
 }

@@ -43,16 +43,29 @@ pub enum SyntaxKind {
     BACKSLASH,
     COMMA,
     OPERATOR,
-
+    
     COMMENT,
     ERROR,
-
+    
     // composite nodes
     ROOT, // The entire file
     RULE, // A single rule
     RECIPE,
     VARIABLE,
     EXPR,
+    
+    // Directives
+    CONDITIONAL,
+    INCLUDE,
+    
+    // New types
+    PATH,
+    NUMBER,
+    OP_DOLLAR,
+    ASSIGNMENT,
+    STRING,
+    BLOCK,
+    COMMAND,
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
