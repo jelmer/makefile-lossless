@@ -585,70 +585,68 @@ fn parse(text: &str) -> Parse {
             self.builder.finish_node();
         }
 
-        fn parse(mut self) -> Parse {
-            self.builder.start_node(ROOT.into());
-            loop {
-                // Skip whitespace at the beginning of the loop
-                self.skip_ws();
-                
-                // Check if we're at EOF
-                if self.current().is_none() {
-                    break;
+        fn parse_identifier_token(&mut self) -> bool {
+            let token = self.tokens.last().unwrap().1.clone();
+            
+            // Handle special cases first
+            if token.starts_with("%") {
+                self.parse_rule();
+                return true;
+            }
+            
+            if token.starts_with("if") {
+                self.parse_conditional();
+                return true;
+            }
+            
+            if token == "include" {
+                self.parse_include();
+                return true;
+            }
+            
+            // Handle normal content (assignment or rule)
+            self.parse_normal_content();
+            true
+        }
+        
+        fn parse_token(&mut self) -> bool {
+            match self.current() {
+                None => false,
+                Some(IDENTIFIER) => self.parse_identifier_token(),
+                Some(DOLLAR) => {
+                    self.parse_normal_content();
+                    true
                 }
-                
-                match self.current() {
-                    // Special case for pattern rules (%.o: %.c)
-                    Some(IDENTIFIER) if self.tokens.last().unwrap().1.starts_with("%") => {
-                        self.parse_rule();
-                    }
-                    // Handle conditional directives (ifeq, ifneq, etc.)
-                    Some(IDENTIFIER) if self.tokens.last().unwrap().1.starts_with("if") => {
-                        self.parse_conditional();
-                    }
-                    // Handle include directives
-                    Some(IDENTIFIER) if self.tokens.last().unwrap().1 == "include" => {
-                        self.parse_include();
-                    }
-                    // Handle rules or variable assignments
-                    Some(IDENTIFIER) => {
-                        // Try to determine if it's an assignment or a rule
-                        let is_assignment = self.is_assignment_line();
-                        
-                        if is_assignment {
-                            self.parse_assignment();
-                        } else {
-                            self.parse_rule();
-                        }
-                    }
-                    // Handle variable rule reference: $(VAR): ...
-                    Some(DOLLAR) => {
-                        // Try to determine if it's an assignment or a rule
-                        let is_assignment = self.is_assignment_line();
-                        
-                        if is_assignment {
-                            self.parse_assignment();
-                        } else {
-                            self.parse_rule();
-                        }
-                    }
-                    // Handle comments, whitespace and other tokens
-                    Some(NEWLINE) => {
-                        self.bump();
-                    }
-                    Some(COMMENT) => {
-                        self.parse_comment();
-                    }
-                    Some(INDENT) => {
-                        self.error("indented line not part of a rule".into());
-                        self.bump();
-                    }
-                    _ => {
-                        // Skip any other tokens
-                        self.error(format!("unexpected token {:?}", self.current()));
-                        self.bump();
-                    }
+                Some(NEWLINE) => {
+                    self.bump();
+                    true
+                }
+                Some(COMMENT) => {
+                    self.parse_comment();
+                    true
+                }
+                Some(WHITESPACE) => {
+                    self.skip_ws();
+                    true
+                }
+                Some(INDENT) => {
+                    self.error("indented line not part of a rule".into());
+                    self.bump();
+                    true
+                }
+                Some(kind) => {
+                    self.error(format!("unexpected token {:?}", kind));
+                    self.bump();
+                    true
                 }
             }
+        }
+
+        fn parse(mut self) -> Parse {
+            self.builder.start_node(ROOT.into());
+            
+            while self.parse_token() {}
+            
             self.builder.finish_node();
 
             Parse {
