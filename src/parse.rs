@@ -445,46 +445,47 @@ fn parse(text: &str) -> Parse {
 
         // Helper method to parse conditional body (including nested conditionals)
         fn parse_conditional_body(&mut self) {
-            // Store initial depth for this conditional
             let mut depth = 1;
             
             while depth > 0 && self.current().is_some() {
                 match self.current() {
+                    None => {
+                        self.error("unterminated conditional (missing endif)".into());
+                        break;
+                    }
                     Some(IDENTIFIER) => {
-                        let ident = self.tokens.last().unwrap().1.clone();
-                        
-                        if ident.starts_with("if") {
-                            // Parse nested conditional
-                            self.parse_conditional();
-                        } else if ident == "endif" {
-                            // Found endif - decrement depth and exit if we're at the right level
-                            depth -= 1;
-                            self.bump();
-                            self.skip_ws();
-                            self.expect_eol();
-                            if depth == 0 {
-                                break;
-                            }
-                        } else if (ident == "else" || ident == "elif") && depth == 1 {
-                            // Parse else/elif branch at the current level
-                            self.bump();
-                            
-                            if ident == "elif" {
+                        let token = self.tokens.last().unwrap().1.clone();
+                        match token.as_str() {
+                            "endif" => {
+                                depth -= 1;
+                                self.bump();
                                 self.skip_ws();
-                                if self.current() == Some(IDENTIFIER) {
-                                    self.builder.start_node(EXPR.into());
-                                    self.bump();
-                                    self.builder.finish_node();
-                                } else if self.current() == Some(LPAREN) {
-                                    self.parse_parenthesized_expr();
-                                }
+                                self.expect_eol();
+                                continue;
                             }
-                            
-                            self.skip_ws();
-                            self.expect_eol();
-                        } else {
-                            // Regular content - parse as assignment or rule
-                            self.parse_normal_content();
+                            "else" | "elif" if depth == 1 => {
+                                self.bump();
+                                if token == "elif" {
+                                    self.skip_ws();
+                                    match self.current() {
+                                        Some(IDENTIFIER) => {
+                                            self.builder.start_node(EXPR.into());
+                                            self.bump();
+                                            self.builder.finish_node();
+                                        }
+                                        Some(LPAREN) => self.parse_parenthesized_expr(),
+                                        _ => self.error("expected condition after elif".into()),
+                                    }
+                                }
+                                self.skip_ws();
+                                self.expect_eol();
+                                continue;
+                            }
+                            s if s.starts_with("if") => {
+                                self.parse_conditional();
+                                continue;
+                            }
+                            _ => self.parse_normal_content(),
                         }
                     }
                     Some(INDENT) => self.parse_recipe_line(),
@@ -495,10 +496,6 @@ fn parse(text: &str) -> Parse {
                     Some(_) => {
                         self.error(format!("unexpected token in conditional block: {:?}", self.current()));
                         self.bump();
-                    }
-                    None => {
-                        self.error("unterminated conditional (missing endif)".into());
-                        break;
                     }
                 }
             }
@@ -616,54 +613,27 @@ fn parse(text: &str) -> Parse {
         }
         
         // Simplify the is_assignment_line method by making it more direct
-        fn is_assignment_line(&self) -> bool {
+        fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-            
-            // Scan through tokens in one pass, keeping track of positions
-            let mut assign_pos = usize::MAX;
-            let mut colon_pos = usize::MAX;
-            
-            // Get the position of the current token and scan backwards
-            let start_pos = self.tokens.len() - 1;
-            let mut pos = start_pos;
+            let mut pos = self.tokens.len().saturating_sub(1);
+            let mut seen_identifier = false;
+            let mut seen_export = false;
             
             while pos > 0 {
                 let (kind, text) = &self.tokens[pos];
                 
-                // If we hit a newline, stop looking (we're only examining one line)
-                if *kind == NEWLINE {
-                    break;
+                match kind {
+                    NEWLINE => break,
+                    IDENTIFIER if text == "export" => seen_export = true,
+                    IDENTIFIER if !seen_identifier => seen_identifier = true,
+                    OPERATOR if assignment_ops.contains(&text.as_str()) => return seen_identifier || seen_export,
+                    OPERATOR if text == ":" => return false, // It's a rule if we see a colon first
+                    WHITESPACE => (),
+                    _ if seen_export => return true, // Everything after export is part of the assignment
+                    _ => return false,
                 }
-                
-                // Check for operators and record their positions
-                if *kind == OPERATOR {
-                    if assignment_ops.contains(&text.as_str()) && assign_pos == usize::MAX {
-                        assign_pos = pos;
-                    } else if text == ":" && colon_pos == usize::MAX {
-                        colon_pos = pos;
-                    }
-                }
-                
-                pos -= 1;
+                pos = pos.saturating_sub(1);
             }
-            
-            // If we found neither, it's not an assignment
-            if assign_pos == usize::MAX && colon_pos == usize::MAX {
-                return false;
-            }
-            
-            // If we found an assignment operator but no colon, it's an assignment
-            if assign_pos != usize::MAX && colon_pos == usize::MAX {
-                return true;
-            }
-            
-            // If we found both, the one that appears first (closer to the beginning of the line) determines the type
-            // (comparing positions - smaller position means closer to the beginning)
-            if assign_pos != usize::MAX && colon_pos != usize::MAX {
-                return assign_pos < colon_pos;
-            }
-            
-            // Default to false (treat as rule)
             false
         }
 
