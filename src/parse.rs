@@ -113,16 +113,17 @@ fn parse(text: &str) -> Parse {
     impl Parser {
         fn error(&mut self, msg: String) {
             self.builder.start_node(ERROR.into());
-            
+
             let (line, context) = if self.current() == Some(INDENT) {
                 // For indented lines, report the error on the next line
                 let lines: Vec<&str> = self.original_text.lines().collect();
-                let tab_line = lines.iter()
+                let tab_line = lines
+                    .iter()
                     .enumerate()
                     .find(|(_, line)| line.starts_with('\t'))
                     .map(|(i, _)| i + 1)
                     .unwrap_or(1);
-                
+
                 // Use the next line as context if available
                 let next_line = tab_line + 1;
                 if next_line <= lines.len() {
@@ -134,9 +135,9 @@ fn parse(text: &str) -> Parse {
                 let line = self.get_line_number_for_position(self.tokens.len());
                 (line, self.get_context_for_line(line))
             };
-            
+
             let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
-                if self.tokens.len() > 0 && self.tokens[self.tokens.len()-1].0 == IDENTIFIER {
+                if self.tokens.len() > 0 && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
                     "expected ':'".to_string()
                 } else {
                     "indented line not part of a rule".to_string()
@@ -144,27 +145,32 @@ fn parse(text: &str) -> Parse {
             } else {
                 msg
             };
-            
-            self.errors.push(ErrorInfo { message, line, context });
-            
+
+            self.errors.push(ErrorInfo {
+                message,
+                line,
+                context,
+            });
+
             if self.current().is_some() {
                 self.bump();
             }
             self.builder.finish_node();
         }
-        
+
         fn get_line_number_for_position(&self, position: usize) -> usize {
             if position >= self.tokens.len() {
                 return self.original_text.matches('\n').count() + 1;
             }
-            
+
             // Count newlines in the processed text up to this position
             self.tokens[0..position]
                 .iter()
                 .filter(|(kind, _)| *kind == NEWLINE)
-                .count() + 1
+                .count()
+                + 1
         }
-        
+
         fn get_context_for_line(&self, line_number: usize) -> String {
             self.original_text
                 .lines()
@@ -175,7 +181,7 @@ fn parse(text: &str) -> Parse {
 
         fn parse_recipe_line(&mut self) {
             self.builder.start_node(RECIPE.into());
-            
+
             // Check for and consume the indent
             if self.current() != Some(INDENT) {
                 self.error("recipe line must start with a tab".into());
@@ -183,7 +189,7 @@ fn parse(text: &str) -> Parse {
                 return;
             }
             self.bump();
-            
+
             // Parse the recipe content
             match self.current() {
                 Some(TEXT) => self.bump(),
@@ -199,7 +205,7 @@ fn parse(text: &str) -> Parse {
                     // End of file after tab is valid
                 }
             }
-            
+
             // Ensure proper line ending if we're not at EOF
             if self.current().is_some() && self.current() != Some(NEWLINE) {
                 self.error("recipe line must end with a newline".into());
@@ -207,7 +213,7 @@ fn parse(text: &str) -> Parse {
             } else if self.current() == Some(NEWLINE) {
                 self.bump();
             }
-            
+
             self.builder.finish_node();
         }
 
@@ -254,17 +260,20 @@ fn parse(text: &str) -> Parse {
         fn find_and_consume_colon(&mut self) -> bool {
             // Skip whitespace before colon
             self.skip_ws();
-            
+
             // Check if we're at a colon
             if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
                 self.bump();
                 return true;
             }
-            
+
             // Look ahead for a colon
-            let has_colon = self.tokens.iter().rev().any(|(kind, text)| 
-                *kind == OPERATOR && text == ":");
-            
+            let has_colon = self
+                .tokens
+                .iter()
+                .rev()
+                .any(|(kind, text)| *kind == OPERATOR && text == ":");
+
             if has_colon {
                 // Consume tokens until we find the colon
                 while self.current().is_some() {
@@ -275,35 +284,35 @@ fn parse(text: &str) -> Parse {
                     self.bump();
                 }
             }
-            
+
             self.error("expected ':'".into());
             false
         }
 
         fn parse_rule(&mut self) {
             self.builder.start_node(RULE.into());
-            
+
             // Parse target
             self.skip_ws();
             let has_target = self.parse_rule_target();
-            
+
             // Find and consume the colon
             let has_colon = if has_target {
                 self.find_and_consume_colon()
             } else {
                 false
             };
-            
+
             // Parse dependencies if we found both target and colon
             if has_target && has_colon {
                 self.skip_ws();
                 self.parse_rule_dependencies();
                 self.expect_eol();
-                
+
                 // Parse recipe lines
                 self.parse_rule_recipes();
             }
-            
+
             self.builder.finish_node();
         }
 
@@ -314,14 +323,14 @@ fn parse(text: &str) -> Parse {
 
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
-            
+
             // Handle export prefix if present
             self.skip_ws();
             if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "export" {
                 self.bump();
                 self.skip_ws();
             }
-            
+
             // Parse variable name
             match self.current() {
                 Some(IDENTIFIER) => self.bump(),
@@ -332,7 +341,7 @@ fn parse(text: &str) -> Parse {
                     return;
                 }
             }
-            
+
             // Skip whitespace and parse operator
             self.skip_ws();
             match self.current() {
@@ -341,14 +350,14 @@ fn parse(text: &str) -> Parse {
                     if ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&op.as_str()) {
                         self.bump();
                         self.skip_ws();
-                        
+
                         // Parse value
                         self.builder.start_node(EXPR.into());
                         while self.current().is_some() && self.current() != Some(NEWLINE) {
                             self.bump();
                         }
                         self.builder.finish_node();
-                        
+
                         // Expect newline
                         if self.current() == Some(NEWLINE) {
                             self.bump();
@@ -361,7 +370,7 @@ fn parse(text: &str) -> Parse {
                 }
                 _ => self.error("expected assignment operator".into()),
             }
-            
+
             self.builder.finish_node();
         }
 
@@ -397,13 +406,13 @@ fn parse(text: &str) -> Parse {
                 self.error("expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".into());
                 return None;
             }
-            
+
             let token = self.tokens.last().unwrap().1.clone();
             if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
                 self.error(format!("unknown conditional directive: {}", token));
                 return None;
             }
-            
+
             self.bump();
             Some(token)
         }
@@ -457,23 +466,23 @@ fn parse(text: &str) -> Parse {
                     self.parse_conditional();
                     true
                 }
-                _ => false
+                _ => false,
             }
         }
 
         fn parse_conditional(&mut self) {
             self.builder.start_node(CONDITIONAL.into());
-            
+
             // Parse the conditional keyword
             let Some(token) = self.parse_conditional_keyword() else {
                 self.skip_until_newline();
                 self.builder.finish_node();
                 return;
             };
-            
+
             // Skip whitespace after keyword
             self.skip_ws();
-            
+
             // Parse the condition based on keyword type
             match token.as_str() {
                 "ifdef" | "ifndef" => {
@@ -482,9 +491,9 @@ fn parse(text: &str) -> Parse {
                 "ifeq" | "ifneq" => {
                     self.parse_parenthesized_expr();
                 }
-                _ => unreachable!("Invalid conditional token")
+                _ => unreachable!("Invalid conditional token"),
             }
-            
+
             // Parse the conditional body
             let mut depth = 1;
             while depth > 0 && self.current().is_some() {
@@ -505,28 +514,31 @@ fn parse(text: &str) -> Parse {
                     Some(NEWLINE) => self.bump(),
                     Some(DOLLAR) => self.parse_normal_content(),
                     Some(_) => {
-                        self.error(format!("unexpected token in conditional block: {:?}", self.current()));
+                        self.error(format!(
+                            "unexpected token in conditional block: {:?}",
+                            self.current()
+                        ));
                         self.bump();
                     }
                 }
             }
-            
+
             self.builder.finish_node();
         }
 
         // Helper method to parse a parenthesized expression
         fn parse_parenthesized_expr(&mut self) {
             self.builder.start_node(EXPR.into());
-            
+
             if self.current() != Some(LPAREN) {
                 self.error("expected opening parenthesis".into());
                 self.builder.finish_node();
                 return;
             }
-            
+
             let mut paren_count = 1;
             self.bump(); // Consume opening paren
-            
+
             while paren_count > 0 && self.current().is_some() {
                 match self.current() {
                     Some(LPAREN) => {
@@ -544,7 +556,7 @@ fn parse(text: &str) -> Parse {
                     }
                 }
             }
-            
+
             self.skip_ws();
             self.expect_eol();
             self.builder.finish_node();
@@ -554,7 +566,7 @@ fn parse(text: &str) -> Parse {
         fn parse_normal_content(&mut self) {
             // Skip any leading whitespace
             self.skip_ws();
-            
+
             // Check if this could be a variable assignment
             if self.is_assignment_line() {
                 self.parse_assignment();
@@ -566,7 +578,7 @@ fn parse(text: &str) -> Parse {
 
         fn parse_include(&mut self) {
             self.builder.start_node(INCLUDE.into());
-            
+
             // Consume 'include' keyword
             if self.current() != Some(IDENTIFIER) || self.tokens.last().unwrap().1 != "include" {
                 self.error("expected 'include' keyword".into());
@@ -575,11 +587,11 @@ fn parse(text: &str) -> Parse {
             }
             self.bump();
             self.skip_ws();
-            
+
             // Parse file paths
             self.builder.start_node(EXPR.into());
             let mut found_path = false;
-            
+
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
@@ -595,13 +607,13 @@ fn parse(text: &str) -> Parse {
                     None => break,
                 }
             }
-            
+
             if !found_path {
                 self.error("expected file path after include".into());
             }
-            
+
             self.builder.finish_node();
-            
+
             // Expect newline
             if self.current() == Some(NEWLINE) {
                 self.bump();
@@ -609,34 +621,34 @@ fn parse(text: &str) -> Parse {
                 self.error("expected newline after include".into());
                 self.skip_until_newline();
             }
-            
+
             self.builder.finish_node();
         }
 
         fn parse_identifier_token(&mut self) -> bool {
             let token = self.tokens.last().unwrap().1.clone();
-            
+
             // Handle special cases first
             if token.starts_with("%") {
                 self.parse_rule();
                 return true;
             }
-            
+
             if token.starts_with("if") {
                 self.parse_conditional();
                 return true;
             }
-            
+
             if token == "include" {
                 self.parse_include();
                 return true;
             }
-            
+
             // Handle normal content (assignment or rule)
             self.parse_normal_content();
             true
         }
-        
+
         fn parse_token(&mut self) -> bool {
             match self.current() {
                 None => false,
@@ -672,9 +684,9 @@ fn parse(text: &str) -> Parse {
 
         fn parse(mut self) -> Parse {
             self.builder.start_node(ROOT.into());
-            
+
             while self.parse_token() {}
-            
+
             self.builder.finish_node();
 
             Parse {
@@ -682,22 +694,24 @@ fn parse(text: &str) -> Parse {
                 errors: self.errors,
             }
         }
-        
+
         // Simplify the is_assignment_line method by making it more direct
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
             let mut pos = self.tokens.len().saturating_sub(1);
             let mut seen_identifier = false;
             let mut seen_export = false;
-            
+
             while pos > 0 {
                 let (kind, text) = &self.tokens[pos];
-                
+
                 match kind {
                     NEWLINE => break,
                     IDENTIFIER if text == "export" => seen_export = true,
                     IDENTIFIER if !seen_identifier => seen_identifier = true,
-                    OPERATOR if assignment_ops.contains(&text.as_str()) => return seen_identifier || seen_export,
+                    OPERATOR if assignment_ops.contains(&text.as_str()) => {
+                        return seen_identifier || seen_export
+                    }
                     OPERATOR if text == ":" => return false, // It's a rule if we see a colon first
                     WHITESPACE => (),
                     _ if seen_export => return true, // Everything after export is part of the assignment
@@ -929,10 +943,12 @@ impl Makefile {
     pub fn from_reader<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
-        
+
         let parsed = parse(&buf);
         if !parsed.errors.is_empty() {
-            Err(Error::Parse(ParseError { errors: parsed.errors }))
+            Err(Error::Parse(ParseError {
+                errors: parsed.errors,
+            }))
         } else {
             Ok(parsed.root())
         }
@@ -944,21 +960,23 @@ impl FromStr for Rule {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parsed = parse(s);
-        
+
         if !parsed.errors.is_empty() {
-            return Err(ParseError { errors: parsed.errors });
+            return Err(ParseError {
+                errors: parsed.errors,
+            });
         }
-        
+
         let rules = parsed.root().rules().collect::<Vec<_>>();
         if rules.len() == 1 {
             Ok(rules.into_iter().next().unwrap())
         } else {
-            Err(ParseError { 
+            Err(ParseError {
                 errors: vec![ErrorInfo {
                     message: "expected a single rule".to_string(),
                     line: 1,
                     context: s.lines().next().unwrap_or("").to_string(),
-                }]
+                }],
             })
         }
     }
@@ -972,7 +990,9 @@ impl FromStr for Makefile {
         if parsed.errors.is_empty() {
             Ok(parsed.root())
         } else {
-            Err(ParseError { errors: parsed.errors })
+            Err(ParseError {
+                errors: parsed.errors,
+            })
         }
     }
 }
@@ -989,18 +1009,19 @@ impl Rule {
     /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
         let mut result = Vec::new();
-        let mut tokens = self.syntax()
+        let mut tokens = self
+            .syntax()
             .children_with_tokens()
             .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
             .peekable();
-        
+
         while let Some(token) = tokens.next() {
             if let Some(t) = token.as_token() {
                 if t.kind() == DOLLAR {
                     // Start of a variable reference - collect all tokens until )
                     let mut var_ref = String::new();
                     var_ref.push_str(t.text());
-                    
+
                     while let Some(next_token) = tokens.next() {
                         if let Some(nt) = next_token.as_token() {
                             var_ref.push_str(nt.text());
@@ -1034,14 +1055,14 @@ impl Rule {
             .flat_map(|it| {
                 let mut tokens = it.children_with_tokens().peekable();
                 let mut result = Vec::new();
-                
+
                 while let Some(token) = tokens.next() {
                     if let Some(t) = token.as_token() {
                         if t.kind() == DOLLAR {
                             // Start of a variable reference - collect all tokens until )
                             let mut var_ref = String::new();
                             var_ref.push_str(t.text());
-                            
+
                             while let Some(next_token) = tokens.next() {
                                 if let Some(nt) = next_token.as_token() {
                                     var_ref.push_str(nt.text());
@@ -1370,38 +1391,45 @@ rule: dependency
 
     #[test]
     fn test_parse_with_comment_after_last_newline() {
-        let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n#comment".as_bytes()).unwrap();
+        let makefile =
+            Makefile::from_reader("rule: dependency\n\tcommand\n#comment".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
 
     #[test]
     fn test_parse_with_variable_rule() {
-        let makefile = Makefile::from_reader("RULE := rule\n$(RULE): dependency\n\tcommand".as_bytes()).unwrap();
-        
+        let makefile =
+            Makefile::from_reader("RULE := rule\n$(RULE): dependency\n\tcommand".as_bytes())
+                .unwrap();
+
         // Check variable definition
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("RULE".to_string()));
         assert_eq!(vars[0].raw_value(), Some("rule".to_string()));
-        
+
         // Check rule
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$(RULE)"]);
-        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(
+            rules[0].prerequisites().collect::<Vec<_>>(),
+            vec!["dependency"]
+        );
         assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
     #[test]
     fn test_parse_with_variable_dependency() {
-        let makefile = Makefile::from_reader("DEP := dependency\nrule: $(DEP)\n\tcommand".as_bytes()).unwrap();
-        
+        let makefile =
+            Makefile::from_reader("DEP := dependency\nrule: $(DEP)\n\tcommand".as_bytes()).unwrap();
+
         // Check variable definition
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("DEP".to_string()));
         assert_eq!(vars[0].raw_value(), Some("dependency".to_string()));
-        
+
         // Check rule
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
@@ -1412,47 +1440,49 @@ rule: dependency
 
     #[test]
     fn test_parse_with_variable_command() {
-        let makefile = Makefile::from_reader("COM := command\nrule: dependency\n\t$(COM)".as_bytes()).unwrap();
-        
+        let makefile =
+            Makefile::from_reader("COM := command\nrule: dependency\n\t$(COM)".as_bytes()).unwrap();
+
         // Check variable definition
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("COM".to_string()));
         assert_eq!(vars[0].raw_value(), Some("command".to_string()));
-        
+
         // Check rule
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["rule"]);
-        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+        assert_eq!(
+            rules[0].prerequisites().collect::<Vec<_>>(),
+            vec!["dependency"]
+        );
         assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["$(COM)"]);
     }
 
     #[test]
     fn test_regular_line_error_reporting() {
         let input = "rule target\n\tcommand";
-        
+
         // Test both APIs with one input
         let parsed = parse(input);
         let direct_error = &parsed.errors[0];
-        
+
         // Verify error is detected with correct details
         assert_eq!(direct_error.line, 2);
         assert_eq!(direct_error.message, "expected ':'");
         assert_eq!(direct_error.context, "\tcommand");
-        
+
         // Check public API
         let reader_result = Makefile::from_reader(input.as_bytes());
         let parse_error = match reader_result {
             Ok(_) => panic!("Expected Parse error from from_reader"),
-            Err(err) => {
-                match err {
-                    self::Error::Parse(parse_err) => parse_err,
-                    _ => panic!("Expected Parse error"),
-                }
-            }
+            Err(err) => match err {
+                self::Error::Parse(parse_err) => parse_err,
+                _ => panic!("Expected Parse error"),
+            },
         };
-        
+
         // Verify formatting includes line number and context
         let error_text = parse_error.to_string();
         assert!(error_text.contains("Error at line 2:"));
@@ -1466,27 +1496,25 @@ rule: dependency
         println!("Input: {:?}", input);
         println!("Line count: {}", input.lines().count());
         for (i, line) in input.lines().enumerate() {
-            println!("Line {}: {:?}", i+1, line);
+            println!("Line {}: {:?}", i + 1, line);
             if line.starts_with('\t') {
-                println!("Found tab on line {}", i+1);
+                println!("Found tab on line {}", i + 1);
             }
         }
-        
+
         let reader_error = match Makefile::from_reader(input.as_bytes()) {
             Ok(_) => panic!("Expected error"),
-            Err(err) => {
-                match err {
-                    self::Error::Parse(error) => {
-                        println!("Error: {:?}", error);
-                        println!("Error line: {}", error.errors[0].line);
-                        println!("Error context: {:?}", error.errors[0].context);
-                        error
-                    },
-                    _ => panic!("Expected Parse error"),
+            Err(err) => match err {
+                self::Error::Parse(error) => {
+                    println!("Error: {:?}", error);
+                    println!("Error line: {}", error.errors[0].line);
+                    println!("Error context: {:?}", error.errors[0].context);
+                    error
                 }
-            }
+                _ => panic!("Expected Parse error"),
+            },
         };
-        
+
         // Line number is 3 (where the indented line is)
         assert_eq!(reader_error.errors[0].line, 3);
         assert_eq!(reader_error.errors[0].context, "#end comment");
@@ -1495,14 +1523,14 @@ rule: dependency
     #[test]
     fn test_error_message_format() {
         // Test the error formatter directly
-        let parse_error = ParseError { 
+        let parse_error = ParseError {
             errors: vec![ErrorInfo {
                 message: "test error".to_string(),
                 line: 42,
                 context: "some problematic code".to_string(),
-            }]
+            }],
         };
-        
+
         let error_text = parse_error.to_string();
         assert!(error_text.contains("Error at line 42: test error"));
         assert!(error_text.contains("42| some problematic code"));
@@ -1516,23 +1544,28 @@ rule: dependency
             ("#comment\n\t(╯°□°)╯︵ ┻━┻", 2),
             ("var = value\n#comment\n\tindented line", 3),
         ];
-        
+
         for (input, expected_line) in test_cases {
             println!("Testing input: {:?}", input);
-            
+
             // From the FromStr implementation, we expect ParseError directly
             let parsed = match input.parse::<Makefile>() {
                 Ok(_) => panic!("Expected parse error"),
-                Err(err) => err  // err is already a ParseError
+                Err(err) => err, // err is already a ParseError
             };
-            
+
             println!("Error message: {}", parsed.errors[0].message);
-            println!("Error line: {}, expected: {}", parsed.errors[0].line, expected_line);
+            println!(
+                "Error line: {}, expected: {}",
+                parsed.errors[0].line, expected_line
+            );
             println!("Error context: {:?}", parsed.errors[0].context);
-            
+
             assert_eq!(parsed.errors[0].line, expected_line);
-            assert!(parsed.errors[0].context.starts_with('\t'), 
-                    "Context should include the tab character");
+            assert!(
+                parsed.errors[0].context.starts_with('\t'),
+                "Context should include the tab character"
+            );
         }
     }
 
@@ -1626,9 +1659,12 @@ distclean:
 "#;
         let parsed = parse(SMALL);
         if !parsed.errors.is_empty() {
-            println!("Found {} errors in small makefile test:", parsed.errors.len());
+            println!(
+                "Found {} errors in small makefile test:",
+                parsed.errors.len()
+            );
             for (i, err) in parsed.errors.iter().enumerate() {
-                println!("Error {}: line {} - {}", i+1, err.line, err.message);
+                println!("Error {}: line {} - {}", i + 1, err.line, err.message);
                 println!("Context: {}", err.context);
             }
         }
@@ -1694,7 +1730,6 @@ include $(MAKE_INCLUDE)
 "#;
         let parsed = parse(SMALL);
         assert!(parsed.errors.is_empty());
-
     }
 
     #[test]
@@ -1774,10 +1809,12 @@ uninstall:
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
     }
-    
+
     #[test]
     fn test_parse_makefile_conditional() {
-        let parsed = parse("ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n");
+        let parsed = parse(
+            "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n",
+        );
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
@@ -1793,7 +1830,7 @@ uninstall:
         assert!(node_debug.matches("DEBUG").count() >= 1);
         assert!(node_debug.matches("VERBOSE").count() >= 1);
     }
-    
+
     #[test]
     fn test_include_directive() {
         let parsed = parse("include config.mk\ninclude $(TOPDIR)/rules.mk\ninclude *.mk\n");
@@ -1801,7 +1838,7 @@ uninstall:
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("INCLUDE@"));
     }
-    
+
     #[test]
     fn test_export_variables() {
         let parsed = parse("export SHELL := /bin/bash\n");
@@ -1809,13 +1846,17 @@ uninstall:
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 1);
-        let shell_var = vars.iter().find(|v| v.name() == Some("SHELL".to_string())).unwrap();
+        let shell_var = vars
+            .iter()
+            .find(|v| v.name() == Some("SHELL".to_string()))
+            .unwrap();
         assert!(shell_var.raw_value().unwrap().contains("bin/bash"));
     }
-    
+
     #[test]
     fn test_variable_scopes() {
-        let parsed = parse("SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n");
+        let parsed =
+            parse("SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n");
         assert!(parsed.errors.is_empty());
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -1838,7 +1879,7 @@ uninstall:
         assert!(var_names.contains(&"FILES".to_string()));
         assert!(var_names.contains(&"OBJS".to_string()));
     }
-    
+
     #[test]
     fn test_pattern_rule_parsing() {
         let parsed = parse("%.o: %.c\n\t$(CC) -c -o $@ $<\n");

@@ -24,7 +24,7 @@
 mod lex;
 mod parse;
 
-pub use parse::{Identifier, Makefile, Rule, VariableDefinition, ParseError, Error};
+pub use parse::{Error, Identifier, Makefile, ParseError, Rule, VariableDefinition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(non_camel_case_types)]
@@ -43,21 +43,21 @@ pub enum SyntaxKind {
     BACKSLASH,
     COMMA,
     OPERATOR,
-    
+
     COMMENT,
     ERROR,
-    
+
     // composite nodes
     ROOT, // The entire file
     RULE, // A single rule
     RECIPE,
     VARIABLE,
     EXPR,
-    
+
     // Directives
     CONDITIONAL,
     INCLUDE,
-    
+
     // New types
     PATH,
     NUMBER,
