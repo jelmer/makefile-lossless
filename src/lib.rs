@@ -57,15 +57,6 @@ pub enum SyntaxKind {
     // Directives
     CONDITIONAL,
     INCLUDE,
-
-    // New types
-    PATH,
-    NUMBER,
-    OP_DOLLAR,
-    ASSIGNMENT,
-    STRING,
-    BLOCK,
-    COMMAND,
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
