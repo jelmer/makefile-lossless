@@ -317,80 +317,78 @@ fn parse(text: &str) -> Parse {
             // Handle export prefix if present
             self.skip_ws();
             if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "export" {
-                self.bump();  // Consume "export"
+                self.bump();
                 self.skip_ws();
             }
             
-            // Parse the variable name
-            if self.current() == Some(IDENTIFIER) || self.current() == Some(DOLLAR) {
-                // Variable name could be an identifier or variable reference $(...)
-                if self.current() == Some(DOLLAR) {
-                    // Handle variable reference: $(VAR)
-                    self.bump(); // Consume $
-                    if self.current() == Some(LPAREN) {
-                        self.bump(); // Consume (
-                        // Parse everything until closing paren
-                        let mut paren_depth = 1;
-                        while paren_depth > 0 && self.current().is_some() {
-                            match self.current() {
-                                Some(LPAREN) => {
-                                    paren_depth += 1;
-                                    self.bump();
-                                }
-                                Some(RPAREN) => {
-                                    paren_depth -= 1;
-                                    if paren_depth > 0 {
-                                        self.bump();
-                                    } else {
-                                        self.bump(); // Consume final )
-                                    }
-                                }
-                                _ => self.bump(),
-                            }
-                        }
-                    } else {
-                        self.error("expected ( after $ in variable reference".into());
-                    }
-                } else {
-                    // Regular identifier
-                    self.bump();
+            // Parse variable name
+            match self.current() {
+                Some(IDENTIFIER) => self.bump(),
+                Some(DOLLAR) => self.parse_variable_reference(),
+                _ => {
+                    self.error("expected variable name".into());
+                    self.builder.finish_node();
+                    return;
                 }
-                
-                // Skip whitespace after the variable name
-                self.skip_ws();
-                
-                // Parse the assignment operator
-                if self.current() == Some(OPERATOR) {
+            }
+            
+            // Skip whitespace and parse operator
+            self.skip_ws();
+            match self.current() {
+                Some(OPERATOR) => {
                     let op = self.tokens.last().unwrap().1.clone();
                     if ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&op.as_str()) {
-                        self.bump();  // Consume the operator
+                        self.bump();
                         self.skip_ws();
                         
-                        // Parse the variable value
+                        // Parse value
                         self.builder.start_node(EXPR.into());
-                        // Consume everything until newline
                         while self.current().is_some() && self.current() != Some(NEWLINE) {
                             self.bump();
                         }
                         self.builder.finish_node();
                         
-                        // Consume the newline
+                        // Expect newline
                         if self.current() == Some(NEWLINE) {
                             self.bump();
                         } else {
-                            self.error("expected newline after variable assignment".into());
+                            self.error("expected newline after variable value".into());
                         }
                     } else {
-                        self.error(format!("unexpected operator in assignment: {}", op).into());
+                        self.error(format!("invalid assignment operator: {}", op));
                     }
-                } else {
-                    self.error("expected assignment operator (=, :=, +=, etc.)".into());
                 }
-            } else {
-                self.error("expected variable name in assignment".into());
+                _ => self.error("expected assignment operator".into()),
             }
             
             self.builder.finish_node();
+        }
+
+        fn parse_variable_reference(&mut self) {
+            self.bump(); // Consume $
+            if self.current() == Some(LPAREN) {
+                self.bump(); // Consume (
+                let mut paren_depth = 1;
+                while paren_depth > 0 && self.current().is_some() {
+                    match self.current() {
+                        Some(LPAREN) => {
+                            paren_depth += 1;
+                            self.bump();
+                        }
+                        Some(RPAREN) => {
+                            paren_depth -= 1;
+                            self.bump();
+                        }
+                        Some(_) => self.bump(),
+                        None => {
+                            self.error("unclosed variable reference".into());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                self.error("expected ( after $ in variable reference".into());
+            }
         }
 
         fn parse_conditional(&mut self) {
@@ -541,26 +539,47 @@ fn parse(text: &str) -> Parse {
         fn parse_include(&mut self) {
             self.builder.start_node(INCLUDE.into());
             
-            // Consume the 'include' token
-            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "include" {
-                self.bump();
-                
-                // Skip any whitespace
-                self.skip_ws();
-                
-                // Parse the file paths to include
-                while self.current().is_some() && self.current() != Some(NEWLINE) {
-                    self.bump();
-                }
-                
-                // Consume the newline
-                if self.current() == Some(NEWLINE) {
-                    self.bump();
-                } else {
-                    self.error("expected end of line after include".into());
-                }
-            } else {
+            // Consume 'include' keyword
+            if self.current() != Some(IDENTIFIER) || self.tokens.last().unwrap().1 != "include" {
                 self.error("expected 'include' keyword".into());
+                self.builder.finish_node();
+                return;
+            }
+            self.bump();
+            self.skip_ws();
+            
+            // Parse file paths
+            self.builder.start_node(EXPR.into());
+            let mut found_path = false;
+            
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                match self.current() {
+                    Some(WHITESPACE) => self.skip_ws(),
+                    Some(DOLLAR) => {
+                        found_path = true;
+                        self.parse_variable_reference();
+                    }
+                    Some(_) => {
+                        // Accept any token as part of the path
+                        found_path = true;
+                        self.bump();
+                    }
+                    None => break,
+                }
+            }
+            
+            if !found_path {
+                self.error("expected file path after include".into());
+            }
+            
+            self.builder.finish_node();
+            
+            // Expect newline
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            } else if self.current().is_some() {
+                self.error("expected newline after include".into());
+                self.skip_until_newline();
             }
             
             self.builder.finish_node();
