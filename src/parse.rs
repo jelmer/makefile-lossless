@@ -154,38 +154,21 @@ fn parse(text: &str) -> Parse {
         }
         
         fn get_line_number_for_position(&self, position: usize) -> usize {
-            // If position is out of bounds or we're at the end of tokens
-            // Calculate based on the entire text
             if position >= self.tokens.len() {
-                // Count all newlines in the original text + 1 for the last line
                 return self.original_text.matches('\n').count() + 1;
             }
             
-            // Special case: if the current token is INDENT, find the first indented line
-            if self.tokens[position].0 == INDENT {
-                return self.original_text
-                    .lines()
-                    .enumerate()
-                    .find(|(_, _)| true)
-                    .map(|(i, _)| i + 1)
-                    .unwrap_or(1);
-            }
-            
-            // For other tokens, just count newlines in the processed text
-            let processed_text: String = self.tokens[0..position]
+            // Count newlines in the processed text up to this position
+            self.tokens[0..position]
                 .iter()
-                .map(|(_, text)| text.as_str())
-                .collect();
-            
-            processed_text.matches('\n').count() + 1
+                .filter(|(kind, _)| *kind == NEWLINE)
+                .count() + 1
         }
         
         fn get_context_for_line(&self, line_number: usize) -> String {
-            // Get the line from the original text at the specified line number
-            let line_index = line_number.saturating_sub(1);
             self.original_text
                 .lines()
-                .nth(line_index)
+                .nth(line_number - 1)
                 .unwrap_or("")
                 .to_string()
         }
