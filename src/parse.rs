@@ -211,84 +211,32 @@ fn parse(text: &str) -> Parse {
             self.builder.finish_node();
         }
 
-        fn parse_rule(&mut self) {
-            self.builder.start_node(RULE.into());
-            self.skip_ws();
-            
-            // Parse rule target - either an identifier or a variable reference
+        fn parse_rule_target(&mut self) -> bool {
             match self.current() {
                 Some(IDENTIFIER) => {
                     self.bump();
+                    true
                 }
                 Some(DOLLAR) => {
-                    // Handle variable reference: $(VAR)
-                    self.bump(); // Consume $
-                    if self.current() == Some(LPAREN) {
-                        self.bump(); // Consume (
-                        // Parse everything until closing paren
-                        let mut paren_depth = 1;
-                        while paren_depth > 0 && self.current().is_some() {
-                            match self.current() {
-                                Some(LPAREN) => {
-                                    paren_depth += 1;
-                                    self.bump();
-                                }
-                                Some(RPAREN) => {
-                                    paren_depth -= 1;
-                                    if paren_depth > 0 {
-                                        self.bump();
-                                    } else {
-                                        self.bump(); // Consume final )
-                                    }
-                                }
-                                _ => self.bump(),
-                            }
-                        }
-                    } else {
-                        self.error("expected ( after $ in variable reference".into());
-                    }
+                    self.parse_variable_reference();
+                    true
                 }
                 _ => {
                     self.error("expected rule target".into());
+                    false
                 }
             }
-            
-            // Skip whitespace and look for colon
-            self.skip_ws();
-            if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
-                self.bump(); // Consume :
-            } else {
-                // Test if the colon is somewhere in the token stream
-                let has_colon = self.tokens.iter().rev().any(|(kind, text)| *kind == OPERATOR && text == ":");
-                
-                if has_colon {
-                    // Continue processing, expecting to find the colon later
-                    while self.current().is_some() 
-                        && (self.current() != Some(OPERATOR) || self.tokens.last().unwrap().1 != ":") {
-                        self.bump();
-                    }
-                    if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
-                        self.bump(); // Consume :
-                    } else {
-                        self.error("expected ':'".into());
-                    }
-                } else {
-                    self.error("expected ':'".into());
-                }
-            }
-            
-            self.skip_ws();
-            
-            // Parse dependencies (the rest of the line)
+        }
+
+        fn parse_rule_dependencies(&mut self) {
             self.builder.start_node(EXPR.into());
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 self.bump();
             }
             self.builder.finish_node();
-            
-            self.expect_eol();
-            
-            // Parse recipe lines (indented commands)
+        }
+
+        fn parse_rule_recipes(&mut self) {
             loop {
                 match self.current() {
                     Some(INDENT) => {
@@ -298,11 +246,64 @@ fn parse(text: &str) -> Parse {
                         self.bump();
                         break;
                     }
-                    _ => {
-                        break;
-                    }
+                    _ => break,
                 }
             }
+        }
+
+        fn find_and_consume_colon(&mut self) -> bool {
+            // Skip whitespace before colon
+            self.skip_ws();
+            
+            // Check if we're at a colon
+            if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+                self.bump();
+                return true;
+            }
+            
+            // Look ahead for a colon
+            let has_colon = self.tokens.iter().rev().any(|(kind, text)| 
+                *kind == OPERATOR && text == ":");
+            
+            if has_colon {
+                // Consume tokens until we find the colon
+                while self.current().is_some() {
+                    if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+                        self.bump();
+                        return true;
+                    }
+                    self.bump();
+                }
+            }
+            
+            self.error("expected ':'".into());
+            false
+        }
+
+        fn parse_rule(&mut self) {
+            self.builder.start_node(RULE.into());
+            
+            // Parse target
+            self.skip_ws();
+            let has_target = self.parse_rule_target();
+            
+            // Find and consume the colon
+            let has_colon = if has_target {
+                self.find_and_consume_colon()
+            } else {
+                false
+            };
+            
+            // Parse dependencies if we found both target and colon
+            if has_target && has_colon {
+                self.skip_ws();
+                self.parse_rule_dependencies();
+                self.expect_eol();
+                
+                // Parse recipe lines
+                self.parse_rule_recipes();
+            }
+            
             self.builder.finish_node();
         }
 
