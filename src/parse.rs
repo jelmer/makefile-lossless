@@ -175,19 +175,39 @@ fn parse(text: &str) -> Parse {
 
         fn parse_recipe_line(&mut self) {
             self.builder.start_node(RECIPE.into());
-            self.expect(INDENT);
+            
+            // Check for and consume the indent
+            if self.current() != Some(INDENT) {
+                self.error("recipe line must start with a tab".into());
+                self.builder.finish_node();
+                return;
+            }
+            self.bump();
+            
+            // Parse the recipe content
             match self.current() {
-                Some(TEXT) => {
+                Some(TEXT) => self.bump(),
+                Some(NEWLINE) => {
+                    // Empty recipe line (just a tab) is valid
                     self.bump();
                 }
-                None => {}
-                Some(got) => {
+                Some(kind) => {
+                    self.error(format!("unexpected token in recipe: {:?}", kind));
                     self.bump();
-                    self.error(format!("expected {:?}, got {:?}", TEXT, got));
+                }
+                None => {
+                    // End of file after tab is valid
                 }
             }
-
-            self.expect_eol();
+            
+            // Ensure proper line ending if we're not at EOF
+            if self.current().is_some() && self.current() != Some(NEWLINE) {
+                self.error("recipe line must end with a newline".into());
+                self.skip_until_newline();
+            } else if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            
             self.builder.finish_node();
         }
 
@@ -412,35 +432,38 @@ fn parse(text: &str) -> Parse {
 
         // Helper method to parse a parenthesized expression
         fn parse_parenthesized_expr(&mut self) {
-            if self.current() == Some(LPAREN) {
-                self.builder.start_node(EXPR.into());
-                self.bump();  // Consume the opening paren
-                
-                // Parse the expression within the parentheses
-                let mut paren_count = 1;
-                while paren_count > 0 && self.current().is_some() {
-                    match self.current() {
-                        Some(LPAREN) => {
-                            paren_count += 1;
-                            self.bump();
-                        }
-                        Some(RPAREN) => {
-                            paren_count -= 1;
-                            self.bump();
-                        }
-                        _ => self.bump(),
+            self.builder.start_node(EXPR.into());
+            
+            if self.current() != Some(LPAREN) {
+                self.error("expected opening parenthesis".into());
+                self.builder.finish_node();
+                return;
+            }
+            
+            let mut paren_count = 1;
+            self.bump(); // Consume opening paren
+            
+            while paren_count > 0 && self.current().is_some() {
+                match self.current() {
+                    Some(LPAREN) => {
+                        paren_count += 1;
+                        self.bump();
+                    }
+                    Some(RPAREN) => {
+                        paren_count -= 1;
+                        self.bump();
+                    }
+                    Some(_) => self.bump(),
+                    None => {
+                        self.error("unclosed parenthesis".into());
+                        break;
                     }
                 }
-                
-                self.builder.finish_node();
-                
-                // Skip any whitespace and expect EOL
-                self.skip_ws();
-                self.expect_eol();
-            } else {
-                self.error("expected opening parenthesis after conditional".into());
-                self.skip_until_newline();
             }
+            
+            self.skip_ws();
+            self.expect_eol();
+            self.builder.finish_node();
         }
 
         // Helper method to parse conditional body (including nested conditionals)
@@ -503,6 +526,9 @@ fn parse(text: &str) -> Parse {
 
         // Helper to parse normal content (either assignment or rule)
         fn parse_normal_content(&mut self) {
+            // Skip any leading whitespace
+            self.skip_ws();
+            
             // Check if this could be a variable assignment
             if self.is_assignment_line() {
                 self.parse_assignment();
