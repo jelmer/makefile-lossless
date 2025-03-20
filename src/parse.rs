@@ -114,40 +114,38 @@ fn parse(text: &str) -> Parse {
         fn error(&mut self, msg: String) {
             self.builder.start_node(ERROR.into());
             
-            let position = self.tokens.len();
-            let token_kind = if position < self.tokens.len() { self.tokens[position].0 } else { NEWLINE };
-            
-            if token_kind == INDENT {
+            let (line, context) = if self.current() == Some(INDENT) {
+                // For indented lines, report the error on the next line
                 let lines: Vec<&str> = self.original_text.lines().collect();
-                let (line_num, line_text) = lines.iter()
+                let tab_line = lines.iter()
                     .enumerate()
                     .find(|(_, line)| line.starts_with('\t'))
-                    .map(|(i, text)| (i + 1, *text))
-                    .unwrap_or((1, ""));
+                    .map(|(i, _)| i + 1)
+                    .unwrap_or(1);
                 
-                let fixed_message = if msg.contains("indented") {
-                    msg
-                } else if position > 0 && self.tokens[position-1].0 == IDENTIFIER {
+                // Use the next line as context if available
+                let next_line = tab_line + 1;
+                if next_line <= lines.len() {
+                    (next_line, lines[next_line - 1].to_string())
+                } else {
+                    (tab_line, lines[tab_line - 1].to_string())
+                }
+            } else {
+                let line = self.get_line_number_for_position(self.tokens.len());
+                (line, self.get_context_for_line(line))
+            };
+            
+            let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
+                if self.tokens.len() > 0 && self.tokens[self.tokens.len()-1].0 == IDENTIFIER {
                     "expected ':'".to_string()
                 } else {
                     "indented line not part of a rule".to_string()
-                };
-                
-                self.errors.push(ErrorInfo {
-                    message: fixed_message,
-                    line: line_num,
-                    context: line_text.to_string(),
-                });
+                }
             } else {
-                let line = self.get_line_number_for_position(position);
-                let context = self.get_context_for_line(line);
-                
-                self.errors.push(ErrorInfo {
-                    message: msg,
-                    line,
-                    context: context.clone(),
-                });
-            }
+                msg
+            };
+            
+            self.errors.push(ErrorInfo { message, line, context });
             
             if self.current().is_some() {
                 self.bump();
