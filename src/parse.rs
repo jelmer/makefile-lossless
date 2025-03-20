@@ -392,39 +392,124 @@ fn parse(text: &str) -> Parse {
             }
         }
 
-        fn parse_conditional(&mut self) {
-            self.builder.start_node(CONDITIONAL.into());
+        fn parse_conditional_keyword(&mut self) -> Option<String> {
+            if self.current() != Some(IDENTIFIER) {
+                self.error("expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".into());
+                return None;
+            }
             
-            // Consume the conditional token (ifdef, ifndef, etc.)
             let token = self.tokens.last().unwrap().1.clone();
+            if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
+                self.error(format!("unknown conditional directive: {}", token));
+                return None;
+            }
+            
             self.bump();
-            
-            // Skip any whitespace after the conditional keyword
+            Some(token)
+        }
+
+        fn parse_simple_condition(&mut self) {
+            self.builder.start_node(EXPR.into());
+            if self.current() == Some(IDENTIFIER) {
+                self.bump();
+            } else {
+                self.error("expected variable name".into());
+            }
+            self.builder.finish_node();
+            self.expect_eol();
+        }
+
+        fn parse_elif_condition(&mut self) {
             self.skip_ws();
-            
-            // Process the condition part
-            if token == "ifdef" || token == "ifndef" {
-                // Simple variable name for ifdef/ifndef
-                if self.current() == Some(IDENTIFIER) {
+            match self.current() {
+                Some(IDENTIFIER) => {
                     self.builder.start_node(EXPR.into());
                     self.bump();
                     self.builder.finish_node();
-                } else {
-                    self.error("expected variable name".into());
                 }
-                self.expect_eol();
-            } else if token == "ifeq" || token == "ifneq" {
-                // Parse parenthesized expression for ifeq/ifneq
-                self.parse_parenthesized_expr();
-            } else {
-                self.error(format!("unknown conditional directive: {}", token));
+                Some(LPAREN) => self.parse_parenthesized_expr(),
+                _ => self.error("expected condition after elif".into()),
+            }
+            self.skip_ws();
+            self.expect_eol();
+        }
+
+        fn handle_conditional_token(&mut self, token: &str, depth: &mut i32) -> bool {
+            match token {
+                "endif" => {
+                    *depth -= 1;
+                    self.bump();
+                    self.skip_ws();
+                    self.expect_eol();
+                    true
+                }
+                "else" | "elif" if *depth == 1 => {
+                    self.bump();
+                    if token == "elif" {
+                        self.parse_elif_condition();
+                    } else {
+                        self.skip_ws();
+                        self.expect_eol();
+                    }
+                    true
+                }
+                s if s.starts_with("if") => {
+                    self.parse_conditional();
+                    true
+                }
+                _ => false
+            }
+        }
+
+        fn parse_conditional(&mut self) {
+            self.builder.start_node(CONDITIONAL.into());
+            
+            // Parse the conditional keyword
+            let Some(token) = self.parse_conditional_keyword() else {
                 self.skip_until_newline();
                 self.builder.finish_node();
                 return;
+            };
+            
+            // Skip whitespace after keyword
+            self.skip_ws();
+            
+            // Parse the condition based on keyword type
+            match token.as_str() {
+                "ifdef" | "ifndef" => {
+                    self.parse_simple_condition();
+                }
+                "ifeq" | "ifneq" => {
+                    self.parse_parenthesized_expr();
+                }
+                _ => unreachable!("Invalid conditional token")
             }
             
-            // Process the conditional body
-            self.parse_conditional_body();
+            // Parse the conditional body
+            let mut depth = 1;
+            while depth > 0 && self.current().is_some() {
+                match self.current() {
+                    None => {
+                        self.error("unterminated conditional (missing endif)".into());
+                        break;
+                    }
+                    Some(IDENTIFIER) => {
+                        let token = self.tokens.last().unwrap().1.clone();
+                        if !self.handle_conditional_token(&token, &mut depth) {
+                            self.parse_normal_content();
+                        }
+                    }
+                    Some(INDENT) => self.parse_recipe_line(),
+                    Some(WHITESPACE) => self.bump(),
+                    Some(COMMENT) => self.parse_comment(),
+                    Some(NEWLINE) => self.bump(),
+                    Some(DOLLAR) => self.parse_normal_content(),
+                    Some(_) => {
+                        self.error(format!("unexpected token in conditional block: {:?}", self.current()));
+                        self.bump();
+                    }
+                }
+            }
             
             self.builder.finish_node();
         }
@@ -463,64 +548,6 @@ fn parse(text: &str) -> Parse {
             self.skip_ws();
             self.expect_eol();
             self.builder.finish_node();
-        }
-
-        // Helper method to parse conditional body (including nested conditionals)
-        fn parse_conditional_body(&mut self) {
-            let mut depth = 1;
-            
-            while depth > 0 && self.current().is_some() {
-                match self.current() {
-                    None => {
-                        self.error("unterminated conditional (missing endif)".into());
-                        break;
-                    }
-                    Some(IDENTIFIER) => {
-                        let token = self.tokens.last().unwrap().1.clone();
-                        match token.as_str() {
-                            "endif" => {
-                                depth -= 1;
-                                self.bump();
-                                self.skip_ws();
-                                self.expect_eol();
-                                continue;
-                            }
-                            "else" | "elif" if depth == 1 => {
-                                self.bump();
-                                if token == "elif" {
-                                    self.skip_ws();
-                                    match self.current() {
-                                        Some(IDENTIFIER) => {
-                                            self.builder.start_node(EXPR.into());
-                                            self.bump();
-                                            self.builder.finish_node();
-                                        }
-                                        Some(LPAREN) => self.parse_parenthesized_expr(),
-                                        _ => self.error("expected condition after elif".into()),
-                                    }
-                                }
-                                self.skip_ws();
-                                self.expect_eol();
-                                continue;
-                            }
-                            s if s.starts_with("if") => {
-                                self.parse_conditional();
-                                continue;
-                            }
-                            _ => self.parse_normal_content(),
-                        }
-                    }
-                    Some(INDENT) => self.parse_recipe_line(),
-                    Some(WHITESPACE) => self.bump(),
-                    Some(COMMENT) => self.parse_comment(),
-                    Some(NEWLINE) => self.bump(),
-                    Some(DOLLAR) => self.parse_normal_content(),
-                    Some(_) => {
-                        self.error(format!("unexpected token in conditional block: {:?}", self.current()));
-                        self.bump();
-                    }
-                }
-            }
         }
 
         // Helper to parse normal content (either assignment or rule)
