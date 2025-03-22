@@ -1657,4 +1657,10 @@ rule: dependency
         assert_eq!(rules[0].targets().next().unwrap(), "%.o");
         assert!(rules[0].recipes().next().unwrap().contains("$@"));
     }
+
+    #[test]
+    fn test_parse_with_include() {
+        let makefile = Makefile::from_reader(".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
 }
