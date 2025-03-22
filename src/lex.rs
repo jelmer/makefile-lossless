@@ -404,4 +404,20 @@ override_dh_auto_clean:
             ]
         );
     }
+
+    #[test]
+    fn test_include_directive() {
+        assert_eq!(
+            lex("-include .env\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "-include"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, ".env"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
 }
