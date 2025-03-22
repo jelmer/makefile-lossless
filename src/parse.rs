@@ -580,8 +580,10 @@ fn parse(text: &str) -> Parse {
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
-            if self.current() != Some(IDENTIFIER) || 
-               (!["include", "-include", "sinclude"].contains(&self.tokens.last().unwrap().1.as_str())) {
+            if self.current() != Some(IDENTIFIER)
+                || (!["include", "-include", "sinclude"]
+                    .contains(&self.tokens.last().unwrap().1.as_str()))
+            {
                 self.error("expected include directive".into());
                 self.builder.finish_node();
                 return;
@@ -980,7 +982,8 @@ impl Makefile {
     /// ```
     pub fn included_files(&self) -> impl Iterator<Item = String> + '_ {
         self.includes().map(|include| {
-            include.syntax()
+            include
+                .syntax()
                 .children()
                 .find(|node| node.kind() == EXPR)
                 .map(|expr| expr.text().to_string().trim().to_string())
@@ -1221,7 +1224,7 @@ impl Include {
             .find(|it| it.kind() == EXPR)
             .map(|it| it.text().to_string().trim().to_string())
     }
-    
+
     /// Check if this is an optional include (-include or sinclude)
     pub fn is_optional(&self) -> bool {
         let text = self.syntax().text();
@@ -1716,25 +1719,29 @@ rule: dependency
         let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
         let parsed = parse(makefile_str);
         assert!(parsed.errors.is_empty());
-        
+
         // Get the syntax tree for inspection
         let node = parsed.syntax();
         let debug_str = format!("{:#?}", node);
-        
+
         // Check that all includes are correctly parsed as INCLUDE nodes
         assert_eq!(debug_str.matches("INCLUDE@").count(), 4);
-        
+
         // Check that we can access the includes through the AST
         let makefile = parsed.root();
-        
+
         // Count all child nodes that are INCLUDE kind
-        let include_count = makefile.syntax().children()
+        let include_count = makefile
+            .syntax()
+            .children()
             .filter(|child| child.kind() == INCLUDE)
             .count();
         assert_eq!(include_count, 4);
-        
+
         // Test variable expansion in include paths
-        assert!(makefile.included_files().any(|path| path.contains("$(VAR)")));
+        assert!(makefile
+            .included_files()
+            .any(|path| path.contains("$(VAR)")));
     }
 
     #[test]
@@ -1742,20 +1749,20 @@ rule: dependency
         // Test the API for working with include directives
         let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
         let makefile: Makefile = makefile_str.parse().unwrap();
-        
+
         // Test the includes method
         let includes: Vec<_> = makefile.includes().collect();
         assert_eq!(includes.len(), 3);
-        
+
         // Test the is_optional method
-        assert!(!includes[0].is_optional());  // include
-        assert!(includes[1].is_optional());   // -include
-        assert!(includes[2].is_optional());   // sinclude
-        
+        assert!(!includes[0].is_optional()); // include
+        assert!(includes[1].is_optional()); // -include
+        assert!(includes[2].is_optional()); // sinclude
+
         // Test the included_files method
         let files: Vec<_> = makefile.included_files().collect();
         assert_eq!(files, vec!["simple.mk", "optional.mk", "synonym.mk"]);
-        
+
         // Test the path method on Include
         assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
         assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
@@ -1765,31 +1772,33 @@ rule: dependency
     #[test]
     fn test_include_integration() {
         // Test include directives in realistic makefile contexts
-        
+
         // Case 1: With .PHONY (which was a source of the original issue)
         let phony_makefile = Makefile::from_reader(
             ".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
             .as_bytes()
         ).unwrap();
-        
+
         // We expect 2 rules: .PHONY and rule
         assert_eq!(phony_makefile.rules().count(), 2);
-        
+
         // But only one non-special rule (not starting with '.')
-        let normal_rules_count = phony_makefile.rules()
+        let normal_rules_count = phony_makefile
+            .rules()
             .filter(|r| !r.targets().any(|t| t.starts_with('.')))
             .count();
         assert_eq!(normal_rules_count, 1);
-        
+
         // Verify we have the include directive
         assert_eq!(phony_makefile.includes().count(), 1);
         assert_eq!(phony_makefile.included_files().next().unwrap(), ".env");
-        
+
         // Case 2: Without .PHONY, just a regular rule and include
         let simple_makefile = Makefile::from_reader(
             "\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
-            .as_bytes()
-        ).unwrap();
+                .as_bytes(),
+        )
+        .unwrap();
         assert_eq!(simple_makefile.rules().count(), 1);
         assert_eq!(simple_makefile.includes().count(), 1);
     }
