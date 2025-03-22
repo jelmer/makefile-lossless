@@ -579,10 +579,10 @@ fn parse(text: &str) -> Parse {
         fn parse_include(&mut self) {
             self.builder.start_node(INCLUDE.into());
 
-            // Consume 'include' keyword
+            // Consume include keyword variant
             if self.current() != Some(IDENTIFIER) || 
-               (!self.tokens.last().unwrap().1.ends_with("include")) {
-                self.error("expected 'include' keyword".into());
+               (!["include", "-include", "sinclude"].contains(&self.tokens.last().unwrap().1.as_str())) {
+                self.error("expected include directive".into());
                 self.builder.finish_node();
                 return;
             }
@@ -640,7 +640,7 @@ fn parse(text: &str) -> Parse {
                 return true;
             }
 
-            if token == "include" || token == "-include" {
+            if token == "include" || token == "-include" || token == "sinclude" {
                 self.parse_include();
                 return true;
             }
@@ -840,6 +840,7 @@ ast_node!(Makefile, ROOT);
 ast_node!(Rule, RULE);
 ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
+ast_node!(Include, INCLUDE);
 
 impl VariableDefinition {
     /// Get the name of the variable definition
@@ -953,6 +954,40 @@ impl Makefile {
         } else {
             Ok(parsed.root())
         }
+    }
+
+    /// Get all include directives in the makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "include config.mk\n-include .env\n".parse().unwrap();
+    /// let includes = makefile.includes().collect::<Vec<_>>();
+    /// assert_eq!(includes.len(), 2);
+    /// ```
+    pub fn includes(&self) -> impl Iterator<Item = Include> {
+        self.syntax().children().filter_map(Include::cast)
+    }
+
+    /// Get all included file paths
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "include config.mk\n-include .env\n".parse().unwrap();
+    /// let paths = makefile.included_files().collect::<Vec<_>>();
+    /// assert_eq!(paths, vec!["config.mk", ".env"]);
+    /// ```
+    pub fn included_files(&self) -> impl Iterator<Item = String> + '_ {
+        self.includes().map(|include| {
+            include.syntax()
+                .children()
+                .find(|node| node.kind() == EXPR)
+                .map(|expr| expr.text().to_string().trim().to_string())
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
     }
 }
 
@@ -1175,6 +1210,22 @@ impl Rule {
 impl Default for Makefile {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Include {
+    /// Get the raw path of the include directive
+    pub fn path(&self) -> Option<String> {
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == EXPR)
+            .map(|it| it.text().to_string().trim().to_string())
+    }
+    
+    /// Check if this is an optional include (-include or sinclude)
+    pub fn is_optional(&self) -> bool {
+        let text = self.syntax().text();
+        text.to_string().starts_with("-include") || text.to_string().starts_with("sinclude")
     }
 }
 
@@ -1679,5 +1730,62 @@ rule: dependency
     fn test_parse_with_include_no_phony() {
         let makefile = Makefile::from_reader("\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_include_variants() {
+        // Test all variants of include directives
+        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
+        let parsed = parse(makefile_str);
+        
+        // Print errors for debugging
+        if !parsed.errors.is_empty() {
+            for error in &parsed.errors {
+                println!("Parse error: {} at line {}", error.message, error.line);
+                println!("Context: {}", error.context);
+            }
+        }
+        
+        assert!(parsed.errors.is_empty());
+        
+        // Get the syntax tree for inspection
+        let node = parsed.syntax();
+        let debug_str = format!("{:#?}", node);
+        
+        // Check that all includes are correctly parsed as INCLUDE nodes
+        assert_eq!(debug_str.matches("INCLUDE@").count(), 4);
+        
+        // Check that we can access the includes through the AST
+        let makefile = parsed.root();
+        
+        // Count all child nodes that are INCLUDE kind
+        let include_count = makefile.syntax().children()
+            .filter(|child| child.kind() == INCLUDE)
+            .count();
+        assert_eq!(include_count, 4);
+    }
+
+    #[test]
+    fn test_included_files_api() {
+        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
+        let makefile: Makefile = makefile_str.parse().unwrap();
+        
+        // Test the includes method
+        let includes: Vec<_> = makefile.includes().collect();
+        assert_eq!(includes.len(), 3);
+        
+        // Test the is_optional method
+        assert!(!includes[0].is_optional());  // include
+        assert!(includes[1].is_optional());   // -include
+        assert!(includes[2].is_optional());   // sinclude
+        
+        // Test the included_files method
+        let files: Vec<_> = makefile.included_files().collect();
+        assert_eq!(files, vec!["simple.mk", "optional.mk", "synonym.mk"]);
+        
+        // Test the path method on Include
+        assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
+        assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
+        assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
     }
 }
