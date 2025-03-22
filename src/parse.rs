@@ -1711,41 +1711,10 @@ rule: dependency
     }
 
     #[test]
-    fn test_parse_with_include() {
-        let makefile = Makefile::from_reader(".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
-        
-        // Count only non-special rules (not starting with '.')
-        let normal_rules_count = makefile.rules()
-            .filter(|r| !r.targets().any(|t| t.starts_with('.')))
-            .count();
-            
-        assert_eq!(normal_rules_count, 1);
-        
-        // Verify we have the specific rule we're looking for
-        let rule_targets: Vec<_> = makefile.rules_by_target("rule").collect();
-        assert_eq!(rule_targets.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_with_include_no_phony() {
-        let makefile = Makefile::from_reader("\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
-        assert_eq!(makefile.rules().count(), 1);
-    }
-
-    #[test]
     fn test_include_variants() {
         // Test all variants of include directives
         let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
         let parsed = parse(makefile_str);
-        
-        // Print errors for debugging
-        if !parsed.errors.is_empty() {
-            for error in &parsed.errors {
-                println!("Parse error: {} at line {}", error.message, error.line);
-                println!("Context: {}", error.context);
-            }
-        }
-        
         assert!(parsed.errors.is_empty());
         
         // Get the syntax tree for inspection
@@ -1763,10 +1732,14 @@ rule: dependency
             .filter(|child| child.kind() == INCLUDE)
             .count();
         assert_eq!(include_count, 4);
+        
+        // Test variable expansion in include paths
+        assert!(makefile.included_files().any(|path| path.contains("$(VAR)")));
     }
 
     #[test]
-    fn test_included_files_api() {
+    fn test_include_api() {
+        // Test the API for working with include directives
         let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
         let makefile: Makefile = makefile_str.parse().unwrap();
         
@@ -1787,5 +1760,37 @@ rule: dependency
         assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
         assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
         assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
+    }
+
+    #[test]
+    fn test_include_integration() {
+        // Test include directives in realistic makefile contexts
+        
+        // Case 1: With .PHONY (which was a source of the original issue)
+        let phony_makefile = Makefile::from_reader(
+            ".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
+            .as_bytes()
+        ).unwrap();
+        
+        // We expect 2 rules: .PHONY and rule
+        assert_eq!(phony_makefile.rules().count(), 2);
+        
+        // But only one non-special rule (not starting with '.')
+        let normal_rules_count = phony_makefile.rules()
+            .filter(|r| !r.targets().any(|t| t.starts_with('.')))
+            .count();
+        assert_eq!(normal_rules_count, 1);
+        
+        // Verify we have the include directive
+        assert_eq!(phony_makefile.includes().count(), 1);
+        assert_eq!(phony_makefile.included_files().next().unwrap(), ".env");
+        
+        // Case 2: Without .PHONY, just a regular rule and include
+        let simple_makefile = Makefile::from_reader(
+            "\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
+            .as_bytes()
+        ).unwrap();
+        assert_eq!(simple_makefile.rules().count(), 1);
+        assert_eq!(simple_makefile.includes().count(), 1);
     }
 }
