@@ -1663,4 +1663,10 @@ rule: dependency
         let makefile = Makefile::from_reader(".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
         assert_eq!(makefile.rules().count(), 1);
     }
+
+    #[test]
+    fn test_parse_with_include_no_phony() {
+        let makefile = Makefile::from_reader("\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand".as_bytes()).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
 }
