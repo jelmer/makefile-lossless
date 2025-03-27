@@ -505,7 +505,11 @@ fn parse(text: &str) -> Parse {
                     Some(IDENTIFIER) => {
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
-                            self.parse_normal_content();
+                            if token == "include" {
+                                self.parse_include();
+                            } else {
+                                self.parse_normal_content();
+                            }
                         }
                     }
                     Some(INDENT) => self.parse_recipe_line(),
@@ -655,7 +659,15 @@ fn parse(text: &str) -> Parse {
         fn parse_token(&mut self) -> bool {
             match self.current() {
                 None => false,
-                Some(IDENTIFIER) => self.parse_identifier_token(),
+                Some(IDENTIFIER) => {
+                    let token = self.tokens.last().unwrap().1.clone();
+                    if token.starts_with("if") {
+                        self.parse_conditional();
+                        true
+                    } else {
+                        self.parse_identifier_token()
+                    }
+                }
                 Some(DOLLAR) => {
                     self.parse_normal_content();
                     true
@@ -1809,5 +1821,47 @@ rule: dependency
         .unwrap();
         assert_eq!(simple_makefile.rules().count(), 1);
         assert_eq!(simple_makefile.includes().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_with_comments() {
+        // Test comment before conditional
+        let parsed = parse("# Start of file\nifdef DEBUG\n    CFLAGS += -g\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+        
+        // Test comment after conditional
+        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\nendif\n# End of file");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+        
+        // Test comment inside conditional
+        let parsed = parse("ifdef DEBUG\n    # Debug flags\n    CFLAGS += -g\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_include_with_comments() {
+        // Test comment before include
+        let parsed = parse("# Include config\ninclude config.mk\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("INCLUDE@"));
+        
+        // Test comment after include
+        let parsed = parse("include config.mk\n# End of includes");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("INCLUDE@"));
+        
+        // Test comment between includes
+        let parsed = parse("include config.mk\n# More includes\ninclude rules.mk\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert_eq!(format!("{:#?}", node).matches("INCLUDE@").count(), 2);
     }
 }
