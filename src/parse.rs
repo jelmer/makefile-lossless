@@ -1663,10 +1663,10 @@ rule: dependency
 
     #[test]
     fn test_include_directive_nested() {
-        let parsed = parse("ifneq (,$(wildcard Makefile.local))\n\tinclude Makefile.local\nendif\n");
+        let parsed = parse("#comment\nifneq (,$(wildcard Makefile.local))\n  include Makefile.local\nendif\n");
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("INCLUDE@"));
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
     }
 
     #[test]
