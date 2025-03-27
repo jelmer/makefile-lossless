@@ -30,7 +30,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
-        c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '.' || c == '-' || c == '%'
+        c.is_ascii_alphabetic()
+            || c.is_ascii_digit()
+            || c == '_'
+            || c == '.'
+            || c == '-'
+            || c == '%'
     }
 
     fn read_quoted_string(&mut self) -> String {

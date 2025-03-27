@@ -1726,7 +1726,9 @@ rule: dependency
 
     #[test]
     fn test_include_directive_nested() {
-        let parsed = parse("#comment\nifneq (,$(wildcard Makefile.local))\n  include Makefile.local\nendif\n");
+        let parsed = parse(
+            "#comment\nifneq (,$(wildcard Makefile.local))\n  include Makefile.local\nendif\n",
+        );
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
@@ -1881,13 +1883,13 @@ rule: dependency
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-        
+
         // Test comment after conditional
         let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\nendif\n# End of file");
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-        
+
         // Test comment inside conditional
         let parsed = parse("ifdef DEBUG\n    # Debug flags\n    CFLAGS += -g\nendif\n");
         assert!(parsed.errors.is_empty());
@@ -1925,13 +1927,16 @@ rule: dependency
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
 
         // Test with escaped characters
-        let parsed = parse("ifneq ($(PATH),\"C:\\Program Files\")\n    PATH := $(PATH):/usr/local/bin\nendif\n");
+        let parsed = parse(
+            "ifneq ($(PATH),\"C:\\Program Files\")\n    PATH := $(PATH):/usr/local/bin\nendif\n",
+        );
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
 
         // Test with spaces in variable names
-        let parsed = parse("ifdef \"Program Files\"\n    INSTALL_DIR := \"C:\\Program Files\"\nendif\n");
+        let parsed =
+            parse("ifdef \"Program Files\"\n    INSTALL_DIR := \"C:\\Program Files\"\nendif\n");
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
@@ -2009,7 +2014,8 @@ rule: dependency
     #[test]
     fn test_nested_different_conditionals() {
         // Test ifdef inside ifeq
-        let parsed = parse("ifeq ($(OS),Linux)\n    ifdef DEBUG\n        CFLAGS += -g\n    endif\nendif\n");
+        let parsed =
+            parse("ifeq ($(OS),Linux)\n    ifdef DEBUG\n        CFLAGS += -g\n    endif\nendif\n");
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         let node_str = format!("{:#?}", node);
@@ -2032,13 +2038,13 @@ rule: dependency
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("INCLUDE@"));
-        
+
         // Test comment after include
         let parsed = parse("include config.mk\n# End of includes");
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("INCLUDE@"));
-        
+
         // Test comment between includes
         let parsed = parse("include config.mk\n# More includes\ninclude rules.mk\n");
         assert!(parsed.errors.is_empty());
