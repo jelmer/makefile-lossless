@@ -419,10 +419,40 @@ fn parse(text: &str) -> Parse {
 
         fn parse_simple_condition(&mut self) {
             self.builder.start_node(EXPR.into());
-            if self.current() == Some(IDENTIFIER) {
-                self.bump();
-            } else {
-                self.error("expected variable name".into());
+            match self.current() {
+                Some(IDENTIFIER) => self.bump(),
+                Some(DOLLAR) => self.parse_variable_reference(),
+                Some(QUOTE) => {
+                    // Handle quoted strings
+                    self.bump();
+                    while self.current().is_some() && self.current() != Some(QUOTE) {
+                        self.bump();
+                    }
+                    if self.current() == Some(QUOTE) {
+                        self.bump();
+                    }
+                }
+                _ => self.error("expected variable name or quoted string".into()),
+            }
+
+            // Handle additional tokens after the main condition
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                match self.current() {
+                    Some(WHITESPACE) => self.skip_ws(),
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(IDENTIFIER) => self.bump(),
+                    Some(OPERATOR) => self.bump(),
+                    Some(QUOTE) => {
+                        self.bump();
+                        while self.current().is_some() && self.current() != Some(QUOTE) {
+                            self.bump();
+                        }
+                        if self.current() == Some(QUOTE) {
+                            self.bump();
+                        }
+                    }
+                    _ => break,
+                }
             }
             self.builder.finish_node();
             self.expect_eol();
@@ -434,9 +464,26 @@ fn parse(text: &str) -> Parse {
                 Some(IDENTIFIER) => {
                     self.builder.start_node(EXPR.into());
                     self.bump();
+                    // Handle additional tokens after identifier
+                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        match self.current() {
+                            Some(WHITESPACE) => self.skip_ws(),
+                            Some(LPAREN) => self.parse_parenthesized_expr(),
+                            Some(DOLLAR) => self.parse_variable_reference(),
+                            Some(QUOTE) => self.bump(),
+                            Some(IDENTIFIER) => self.bump(),
+                            Some(OPERATOR) => self.bump(),
+                            _ => break,
+                        }
+                    }
                     self.builder.finish_node();
                 }
                 Some(LPAREN) => self.parse_parenthesized_expr(),
+                Some(DOLLAR) => {
+                    self.builder.start_node(EXPR.into());
+                    self.parse_variable_reference();
+                    self.builder.finish_node();
+                }
                 _ => self.error("expected condition after elif".into()),
             }
             self.skip_ws();
@@ -517,6 +564,7 @@ fn parse(text: &str) -> Parse {
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
                     Some(DOLLAR) => self.parse_normal_content(),
+                    Some(QUOTE) => self.bump(),
                     Some(_) => {
                         self.error(format!(
                             "unexpected token in conditional block: {:?}",
@@ -551,6 +599,9 @@ fn parse(text: &str) -> Parse {
                     }
                     Some(RPAREN) => {
                         paren_count -= 1;
+                        self.bump();
+                    }
+                    Some(QUOTE) => {
                         self.bump();
                     }
                     Some(_) => self.bump(),
@@ -1842,6 +1893,136 @@ rule: dependency
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_empty_and_multiple_branch_conditionals() {
+        // Test empty conditional
+        let parsed = parse("ifdef DEBUG\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test multiple elif branches
+        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\nelif eq ($(OPT),1)\n    CFLAGS += -O1\nelif eq ($(OPT),2)\n    CFLAGS += -O2\nelse\n    CFLAGS += -O3\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test multiple elif branches with different conditional types
+        let parsed = parse("ifeq ($(CC),gcc)\n    CFLAGS += -gcc\nelif eq ($(CC),clang)\n    CFLAGS += -clang\nelif eq ($(CC),msvc)\n    CFLAGS += -msvc\nelse\n    CFLAGS += -unknown\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_conditional_with_special_chars() {
+        // Test with quoted strings
+        let parsed = parse("ifeq (\"$(OS)\",\"Windows_NT\")\n    EXT := .exe\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with escaped characters
+        let parsed = parse("ifneq ($(PATH),\"C:\\Program Files\")\n    PATH := $(PATH):/usr/local/bin\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with spaces in variable names
+        let parsed = parse("ifdef \"Program Files\"\n    INSTALL_DIR := \"C:\\Program Files\"\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_conditional_with_shell_functions() {
+        // Test with shell command
+        let parsed = parse("ifneq (,$(shell which gcc))\n    CC := gcc\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with wildcard function
+        let parsed = parse("ifneq (,$(wildcard *.c))\n    SRCS := $(wildcard *.c)\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with filter function
+        let parsed = parse("ifneq (,$(filter %.c,$(MAKEFILE_LIST)))\n    CFLAGS += -c\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_conditional_with_variable_operations() {
+        // Test with variable modifiers
+        let parsed = parse("ifneq (,$(SRCS:.c=.o))\n    OBJS := $(SRCS:.c=.o)\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with computed variable names
+        let parsed = parse("ifdef $(shell echo VAR)\n    VALUE := $(shell echo value)\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with variable references in variable names
+        let parsed = parse("ifdef $(COMPILER)_FLAGS\n    CFLAGS := $($(COMPILER)_FLAGS)\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_conditional_with_rules_and_variables() {
+        // Test with rule definition
+        let parsed = parse("ifdef DEBUG\n    %.o: %.c\n\t$(CC) -g -c $< -o $@\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with variable assignment
+        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\n    LDFLAGS += -debug\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with include directive
+        let parsed = parse("ifdef DEBUG\n    include debug.mk\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+
+        // Test with export directive
+        let parsed = parse("ifdef DEBUG\n    export DEBUG_FLAGS := -g -v\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+    }
+
+    #[test]
+    fn test_nested_different_conditionals() {
+        // Test ifdef inside ifeq
+        let parsed = parse("ifeq ($(OS),Linux)\n    ifdef DEBUG\n        CFLAGS += -g\n    endif\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        let node_str = format!("{:#?}", node);
+        assert!(node_str.contains("CONDITIONAL@"));
+        assert!(node_str.matches("DEBUG").count() >= 1);
+
+        // Test ifneq inside ifdef
+        let parsed = parse("ifdef COMPILER\n    ifneq ($(COMPILER),gcc)\n        CFLAGS += -clang\n    endif\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        let node_str = format!("{:#?}", node);
+        assert!(node_str.contains("CONDITIONAL@"));
+        assert!(node_str.matches("COMPILER").count() >= 2);
     }
 
     #[test]
