@@ -384,10 +384,29 @@ fn parse(text: &str) -> Parse {
                         Some(LPAREN) => {
                             paren_depth += 1;
                             self.bump();
+                            // Start a new expression node for nested variable references
+                            self.builder.start_node(EXPR.into());
                         }
                         Some(RPAREN) => {
                             paren_depth -= 1;
                             self.bump();
+                            if paren_depth > 0 {
+                                self.builder.finish_node();
+                            }
+                        }
+                        Some(QUOTE) => {
+                            // Handle quoted strings
+                            self.bump();
+                            while self.current().is_some() && self.current() != Some(QUOTE) {
+                                self.bump();
+                            }
+                            if self.current() == Some(QUOTE) {
+                                self.bump();
+                            }
+                        }
+                        Some(DOLLAR) => {
+                            // Handle variable references
+                            self.parse_variable_reference();
                         }
                         Some(_) => self.bump(),
                         None => {
@@ -596,13 +615,29 @@ fn parse(text: &str) -> Parse {
                     Some(LPAREN) => {
                         paren_count += 1;
                         self.bump();
+                        // Start a new expression node for nested parentheses
+                        self.builder.start_node(EXPR.into());
                     }
                     Some(RPAREN) => {
                         paren_count -= 1;
                         self.bump();
+                        if paren_count > 0 {
+                            self.builder.finish_node();
+                        }
                     }
                     Some(QUOTE) => {
+                        // Handle quoted strings
                         self.bump();
+                        while self.current().is_some() && self.current() != Some(QUOTE) {
+                            self.bump();
+                        }
+                        if self.current() == Some(QUOTE) {
+                            self.bump();
+                        }
+                    }
+                    Some(DOLLAR) => {
+                        // Handle variable references
+                        self.parse_variable_reference();
                     }
                     Some(_) => self.bump(),
                     None => {

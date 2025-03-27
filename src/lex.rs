@@ -51,8 +51,13 @@ impl<'a> Lexer<'a> {
             } else if c == '\\' {
                 self.input.next(); // Consume backslash
                 if let Some(next) = self.input.next() {
+                    // Handle any escaped character, not just quotes
                     result.push(next);
                 }
+            } else if c == '$' {
+                // Handle variable references inside quotes
+                result.push(c);
+                self.input.next();
             } else {
                 result.push(c);
                 self.input.next();
