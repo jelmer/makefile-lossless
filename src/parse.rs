@@ -1662,6 +1662,14 @@ rule: dependency
     }
 
     #[test]
+    fn test_include_directive_nested() {
+        let parsed = parse("ifneq (,$(wildcard Makefile.local))\n\tinclude Makefile.local\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("INCLUDE@"));
+    }
+
+    #[test]
     fn test_export_variables() {
         let parsed = parse("export SHELL := /bin/bash\n");
         assert!(parsed.errors.is_empty());
