@@ -1987,37 +1987,192 @@ rule: dependency
     #[test]
     fn test_conditional_features() {
         // Conditionals with comments
-        let parsed = parse(
-            "ifdef DEBUG # This is a debug flag\n    CFLAGS += -g # Add debug symbols\nendif\n",
-        );
+        let parsed = parse("ifdef DEBUG # This is a debug flag\n    CFLAGS += -g # Add debug symbols\nendif\n");
         assert!(parsed.errors.is_empty());
         let node_debug = format!("{:#?}", parsed.syntax());
         assert!(node_debug.contains("CONDITIONAL@"));
         assert!(node_debug.contains("COMMENT@"));
-
+        
         // Conditionals with quoted strings
         let parsed = parse("ifeq (\"$(OS)\",\"Windows\")\n    EXT := .exe\nendif\n");
         assert!(parsed.errors.is_empty());
-
+        
         // Conditionals with variable operations
         let parsed = parse("ifdef $(DEBUG_FLAG)\n    CFLAGS += -g\nendif\n");
         assert!(parsed.errors.is_empty());
-
+        
         // Conditionals with complex expressions
-        let parsed = parse(
-            "ifeq ($(strip $(TARGET)),$(filter $(TARGET),x86_64 i686))\n    ARCH := x86\nendif\n",
-        );
+        let parsed = parse("ifeq ($(strip $(TARGET)),$(filter $(TARGET),x86_64 i686))\n    ARCH := x86\nendif\n");
         assert!(parsed.errors.is_empty());
-
+        
         // Conditionals with rules
         let parsed = parse("ifdef DEBUG\ntest: debug.o\n\t$(CC) -o $@ $^\nendif\n");
         assert!(parsed.errors.is_empty());
-
+        
         // Conditionals with includes
         let parsed = parse("ifdef DEBUG\ninclude debug.mk\nendif\n");
         assert!(parsed.errors.is_empty());
         let includes = parsed.root().included_files().collect::<Vec<_>>();
         assert_eq!(includes.len(), 1);
         assert_eq!(includes[0], "debug.mk");
+        
+        // Multiple includes inside conditionals
+        let parsed = parse("ifdef PROD\n  include prod.mk\n  include prod_extra.mk\nelse\n  include dev.mk\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let includes = parsed.root().included_files().collect::<Vec<_>>();
+        assert_eq!(includes.len(), 3);
+        assert!(includes.contains(&"prod.mk".to_string()));
+        assert!(includes.contains(&"prod_extra.mk".to_string()));
+        assert!(includes.contains(&"dev.mk".to_string()));
+    }
+
+    #[test]
+    fn test_include_directive() {
+        let parsed = parse("include config.mk\ninclude $(TOPDIR)/rules.mk\ninclude *.mk\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("INCLUDE@"));
+    }
+
+    #[test]
+    fn test_export_variables() {
+        let parsed = parse("export SHELL := /bin/bash\n");
+        assert!(parsed.errors.is_empty());
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        let shell_var = vars
+            .iter()
+            .find(|v| v.name() == Some("SHELL".to_string()))
+            .unwrap();
+        assert!(shell_var.raw_value().unwrap().contains("bin/bash"));
+    }
+
+    #[test]
+    fn test_variable_scopes() {
+        let parsed =
+            parse("SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n");
+        assert!(parsed.errors.is_empty());
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 4);
+        let var_names: Vec<_> = vars.iter().filter_map(|v| v.name()).collect();
+        assert!(var_names.contains(&"SIMPLE".to_string()));
+        assert!(var_names.contains(&"IMMEDIATE".to_string()));
+        assert!(var_names.contains(&"CONDITIONAL".to_string()));
+        assert!(var_names.contains(&"APPEND".to_string()));
+    }
+
+    #[test]
+    fn test_complex_variable_references() {
+        let parsed = parse("FILES := $(wildcard *.c)\nOBJS := $(patsubst %.c,%.o,$(FILES))\n");
+        assert!(parsed.errors.is_empty());
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        let var_names: Vec<_> = vars.iter().filter_map(|v| v.name()).collect();
+        assert!(var_names.contains(&"FILES".to_string()));
+        assert!(var_names.contains(&"OBJS".to_string()));
+    }
+
+    #[test]
+    fn test_pattern_rule_parsing() {
+        let parsed = parse("%.o: %.c\n\t$(CC) -c -o $@ $<\n");
+        assert!(parsed.errors.is_empty());
+        let makefile = parsed.root();
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().next().unwrap(), "%.o");
+        assert!(rules[0].recipes().next().unwrap().contains("$@"));
+    }
+
+    #[test]
+    fn test_include_variants() {
+        // Test all variants of include directives
+        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
+        let parsed = parse(makefile_str);
+        assert!(parsed.errors.is_empty());
+
+        // Get the syntax tree for inspection
+        let node = parsed.syntax();
+        let debug_str = format!("{:#?}", node);
+
+        // Check that all includes are correctly parsed as INCLUDE nodes
+        assert_eq!(debug_str.matches("INCLUDE@").count(), 4);
+
+        // Check that we can access the includes through the AST
+        let makefile = parsed.root();
+
+        // Count all child nodes that are INCLUDE kind
+        let include_count = makefile
+            .syntax()
+            .children()
+            .filter(|child| child.kind() == INCLUDE)
+            .count();
+        assert_eq!(include_count, 4);
+
+        // Test variable expansion in include paths
+        assert!(makefile
+            .included_files()
+            .any(|path| path.contains("$(VAR)")));
+    }
+
+    #[test]
+    fn test_include_api() {
+        // Test the API for working with include directives
+        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
+        let makefile: Makefile = makefile_str.parse().unwrap();
+
+        // Test the includes method
+        let includes: Vec<_> = makefile.includes().collect();
+        assert_eq!(includes.len(), 3);
+
+        // Test the is_optional method
+        assert!(!includes[0].is_optional()); // include
+        assert!(includes[1].is_optional()); // -include
+        assert!(includes[2].is_optional()); // sinclude
+
+        // Test the included_files method
+        let files: Vec<_> = makefile.included_files().collect();
+        assert_eq!(files, vec!["simple.mk", "optional.mk", "synonym.mk"]);
+
+        // Test the path method on Include
+        assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
+        assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
+        assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
+    }
+
+    #[test]
+    fn test_include_integration() {
+        // Test include directives in realistic makefile contexts
+
+        // Case 1: With .PHONY (which was a source of the original issue)
+        let phony_makefile = Makefile::from_reader(
+            ".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
+            .as_bytes()
+        ).unwrap();
+
+        // We expect 2 rules: .PHONY and rule
+        assert_eq!(phony_makefile.rules().count(), 2);
+
+        // But only one non-special rule (not starting with '.')
+        let normal_rules_count = phony_makefile
+            .rules()
+            .filter(|r| !r.targets().any(|t| t.starts_with('.')))
+            .count();
+        assert_eq!(normal_rules_count, 1);
+
+        // Verify we have the include directive
+        assert_eq!(phony_makefile.includes().count(), 1);
+        assert_eq!(phony_makefile.included_files().next().unwrap(), ".env");
+
+        // Case 2: Without .PHONY, just a regular rule and include
+        let simple_makefile = Makefile::from_reader(
+            "\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand"
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(simple_makefile.rules().count(), 1);
+        assert_eq!(simple_makefile.includes().count(), 1);
     }
 }
