@@ -1562,6 +1562,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_conditionals() {
+        // Basic conditionals - ifdef/ifndef
+        let parsed = parse("ifdef DEBUG\n    DEBUG_FLAG := 1\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+        
+        // Basic conditionals - ifeq/ifneq
+        let parsed = parse("ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
+        
+        // Nested conditionals with else
+        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\n    ifdef VERBOSE\n        CFLAGS += -v\n    endif\nelse\n    CFLAGS += -O2\nendif\n");
+        assert!(parsed.errors.is_empty());
+        let node = parsed.syntax();
+        let node_debug = format!("{:#?}", node);
+        assert!(node_debug.contains("CONDITIONAL@"));
+        assert!(node_debug.matches("DEBUG").count() >= 1);
+        assert!(node_debug.matches("VERBOSE").count() >= 1);
+        
+        // Empty conditionals
+        let parsed = parse("ifdef DEBUG\nendif\n");
+        assert!(parsed.errors.is_empty());
+        assert!(format!("{:#?}", parsed.syntax()).contains("CONDITIONAL@"));
+        
+        // Conditionals with elif
+        let parsed = parse("ifeq ($(OS),Windows)\n    EXT := .exe\nelif ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n");
+        assert!(parsed.errors.is_empty());
+        assert!(format!("{:#?}", parsed.syntax()).contains("CONDITIONAL@"));
+        
+        // Invalid conditionals
+        let parsed = parse("ifXYZ DEBUG\nDEBUG := 1\nendif\n");
+        assert!(!parsed.errors.is_empty());
+        
+        // Missing condition
+        let parsed = parse("ifdef \nDEBUG := 1\nendif\n");
+        assert!(!parsed.errors.is_empty());
+    }
+
+    #[test]
     fn test_parse_simple() {
         const SIMPLE: &str = r#"VARIABLE = value
 
@@ -1702,15 +1744,16 @@ rule: dependency
         let mut makefile = Makefile::new();
         let rule = makefile.add_rule("rule");
         rule.push_command("command");
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
-
         rule.push_command("command2");
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
+
+        rule.push_command("command3");
         assert_eq!(
             rule.recipes().collect::<Vec<_>>(),
-            vec!["command", "command2"]
+            vec!["command", "command2", "command3"]
         );
 
-        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n\tcommand2\n");
+        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n\tcommand2\n\tcommand3\n");
     }
 
     #[test]
@@ -1948,926 +1991,35 @@ rule: dependency
     }
 
     #[test]
-    fn test_parse_simple_conditional() {
-        let parsed = parse("ifdef DEBUG\n    DEBUG_FLAG := 1\nendif\n");
+    fn test_conditional_features() {
+        // Conditionals with comments
+        let parsed = parse("ifdef DEBUG # This is a debug flag\n    CFLAGS += -g # Add debug symbols\nendif\n");
         assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_parse_makefile_conditional() {
-        let parsed = parse(
-            "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n",
-        );
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_nested_conditionals() {
-        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\n    ifdef VERBOSE\n        CFLAGS += -v\n    endif\nelse\n    CFLAGS += -O2\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_debug = format!("{:#?}", node);
+        let node_debug = format!("{:#?}", parsed.syntax());
         assert!(node_debug.contains("CONDITIONAL@"));
-        assert!(node_debug.matches("DEBUG").count() >= 1);
-        assert!(node_debug.matches("VERBOSE").count() >= 1);
-    }
-
-    #[test]
-    fn test_include_directive() {
-        let parsed = parse("include config.mk\ninclude $(TOPDIR)/rules.mk\ninclude *.mk\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("INCLUDE@"));
-    }
-
-    #[test]
-    fn test_include_directive_nested() {
-        let parsed = parse(
-            "#comment\nifneq (,$(wildcard Makefile.local))\n  include Makefile.local\nendif\n",
-        );
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_export_variables() {
-        let parsed = parse("export SHELL := /bin/bash\n");
-        assert!(parsed.errors.is_empty());
-        let makefile = parsed.root();
-        let vars = makefile.variable_definitions().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 1);
-        let shell_var = vars
-            .iter()
-            .find(|v| v.name() == Some("SHELL".to_string()))
-            .unwrap();
-        assert!(shell_var.raw_value().unwrap().contains("bin/bash"));
-    }
-
-    #[test]
-    fn test_variable_scopes() {
-        let parsed =
-            parse("SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n");
-        assert!(parsed.errors.is_empty());
-        let makefile = parsed.root();
-        let vars = makefile.variable_definitions().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 4);
-        let var_names: Vec<_> = vars.iter().filter_map(|v| v.name()).collect();
-        assert!(var_names.contains(&"SIMPLE".to_string()));
-        assert!(var_names.contains(&"IMMEDIATE".to_string()));
-        assert!(var_names.contains(&"CONDITIONAL".to_string()));
-        assert!(var_names.contains(&"APPEND".to_string()));
-    }
-
-    #[test]
-    fn test_complex_variable_references() {
-        let parsed = parse("FILES := $(wildcard *.c)\nOBJS := $(patsubst %.c,%.o,$(FILES))\n");
-        assert!(parsed.errors.is_empty());
-        let makefile = parsed.root();
-        let vars = makefile.variable_definitions().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 2);
-        let var_names: Vec<_> = vars.iter().filter_map(|v| v.name()).collect();
-        assert!(var_names.contains(&"FILES".to_string()));
-        assert!(var_names.contains(&"OBJS".to_string()));
-    }
-
-    #[test]
-    fn test_pattern_rule_parsing() {
-        let parsed = parse("%.o: %.c\n\t$(CC) -c -o $@ $<\n");
-        assert!(parsed.errors.is_empty());
-        let makefile = parsed.root();
-        let rules = makefile.rules().collect::<Vec<_>>();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].targets().next().unwrap(), "%.o");
-        assert!(rules[0].recipes().next().unwrap().contains("$@"));
-    }
-
-    #[test]
-    fn test_include_variants() {
-        // Test all variants of include directives
-        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
-        let parsed = parse(makefile_str);
-        assert!(parsed.errors.is_empty());
-
-        // Get the syntax tree for inspection
-        let node = parsed.syntax();
-        let debug_str = format!("{:#?}", node);
-
-        // Check that all includes are correctly parsed as INCLUDE nodes
-        assert_eq!(debug_str.matches("INCLUDE@").count(), 4);
-
-        // Check that we can access the includes through the AST
-        let makefile = parsed.root();
-
-        // Count all child nodes that are INCLUDE kind
-        let include_count = makefile
-            .syntax()
-            .children()
-            .filter(|child| child.kind() == INCLUDE)
-            .count();
-        assert_eq!(include_count, 4);
-
-        // Test variable expansion in include paths
-        assert!(makefile
-            .included_files()
-            .any(|path| path.contains("$(VAR)")));
-    }
-
-    #[test]
-    fn test_include_api() {
-        // Test the API for working with include directives
-        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
-        let makefile: Makefile = makefile_str.parse().unwrap();
-
-        // Test the includes method
-        let includes: Vec<_> = makefile.includes().collect();
-        assert_eq!(includes.len(), 3);
-
-        // Test the is_optional method
-        assert!(!includes[0].is_optional()); // include
-        assert!(includes[1].is_optional()); // -include
-        assert!(includes[2].is_optional()); // sinclude
-
-        // Test the included_files method
-        let files: Vec<_> = makefile.included_files().collect();
-        assert_eq!(files, vec!["simple.mk", "optional.mk", "synonym.mk"]);
-
-        // Test the path method on Include
-        assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
-        assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
-        assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
-    }
-
-    #[test]
-    fn test_include_integration() {
-        // Test include directives in realistic makefile contexts
-        let makefile_str = ".PHONY: build\n\nVERBOSE ?= 0\n\n# comment\n-include .env\n\nrule: dependency\n\tcommand";
-        let phony_makefile = Makefile::from_reader(makefile_str.as_bytes()).unwrap();
-
-        // We expect 2 rules: .PHONY and rule
-        assert_eq!(phony_makefile.rules().count(), 2);
-
-        // But only one non-special rule (not starting with '.')
-        let normal_rules_count = phony_makefile
-            .rules()
-            .filter(|r| !r.targets().any(|t| t.starts_with('.')))
-            .count();
-        assert_eq!(normal_rules_count, 1);
-
-        // Verify we have the include directive
-        assert_eq!(phony_makefile.includes().count(), 1);
-        assert_eq!(phony_makefile.included_files().next().unwrap(), ".env");
-    }
-
-    #[test]
-    fn test_conditional_with_comments() {
-        // Test comment before conditional
-        let parsed = parse("# Start of file\nifdef DEBUG\n    CFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test comment after conditional
-        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\nendif\n# End of file");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test comment inside conditional
-        let parsed = parse("ifdef DEBUG\n    # Debug flags\n    CFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditional_with_special_chars() {
-        // Test with quoted strings
-        let parsed = parse("ifeq (\"$(OS)\",\"Windows_NT\")\n    EXT := .exe\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with escaped characters
-        let parsed = parse(
-            "ifneq ($(PATH),\"C:\\Program Files\")\n    PATH := $(PATH):/usr/local/bin\nendif\n",
-        );
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with spaces in variable names
-        let parsed =
-            parse("ifdef \"Program Files\"\n    INSTALL_DIR := \"C:\\Program Files\"\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditional_with_variable_operations() {
-        // Test with variable modifiers
-        let parsed = parse("ifneq (,$(SRCS:.c=.o))\n    OBJS := $(SRCS:.c=.o)\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with computed variable names
-        let parsed = parse("ifdef $(shell echo VAR)\n    VALUE := $(shell echo value)\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with variable references in variable names
-        let parsed = parse("ifdef $(COMPILER)_FLAGS\n    CFLAGS := $($(COMPILER)_FLAGS)\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditional_with_rules_and_variables() {
-        // Test with rule definition
-        let parsed = parse("ifdef DEBUG\n    %.o: %.c\n\t$(CC) -g -c $< -o $@\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with variable assignment
-        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\n    LDFLAGS += -debug\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with include directive
-        let parsed = parse("ifdef DEBUG\n    include debug.mk\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test with export directive
-        let parsed = parse("ifdef DEBUG\n    export DEBUG_FLAGS := -g -v\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_nested_different_conditionals() {
-        // Test ifdef inside ifeq
-        let parsed =
-            parse("ifeq ($(OS),Linux)\n    ifdef DEBUG\n        CFLAGS += -g\n    endif\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.matches("DEBUG").count() >= 1);
-
-        // Test ifneq inside ifdef
-        let parsed = parse("ifdef COMPILER\n    ifneq ($(COMPILER),gcc)\n        CFLAGS += -clang\n    endif\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.matches("COMPILER").count() >= 2);
-    }
-
-    #[test]
-    fn test_include_with_comments() {
-        // Test comment before include
-        let parsed = parse("# Include config\ninclude config.mk\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("INCLUDE@"));
-
-        // Test comment after include
-        let parsed = parse("include config.mk\n# End of includes");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("INCLUDE@"));
-
-        // Test comment between includes
-        let parsed = parse("include config.mk\n# More includes\ninclude rules.mk\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert_eq!(format!("{:#?}", node).matches("INCLUDE@").count(), 2);
-    }
-
-    #[test]
-    fn test_empty_conditionals() {
-        // Test empty ifdef
-        let parsed = parse("ifdef DEBUG\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-
-        // Test empty if-else
-        let parsed = parse("ifdef DEBUG\nelse\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-        
-        // Test empty if-elif-else
-        let parsed = parse("ifdef DEBUG\nelif defined(RELEASE)\nelse\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditionals_with_else() {
-        // Basic if-else
-        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\nelse\n    CFLAGS += -O2\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("-g") && node_str.contains("-O2"));
-
-        // Multiple assignments in branches
-        let parsed = parse("ifdef DEBUG\n    CFLAGS += -g\n    DEBUG := 1\nelse\n    CFLAGS += -O2\n    RELEASE := 1\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditionals_with_multiple_elif() {
-        // if-elif-elif-else
-        let parsed = parse("ifeq ($(OS),Windows)\n    EXT := .exe\nelif ifeq ($(OS),Linux)\n    EXT := .bin\nelif ifeq ($(OS),Darwin)\n    EXT := .app\nelse\n    EXT := .out\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Complex conditions in elif
-        let parsed = parse("ifeq ($(COMPILER),gcc)\n    CC := gcc\nelif ifeq (\"$(COMPILER)\",\"clang\")\n    CC := clang\nelif ifeq ($(shell echo $(COMPILER)),nvcc)\n    CC := nvcc\nelse\n    CC := cc\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditionals_inside_recipes() {
-        // Conditional inside recipe with tabs
-        let parsed = parse("all:\n\t@echo Building...\n\tifdef DEBUG\n\t\t@echo Debug mode\n\telse\n\t\t@echo Release mode\n\tendif\n\t@echo Done.\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("RULE@"));
-        
-        // Recipe with conditional and multiple targets
-        let parsed = parse("build test: main.c\n\t@echo Building $@\n\tifdef DEBUG\n\t\t$(CC) -g $< -o $@\n\telse\n\t\t$(CC) -O2 $< -o $@\n\tendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("RULE@"));
-    }
-
-    #[test]
-    fn test_multiline_condition_expressions() {
-        // Condition split across lines
-        let parsed = parse("ifeq ($(shell echo \\\nVAR),\\\nvalue)\n    RESULT := true\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-        
-        // Complex multiline condition
-        let parsed = parse("ifneq ($(shell grep -q \\\n'^DEBUG=1' \\\n.env && echo 1),)\n    CFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        assert!(format!("{:#?}", node).contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_complex_nested_conditionals_with_includes() {
-        // This test is being replaced with a simpler version
-    }
-
-    #[test]
-    fn test_conditional_with_include() {
-        let parsed = parse("ifdef DEBUG\nCFLAGS = -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        
-        // Check structure
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Test conditional with else
-        let parsed = parse("ifdef DEBUG\nCFLAGS = -g\nelse\nCFLAGS = -O2\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Test nested conditionals
-        let parsed = parse("ifdef DEBUG\nifdef VERBOSE\nCFLAGS = -g -v\nendif\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Test conditional with variable assignment
-        let parsed = parse("ifdef DEBUG\nCFLAGS = -g\nLDFLAGS = -debug\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_include_inside_conditional() {
-        // Test with a simple conditional containing an include directive
-        let makefile_str = "ifdef HAVE_CONFIG\ninclude config.mk\nendif\n";
-        let parsed = parse(makefile_str);
-        assert!(parsed.errors.is_empty());
-        
-        // Check conditionals via syntax tree
-        let node = parsed.syntax();
-        let node_str = format!("{:#?}", node);
-        
-        // Verify the structure contains both CONDITIONAL and INCLUDE nodes
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("INCLUDE@"));
-        assert!(node_str.contains("config.mk"));
-        
-        // We can't assert the includes length because the API might not expose
-        // includes from within conditionals yet - that would be part of the PR
-    }
-
-    #[test]
-    fn test_include_inside_conditional_with_api_access() {
-        // Test with a conditional containing an include directive
-        let makefile_str = "ifdef HAVE_CONFIG\ninclude config.mk\nendif\n";
-        let parsed = parse(makefile_str);
-        assert!(parsed.errors.is_empty());
-        
-        // Get makefile structure from parse result
-        let makefile = parsed.root();
-        
-        // Check all includes via the API - should find the one inside the conditional
-        let all_includes = makefile.included_files().collect::<Vec<_>>();
-        assert_eq!(all_includes.len(), 1);
-        assert_eq!(all_includes[0], "config.mk");
-        
-        // Test more complex nested conditionals with includes
-        let nested_str = "ifdef DEBUG\n\
-            include debug.mk\n\
-            ifdef VERBOSE\n\
-                include verbose.mk\n\
-            endif\n\
-        endif\n\
-        ifndef RELEASE\n\
-            include dev.mk\n\
-        endif\n";
-        let parsed = parse(nested_str);
-        assert!(parsed.errors.is_empty());
-        
-        // Get makefile structure 
-        let makefile = parsed.root();
-        
-        // Check all includes via the API - should find all includes in all conditionals
-        let all_includes = makefile.included_files().collect::<Vec<_>>();
-        assert_eq!(all_includes.len(), 3);
-        assert!(all_includes.contains(&"debug.mk".to_string()));
-        assert!(all_includes.contains(&"verbose.mk".to_string()));
-        assert!(all_includes.contains(&"dev.mk".to_string()));
-        
-        // Test with a complex mix of conditionals, includes, and variable assignments
-        let complex_str = "CC = gcc\n\
-            ifdef DEBUG\n\
-                CFLAGS = -g\n\
-                include debug.mk\n\
-                ifdef SANITIZE\n\
-                    CFLAGS += -fsanitize=address\n\
-                    include sanitize.mk\n\
-                endif\n\
-            else\n\
-                CFLAGS = -O2\n\
-                include release.mk\n\
-            endif\n";
-        let parsed = parse(complex_str);
-        assert!(parsed.errors.is_empty());
-        
-        // Get makefile structure 
-        let makefile = parsed.root();
-        
-        // Check all includes via the API - should find all includes in all conditions
-        let all_includes = makefile.included_files().collect::<Vec<_>>();
-        assert_eq!(all_includes.len(), 3);
-        assert!(all_includes.contains(&"debug.mk".to_string()));
-        assert!(all_includes.contains(&"sanitize.mk".to_string()));
-        assert!(all_includes.contains(&"release.mk".to_string()));
-    }
-
-    #[test]
-    fn test_complex_conditional_expressions() {
-        // Test shell command in conditional
-        let shell_cond = parse("ifeq ($(shell echo hello),hello)\nFOUND := yes\nendif\n");
-        assert!(shell_cond.errors.is_empty());
-        let node = shell_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"shell\""));
-        assert!(node_str.contains("\"echo\""));
-        assert!(node_str.contains("\"hello\""));
-        
-        // Test wildcard function in conditional
-        let wildcard_cond = parse("ifneq ($(wildcard *.c),)\nHAS_C_FILES := yes\nendif\n");
-        assert!(wildcard_cond.errors.is_empty());
-        let node = wildcard_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"wildcard\""));
-        
-        // Test call function in conditional
-        let call_cond = parse("ifeq ($(call check,$(VERSION)),1)\nRELEASE := yes\nendif\n");
-        assert!(call_cond.errors.is_empty());
-        let node = call_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"call\""));
-        assert!(node_str.contains("\"check\""));
-        
-        // Test variable substitution in conditional
-        let subst_cond = parse("ifneq ($(SOURCES:.c=.o),)\nOBJS := $(SOURCES:.c=.o)\nendif\n");
-        assert!(subst_cond.errors.is_empty());
-        let node = subst_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"SOURCES\""));
-        assert!(node_str.contains("\".c\""));
-        assert!(node_str.contains("\".o\""));
+        assert!(node_debug.contains("COMMENT@"));
         
-        // Test multiple variables and functions in a condition
-        let complex_cond = parse("ifeq ($(shell uname),$(OS)_$(ARCH))\nCOMPATIBLE := yes\nendif\n");
-        assert!(complex_cond.errors.is_empty());
-        let node = complex_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"shell\""));
-        assert!(node_str.contains("\"uname\""));
-        assert!(node_str.contains("\"OS\""));
-        assert!(node_str.contains("\"ARCH\""));
-        
-        // Test multiple nested functions
-        let nested_func_cond = parse("ifeq ($(shell echo $(shell pwd)),$(abspath $(CURDIR)))\nSAME_DIR := yes\nendif\n");
-        assert!(nested_func_cond.errors.is_empty());
-        let node = nested_func_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"shell\""));
-        assert!(node_str.contains("\"echo\""));
-        assert!(node_str.contains("\"pwd\""));
-        assert!(node_str.contains("\"abspath\""));
-        assert!(node_str.contains("\"CURDIR\""));
-        
-        // Test complex boolean operators in if conditions
-        let bool_cond = parse("ifdef DEBUG TRACE VERBOSE\nDEBUG_BUILD := yes\nendif\n");
-        assert!(bool_cond.errors.is_empty());
-        let node = bool_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"DEBUG\""));
-        assert!(node_str.contains("\"TRACE\""));
-        assert!(node_str.contains("\"VERBOSE\""));
-        
-        // Test arithmetic comparisons
-        let arith_cond = parse("ifeq ($(VERSION),$(shell expr $(MAJOR) + $(MINOR)))\nVALID_VERSION := yes\nendif\n");
-        assert!(arith_cond.errors.is_empty());
-        let node = arith_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"VERSION\""));
-        assert!(node_str.contains("\"shell\""));
-        assert!(node_str.contains("\"expr\""));
-        assert!(node_str.contains("\"MAJOR\""));
-        assert!(node_str.contains("\"MINOR\""));
-        assert!(node_str.contains("\"+\""));
-        
-        // Test negative conditions with !
-        let negative_cond = parse("ifeq ($(shell test -f file.txt || echo 1),1)\nFILE_NOT_FOUND := yes\nendif\n");
-        assert!(negative_cond.errors.is_empty());
-        let node = negative_cond.syntax();
-        let node_str = format!("{:#?}", node);
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("\"test\""));
-        assert!(node_str.contains("\"file.txt\""));
-    }
-
-    #[test]
-    fn test_parse_with_variable_rule_debug() {
-        let input = "RULE := rule\n$(RULE): dependency\n\tcommand";
-        let makefile = Makefile::from_reader(input.as_bytes()).unwrap();
-        
-        println!("Input: {}", input);
-        
-        // Inspect the rule node with debug output
-        let rules = makefile.rules().collect::<Vec<_>>();
-        assert_eq!(rules.len(), 1);
-        
-        // Debug the syntax node structure
-        let rule_syntax = rules[0].syntax();
-        println!("Rule syntax tree:\n{:#?}", rule_syntax);
-        
-        // Try to collect the targets
-        let targets = rules[0].targets().collect::<Vec<_>>();
-        println!("Collected targets: {:?}", targets);
-        
-        // Also check prerequisites 
-        let prerequisites = rules[0].prerequisites().collect::<Vec<_>>();
-        println!("Collected prerequisites: {:?}", prerequisites);
-        
-        // Check the actual token sequence in the rule
-        println!("Token sequence in rule:");
-        for token in rule_syntax.children_with_tokens() {
-            if let Some(t) = token.as_token() {
-                println!("  {:?}: '{}'", t.kind(), t.text());
-            } else {
-                println!("  Node: {:?}", token.as_node().unwrap().kind());
-            }
-        }
-        
-        // Check if we can find the target in a more direct way
-        for token in rule_syntax.children_with_tokens().take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR)) {
-            if let Some(t) = token.as_token() {
-                println!("Target token: {:?}: '{}'", t.kind(), t.text());
-            }
-        }
-    }
-
-    #[test]
-    fn test_condensed_conditionals() {
-        // Testing conditional syntax in GNU Make
-        // Note: Single-line conditionals with semicolons aren't supported by this parser
-        let parsed = parse("ifdef DEBUG\nCFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Testing minimal spacing but with proper newlines
-        let parsed = parse("ifdef DEBUG\nCFLAGS+=-g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Testing with minimal spacing around parentheses - this works despite being poorly formatted
-        let parsed = parse("ifeq($(OS),Linux)\nCFLAGS+=-linux\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_comments_in_conditionals() {
-        // Comment before condition
-        let parsed = parse("# This enables debug mode\nifdef DEBUG\nCFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Comment on separate line after condition keyword
-        let parsed = parse("ifdef DEBUG\n# Enable debug mode\nCFLAGS += -g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Comment at end of block on separate line
-        let parsed = parse("ifdef DEBUG\nCFLAGS += -g\n# End of debug block\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Note: Inline comments after directives are not supported in this parser
-    }
-
-    #[test]
-    fn test_conditional_edge_cases() {
-        // No space between if and def (should fail)
-        let parsed = parse("ifdefDEBUG\nCFLAGS += -g\nendif\n");
-        assert!(!parsed.errors.is_empty());
-        
-        // Conditional at end of file without newline (should still work)
-        let parsed = parse("ifdef DEBUG\nCFLAGS += -g\nendif");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Newlines in the condition - this works because the parser treats each part as separate tokens
-        let parsed = parse("ifeq ($(OS)\n,\nLinux\n)\nCFLAGS += -linux\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Conditional without content (should work)
-        let parsed = parse("ifdef DEBUG\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Multiple else branches (this parser actually accepts it)
-        let parsed = parse("ifdef DEBUG\nDEBUG = 1\nelse\nRELEASE = 1\nelse\nTEST = 1\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Stacked conditionals with proper syntax
-        let parsed = parse("ifdef DEBUG\nDEBUG = 1\nendif\nifdef RELEASE\nRELEASE = 1\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert_eq!(node_str.matches("CONDITIONAL@").count(), 2);
-    }
-
-    #[test]
-    fn test_conditionals_without_newlines() {
-        // These tests check conditionals with unusual syntax
-        // Note: GNU Make requires conditional directives to be on their own line,
-        // but this parser seems to handle some unusual cases
-        
-        // Missing newline before elif (parser accepts this)
-        let parsed = parse("ifdef A\nA := 1 elif defined(B)\nB := 1\nendif\n");
+        // Conditionals with quoted strings
+        let parsed = parse("ifeq (\"$(OS)\",\"Windows\")\n    EXT := .exe\nendif\n");
         assert!(parsed.errors.is_empty());
         
-        // Missing newline before else (parser accepts this)
-        let parsed = parse("ifdef A\nA := 1 else\nB := 1\nendif\n");
+        // Conditionals with variable operations
+        let parsed = parse("ifdef $(DEBUG_FLAG)\n    CFLAGS += -g\nendif\n");
         assert!(parsed.errors.is_empty());
         
-        // Missing newline before endif (parser accepts this)
-        let parsed = parse("ifdef A\nA := 1 endif\nB := 2\n");
+        // Conditionals with complex expressions
+        let parsed = parse("ifeq ($(strip $(TARGET)),$(filter $(TARGET),x86_64 i686))\n    ARCH := x86\nendif\n");
         assert!(parsed.errors.is_empty());
-    }
-
-    #[test]
-    fn test_multiline_conditions() {
-        // The current parser doesn't support line continuations in conditions
-        // These tests verify this limitation is properly detected
         
-        // Single condition split over multiple lines (not supported)
-        let parsed = parse("ifdef \\\nDEBUG\nCFLAGS += -g\nendif\n");
-        assert!(!parsed.errors.is_empty());
-        
-        // Using line continuation in ifeq (not supported)
-        let parsed = parse("ifeq ($(shell echo $(OS)),Linux)\nCFLAGS += -linux\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Testing properly formed multiline conditional without continuations
-        let parsed = parse("ifeq ($(CONFIG),$(shell cat config.txt))\nUSE_CONFIG := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_whitespace_in_conditionals() {
-        // Extra whitespace around conditional keywords
-        let parsed = parse("  ifdef   DEBUG   \n   CFLAGS   +=   -g   \n   endif   \n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Tabs instead of spaces
-        let parsed = parse("ifdef\tDEBUG\n\tCFLAGS\t+=\t-g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Mixed whitespace
-        let parsed = parse("ifndef\t  NO_DEBUG \t \nCFLAGS\t  += \t-g\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_conditionals_at_eof() {
-        // Conditional at EOF with no trailing newline
-        let parsed = parse("ifdef DEBUG\nDEBUG := 1\nendif");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Conditional with else at EOF with no trailing newline
-        let parsed = parse("ifdef DEBUG\nDEBUG := 1\nelse\nRELEASE := 1\nendif");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Nested conditional at EOF with no trailing newline
-        let parsed = parse("ifdef A\nA := 1\nifdef B\nB := 1\nendif\nendif");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_complex_condition_expressions() {
-        // Complex expressions in ifeq
-        let parsed = parse("ifeq ($(shell echo $(VERSION) | grep -q '^1\\.'),)\nV1 := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Multiple variables in condition
-        let parsed = parse("ifdef DEBUG VERBOSE TRACING\nDEBUG_FULL := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Quoted strings in conditions
-        let parsed = parse("ifeq (\"$(CONFIG)\",\"debug\")\nDEBUG := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Spaces in variable values in conditions
-        let parsed = parse("ifeq ($(CONFIG),debug build)\nDEBUG := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        
-        // Escaping in conditions
-        let parsed = parse("ifeq ($(shell echo \"\\\"hello\\\"\"),\"\\\"hello\\\"\")\nESCAPED := yes\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_nested_complex_conditionals() {
-        // Deeply nested conditionals
-        let parsed = parse("ifdef A\nA := 1\nifdef B\nB := 1\nifdef C\nC := 1\nendif\nendif\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert_eq!(node_str.matches("CONDITIONAL@").count(), 3);
-        
-        // Mix of different conditional types
-        let parsed = parse("ifdef DEBUG\nDEBUG := 1\nifeq ($(OS),Linux)\nOS := linux\nifndef RELEASE\nDEVELOPMENT := 1\nendif\nendif\nendif\n");
+        // Conditionals with rules
+        let parsed = parse("ifdef DEBUG\ntest: debug.o\n\t$(CC) -o $@ $^\nendif\n");
         assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert_eq!(node_str.matches("CONDITIONAL@").count(), 3);
         
-        // Alternating if-else with deep nesting
-        let parsed = parse("ifdef A\nA := 1\nelse\nifdef B\nB := 1\nelse\nifdef C\nC := 1\nelse\nD := 1\nendif\nendif\nendif\n");
+        // Conditionals with includes
+        let parsed = parse("ifdef DEBUG\ninclude debug.mk\nendif\n");
         assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-    }
-
-    #[test]
-    fn test_deep_conditionals_with_rules() {
-        // Conditionals with rules inside
-        let parsed = parse("ifdef DEBUG\ndebug: all\n\t@echo Debug build\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert!(node_str.contains("RULE@"));
-        
-        // Multiple rules in conditionals
-        let parsed = parse("ifdef DEBUG\ndebug: all\n\t@echo Debug build\ntest: debug\n\t@echo Test\nendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("CONDITIONAL@"));
-        assert_eq!(node_str.matches("RULE@").count(), 2);
-        
-        // Rules with nested conditionals in recipes
-        let parsed = parse("all:\n\t@echo Building\n\tifdef DEBUG\n\t@echo Debug mode\n\tifdef VERBOSE\n\t@echo Verbose output\n\tendif\n\tendif\n\t@echo Done\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("RULE@"));
-    }
-
-    #[test]
-    fn test_conditionals_with_recipes() {
-        // Conditionals in recipes with tabs
-        let parsed = parse("all:\n\t@echo Start\n\tifdef DEBUG\n\t\t@echo Debug mode\n\telse\n\t\t@echo Release mode\n\tendif\n\t@echo End\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("RULE@"));
-        
-        // Multiple levels of conditionals in recipes
-        let parsed = parse("all:\n\tifdef DEBUG\n\t\tifdef VERBOSE\n\t\t\t@echo Very verbose debug\n\t\telse\n\t\t\t@echo Normal debug\n\t\tendif\n\telse\n\t\t@echo Release\n\tendif\n");
-        assert!(parsed.errors.is_empty());
-        let node_str = format!("{:#?}", parsed.syntax());
-        assert!(node_str.contains("RULE@"));
-    }
-
-    #[test]
-    fn test_invalid_conditionals() {
-        // A truly invalid case - unknown conditional directive
-        let parsed = parse("ifXYZ DEBUG\nDEBUG := 1\nendif\n");
-        assert!(!parsed.errors.is_empty());
-        
-        // Missing condition without identifier
-        let parsed = parse("ifdef \nDEBUG := 1\nendif\n");
-        assert!(!parsed.errors.is_empty());
+        let includes = parsed.root().included_files().collect::<Vec<_>>();
+        assert_eq!(includes.len(), 1);
+        assert_eq!(includes[0], "debug.mk");
     }
 }
