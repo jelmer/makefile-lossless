@@ -1987,35 +1987,39 @@ rule: dependency
     #[test]
     fn test_conditional_features() {
         // Conditionals with comments
-        let parsed = parse("ifdef DEBUG # This is a debug flag\n    CFLAGS += -g # Add debug symbols\nendif\n");
+        let parsed = parse(
+            "ifdef DEBUG # This is a debug flag\n    CFLAGS += -g # Add debug symbols\nendif\n",
+        );
         assert!(parsed.errors.is_empty());
         let node_debug = format!("{:#?}", parsed.syntax());
         assert!(node_debug.contains("CONDITIONAL@"));
         assert!(node_debug.contains("COMMENT@"));
-        
+
         // Conditionals with quoted strings
         let parsed = parse("ifeq (\"$(OS)\",\"Windows\")\n    EXT := .exe\nendif\n");
         assert!(parsed.errors.is_empty());
-        
+
         // Conditionals with variable operations
         let parsed = parse("ifdef $(DEBUG_FLAG)\n    CFLAGS += -g\nendif\n");
         assert!(parsed.errors.is_empty());
-        
+
         // Conditionals with complex expressions
-        let parsed = parse("ifeq ($(strip $(TARGET)),$(filter $(TARGET),x86_64 i686))\n    ARCH := x86\nendif\n");
+        let parsed = parse(
+            "ifeq ($(strip $(TARGET)),$(filter $(TARGET),x86_64 i686))\n    ARCH := x86\nendif\n",
+        );
         assert!(parsed.errors.is_empty());
-        
+
         // Conditionals with rules
         let parsed = parse("ifdef DEBUG\ntest: debug.o\n\t$(CC) -o $@ $^\nendif\n");
         assert!(parsed.errors.is_empty());
-        
+
         // Conditionals with includes
         let parsed = parse("ifdef DEBUG\ninclude debug.mk\nendif\n");
         assert!(parsed.errors.is_empty());
         let includes = parsed.root().included_files().collect::<Vec<_>>();
         assert_eq!(includes.len(), 1);
         assert_eq!(includes[0], "debug.mk");
-        
+
         // Multiple includes inside conditionals
         let parsed = parse("ifdef PROD\n  include prod.mk\n  include prod_extra.mk\nelse\n  include dev.mk\nendif\n");
         assert!(parsed.errors.is_empty());
