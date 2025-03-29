@@ -383,10 +383,9 @@ fn parse(text: &str) -> Parse {
                 
                 // Start by checking if this is a function like $(shell ...)
                 let mut is_function = false;
-                let function_name;
                 
                 if self.current() == Some(IDENTIFIER) {
-                    function_name = self.tokens.last().unwrap().1.clone();
+                    let function_name = self.tokens.last().unwrap().1.clone();
                     // Common makefile functions
                     let known_functions = ["shell", "wildcard", "call", "eval", "file", "abspath", "dir"];
                     if known_functions.contains(&function_name.as_str()) {
@@ -399,31 +398,7 @@ fn parse(text: &str) -> Parse {
                     self.bump();
                     
                     // Parse the rest of the function call, handling nested variable references
-                    let mut paren_count = 1;
-                    while paren_count > 0 && self.current().is_some() {
-                        match self.current() {
-                            Some(LPAREN) => {
-                                paren_count += 1;
-                                self.bump();
-                            }
-                            Some(RPAREN) => {
-                                paren_count -= 1;
-                                self.bump();
-                                if paren_count == 0 {
-                                    break;
-                                }
-                            }
-                            Some(DOLLAR) => {
-                                // Recursively parse nested variable references
-                                self.parse_variable_reference();
-                            }
-                            Some(_) => self.bump(),
-                            None => {
-                                self.error("unclosed variable reference in function".into());
-                                break;
-                            }
-                        }
-                    }
+                    self.consume_balanced_parens(1);
                 } else {
                     // Handle regular variable references
                     self.parse_parenthesized_expr_internal(true);
@@ -453,6 +428,7 @@ fn parse(text: &str) -> Parse {
         // Internal helper to parse parenthesized expressions
         fn parse_parenthesized_expr_internal(&mut self, is_variable_ref: bool) {
             let mut paren_count = 1;
+            
             while paren_count > 0 && self.current().is_some() {
                 match self.current() {
                     Some(LPAREN) => {
@@ -470,13 +446,7 @@ fn parse(text: &str) -> Parse {
                     }
                     Some(QUOTE) => {
                         // Handle quoted strings
-                        self.bump();
-                        while self.current().is_some() && self.current() != Some(QUOTE) {
-                            self.bump();
-                        }
-                        if self.current() == Some(QUOTE) {
-                            self.bump();
-                        }
+                        self.parse_quoted_string();
                     }
                     Some(DOLLAR) => {
                         // Handle variable references
@@ -499,6 +469,17 @@ fn parse(text: &str) -> Parse {
                 self.expect_eol();
             }
         }
+        
+        // Handle parsing a quoted string - combines common quoting logic
+        fn parse_quoted_string(&mut self) {
+            self.bump(); // Consume the quote
+            while self.current().is_some() && self.current() != Some(QUOTE) {
+                self.bump();
+            }
+            if self.current() == Some(QUOTE) {
+                self.bump();
+            }
+        }
 
         fn parse_conditional_keyword(&mut self) -> Option<String> {
             if self.current() != Some(IDENTIFIER) {
@@ -518,43 +499,42 @@ fn parse(text: &str) -> Parse {
 
         fn parse_simple_condition(&mut self) {
             self.builder.start_node(EXPR.into());
-            match self.current() {
-                Some(IDENTIFIER) => self.bump(),
-                Some(DOLLAR) => self.parse_variable_reference(),
-                Some(QUOTE) => {
-                    // Handle quoted strings
-                    self.bump();
-                    while self.current().is_some() && self.current() != Some(QUOTE) {
-                        self.bump();
-                    }
-                    if self.current() == Some(QUOTE) {
-                        self.bump();
-                    }
-                }
-                _ => self.error("expected variable name or quoted string".into()),
-            }
 
-            // Handle additional tokens after the main condition
+            // Skip any leading whitespace
+            self.skip_ws();
+
+            // Collect variable names
+            let mut found_var = false;
+
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
-                    Some(DOLLAR) => self.parse_variable_reference(),
-                    Some(IDENTIFIER) => self.bump(),
-                    Some(OPERATOR) => self.bump(),
-                    Some(QUOTE) => {
-                        self.bump();
-                        while self.current().is_some() && self.current() != Some(QUOTE) {
-                            self.bump();
-                        }
-                        if self.current() == Some(QUOTE) {
-                            self.bump();
-                        }
+                    Some(DOLLAR) => {
+                        found_var = true;
+                        self.parse_variable_reference();
                     }
-                    _ => break,
+                    Some(_) => {
+                        // Accept any token as part of condition
+                        found_var = true;
+                        self.bump();
+                    }
+                    None => break,
                 }
             }
+
+            if !found_var {
+                // Empty condition is an error in GNU Make
+                self.error("expected condition after conditional directive".into());
+            }
+
             self.builder.finish_node();
-            self.expect_eol();
+
+            // Expect end of line
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            } else if self.current().is_some() {
+                self.skip_until_newline();
+            }
         }
 
         fn parse_elif_condition(&mut self) {
@@ -589,28 +569,103 @@ fn parse(text: &str) -> Parse {
             self.expect_eol();
         }
 
-        fn handle_conditional_token(&mut self, token: &str, depth: &mut i32) -> bool {
+        // Helper to check if a token is a conditional directive
+        fn is_conditional_directive(&self, token: &str) -> bool {
+            token == "ifdef" || token == "ifndef" || token == "ifeq" || token == "ifneq" || 
+            token == "else" || token == "elif" || token == "endif"
+        }
+        
+        // Helper method to handle conditional token
+        fn handle_conditional_token(&mut self, token: &str, depth: &mut usize) -> bool {
             match token {
-                "endif" => {
-                    *depth -= 1;
-                    self.bump();
-                    self.skip_ws();
-                    self.expect_eol();
-                    true
-                }
-                "else" | "elif" if *depth == 1 => {
-                    self.bump();
-                    if token == "elif" {
-                        self.parse_elif_condition();
-                    } else {
-                        self.skip_ws();
-                        self.expect_eol();
-                    }
-                    true
-                }
-                s if s.starts_with("if") => {
+                "ifdef" | "ifndef" | "ifeq" | "ifneq" => {
+                    *depth += 1;
                     self.parse_conditional();
                     true
+                }
+                "else" | "elif" => {
+                    // Not valid outside of a conditional
+                    if *depth == 0 {
+                        self.error(format!("{} without matching if", token));
+                        false
+                    } else {
+                        // Consume the token
+                        self.bump();
+                        
+                        // Parse an additional condition if this is an elif
+                        if token == "elif" {
+                            self.skip_ws();
+                            
+                            // Check various patterns of elif usage
+                            if self.current() == Some(IDENTIFIER) {
+                                let next_token = self.tokens.last().unwrap().1.clone();
+                                if next_token == "ifeq" || next_token == "ifdef" || next_token == "ifndef" || next_token == "ifneq" {
+                                    // Parse the nested condition
+                                    match next_token.as_str() {
+                                        "ifdef" | "ifndef" => {
+                                            self.bump(); // Consume the directive token
+                                            self.skip_ws();
+                                            self.parse_simple_condition();
+                                        }
+                                        "ifeq" | "ifneq" => {
+                                            self.bump(); // Consume the directive token
+                                            self.skip_ws();
+                                            self.parse_parenthesized_expr();
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                } else {
+                                    // Handle other patterns like "elif defined(X)"
+                                    self.builder.start_node(EXPR.into());
+                                    // Just consume tokens until newline - more permissive parsing
+                                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                                        self.bump();
+                                    }
+                                    self.builder.finish_node();
+                                    if self.current() == Some(NEWLINE) {
+                                        self.bump();
+                                    }
+                                }
+                            } else {
+                                // Handle any other pattern permissively
+                                self.builder.start_node(EXPR.into());
+                                // Just consume tokens until newline
+                                while self.current().is_some() && self.current() != Some(NEWLINE) {
+                                    self.bump();
+                                }
+                                self.builder.finish_node();
+                                if self.current() == Some(NEWLINE) {
+                                    self.bump();
+                                }
+                            }
+                        } else {
+                            // For 'else', just expect EOL
+                            self.expect_eol();
+                        }
+                        true
+                    }
+                }
+                "endif" => {
+                    // Not valid outside of a conditional
+                    if *depth == 0 {
+                        self.error("endif without matching if".into());
+                        false
+                    } else {
+                        *depth -= 1;
+                        // Consume the endif
+                        self.bump();
+                        
+                        // Be more permissive with whitespace after endif
+                        self.skip_ws();
+                        if self.current() == Some(NEWLINE) {
+                            self.bump();
+                        } else if self.current().is_some() {
+                            // Accept anything after endif with optional whitespace
+                            // This handles cases like "A := 1 endif"
+                            self.skip_until_newline();
+                        }
+                        true
+                    }
                 }
                 _ => false,
             }
@@ -642,7 +697,37 @@ fn parse(text: &str) -> Parse {
 
             // Parse the conditional body
             let mut depth = 1;
+            
+            // Enhanced safety to prevent infinite loops
+            let mut last_position = self.tokens.len();
+            let mut last_token = self.current();
+            let mut iterations_at_position = 0;
+            let max_iterations_without_progress = 20; // Increase limit for complex conditionals
+            
             while depth > 0 && self.current().is_some() {
+                // More sophisticated safety check for infinite loops
+                // Check if neither the token count nor the current token has changed
+                if self.tokens.len() == last_position && self.current() == last_token {
+                    iterations_at_position += 1;
+                    
+                    // Only break if we're truly stuck
+                    if iterations_at_position > max_iterations_without_progress {
+                        // Instead of breaking immediately, try to recover
+                        // Force moving forward by consuming the current token
+                        if self.current().is_some() {
+                            self.bump();
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    // We made progress, reset counter
+                    iterations_at_position = 0;
+                    last_position = self.tokens.len();
+                    last_token = self.current();
+                }
+                
                 match self.current() {
                     None => {
                         self.error("unterminated conditional (missing endif)".into());
@@ -651,7 +736,7 @@ fn parse(text: &str) -> Parse {
                     Some(IDENTIFIER) => {
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
-                            if token == "include" {
+                            if token == "include" || token == "-include" || token == "sinclude" {
                                 self.parse_include();
                             } else {
                                 self.parse_normal_content();
@@ -663,12 +748,11 @@ fn parse(text: &str) -> Parse {
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
                     Some(DOLLAR) => self.parse_normal_content(),
-                    Some(QUOTE) => self.bump(),
+                    Some(QUOTE) => {
+                        self.parse_quoted_string();
+                    },
                     Some(_) => {
-                        self.error(format!(
-                            "unexpected token in conditional block: {:?}",
-                            self.current()
-                        ));
+                        // Be more tolerant of unexpected tokens in conditionals
                         self.bump();
                     }
                 }
@@ -772,7 +856,7 @@ fn parse(text: &str) -> Parse {
                 None => false,
                 Some(IDENTIFIER) => {
                     let token = self.tokens.last().unwrap().1.clone();
-                    if token.starts_with("if") {
+                    if self.is_conditional_directive(&token) {
                         self.parse_conditional();
                         true
                     } else {
@@ -890,6 +974,38 @@ fn parse(text: &str) -> Parse {
             if self.current() == Some(NEWLINE) {
                 self.bump();
             }
+        }
+
+        // Helper to handle nested parentheses and collect tokens until matching closing parenthesis
+        fn consume_balanced_parens(&mut self, start_paren_count: usize) -> usize {
+            let mut paren_count = start_paren_count;
+            
+            while paren_count > 0 && self.current().is_some() {
+                match self.current() {
+                    Some(LPAREN) => {
+                        paren_count += 1;
+                        self.bump();
+                    }
+                    Some(RPAREN) => {
+                        paren_count -= 1;
+                        self.bump();
+                        if paren_count == 0 {
+                            break;
+                        }
+                    }
+                    Some(DOLLAR) => {
+                        // Handle nested variable references
+                        self.parse_variable_reference();
+                    }
+                    Some(_) => self.bump(),
+                    None => {
+                        self.error("unclosed parenthesis".into());
+                        break;
+                    }
+                }
+            }
+            
+            paren_count
         }
     }
 
@@ -1182,44 +1298,17 @@ impl FromStr for Makefile {
 }
 
 impl Rule {
-    /// Targets of this rule
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::Rule;
-    ///
-    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
-    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-    /// ```
-    pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
-        let mut result = Vec::new();
-        let mut tokens = self
-            .syntax()
-            .children_with_tokens()
-            .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
-            .peekable();
-
-        while let Some(token) = tokens.next() {
-            if let Some(node) = token.as_node() {
-                if node.kind() == EXPR {
-                    // Handle when the target is an expression node
-                    let mut var_content = String::new();
-                    for child in node.children_with_tokens() {
-                        if let Some(t) = child.as_token() {
-                            var_content.push_str(t.text());
-                        }
-                    }
-                    if !var_content.is_empty() {
-                        result.push(var_content);
-                    }
-                }
-            } else if let Some(t) = token.as_token() {
+    // Helper method to collect variable references from tokens
+    fn collect_variable_reference(&self, tokens: &mut std::iter::Peekable<impl Iterator<Item = SyntaxElement>>) -> Option<String> {
+        let mut var_ref = String::new();
+        
+        // Check if we're at a $ token
+        if let Some(token) = tokens.next() {
+            if let Some(t) = token.as_token() {
                 if t.kind() == DOLLAR {
-                    // Start of a variable reference - collect all tokens until matching )
-                    let mut var_ref = String::new();
                     var_ref.push_str(t.text());
                     
-                    // Handling nested parentheses for complex variable references
+                    // Check if the next token is a (
                     if let Some(next) = tokens.peek() {
                         if let Some(nt) = next.as_token() {
                             if nt.kind() == LPAREN {
@@ -1246,8 +1335,7 @@ impl Rule {
                                     }
                                 }
                                 
-                                result.push(var_ref);
-                                continue;
+                                return Some(var_ref);
                             }
                         }
                     }
@@ -1261,9 +1349,56 @@ impl Rule {
                             }
                         }
                     }
-                    result.push(var_ref);
+                    return Some(var_ref);
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Targets of this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    ///
+    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+    /// ```
+    pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
+        let mut result = Vec::new();
+        let mut tokens = self
+            .syntax()
+            .children_with_tokens()
+            .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
+            .peekable();
+
+        while let Some(token) = tokens.peek().cloned() {
+            if let Some(node) = token.as_node() {
+                tokens.next(); // Consume the node
+                if node.kind() == EXPR {
+                    // Handle when the target is an expression node
+                    let mut var_content = String::new();
+                    for child in node.children_with_tokens() {
+                        if let Some(t) = child.as_token() {
+                            var_content.push_str(t.text());
+                        }
+                    }
+                    if !var_content.is_empty() {
+                        result.push(var_content);
+                    }
+                }
+            } else if let Some(t) = token.as_token() {
+                if t.kind() == DOLLAR {
+                    if let Some(var_ref) = self.collect_variable_reference(&mut tokens) {
+                        result.push(var_ref);
+                    }
                 } else if t.kind() == IDENTIFIER {
                     result.push(t.text().to_string());
+                    tokens.next(); // Consume the identifier
+                } else {
+                    tokens.next(); // Skip other token types
                 }
             }
         }
@@ -1296,59 +1431,20 @@ impl Rule {
                     if node.kind() == EXPR {
                         // Process this expression node for prerequisites
                         let mut tokens = node.children_with_tokens().peekable();
-                        while let Some(token) = tokens.next() {
+                        while let Some(token) = tokens.peek().cloned() {
                             if let Some(t) = token.as_token() {
                                 if t.kind() == DOLLAR {
-                                    // Start of a variable reference - collect all tokens until matching )
-                                    let mut var_ref = String::new();
-                                    var_ref.push_str(t.text());
-                                    
-                                    // Handling nested parentheses for complex variable references
-                                    if let Some(next) = tokens.peek() {
-                                        if let Some(nt) = next.as_token() {
-                                            if nt.kind() == LPAREN {
-                                                // Consume the opening parenthesis
-                                                var_ref.push_str(nt.text());
-                                                tokens.next();
-                                                
-                                                // Track parenthesis nesting level
-                                                let mut paren_count = 1;
-                                                
-                                                // Keep consuming tokens until we find the matching closing parenthesis
-                                                while let Some(next_token) = tokens.next() {
-                                                    if let Some(nt) = next_token.as_token() {
-                                                        var_ref.push_str(nt.text());
-                                                        
-                                                        if nt.kind() == LPAREN {
-                                                            paren_count += 1;
-                                                        } else if nt.kind() == RPAREN {
-                                                            paren_count -= 1;
-                                                            if paren_count == 0 {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                result.push(var_ref);
-                                                continue;
-                                            }
-                                        }
+                                    if let Some(var_ref) = self.collect_variable_reference(&mut tokens) {
+                                        result.push(var_ref);
                                     }
-                                    
-                                    // Handle simpler variable references (though this branch may be less common)
-                                    while let Some(next_token) = tokens.next() {
-                                        if let Some(nt) = next_token.as_token() {
-                                            var_ref.push_str(nt.text());
-                                            if nt.kind() == RPAREN {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    result.push(var_ref);
                                 } else if t.kind() == IDENTIFIER {
                                     result.push(t.text().to_string());
+                                    tokens.next(); // Consume the identifier
+                                } else {
+                                    tokens.next(); // Skip other token types
                                 }
+                            } else {
+                                tokens.next(); // Skip other elements
                             }
                         }
                         break; // Only process the first EXPR after the operator
