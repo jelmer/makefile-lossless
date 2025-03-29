@@ -30,7 +30,40 @@ impl<'a> Lexer<'a> {
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '%'
+        c.is_ascii_alphabetic()
+            || c.is_ascii_digit()
+            || c == '_'
+            || c == '.'
+            || c == '-'
+            || c == '%'
+    }
+
+    fn read_quoted_string(&mut self) -> String {
+        let mut result = String::new();
+        let quote = self.input.next().unwrap(); // Consume opening quote
+        result.push(quote);
+
+        while let Some(&c) = self.input.peek() {
+            if c == quote {
+                result.push(c);
+                self.input.next();
+                break;
+            } else if c == '\\' {
+                self.input.next(); // Consume backslash
+                if let Some(next) = self.input.next() {
+                    // Handle any escaped character, not just quotes
+                    result.push(next);
+                }
+            } else if c == '$' {
+                // Handle variable references inside quotes
+                result.push(c);
+                self.input.next();
+            } else {
+                result.push(c);
+                self.input.next();
+            }
+        }
+        result
     }
 
     fn read_while<F>(&mut self, predicate: F) -> String
@@ -89,6 +122,7 @@ impl<'a> Lexer<'a> {
                         SyntaxKind::IDENTIFIER,
                         self.read_while(Self::is_valid_identifier_char),
                     )),
+                    '"' | '\'' => Some((SyntaxKind::QUOTE, self.read_quoted_string())),
                     ':' | '=' | '?' | '+' => {
                         let text = self.input.next().unwrap().to_string()
                             + self
@@ -115,10 +149,6 @@ impl<'a> Lexer<'a> {
                     '\\' => {
                         self.input.next();
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
-                    }
-                    '"' => {
-                        self.input.next();
-                        Some((SyntaxKind::QUOTE, "\"".to_string()))
                     }
                     _ => {
                         self.input.next();
