@@ -1620,7 +1620,7 @@ rule: dependency
     EXPR@24..34
       IDENTIFIER@24..34 "dependency"
     NEWLINE@34..35 "\n"
-    RECIPE_LINE@35..44
+    RECIPE@35..44
       INDENT@35..36 "\t"
       TEXT@36..43 "command"
       NEWLINE@43..44 "\n"
@@ -1696,7 +1696,7 @@ rule: dependency
       WHITESPACE@17..18 " "
       IDENTIFIER@18..29 "dependency2"
     NEWLINE@29..30 "\n"
-    RECIPE_LINE@30..39
+    RECIPE@30..39
       INDENT@30..31 "\t"
       TEXT@31..38 "command"
       NEWLINE@38..39 "\n"
