@@ -1465,15 +1465,18 @@ impl Rule {
     /// rule.replace_command(0, "new command");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
     /// ```
-    pub fn replace_command(&self, i: usize, line: &str) {
+    pub fn replace_command(&self, i: usize, line: &str) -> Option<Rule> {
         // Find the RECIPE with index i, then replace the line in it
         let index = self
             .syntax()
             .children()
             .filter(|it| it.kind() == RECIPE)
-            .nth(i)
-            .expect("index out of bounds")
-            .index();
+            .nth(i);
+            
+        let index = match index {
+            Some(node) => node.index(),
+            None => return None
+        };
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
@@ -1483,8 +1486,11 @@ impl Rule {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        self.0
-            .splice_children(index..index + 1, vec![syntax.into()]);
+        
+        let clone = self.0.clone();
+        clone.splice_children(index..index + 1, vec![syntax.into()]);
+        
+        Some(Rule(clone))
     }
 
     /// Add a new command to the rule
@@ -1493,10 +1499,10 @@ impl Rule {
     /// ```
     /// use makefile_lossless::Rule;
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
-    /// rule.push_command("command2");
-    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
+    /// let updated_rule = rule.push_command("command2");
+    /// assert_eq!(updated_rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
     /// ```
-    pub fn push_command(&self, line: &str) {
+    pub fn push_command(&self, line: &str) -> Rule {
         // Find the latest RECIPE entry, then append the new line after it.
         let index = self
             .0
@@ -1517,7 +1523,10 @@ impl Rule {
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
-        self.0.splice_children(index..index, vec![syntax.into()]);
+        let clone = self.0.clone();
+        clone.splice_children(index..index, vec![syntax.into()]);
+        
+        Rule(clone)
     }
 }
 
@@ -1731,7 +1740,7 @@ rule: dependency
     fn test_push_command() {
         let mut makefile = Makefile::new();
         let rule = makefile.add_rule("rule");
-
+        
         // Create a new rule with the first command added
         let rule_with_cmd1 = rule.push_command("command");
         // Create a new rule with the second command added
@@ -1750,10 +1759,16 @@ rule: dependency
             vec!["command", "command2", "command3"]
         );
 
-        // The original makefile is unchanged
-        assert_eq!(makefile.to_string(), "rule:\n");
-
-        // Convert the modified rule to a string for verification
+        // Check if the original rule was modified
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2", "command3"]);
+        
+        // Check if the original makefile was modified
+        assert_eq!(
+            makefile.to_string(),
+            "rule:\n\tcommand\n\tcommand2\n\tcommand3\n"
+        );
+        
+        // The modified rule should have the same string representation
         assert_eq!(
             rule_with_all.to_string(),
             "rule:\n\tcommand\n\tcommand2\n\tcommand3\n"
@@ -1783,10 +1798,16 @@ rule: dependency
             vec!["new command", "command2"]
         );
 
-        // The original makefile is unchanged
-        assert_eq!(makefile.to_string(), "rule:\n");
-
-        // Convert the modified rule to a string for verification
+        // Check if the original rule was modified
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command", "command2"]);
+        
+        // Check if the original makefile was modified
+        assert_eq!(
+            makefile.to_string(),
+            "rule:\n\tnew command\n\tcommand2\n"
+        );
+        
+        // The modified rule should have the same string representation
         assert_eq!(
             modified_rule.to_string(),
             "rule:\n\tnew command\n\tcommand2\n"
