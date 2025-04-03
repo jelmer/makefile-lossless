@@ -2140,18 +2140,25 @@ rule: dependency
     fn test_parsing_error_context_with_bad_syntax() {
         // Input with unusual characters to ensure they're preserved
         let input = "#begin comment\n\t(╯°□°)╯︵ ┻━┻\n#end comment";
-        
+
         // With our relaxed parsing, verify we either get a proper error or parse successfully
         match Makefile::from_reader(input.as_bytes()) {
             Ok(makefile) => {
                 // If it parses successfully, our parser is robust enough to handle unusual characters
-                assert_eq!(makefile.rules().count(), 0, "Should not have found any rules");
+                assert_eq!(
+                    makefile.rules().count(),
+                    0,
+                    "Should not have found any rules"
+                );
             }
             Err(err) => match err {
                 self::Error::Parse(error) => {
                     // Verify error details are properly reported
                     assert!(error.errors[0].line >= 2, "Error line should be at least 2");
-                    assert!(!error.errors[0].context.is_empty(), "Error context should not be empty");
+                    assert!(
+                        !error.errors[0].context.is_empty(),
+                        "Error context should not be empty"
+                    );
                 }
                 _ => panic!("Unexpected error type"),
             },
@@ -2197,7 +2204,7 @@ rule: dependency
                         err.errors[0].line, expected_line,
                         "Line number should match the expected line"
                     );
-                    
+
                     // If the error is about indentation, check that the context includes the tab
                     if err.errors[0].message.contains("indented") {
                         assert!(
@@ -2459,101 +2466,132 @@ all: $(OBJS)
     fn test_comment_handling_in_recipes() {
         // Create a recipe with a comment line
         let recipe_comment = "build:\n\t# This is a comment\n\tgcc -o app main.c\n";
-        
+
         // Parse the recipe
         let parsed = parse(recipe_comment);
 
         // Verify no parsing errors
-        assert!(parsed.errors.is_empty(), "Should parse recipe with comments without errors");
+        assert!(
+            parsed.errors.is_empty(),
+            "Should parse recipe with comments without errors"
+        );
 
         // Check rule structure
         let root = parsed.root();
         let rules = root.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1, "Should find exactly one rule");
-        
+
         // Check the rule has the correct name
         let build_rule = &rules[0];
         assert_eq!(
-            build_rule.targets().collect::<Vec<_>>(), 
-            vec!["build"], 
+            build_rule.targets().collect::<Vec<_>>(),
+            vec!["build"],
             "Rule should have 'build' as target"
         );
-        
+
         // Check recipes are parsed correctly
-        // The parser appears to filter out comment lines from recipes 
+        // The parser appears to filter out comment lines from recipes
         // and only keeps actual command lines
         let recipes = build_rule.recipes().collect::<Vec<_>>();
-        assert_eq!(recipes.len(), 1, "Should find exactly one recipe line (comment lines are filtered)");
-        assert!(recipes[0].contains("gcc -o app"), "Recipe should be the command line");
-        assert!(!recipes[0].contains("This is a comment"), "Comments should not be included in recipe lines");
+        assert_eq!(
+            recipes.len(),
+            1,
+            "Should find exactly one recipe line (comment lines are filtered)"
+        );
+        assert!(
+            recipes[0].contains("gcc -o app"),
+            "Recipe should be the command line"
+        );
+        assert!(
+            !recipes[0].contains("This is a comment"),
+            "Comments should not be included in recipe lines"
+        );
     }
 
     #[test]
     fn test_multiline_variables() {
         // Simple multiline variable test
         let multiline = "SOURCES = main.c \\\n          util.c\n";
-        
+
         // Parse the multiline variable
         let parsed = parse(multiline);
-        
+
         // We can extract the variable even with errors (since backslash handling is not perfect)
         let root = parsed.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
         assert!(!vars.is_empty(), "Should find at least one variable");
-        
+
         // Test other multiline variable forms
-        
+
         // := assignment operator
         let operators = "CFLAGS := -Wall \\\n         -Werror\n";
         let parsed_operators = parse(operators);
-        
+
         // Extract variable with := operator
         let root = parsed_operators.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
-        assert!(!vars.is_empty(), "Should find at least one variable with := operator");
-        
+        assert!(
+            !vars.is_empty(),
+            "Should find at least one variable with := operator"
+        );
+
         // += assignment operator
         let append = "LDFLAGS += -L/usr/lib \\\n          -lm\n";
         let parsed_append = parse(append);
-        
+
         // Extract variable with += operator
         let root = parsed_append.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
-        assert!(!vars.is_empty(), "Should find at least one variable with += operator");
+        assert!(
+            !vars.is_empty(),
+            "Should find at least one variable with += operator"
+        );
     }
 
     #[test]
     fn test_whitespace_and_eof_handling() {
         // Test 1: File ending with blank lines
         let blank_lines = "VAR = value\n\n\n";
-        
+
         let parsed_blank = parse(blank_lines);
-        
+
         // We should be able to extract the variable definition
         let root = parsed_blank.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 1, "Should find one variable in blank lines test");
-        
+        assert_eq!(
+            vars.len(),
+            1,
+            "Should find one variable in blank lines test"
+        );
+
         // Test 2: File ending with space
         let trailing_space = "VAR = value \n";
-        
+
         let parsed_space = parse(trailing_space);
-        
+
         // We should be able to extract the variable definition
         let root = parsed_space.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 1, "Should find one variable in trailing space test");
-        
+        assert_eq!(
+            vars.len(),
+            1,
+            "Should find one variable in trailing space test"
+        );
+
         // Test 3: No final newline
         let no_newline = "VAR = value";
-        
+
         let parsed_no_newline = parse(no_newline);
-        
+
         // Regardless of parsing errors, we should be able to extract the variable
         let root = parsed_no_newline.root();
         let vars = root.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 1, "Should find one variable in no newline test");
-        assert_eq!(vars[0].name(), Some("VAR".to_string()), "Variable name should be VAR");
+        assert_eq!(
+            vars[0].name(),
+            Some("VAR".to_string()),
+            "Variable name should be VAR"
+        );
     }
 
     #[test]
@@ -2981,19 +3019,33 @@ clean:
         // Check that we found variables
         let variables = parsed.root().variable_definitions().collect::<Vec<_>>();
         assert!(!variables.is_empty(), "Expected at least one variable");
-        assert_eq!(variables[0].name(), Some("VERSION".to_string()), "Expected VERSION variable");
+        assert_eq!(
+            variables[0].name(),
+            Some("VERSION".to_string()),
+            "Expected VERSION variable"
+        );
 
         // Check that we found rules
         let rules = parsed.root().rules().collect::<Vec<_>>();
         assert!(!rules.is_empty(), "Expected at least one rule");
-        
+
         // Check for specific rules
-        let rule_targets: Vec<String> = rules.iter()
+        let rule_targets: Vec<String> = rules
+            .iter()
             .flat_map(|r| r.targets().collect::<Vec<_>>())
             .collect();
-        assert!(rule_targets.contains(&".PHONY".to_string()), "Expected .PHONY rule");
-        assert!(rule_targets.contains(&"all".to_string()), "Expected 'all' rule");
-        assert!(rule_targets.contains(&"clean".to_string()), "Expected 'clean' rule");
+        assert!(
+            rule_targets.contains(&".PHONY".to_string()),
+            "Expected .PHONY rule"
+        );
+        assert!(
+            rule_targets.contains(&"all".to_string()),
+            "Expected 'all' rule"
+        );
+        assert!(
+            rule_targets.contains(&"clean".to_string()),
+            "Expected 'clean' rule"
+        );
     }
 
     #[test]
@@ -3016,32 +3068,49 @@ clean:
         let parsed = parse(content);
 
         // Verify parsing succeeded
-        assert!(parsed.errors.is_empty(), "Failed to parse indented help text");
+        assert!(
+            parsed.errors.is_empty(),
+            "Failed to parse indented help text"
+        );
 
         // Check that we found the expected rules
         let rules = parsed.root().rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 2, "Expected to find two rules");
 
         // Find the rules by target
-        let help_rule = rules.iter()
+        let help_rule = rules
+            .iter()
             .find(|r| r.targets().any(|t| t == "help"))
             .expect("Expected to find help rule");
-            
-        let clean_rule = rules.iter()
+
+        let clean_rule = rules
+            .iter()
             .find(|r| r.targets().any(|t| t == "clean"))
             .expect("Expected to find clean rule");
 
         // Check help rule has expected recipe lines
         let help_recipes = help_rule.recipes().collect::<Vec<_>>();
-        assert!(!help_recipes.is_empty(), "Help rule should have recipe lines");
-        assert!(help_recipes.iter().any(|line| line.contains("Available targets")), 
-                "Help recipes should include 'Available targets' line");
-                
+        assert!(
+            !help_recipes.is_empty(),
+            "Help rule should have recipe lines"
+        );
+        assert!(
+            help_recipes
+                .iter()
+                .any(|line| line.contains("Available targets")),
+            "Help recipes should include 'Available targets' line"
+        );
+
         // Check clean rule has expected recipe
         let clean_recipes = clean_rule.recipes().collect::<Vec<_>>();
-        assert!(!clean_recipes.is_empty(), "Clean rule should have recipe lines");
-        assert!(clean_recipes.iter().any(|line| line.contains("rm -rf")),
-                "Clean recipes should include 'rm -rf' command");
+        assert!(
+            !clean_recipes.is_empty(),
+            "Clean rule should have recipe lines"
+        );
+        assert!(
+            clean_recipes.iter().any(|line| line.contains("rm -rf")),
+            "Clean recipes should include 'rm -rf' command"
+        );
     }
 
     #[test]
@@ -3053,13 +3122,16 @@ clean:
         let result = parse(content);
 
         // Verify no parsing errors
-        assert!(result.errors.is_empty(), "Failed to parse .PHONY: $(PHONY) pattern");
+        assert!(
+            result.errors.is_empty(),
+            "Failed to parse .PHONY: $(PHONY) pattern"
+        );
 
         // Check that the rule was parsed correctly
         let rules = result.root().rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1, "Expected 1 rule");
         assert_eq!(
-            rules[0].targets().next().unwrap(), 
+            rules[0].targets().next().unwrap(),
             ".PHONY",
             "Expected .PHONY rule"
         );
