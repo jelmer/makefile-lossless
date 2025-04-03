@@ -477,7 +477,7 @@ fn parse(text: &str) -> Parse {
         // Handle parsing a quoted string - combines common quoting logic
         fn parse_quoted_string(&mut self) {
             self.bump(); // Consume the quote
-            while self.current().is_some() && self.current() != Some(QUOTE) {
+            while !self.is_at_eof() && self.current() != Some(QUOTE) {
                 self.bump();
             }
             if self.current() == Some(QUOTE) {
@@ -510,7 +510,7 @@ fn parse(text: &str) -> Parse {
             // Collect variable names
             let mut found_var = false;
 
-            while self.current().is_some() && self.current() != Some(NEWLINE) {
+            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
                     Some(DOLLAR) => {
@@ -536,7 +536,7 @@ fn parse(text: &str) -> Parse {
             // Expect end of line
             if self.current() == Some(NEWLINE) {
                 self.bump();
-            } else if self.current().is_some() {
+            } else if !self.is_at_eof() {
                 self.skip_until_newline();
             }
         }
@@ -660,10 +660,10 @@ fn parse(text: &str) -> Parse {
                                 self.bump();
                             }
                             // If we're at EOF after whitespace, that's fine too
-                        } else if self.current().is_some() {
+                        } else if !self.is_at_eof() {
                             // For any other tokens, be lenient and just consume until EOL
                             // This makes the parser more resilient to various "endif" formattings
-                            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                                 self.bump();
                             }
                             if self.current() == Some(NEWLINE) {
@@ -718,7 +718,7 @@ fn parse(text: &str) -> Parse {
             let mut position_count = std::collections::HashMap::<usize, usize>::new();
             let max_repetitions = 15; // Permissive but safe limit
 
-            while depth > 0 && self.current().is_some() {
+            while depth > 0 && !self.is_at_eof() {
                 // Track position to detect infinite loops
                 let current_pos = self.tokens.len();
                 *position_count.entry(current_pos).or_insert(0) += 1;
@@ -795,7 +795,7 @@ fn parse(text: &str) -> Parse {
             self.builder.start_node(EXPR.into());
             let mut found_path = false;
 
-            while self.current().is_some() && self.current() != Some(NEWLINE) {
+            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
                     Some(DOLLAR) => {
@@ -820,7 +820,7 @@ fn parse(text: &str) -> Parse {
             // Expect newline
             if self.current() == Some(NEWLINE) {
                 self.bump();
-            } else if self.current().is_some() {
+            } else if !self.is_at_eof() {
                 self.error("expected newline after include".into());
                 self.skip_until_newline();
             }
@@ -953,7 +953,7 @@ fn parse(text: &str) -> Parse {
                     self.bump();
 
                     // Consume the rest of the line
-                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                    while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                         self.bump();
                     }
                     if self.current() == Some(NEWLINE) {
@@ -1038,6 +1038,28 @@ fn parse(text: &str) -> Parse {
             }
         }
 
+        // Helper to check if we're at EOF
+        fn is_at_eof(&self) -> bool {
+            self.current().is_none()
+        }
+
+        // Helper to check if we're at EOF or there's only whitespace left
+        fn is_at_eof_or_only_whitespace(&self) -> bool {
+            if self.is_at_eof() {
+                return true;
+            }
+
+            // Check if only whitespace and newlines remain
+            for i in (0..self.tokens.len()).rev() {
+                match self.tokens[i].0 {
+                    WHITESPACE | NEWLINE => continue,
+                    _ => return false,
+                }
+            }
+
+            true
+        }
+
         fn expect(&mut self, expected: SyntaxKind) {
             if self.current() != Some(expected) {
                 self.error(format!("expected {:?}, got {:?}", expected, self.current()));
@@ -1052,7 +1074,7 @@ fn parse(text: &str) -> Parse {
         }
 
         fn skip_until_newline(&mut self) {
-            while self.current().is_some() && self.current() != Some(NEWLINE) {
+            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 self.bump();
             }
             if self.current() == Some(NEWLINE) {
@@ -1094,20 +1116,17 @@ fn parse(text: &str) -> Parse {
 
         // Helper to check if we're near the end of the file with just whitespace
         fn is_end_of_file_or_newline_after_whitespace(&self) -> bool {
+            // Use our new helper method
+            if self.is_at_eof_or_only_whitespace() {
+                return true;
+            }
+
             // If there are 1 or 0 tokens left, we're at EOF
             if self.tokens.len() <= 1 {
                 return true;
             }
 
-            // Check if only whitespace and newlines remain
-            for i in (0..self.tokens.len() - 1).rev() {
-                match self.tokens[i].0 {
-                    WHITESPACE | NEWLINE => continue,
-                    _ => return false,
-                }
-            }
-
-            true
+            false
         }
 
         // Helper to determine if we're running in the test environment
