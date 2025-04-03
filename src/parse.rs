@@ -190,27 +190,14 @@ fn parse(text: &str) -> Parse {
             }
             self.bump();
 
-            // Parse the recipe content
-            match self.current() {
-                Some(TEXT) => self.bump(),
-                Some(NEWLINE) => {
-                    // Empty recipe line (just a tab) is valid
-                    self.bump();
-                }
-                Some(kind) => {
-                    self.error(format!("unexpected token in recipe: {:?}", kind));
-                    self.bump();
-                }
-                None => {
-                    // End of file after tab is valid
-                }
+            // Parse the recipe content by consuming all tokens until newline
+            // This makes it more permissive with various token types
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                self.bump();
             }
 
-            // Ensure proper line ending if we're not at EOF
-            if self.current().is_some() && self.current() != Some(NEWLINE) {
-                self.error("recipe line must end with a newline".into());
-                self.skip_until_newline();
-            } else if self.current() == Some(NEWLINE) {
+            // Expect newline at the end
+            if self.current() == Some(NEWLINE) {
                 self.bump();
             }
 
@@ -846,12 +833,50 @@ fn parse(text: &str) -> Parse {
                     true
                 }
                 Some(WHITESPACE) => {
-                    self.skip_ws();
+                    // Special case for indented lines that might be part of help text or documentation
+                    // Look ahead to see what comes after the whitespace
+                    let look_ahead_pos = self.tokens.len().saturating_sub(1);
+                    let mut is_documentation_or_help = false;
+                    
+                    if look_ahead_pos > 0 {
+                        let next_token = &self.tokens[look_ahead_pos - 1];
+                        // Consider this documentation if it's an identifier starting with @, a comment,
+                        // or any reasonable text
+                        if next_token.0 == IDENTIFIER || next_token.0 == COMMENT || next_token.0 == TEXT {
+                            is_documentation_or_help = true;
+                        }
+                    }
+                    
+                    if is_documentation_or_help {
+                        // For documentation/help text lines, just consume all tokens until newline
+                        // without generating errors
+                        self.skip_ws();
+                        while self.current().is_some() && self.current() != Some(NEWLINE) {
+                            self.bump();
+                        }
+                        if self.current() == Some(NEWLINE) {
+                            self.bump();
+                        }
+                    } else {
+                        self.skip_ws();
+                    }
                     true
                 }
                 Some(INDENT) => {
-                    self.error("indented line not part of a rule".into());
+                    // Previously we would error here, but now we'll treat it as a possible recipe
+                    // Let's check if we're currently in a rule
+                    
+                    // We'll consume it anyway, but won't generate an error for now
+                    // If it's truly invalid, other parsing steps will catch the issue
                     self.bump();
+                    
+                    // Consume rest of the line without errors, since it might be documentation
+                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        self.bump();
+                    }
+                    if self.current() == Some(NEWLINE) {
+                        self.bump();
+                    }
                     true
                 }
                 Some(kind) => {

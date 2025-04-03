@@ -90,6 +90,18 @@ impl<'a> Lexer<'a> {
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, "\t".to_string()));
                 }
+                (' ', None) => {
+                    // Check if this is the start of a space-indented recipe (2 or 4 spaces)
+                    let spaces = self.read_while(|ch| ch == ' ');
+                    if spaces.len() >= 2 {
+                        self.line_type = Some(LineType::Recipe);
+                        return Some((SyntaxKind::INDENT, spaces));
+                    } else {
+                        // If just a single space, treat as normal whitespace
+                        self.line_type = Some(LineType::Other);
+                        return Some((SyntaxKind::WHITESPACE, spaces));
+                    }
+                }
                 (_, None) => {
                     self.line_type = Some(LineType::Other);
                 }
