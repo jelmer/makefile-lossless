@@ -306,7 +306,7 @@ fn parse(text: &str) -> Parse {
         fn parse_comment(&mut self) {
             if self.current() == Some(COMMENT) {
                 self.bump(); // Consume the comment token
-                
+
                 // Handle end of line or file after comment
                 if self.current() == Some(NEWLINE) {
                     self.bump(); // Consume the newline
@@ -671,7 +671,7 @@ fn parse(text: &str) -> Parse {
                             }
                         }
                         // If we're at EOF after endif, that's fine
-                        
+
                         true
                     }
                 }
@@ -681,17 +681,17 @@ fn parse(text: &str) -> Parse {
 
         fn parse_conditional(&mut self) {
             self.builder.start_node(CONDITIONAL.into());
-            
+
             // Parse the conditional keyword
             let Some(token) = self.parse_conditional_keyword() else {
                 self.skip_until_newline();
                 self.builder.finish_node();
                 return;
             };
-            
+
             // Skip whitespace after keyword
             self.skip_ws();
-            
+
             // Parse the condition based on keyword type
             match token.as_str() {
                 "ifdef" | "ifndef" => {
@@ -702,7 +702,7 @@ fn parse(text: &str) -> Parse {
                 }
                 _ => unreachable!("Invalid conditional token"),
             }
-            
+
             // Skip any trailing whitespace and check for inline comments
             self.skip_ws();
             if self.current() == Some(COMMENT) {
@@ -710,11 +710,11 @@ fn parse(text: &str) -> Parse {
             } else {
                 self.expect_eol();
             }
-            
+
             // Parse the conditional body
             let mut depth = 1;
 
-            // More reliable loop detection 
+            // More reliable loop detection
             let mut position_count = std::collections::HashMap::<usize, usize>::new();
             let max_repetitions = 15; // Permissive but safe limit
 
@@ -919,37 +919,39 @@ fn parse(text: &str) -> Parse {
                 }
                 Some(INDENT) => {
                     // Be more permissive about indented lines
-                    // Many makefiles use indented lines for help text and documentation, 
+                    // Many makefiles use indented lines for help text and documentation,
                     // especially in target recipes with echo commands
-                    
+
                     #[cfg(test)]
                     {
-                        // When in test mode, only report errors for indented lines 
+                        // When in test mode, only report errors for indented lines
                         // that are not in conditionals
                         let is_in_test = self.original_text.lines().count() < 20;
-                        let tokens_as_str = self.tokens.iter()
+                        let tokens_as_str = self
+                            .tokens
+                            .iter()
                             .rev()
                             .take(10)
                             .map(|(_kind, text)| text.to_string())
                             .collect::<Vec<_>>()
                             .join(" ");
-                        
+
                         // Don't error if we see conditional keywords in the recent token history
-                        let in_conditional = tokens_as_str.contains("ifdef") || 
-                                           tokens_as_str.contains("ifndef") || 
-                                           tokens_as_str.contains("ifeq") || 
-                                           tokens_as_str.contains("ifneq") || 
-                                           tokens_as_str.contains("else") || 
-                                           tokens_as_str.contains("endif");
-                                           
+                        let in_conditional = tokens_as_str.contains("ifdef")
+                            || tokens_as_str.contains("ifndef")
+                            || tokens_as_str.contains("ifeq")
+                            || tokens_as_str.contains("ifneq")
+                            || tokens_as_str.contains("else")
+                            || tokens_as_str.contains("endif");
+
                         if is_in_test && !in_conditional {
                             self.error("indented line not part of a rule".into());
                         }
                     }
-                    
+
                     // We'll consume the INDENT token
                     self.bump();
-                    
+
                     // Consume the rest of the line
                     while self.current().is_some() && self.current() != Some(NEWLINE) {
                         self.bump();
@@ -1020,7 +1022,7 @@ fn parse(text: &str) -> Parse {
         fn expect_eol(&mut self) {
             // Skip any whitespace before looking for a newline
             self.skip_ws();
-            
+
             match self.current() {
                 Some(NEWLINE) => {
                     self.bump();
@@ -1096,7 +1098,7 @@ fn parse(text: &str) -> Parse {
             if self.tokens.len() <= 1 {
                 return true;
             }
-            
+
             // Check if only whitespace and newlines remain
             for i in (0..self.tokens.len() - 1).rev() {
                 match self.tokens[i].0 {
@@ -1104,7 +1106,7 @@ fn parse(text: &str) -> Parse {
                     _ => return false,
                 }
             }
-            
+
             true
         }
 
@@ -1225,7 +1227,7 @@ impl Makefile {
         let syntax = SyntaxNode::new_root_mut(builder.finish());
         Makefile(syntax)
     }
-    
+
     /// Get the text content of the makefile
     pub fn code(&self) -> String {
         self.syntax().text().to_string()
@@ -1709,19 +1711,18 @@ mod tests {
     #[test]
     fn test_conditionals() {
         // We'll use relaxed parsing for conditionals
-        
+
         // Basic conditionals - ifdef/ifndef
         let code = "ifdef DEBUG\n    DEBUG_FLAG := 1\nendif\n";
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse basic ifdef");
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse basic ifdef");
         assert!(makefile.code().contains("DEBUG_FLAG"));
 
         // Basic conditionals - ifeq/ifneq
-        let code = "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n";
+        let code =
+            "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n";
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse ifeq/ifneq");
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse ifeq/ifneq");
         assert!(makefile.code().contains("RESULT"));
         assert!(makefile.code().contains("windows"));
 
@@ -1736,22 +1737,21 @@ mod tests {
         // Empty conditionals
         let code = "ifdef DEBUG\nendif\n";
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse empty conditionals");
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse empty conditionals");
         assert!(makefile.code().contains("ifdef DEBUG"));
 
         // Conditionals with elif
         let code = "ifeq ($(OS),Windows)\n    EXT := .exe\nelif ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n";
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse conditionals with elif");
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse conditionals with elif");
         assert!(makefile.code().contains("EXT"));
 
         // Invalid conditionals - this should generate parse errors but still produce a Makefile
         let code = "ifXYZ DEBUG\nDEBUG := 1\nendif\n";
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse with recovery");
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse with recovery");
         assert!(makefile.code().contains("DEBUG"));
 
         // Missing condition - this should also generate parse errors but still produce a Makefile
@@ -2244,23 +2244,23 @@ endif
 all: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 "#;
-        
+
         let mut buf = code.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse conditional features");
-        
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse conditional features");
+
         // Instead of checking for variable definitions which might not get created
         // due to conditionals, let's verify that we can parse the content without errors
         assert!(!makefile.code().is_empty(), "Makefile has content");
-        
+
         // Check that we detected a rule
         let rules = makefile.rules().collect::<Vec<_>>();
         assert!(!rules.is_empty(), "Should have found rules");
-        
+
         // Verify conditional presence in the original code
         assert!(code.contains("ifdef DEBUG"));
         assert!(code.contains("endif"));
-        
+
         // Also try with an explicitly defined variable
         let code_with_var = r#"
 # Define a variable first
@@ -2275,14 +2275,17 @@ endif
 all: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 "#;
-        
+
         let mut buf = code_with_var.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse with explicit variable");
-        
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse with explicit variable");
+
         // Now we should definitely find at least the CC variable
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
-        assert!(!vars.is_empty(), "Should have found at least the CC variable definition");
+        assert!(
+            !vars.is_empty(),
+            "Should have found at least the CC variable definition"
+        );
     }
 
     #[test]
@@ -2428,8 +2431,8 @@ all: $(OBJS)
         // Basic if/else conditional
         let conditional = "ifdef DEBUG\nCFLAGS = -g\nelse\nCFLAGS = -O2\nendif\n";
         let mut buf = conditional.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse basic if/else conditional");
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse basic if/else conditional");
         let code = makefile.code();
         assert!(code.contains("ifdef DEBUG"));
         assert!(code.contains("else"));
@@ -2438,8 +2441,7 @@ all: $(OBJS)
         // ifdef with nested ifdef
         let nested = "ifdef DEBUG\nCFLAGS = -g\nifdef VERBOSE\nCFLAGS += -v\nendif\nendif\n";
         let mut buf = nested.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse nested ifdef");
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse nested ifdef");
         let code = makefile.code();
         assert!(code.contains("ifdef DEBUG"));
         assert!(code.contains("ifdef VERBOSE"));
@@ -2447,8 +2449,7 @@ all: $(OBJS)
         // ifeq form
         let ifeq = "ifeq ($(OS),Windows_NT)\nTARGET = app.exe\nelse\nTARGET = app\nendif\n";
         let mut buf = ifeq.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse ifeq form");
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse ifeq form");
         let code = makefile.code();
         assert!(code.contains("ifeq"));
         assert!(code.contains("Windows_NT"));
@@ -2780,7 +2781,7 @@ endif
         let mut buf = content.as_bytes();
         let makefile = Makefile::read_relaxed(&mut buf)
             .expect("Failed to parse indented lines in conditionals");
-        
+
         // Check that we detected conditionals
         let code = makefile.code();
         assert!(code.contains("ifdef DEBUG"));
@@ -2911,9 +2912,9 @@ endif
 "#;
         // Use relaxed parsing for nested conditionals test
         let mut buf = content.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse nested conditionals");
-        
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse nested conditionals");
+
         // Check that we detected conditionals
         let code = makefile.code();
         assert!(code.contains("ifdef RELEASE"));
@@ -2936,7 +2937,7 @@ build:
         let mut buf = content.as_bytes();
         let makefile =
             Makefile::read_relaxed(&mut buf).expect("Failed to parse space-indented recipes");
-        
+
         // Check that we can extract rules even with errors
         let rules = makefile.rules().collect::<Vec<_>>();
         assert!(!rules.is_empty(), "Expected at least one rule");
@@ -3316,11 +3317,14 @@ all: main.o utils.o
 "#;
         // Use relaxed parsing
         let mut buf = phony_with_docs.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse .PHONY with documentation");
-            
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse .PHONY with documentation");
+
         // Verify we got at least one rule
-        assert!(makefile.rules().count() > 0, "Should have found at least one rule");
+        assert!(
+            makefile.rules().count() > 0,
+            "Should have found at least one rule"
+        );
 
         // 2. Help text with indented lines that aren't recipes
         let help_text = r#"
@@ -3340,20 +3344,22 @@ clean:
 "#;
         // Use relaxed parsing
         let mut buf = help_text.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse help text");
-            
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse help text");
+
         // Verify we got the help and clean rules
         let rules = makefile.rules().collect::<Vec<_>>();
         assert!(rules.len() >= 2, "Should have found at least two rules");
-        
+
         // Find help rule
         let help_rule = rules.iter().find(|r| r.targets().any(|t| t == "help"));
         assert!(help_rule.is_some(), "Should have found help rule");
-        
+
         // Check recipes
         let recipes = help_rule.unwrap().recipes().collect::<Vec<_>>();
-        assert!(!recipes.is_empty(), "Should have found recipes in help rule");
+        assert!(
+            !recipes.is_empty(),
+            "Should have found recipes in help rule"
+        );
         assert!(
             recipes.iter().any(|r| r.contains("Available targets")),
             "Should have found 'Available targets' text"
@@ -3374,16 +3380,25 @@ rule2: dep2.o
 "#;
         // Use relaxed parsing
         let mut buf = docs_between_rules.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse docs between rules");
-            
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse docs between rules");
+
         // Verify we got both rules
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 2, "Should have found exactly two rules");
-        
-        let rule_targets: Vec<_> = rules.iter().flat_map(|r| r.targets().collect::<Vec<_>>()).collect();
-        assert!(rule_targets.contains(&"rule1".to_string()), "Should have found rule1");
-        assert!(rule_targets.contains(&"rule2".to_string()), "Should have found rule2");
+
+        let rule_targets: Vec<_> = rules
+            .iter()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert!(
+            rule_targets.contains(&"rule1".to_string()),
+            "Should have found rule1"
+        );
+        assert!(
+            rule_targets.contains(&"rule2".to_string()),
+            "Should have found rule2"
+        );
 
         // 4. Mixed indentation in recipes (tabs and spaces)
         let mixed_indentation = r#"
@@ -3396,9 +3411,8 @@ target: prereq
 "#;
         // Use relaxed parsing
         let mut buf = mixed_indentation.as_bytes();
-        let makefile = Makefile::read_relaxed(&mut buf)
-            .expect("Failed to parse mixed indentation");
-            
+        let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse mixed indentation");
+
         let rules = makefile.rules().collect::<Vec<_>>();
         assert!(
             !rules.is_empty(),
@@ -3419,16 +3433,13 @@ target: prereq
         let mut buf = indented_after_var.as_bytes();
         let makefile = Makefile::read_relaxed(&mut buf)
             .expect("Failed to parse indented block after variable");
-            
+
         // Verify we got both the variable definition and the rule
         assert!(
             makefile.variable_definitions().count() > 0,
             "Should have found variable definition"
         );
-        assert!(
-            makefile.rules().count() > 0,
-            "Should have found rule"
-        );
+        assert!(makefile.rules().count() > 0, "Should have found rule");
     }
 
     #[test]
