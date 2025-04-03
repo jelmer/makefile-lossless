@@ -2630,8 +2630,6 @@ all: $(OBJS)
         assert!(parsed.errors.is_empty());
     }
 
-    // ISSUE 1: Multiline Variable Handling Tests
-
     #[test]
     fn test_multiline_variable_with_backslash() {
         let content = r#"
@@ -2705,8 +2703,6 @@ CFLAGS := -Wall -O2 \
         );
     }
 
-    // ISSUE 2: Indented Line Tests
-
     #[test]
     fn test_indented_help_text() {
         let content = r#"
@@ -2765,8 +2761,6 @@ endif
         assert!(code.contains("endif"));
     }
 
-    // ISSUE 3: Colon vs Assignment Operators
-
     #[test]
     fn test_recipe_with_colon() {
         let content = r#"
@@ -2815,8 +2809,6 @@ all:: prerequisite2
             "Expected to find at least one rule containing 'all'"
         );
     }
-
-    // ISSUE 4: Conditionals and elif Tests
 
     #[test]
     fn test_elif_directive() {
@@ -2898,8 +2890,6 @@ endif
         assert!(code.contains("ifneq"));
     }
 
-    // ISSUE 5: Tab vs Space for Recipes
-
     #[test]
     fn test_space_indented_recipes() {
         // This test is expected to fail with current implementation
@@ -2922,8 +2912,6 @@ build:
         let build_rule = rules.iter().find(|r| r.targets().any(|t| t == "build"));
         assert!(build_rule.is_some(), "Expected to find build rule");
     }
-
-    // ISSUE 7: Advanced Variable Expansions
 
     #[test]
     fn test_complex_variable_functions() {
@@ -2956,8 +2944,6 @@ INSTALL_PATH = $(shell echo $(PREFIX) | sed 's/\/$//')
             parsed.errors
         );
     }
-
-    // ISSUE 8: Special Directives
 
     #[test]
     fn test_special_directives() {
