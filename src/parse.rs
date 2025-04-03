@@ -837,16 +837,19 @@ fn parse(text: &str) -> Parse {
                     // Look ahead to see what comes after the whitespace
                     let look_ahead_pos = self.tokens.len().saturating_sub(1);
                     let mut is_documentation_or_help = false;
-                    
+
                     if look_ahead_pos > 0 {
                         let next_token = &self.tokens[look_ahead_pos - 1];
                         // Consider this documentation if it's an identifier starting with @, a comment,
                         // or any reasonable text
-                        if next_token.0 == IDENTIFIER || next_token.0 == COMMENT || next_token.0 == TEXT {
+                        if next_token.0 == IDENTIFIER
+                            || next_token.0 == COMMENT
+                            || next_token.0 == TEXT
+                        {
                             is_documentation_or_help = true;
                         }
                     }
-                    
+
                     if is_documentation_or_help {
                         // For documentation/help text lines, just consume all tokens until newline
                         // without generating errors
@@ -865,11 +868,11 @@ fn parse(text: &str) -> Parse {
                 Some(INDENT) => {
                     // Previously we would error here, but now we'll treat it as a possible recipe
                     // Let's check if we're currently in a rule
-                    
+
                     // We'll consume it anyway, but won't generate an error for now
                     // If it's truly invalid, other parsing steps will catch the issue
                     self.bump();
-                    
+
                     // Consume rest of the line without errors, since it might be documentation
                     while self.current().is_some() && self.current() != Some(NEWLINE) {
                         self.bump();
@@ -1497,10 +1500,10 @@ impl Rule {
             .children()
             .filter(|it| it.kind() == RECIPE)
             .nth(i);
-            
+
         let index = match index {
             Some(node) => node.index(),
-            None => return None
+            None => return None,
         };
 
         let mut builder = GreenNodeBuilder::new();
@@ -1511,10 +1514,10 @@ impl Rule {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        
+
         let clone = self.0.clone();
         clone.splice_children(index..index + 1, vec![syntax.into()]);
-        
+
         Some(Rule(clone))
     }
 
@@ -1550,7 +1553,7 @@ impl Rule {
 
         let clone = self.0.clone();
         clone.splice_children(index..index, vec![syntax.into()]);
-        
+
         Rule(clone)
     }
 }
@@ -1765,7 +1768,7 @@ rule: dependency
     fn test_push_command() {
         let mut makefile = Makefile::new();
         let rule = makefile.add_rule("rule");
-        
+
         // Create a new rule with the first command added
         let rule_with_cmd1 = rule.push_command("command");
         // Create a new rule with the second command added
@@ -1785,14 +1788,17 @@ rule: dependency
         );
 
         // Check if the original rule was modified
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2", "command3"]);
-        
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2", "command3"]
+        );
+
         // Check if the original makefile was modified
         assert_eq!(
             makefile.to_string(),
             "rule:\n\tcommand\n\tcommand2\n\tcommand3\n"
         );
-        
+
         // The modified rule should have the same string representation
         assert_eq!(
             rule_with_all.to_string(),
@@ -1824,14 +1830,14 @@ rule: dependency
         );
 
         // Check if the original rule was modified
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command", "command2"]);
-        
-        // Check if the original makefile was modified
         assert_eq!(
-            makefile.to_string(),
-            "rule:\n\tnew command\n\tcommand2\n"
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["new command", "command2"]
         );
-        
+
+        // Check if the original makefile was modified
+        assert_eq!(makefile.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+
         // The modified rule should have the same string representation
         assert_eq!(
             modified_rule.to_string(),
