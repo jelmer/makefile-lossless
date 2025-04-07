@@ -1060,13 +1060,6 @@ fn parse(text: &str) -> Parse {
             true
         }
 
-        fn expect(&mut self, expected: SyntaxKind) {
-            if self.current() != Some(expected) {
-                self.error(format!("expected {:?}, got {:?}", expected, self.current()));
-            } else {
-                self.bump();
-            }
-        }
         fn skip_ws(&mut self) {
             while self.current() == Some(WHITESPACE) {
                 self.bump()
