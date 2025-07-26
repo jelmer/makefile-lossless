@@ -1143,7 +1143,6 @@ fn parse(text: &str) -> Parse {
 /// It is also immutable, like a GreenNode,
 /// but it contains parent pointers, offsets, and
 /// has identity semantics.
-
 type SyntaxNode = rowan::SyntaxNode<Lang>;
 #[allow(unused)]
 type SyntaxToken = rowan::SyntaxToken<Lang>;
@@ -1246,9 +1245,7 @@ impl Makefile {
         self.syntax().kind() == ROOT
     }
 
-    /// Returns an iterator over rules
-
-    /// Read a changelog file from a reader
+    /// Read a makefile from a reader
     pub fn read<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
@@ -1453,7 +1450,7 @@ impl Rule {
                                 let mut paren_count = 1;
 
                                 // Keep consuming tokens until we find the matching closing parenthesis
-                                while let Some(next_token) = tokens.next() {
+                                for next_token in tokens.by_ref() {
                                     if let Some(nt) = next_token.as_token() {
                                         var_ref.push_str(nt.text());
 
@@ -1474,7 +1471,7 @@ impl Rule {
                     }
 
                     // Handle simpler variable references (though this branch may be less common)
-                    while let Some(next_token) = tokens.next() {
+                    for next_token in tokens.by_ref() {
                         if let Some(nt) = next_token.as_token() {
                             var_ref.push_str(nt.text());
                             if nt.kind() == RPAREN {
@@ -1504,7 +1501,7 @@ impl Rule {
         let mut tokens = self
             .syntax()
             .children_with_tokens()
-            .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
+            .take_while(|it| it.as_token().map(|t| t.kind() != OPERATOR).unwrap_or(true))
             .peekable();
 
         while let Some(token) = tokens.peek().cloned() {
