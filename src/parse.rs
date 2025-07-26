@@ -137,10 +137,10 @@ fn parse(text: &str) -> Parse {
             };
 
             let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
-                if self.tokens.len() > 0 && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
-                    "expected ':'".to_string()
+                if !self.tokens.is_empty() && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
+                    "expected ':'".into()
                 } else {
-                    "indented line not part of a rule".to_string()
+                    "indented line not part of a rule".into()
                 }
             } else {
                 msg
@@ -176,7 +176,7 @@ fn parse(text: &str) -> Parse {
                 .lines()
                 .nth(line_number - 1)
                 .unwrap_or("")
-                .to_string()
+                .into()
         }
 
         fn parse_recipe_line(&mut self) {
@@ -264,7 +264,7 @@ fn parse(text: &str) -> Parse {
             if has_colon {
                 // Consume tokens until we find the colon
                 while self.current().is_some() {
-                    if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+                    if self.current() == Some(OPERATOR) && self.tokens.last().map(|(_, text)| text.as_str()) == Some(":") {
                         self.bump();
                         return true;
                     }
@@ -348,7 +348,7 @@ fn parse(text: &str) -> Parse {
             self.skip_ws();
             match self.current() {
                 Some(OPERATOR) => {
-                    let op = self.tokens.last().unwrap().1.clone();
+                    let op = &self.tokens.last().unwrap().1;
                     if ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&op.as_str()) {
                         self.bump();
                         self.skip_ws();
@@ -387,7 +387,7 @@ fn parse(text: &str) -> Parse {
                 let mut is_function = false;
 
                 if self.current() == Some(IDENTIFIER) {
-                    let function_name = self.tokens.last().unwrap().1.clone();
+                    let function_name = &self.tokens.last().unwrap().1;
                     // Common makefile functions
                     let known_functions = [
                         "shell", "wildcard", "call", "eval", "file", "abspath", "dir",
@@ -491,14 +491,15 @@ fn parse(text: &str) -> Parse {
                 return None;
             }
 
-            let token = self.tokens.last().unwrap().1.clone();
+            let token = &self.tokens.last().unwrap().1;
             if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
                 self.error(format!("unknown conditional directive: {}", token));
                 return None;
             }
 
+            let token_owned = token.clone();
             self.bump();
-            Some(token)
+            Some(token_owned)
         }
 
         fn parse_simple_condition(&mut self) {
@@ -577,7 +578,7 @@ fn parse(text: &str) -> Parse {
 
                             // Check various patterns of elif usage
                             if self.current() == Some(IDENTIFIER) {
-                                let next_token = self.tokens.last().unwrap().1.clone();
+                                let next_token = &self.tokens.last().unwrap().1;
                                 if next_token == "ifeq"
                                     || next_token == "ifdef"
                                     || next_token == "ifndef"
@@ -829,7 +830,7 @@ fn parse(text: &str) -> Parse {
         }
 
         fn parse_identifier_token(&mut self) -> bool {
-            let token = self.tokens.last().unwrap().1.clone();
+            let token = &self.tokens.last().unwrap().1;
 
             // Handle special cases first
             if token.starts_with("%") {
@@ -856,8 +857,8 @@ fn parse(text: &str) -> Parse {
             match self.current() {
                 None => false,
                 Some(IDENTIFIER) => {
-                    let token = self.tokens.last().unwrap().1.clone();
-                    if self.is_conditional_directive(&token) {
+                    let token = &self.tokens.last().unwrap().1;
+                    if self.is_conditional_directive(token) {
                         self.parse_conditional();
                         true
                     } else {
@@ -1050,14 +1051,9 @@ fn parse(text: &str) -> Parse {
             }
 
             // Check if only whitespace and newlines remain
-            for i in (0..self.tokens.len()).rev() {
-                match self.tokens[i].0 {
-                    WHITESPACE | NEWLINE => continue,
-                    _ => return false,
-                }
-            }
-
-            true
+            self.tokens.iter().rev().all(|(kind, _)| {
+                matches!(*kind, WHITESPACE | NEWLINE)
+            })
         }
 
         fn skip_ws(&mut self) {
@@ -1147,7 +1143,6 @@ fn parse(text: &str) -> Parse {
 /// It is also immutable, like a GreenNode,
 /// but it contains parent pointers, offsets, and
 /// has identity semantics.
-
 type SyntaxNode = rowan::SyntaxNode<Lang>;
 #[allow(unused)]
 type SyntaxToken = rowan::SyntaxToken<Lang>;
@@ -1224,7 +1219,7 @@ impl VariableDefinition {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
-            .map(|it| it.text().to_string())
+            .map(|it| it.text().into())
     }
 }
 
@@ -1250,9 +1245,7 @@ impl Makefile {
         self.syntax().kind() == ROOT
     }
 
-    /// Returns an iterator over rules
-
-    /// Read a changelog file from a reader
+    /// Read a makefile from a reader
     pub fn read<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
@@ -1457,7 +1450,7 @@ impl Rule {
                                 let mut paren_count = 1;
 
                                 // Keep consuming tokens until we find the matching closing parenthesis
-                                while let Some(next_token) = tokens.next() {
+                                for next_token in tokens.by_ref() {
                                     if let Some(nt) = next_token.as_token() {
                                         var_ref.push_str(nt.text());
 
@@ -1478,7 +1471,7 @@ impl Rule {
                     }
 
                     // Handle simpler variable references (though this branch may be less common)
-                    while let Some(next_token) = tokens.next() {
+                    for next_token in tokens.by_ref() {
                         if let Some(nt) = next_token.as_token() {
                             var_ref.push_str(nt.text());
                             if nt.kind() == RPAREN {
@@ -1508,7 +1501,7 @@ impl Rule {
         let mut tokens = self
             .syntax()
             .children_with_tokens()
-            .take_while(|it| it.as_token().map_or(true, |t| t.kind() != OPERATOR))
+            .take_while(|it| it.as_token().map(|t| t.kind() != OPERATOR).unwrap_or(true))
             .peekable();
 
         while let Some(token) = tokens.peek().cloned() {

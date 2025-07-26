@@ -88,7 +88,7 @@ impl<'a> Lexer<'a> {
                 ('\t', None) => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
-                    return Some((SyntaxKind::INDENT, "\t".to_string()));
+                    return Some((SyntaxKind::INDENT, "\t".into()));
                 }
                 (' ', None) => {
                     // Check if this is the start of a space-indented recipe (2 or 4 spaces)
@@ -144,23 +144,23 @@ impl<'a> Lexer<'a> {
                     }
                     '(' => {
                         self.input.next();
-                        Some((SyntaxKind::LPAREN, "(".to_string()))
+                        Some((SyntaxKind::LPAREN, "(".into()))
                     }
                     ')' => {
                         self.input.next();
-                        Some((SyntaxKind::RPAREN, ")".to_string()))
+                        Some((SyntaxKind::RPAREN, ")".into()))
                     }
                     '$' => {
                         self.input.next();
-                        Some((SyntaxKind::DOLLAR, "$".to_string()))
+                        Some((SyntaxKind::DOLLAR, "$".into()))
                     }
                     ',' => {
                         self.input.next();
-                        Some((SyntaxKind::COMMA, ",".to_string()))
+                        Some((SyntaxKind::COMMA, ",".into()))
                     }
                     '\\' => {
                         self.input.next();
-                        Some((SyntaxKind::BACKSLASH, "\\".to_string()))
+                        Some((SyntaxKind::BACKSLASH, "\\".into()))
                     }
                     _ => {
                         self.input.next();
