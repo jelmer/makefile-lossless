@@ -22,9 +22,13 @@
 //! ```
 
 mod lex;
+mod lossless;
 mod parse;
 
-pub use parse::{Error, Identifier, Include, Makefile, ParseError, Rule, VariableDefinition};
+pub use lossless::{
+    Error, Identifier, Include, Lang, Makefile, ParseError, Rule, VariableDefinition,
+};
+pub use parse::Parse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(non_camel_case_types)]
