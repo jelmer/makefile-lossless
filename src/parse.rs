@@ -1825,11 +1825,11 @@ impl Rule {
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
-    /// let updated_rule = rule.remove_command(0).unwrap();
-    /// assert_eq!(updated_rule.recipes().collect::<Vec<_>>(), vec!["command2"]);
+    /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// rule.remove_command(0);
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command2"]);
     /// ```
-    pub fn remove_command(&self, index: usize) -> Option<Rule> {
+    pub fn remove_command(&mut self, index: usize) -> bool {
         let recipes: Vec<_> = self
             .syntax()
             .children()
@@ -1837,15 +1837,15 @@ impl Rule {
             .collect();
 
         if index >= recipes.len() {
-            return None;
+            return false;
         }
 
         let target_node = &recipes[index];
         let target_index = target_node.index();
 
-        let clone = self.0.clone();
-        clone.splice_children(target_index..target_index + 1, vec![]);
-        Some(Rule(clone))
+        self.0
+            .splice_children(target_index..target_index + 1, vec![]);
+        true
     }
 
     /// Insert command at given index
@@ -1853,12 +1853,12 @@ impl Rule {
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
-    /// let updated_rule = rule.insert_command(1, "inserted_command").unwrap();
-    /// let recipes: Vec<_> = updated_rule.recipes().collect();
+    /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// rule.insert_command(1, "inserted_command");
+    /// let recipes: Vec<_> = rule.recipes().collect();
     /// assert_eq!(recipes, vec!["command1", "inserted_command", "command2"]);
     /// ```
-    pub fn insert_command(&self, index: usize, line: &str) -> Option<Rule> {
+    pub fn insert_command(&mut self, index: usize, line: &str) -> bool {
         let recipes: Vec<_> = self
             .syntax()
             .children()
@@ -1866,7 +1866,7 @@ impl Rule {
             .collect();
 
         if index > recipes.len() {
-            return None;
+            return false;
         }
 
         let target_index = if index == recipes.len() {
@@ -1888,9 +1888,9 @@ impl Rule {
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
-        let clone = self.0.clone();
-        clone.splice_children(target_index..target_index, vec![syntax.into()]);
-        Some(Rule(clone))
+        self.0
+            .splice_children(target_index..target_index, vec![syntax.into()]);
+        true
     }
 
     /// Get the number of commands/recipes in this rule
@@ -1913,11 +1913,11 @@ impl Rule {
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
-    /// let updated_rule = rule.clear_commands();
-    /// assert_eq!(updated_rule.recipe_count(), 0);
+    /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// rule.clear_commands();
+    /// assert_eq!(rule.recipe_count(), 0);
     /// ```
-    pub fn clear_commands(&self) -> Rule {
+    pub fn clear_commands(&mut self) {
         let recipes: Vec<_> = self
             .syntax()
             .children()
@@ -1925,18 +1925,14 @@ impl Rule {
             .collect();
 
         if recipes.is_empty() {
-            return Rule(self.0.clone());
+            return;
         }
-
-        let clone = self.0.clone();
 
         // Remove all recipes in reverse order to maintain correct indices
         for recipe in recipes.iter().rev() {
             let index = recipe.index();
-            clone.splice_children(index..index + 1, vec![]);
+            self.0.splice_children(index..index + 1, vec![]);
         }
-
-        Rule(clone)
     }
 }
 
@@ -3598,48 +3594,48 @@ endif
 
     #[test]
     fn test_remove_command() {
-        let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
             .parse()
             .unwrap();
 
-        let updated_rule = rule.remove_command(1).unwrap();
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        rule.remove_command(1);
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["command1", "command3"]);
-        assert_eq!(updated_rule.recipe_count(), 2);
+        assert_eq!(rule.recipe_count(), 2);
     }
 
     #[test]
     fn test_remove_command_out_of_bounds() {
-        let rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+        let mut rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
 
         let result = rule.remove_command(5);
-        assert!(result.is_none());
+        assert!(!result);
     }
 
     #[test]
     fn test_insert_command() {
-        let rule: Rule = "rule:\n\tcommand1\n\tcommand3\n".parse().unwrap();
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand3\n".parse().unwrap();
 
-        let updated_rule = rule.insert_command(1, "command2").unwrap();
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        rule.insert_command(1, "command2");
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["command1", "command2", "command3"]);
     }
 
     #[test]
     fn test_insert_command_at_end() {
-        let rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+        let mut rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
 
-        let updated_rule = rule.insert_command(1, "command2").unwrap();
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        rule.insert_command(1, "command2");
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["command1", "command2"]);
     }
 
     #[test]
     fn test_insert_command_in_empty_rule() {
-        let rule: Rule = "rule:\n".parse().unwrap();
+        let mut rule: Rule = "rule:\n".parse().unwrap();
 
-        let updated_rule = rule.insert_command(0, "new_command").unwrap();
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        rule.insert_command(0, "new_command");
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["new_command"]);
     }
 
@@ -3654,29 +3650,29 @@ endif
 
     #[test]
     fn test_clear_commands() {
-        let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
             .parse()
             .unwrap();
 
-        let updated_rule = rule.clear_commands();
-        assert_eq!(updated_rule.recipe_count(), 0);
+        rule.clear_commands();
+        assert_eq!(rule.recipe_count(), 0);
 
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, Vec::<String>::new());
 
         // Rule target should still be preserved
-        let targets: Vec<_> = updated_rule.targets().collect();
+        let targets: Vec<_> = rule.targets().collect();
         assert_eq!(targets, vec!["rule"]);
     }
 
     #[test]
     fn test_clear_commands_empty_rule() {
-        let rule: Rule = "rule:\n".parse().unwrap();
+        let mut rule: Rule = "rule:\n".parse().unwrap();
 
-        let updated_rule = rule.clear_commands();
-        assert_eq!(updated_rule.recipe_count(), 0);
+        rule.clear_commands();
+        assert_eq!(rule.recipe_count(), 0);
 
-        let targets: Vec<_> = updated_rule.targets().collect();
+        let targets: Vec<_> = rule.targets().collect();
         assert_eq!(targets, vec!["rule"]);
     }
 
@@ -3753,12 +3749,12 @@ VAR2 = value2
 
     #[test]
     fn test_command_operations_preserve_indentation() {
-        let rule: Rule = "rule:\n\t\tdeep_indent\n\tshallow_indent\n"
+        let mut rule: Rule = "rule:\n\t\tdeep_indent\n\tshallow_indent\n"
             .parse()
             .unwrap();
 
-        let updated_rule = rule.insert_command(1, "middle_command").unwrap();
-        let recipes: Vec<_> = updated_rule.recipes().collect();
+        rule.insert_command(1, "middle_command");
+        let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(
             recipes,
             vec!["\tdeep_indent", "middle_command", "shallow_indent"]
@@ -3804,15 +3800,16 @@ rule2:
     #[test]
     fn test_command_manipulation_edge_cases() {
         // Test with rule that has no commands
-        let empty_rule: Rule = "empty:\n".parse().unwrap();
+        let mut empty_rule: Rule = "empty:\n".parse().unwrap();
         assert_eq!(empty_rule.recipe_count(), 0);
 
-        let with_command = empty_rule.insert_command(0, "first_command").unwrap();
-        assert_eq!(with_command.recipe_count(), 1);
+        empty_rule.insert_command(0, "first_command");
+        assert_eq!(empty_rule.recipe_count(), 1);
 
         // Test clearing already empty rule
-        let still_empty = empty_rule.clear_commands();
-        assert_eq!(still_empty.recipe_count(), 0);
+        let mut empty_rule2: Rule = "empty:\n".parse().unwrap();
+        empty_rule2.clear_commands();
+        assert_eq!(empty_rule2.recipe_count(), 0);
     }
 
     #[test]
@@ -3843,7 +3840,7 @@ rule2:
 
     #[test]
     fn test_complex_recipe_manipulation() {
-        let complex_rule: Rule = r#"complex:
+        let mut complex_rule: Rule = r#"complex:
 	@echo "Starting build"
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Build complete"
@@ -3855,10 +3852,10 @@ rule2:
         assert_eq!(complex_rule.recipe_count(), 4);
 
         // Remove the echo statements, keep the actual build commands
-        let step1 = complex_rule.remove_command(0).unwrap(); // Remove first echo
-        let step2 = step1.remove_command(1).unwrap(); // Remove second echo (now at index 1, not 2)
+        complex_rule.remove_command(0); // Remove first echo
+        complex_rule.remove_command(1); // Remove second echo (now at index 1, not 2)
 
-        let final_recipes: Vec<_> = step2.recipes().collect();
+        let final_recipes: Vec<_> = complex_rule.recipes().collect();
         assert_eq!(final_recipes.len(), 2);
         assert!(final_recipes[0].contains("$(CC)"));
         assert!(final_recipes[1].contains("chmod"));
