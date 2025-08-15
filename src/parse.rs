@@ -138,9 +138,9 @@ fn parse(text: &str) -> Parse {
 
             let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
                 if !self.tokens.is_empty() && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
-                    "expected ':'".into()
+                    "expected ':'".to_string()
                 } else {
-                    "indented line not part of a rule".into()
+                    "indented line not part of a rule".to_string()
                 }
             } else {
                 msg
@@ -176,7 +176,7 @@ fn parse(text: &str) -> Parse {
                 .lines()
                 .nth(line_number - 1)
                 .unwrap_or("")
-                .into()
+                .to_string()
         }
 
         fn parse_recipe_line(&mut self) {
@@ -184,7 +184,7 @@ fn parse(text: &str) -> Parse {
 
             // Check for and consume the indent
             if self.current() != Some(INDENT) {
-                self.error("recipe line must start with a tab".into());
+                self.error("recipe line must start with a tab".to_string());
                 self.builder.finish_node();
                 return;
             }
@@ -215,7 +215,7 @@ fn parse(text: &str) -> Parse {
                     true
                 }
                 _ => {
-                    self.error("expected rule target".into());
+                    self.error("expected rule target".to_string());
                     false
                 }
             }
@@ -264,7 +264,9 @@ fn parse(text: &str) -> Parse {
             if has_colon {
                 // Consume tokens until we find the colon
                 while self.current().is_some() {
-                    if self.current() == Some(OPERATOR) && self.tokens.last().map(|(_, text)| text.as_str()) == Some(":") {
+                    if self.current() == Some(OPERATOR)
+                        && self.tokens.last().map(|(_, text)| text.as_str()) == Some(":")
+                    {
                         self.bump();
                         return true;
                     }
@@ -272,7 +274,7 @@ fn parse(text: &str) -> Parse {
                 }
             }
 
-            self.error("expected ':'".into());
+            self.error("expected ':'".to_string());
             false
         }
 
@@ -319,7 +321,7 @@ fn parse(text: &str) -> Parse {
                 }
                 // If we're at EOF after a comment, that's fine
             } else {
-                self.error("expected comment".into());
+                self.error("expected comment".to_string());
             }
         }
 
@@ -338,7 +340,7 @@ fn parse(text: &str) -> Parse {
                 Some(IDENTIFIER) => self.bump(),
                 Some(DOLLAR) => self.parse_variable_reference(),
                 _ => {
-                    self.error("expected variable name".into());
+                    self.error("expected variable name".to_string());
                     self.builder.finish_node();
                     return;
                 }
@@ -364,13 +366,13 @@ fn parse(text: &str) -> Parse {
                         if self.current() == Some(NEWLINE) {
                             self.bump();
                         } else {
-                            self.error("expected newline after variable value".into());
+                            self.error("expected newline after variable value".to_string());
                         }
                     } else {
                         self.error(format!("invalid assignment operator: {}", op));
                     }
                 }
-                _ => self.error("expected assignment operator".into()),
+                _ => self.error("expected assignment operator".to_string()),
             }
 
             self.builder.finish_node();
@@ -408,7 +410,7 @@ fn parse(text: &str) -> Parse {
                     self.parse_parenthesized_expr_internal(true);
                 }
             } else {
-                self.error("expected ( after $ in variable reference".into());
+                self.error("expected ( after $ in variable reference".to_string());
             }
 
             self.builder.finish_node();
@@ -419,7 +421,7 @@ fn parse(text: &str) -> Parse {
             self.builder.start_node(EXPR.into());
 
             if self.current() != Some(LPAREN) {
-                self.error("expected opening parenthesis".into());
+                self.error("expected opening parenthesis".to_string());
                 self.builder.finish_node();
                 return;
             }
@@ -459,9 +461,9 @@ fn parse(text: &str) -> Parse {
                     Some(_) => self.bump(),
                     None => {
                         self.error(if is_variable_ref {
-                            "unclosed variable reference".into()
+                            "unclosed variable reference".to_string()
                         } else {
-                            "unclosed parenthesis".into()
+                            "unclosed parenthesis".to_string()
                         });
                         break;
                     }
@@ -487,19 +489,20 @@ fn parse(text: &str) -> Parse {
 
         fn parse_conditional_keyword(&mut self) -> Option<String> {
             if self.current() != Some(IDENTIFIER) {
-                self.error("expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".into());
+                self.error(
+                    "expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".to_string(),
+                );
                 return None;
             }
 
-            let token = &self.tokens.last().unwrap().1;
+            let token = self.tokens.last().unwrap().1.clone();
             if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
                 self.error(format!("unknown conditional directive: {}", token));
                 return None;
             }
 
-            let token_owned = token.clone();
             self.bump();
-            Some(token_owned)
+            Some(token)
         }
 
         fn parse_simple_condition(&mut self) {
@@ -529,7 +532,7 @@ fn parse(text: &str) -> Parse {
 
             if !found_var {
                 // Empty condition is an error in GNU Make
-                self.error("expected condition after conditional directive".into());
+                self.error("expected condition after conditional directive".to_string());
             }
 
             self.builder.finish_node();
@@ -634,7 +637,7 @@ fn parse(text: &str) -> Parse {
                 "endif" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
-                        self.error("endif without matching if".into());
+                        self.error("endif without matching if".to_string());
                         // Always consume a token to guarantee progress
                         self.bump();
                         false
@@ -734,7 +737,7 @@ fn parse(text: &str) -> Parse {
 
                 match self.current() {
                     None => {
-                        self.error("unterminated conditional (missing endif)".into());
+                        self.error("unterminated conditional (missing endif)".to_string());
                         break;
                     }
                     Some(IDENTIFIER) => {
@@ -785,7 +788,7 @@ fn parse(text: &str) -> Parse {
                 || (!["include", "-include", "sinclude"]
                     .contains(&self.tokens.last().unwrap().1.as_str()))
             {
-                self.error("expected include directive".into());
+                self.error("expected include directive".to_string());
                 self.builder.finish_node();
                 return;
             }
@@ -813,7 +816,7 @@ fn parse(text: &str) -> Parse {
             }
 
             if !found_path {
-                self.error("expected file path after include".into());
+                self.error("expected file path after include".to_string());
             }
 
             self.builder.finish_node();
@@ -822,7 +825,7 @@ fn parse(text: &str) -> Parse {
             if self.current() == Some(NEWLINE) {
                 self.bump();
             } else if !self.is_at_eof() {
-                self.error("expected newline after include".into());
+                self.error("expected newline after include".to_string());
                 self.skip_until_newline();
             }
 
@@ -933,7 +936,7 @@ fn parse(text: &str) -> Parse {
                             .iter()
                             .rev()
                             .take(10)
-                            .map(|(_kind, text)| text.to_string())
+                            .map(|(_kind, text)| text.as_str())
                             .collect::<Vec<_>>()
                             .join(" ");
 
@@ -946,7 +949,7 @@ fn parse(text: &str) -> Parse {
                             || tokens_as_str.contains("endif");
 
                         if is_in_test && !in_conditional {
-                            self.error("indented line not part of a rule".into());
+                            self.error("indented line not part of a rule".to_string());
                         }
                     }
 
@@ -1051,9 +1054,10 @@ fn parse(text: &str) -> Parse {
             }
 
             // Check if only whitespace and newlines remain
-            self.tokens.iter().rev().all(|(kind, _)| {
-                matches!(*kind, WHITESPACE | NEWLINE)
-            })
+            self.tokens
+                .iter()
+                .rev()
+                .all(|(kind, _)| matches!(*kind, WHITESPACE | NEWLINE))
         }
 
         fn skip_ws(&mut self) {
@@ -1094,7 +1098,7 @@ fn parse(text: &str) -> Parse {
                     }
                     Some(_) => self.bump(),
                     None => {
-                        self.error("unclosed parenthesis".into());
+                        self.error("unclosed parenthesis".to_string());
                         break;
                     }
                 }
@@ -1376,8 +1380,6 @@ impl Makefile {
                 .find(|node| node.kind() == EXPR)
                 .map(|expr| expr.text().to_string().trim().to_string())
                 .unwrap_or_default()
-                .trim()
-                .to_string()
         })
     }
 }
@@ -3121,7 +3123,7 @@ clean:
         let parsed = parse(input);
         // This should handle gracefully without infinite loops
         assert!(parsed.errors.is_empty() || !parsed.errors.is_empty());
-        
+
         let input_with_newline = "text\nafter newline";
         let parsed2 = parse(input_with_newline);
         assert!(parsed2.errors.is_empty() || !parsed2.errors.is_empty());
@@ -3134,7 +3136,7 @@ clean:
         let parsed = parse(input);
         // Should produce an error about indented line not part of a rule
         assert!(!parsed.errors.is_empty());
-        
+
         let error_msg = &parsed.errors[0].message;
         assert!(error_msg.contains("indented") || error_msg.contains("part of a rule"));
     }
@@ -3152,7 +3154,7 @@ endif
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         // Should handle conditionals, possibly with errors but without crashing
-        
+
         // Test with nested conditionals
         let nested = r#"
 ifdef DEBUG
@@ -3181,7 +3183,7 @@ endif
         let includes = makefile.includes().collect::<Vec<_>>();
         // Should recognize include directive
         assert!(includes.len() >= 1 || parsed.errors.len() > 0);
-        
+
         // Test with -include
         let optional_include = r#"
 -include optional.mk
@@ -3203,7 +3205,7 @@ COMPLEX = $(if $(condition),$(then_val),$(else_val))
 "#;
         let parsed = parse(input);
         assert!(parsed.errors.is_empty());
-        
+
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert_eq!(vars.len(), 2);
@@ -3220,7 +3222,7 @@ help:
 "#;
         let parsed = parse(input);
         assert!(parsed.errors.is_empty());
-        
+
         let makefile = parsed.root();
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
@@ -3232,7 +3234,7 @@ help:
         // Test with empty input
         let parsed = parse("");
         assert!(parsed.errors.is_empty());
-        
+
         // Test with only whitespace
         let parsed2 = parse("   \n  \n");
         // Some parsers might report warnings/errors for whitespace-only input
