@@ -1341,6 +1341,16 @@ impl Makefile {
     pub fn replace_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
         let rules: Vec<_> = self.0.children().filter(|n| n.kind() == RULE).collect();
 
+        if rules.is_empty() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot replace rule in empty makefile".to_string(),
+                    line: 1,
+                    context: "replace_rule".to_string(),
+                }],
+            }));
+        }
+
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
@@ -1378,6 +1388,16 @@ impl Makefile {
     /// ```
     pub fn remove_rule(&mut self, index: usize) -> Result<Rule, Error> {
         let rules: Vec<_> = self.0.children().filter(|n| n.kind() == RULE).collect();
+
+        if rules.is_empty() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot remove rule from empty makefile".to_string(),
+                    line: 1,
+                    context: "remove_rule".to_string(),
+                }],
+            }));
+        }
 
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
@@ -3699,5 +3719,148 @@ VAR2 = value2
         assert!(output.contains("VAR = value"));
         assert!(output.contains("# Another comment"));
         assert!(output.contains("VAR2 = value2"));
+    }
+
+    #[test]
+    fn test_replace_rule_with_multiple_targets() {
+        let mut makefile: Makefile = "target1 target2: dep\n\tcommand\n".parse().unwrap();
+        let new_rule: Rule = "new_target: new_dep\n\tnew_command\n".parse().unwrap();
+
+        makefile.replace_rule(0, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["new_target"]);
+    }
+
+    #[test]
+    fn test_empty_makefile_operations() {
+        let mut makefile = Makefile::new();
+
+        // Test operations on empty makefile
+        assert!(makefile
+            .replace_rule(0, "rule:\n\tcommand\n".parse().unwrap())
+            .is_err());
+        assert!(makefile.remove_rule(0).is_err());
+
+        // Insert into empty makefile should work
+        let new_rule: Rule = "first_rule:\n\tcommand\n".parse().unwrap();
+        makefile.insert_rule(0, new_rule).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_command_operations_preserve_indentation() {
+        let rule: Rule = "rule:\n\t\tdeep_indent\n\tshallow_indent\n"
+            .parse()
+            .unwrap();
+
+        let updated_rule = rule.insert_command(1, "middle_command").unwrap();
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(
+            recipes,
+            vec!["\tdeep_indent", "middle_command", "shallow_indent"]
+        );
+    }
+
+    #[test]
+    fn test_rule_operations_with_variables_and_includes() {
+        let input = r#"VAR1 = value1
+include common.mk
+
+rule1:
+	command1
+
+VAR2 = value2
+include other.mk
+
+rule2:
+	command2
+"#;
+
+        let mut makefile: Makefile = input.parse().unwrap();
+
+        // Remove middle rule
+        makefile.remove_rule(0).unwrap();
+
+        // Verify structure is preserved
+        let output = makefile.code();
+        assert!(output.contains("VAR1 = value1"));
+        assert!(output.contains("include common.mk"));
+        assert!(output.contains("VAR2 = value2"));
+        assert!(output.contains("include other.mk"));
+
+        // Only rule2 should remain
+        assert_eq!(makefile.rules().count(), 1);
+        let remaining_targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(remaining_targets, vec!["rule2"]);
+    }
+
+    #[test]
+    fn test_command_manipulation_edge_cases() {
+        // Test with rule that has no commands
+        let empty_rule: Rule = "empty:\n".parse().unwrap();
+        assert_eq!(empty_rule.recipe_count(), 0);
+
+        let with_command = empty_rule.insert_command(0, "first_command").unwrap();
+        assert_eq!(with_command.recipe_count(), 1);
+
+        // Test clearing already empty rule
+        let still_empty = empty_rule.clear_commands();
+        assert_eq!(still_empty.recipe_count(), 0);
+    }
+
+    #[test]
+    fn test_large_makefile_performance() {
+        // Create a makefile with many rules to test performance doesn't degrade
+        let mut makefile = Makefile::new();
+
+        // Add 100 rules
+        for i in 0..100 {
+            let rule_name = format!("rule{}", i);
+            let _rule = makefile
+                .add_rule(&rule_name)
+                .push_command(&format!("command{}", i));
+        }
+
+        assert_eq!(makefile.rules().count(), 100);
+
+        // Replace rule in the middle - should be efficient
+        let new_rule: Rule = "middle_rule:\n\tmiddle_command\n".parse().unwrap();
+        makefile.replace_rule(50, new_rule).unwrap();
+
+        // Verify the change
+        let rule_50_targets: Vec<_> = makefile.rules().nth(50).unwrap().targets().collect();
+        assert_eq!(rule_50_targets, vec!["middle_rule"]);
+
+        assert_eq!(makefile.rules().count(), 100); // Count unchanged
+    }
+
+    #[test]
+    fn test_complex_recipe_manipulation() {
+        let complex_rule: Rule = r#"complex:
+	@echo "Starting build"
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "Build complete"
+	chmod +x $@
+"#
+        .parse()
+        .unwrap();
+
+        assert_eq!(complex_rule.recipe_count(), 4);
+
+        // Remove the echo statements, keep the actual build commands
+        let step1 = complex_rule.remove_command(0).unwrap(); // Remove first echo
+        let step2 = step1.remove_command(1).unwrap(); // Remove second echo (now at index 1, not 2)
+
+        let final_recipes: Vec<_> = step2.recipes().collect();
+        assert_eq!(final_recipes.len(), 2);
+        assert!(final_recipes[0].contains("$(CC)"));
+        assert!(final_recipes[1].contains("chmod"));
     }
 }
