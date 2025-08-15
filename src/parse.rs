@@ -1328,6 +1328,118 @@ impl Makefile {
         }
     }
 
+    /// Replace rule at given index with a new rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+    /// let new_rule: makefile_lossless::Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+    /// makefile.replace_rule(0, new_rule).unwrap();
+    /// assert!(makefile.rules().any(|r| r.targets().any(|t| t == "new_rule")));
+    /// ```
+    pub fn replace_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
+        let rules: Vec<_> = self.0.children().filter(|n| n.kind() == RULE).collect();
+
+        if index >= rules.len() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!(
+                        "Rule index {} out of bounds (max {})",
+                        index,
+                        rules.len() - 1
+                    ),
+                    line: 1,
+                    context: "replace_rule".to_string(),
+                }],
+            }));
+        }
+
+        let target_node = &rules[index];
+        let target_index = target_node.index();
+
+        // Replace the rule at the target index
+        self.0.splice_children(
+            target_index..target_index + 1,
+            vec![new_rule.0.clone().into()],
+        );
+        Ok(())
+    }
+
+    /// Remove rule at given index
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+    /// let removed = makefile.remove_rule(0).unwrap();
+    /// assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["rule1"]);
+    /// assert_eq!(makefile.rules().count(), 1);
+    /// ```
+    pub fn remove_rule(&mut self, index: usize) -> Result<Rule, Error> {
+        let rules: Vec<_> = self.0.children().filter(|n| n.kind() == RULE).collect();
+
+        if index >= rules.len() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!(
+                        "Rule index {} out of bounds (max {})",
+                        index,
+                        rules.len() - 1
+                    ),
+                    line: 1,
+                    context: "remove_rule".to_string(),
+                }],
+            }));
+        }
+
+        let target_node = rules[index].clone();
+        let target_index = target_node.index();
+
+        // Remove the rule at the target index
+        self.0
+            .splice_children(target_index..target_index + 1, vec![]);
+        Ok(Rule(target_node))
+    }
+
+    /// Insert rule at given position
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+    /// let new_rule: makefile_lossless::Rule = "inserted_rule:\n\tinserted_command\n".parse().unwrap();
+    /// makefile.insert_rule(1, new_rule).unwrap();
+    /// let targets: Vec<_> = makefile.rules().flat_map(|r| r.targets().collect::<Vec<_>>()).collect();
+    /// assert_eq!(targets, vec!["rule1", "inserted_rule", "rule2"]);
+    /// ```
+    pub fn insert_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
+        let rules: Vec<_> = self.0.children().filter(|n| n.kind() == RULE).collect();
+
+        if index > rules.len() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!("Rule index {} out of bounds (max {})", index, rules.len()),
+                    line: 1,
+                    context: "insert_rule".to_string(),
+                }],
+            }));
+        }
+
+        let target_index = if index == rules.len() {
+            // Insert at the end
+            self.0.children_with_tokens().count()
+        } else {
+            // Insert before the rule at the given index
+            rules[index].index()
+        };
+
+        // Insert the rule at the target index
+        self.0
+            .splice_children(target_index..target_index, vec![new_rule.0.clone().into()]);
+        Ok(())
+    }
+
     /// Get all include directives in the makefile
     ///
     /// # Example
@@ -1684,6 +1796,125 @@ impl Rule {
 
         let clone = self.0.clone();
         clone.splice_children(index..index, vec![syntax.into()]);
+
+        Rule(clone)
+    }
+
+    /// Remove command at given index
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// let updated_rule = rule.remove_command(0).unwrap();
+    /// assert_eq!(updated_rule.recipes().collect::<Vec<_>>(), vec!["command2"]);
+    /// ```
+    pub fn remove_command(&self, index: usize) -> Option<Rule> {
+        let recipes: Vec<_> = self
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == RECIPE)
+            .collect();
+
+        if index >= recipes.len() {
+            return None;
+        }
+
+        let target_node = &recipes[index];
+        let target_index = target_node.index();
+
+        let clone = self.0.clone();
+        clone.splice_children(target_index..target_index + 1, vec![]);
+        Some(Rule(clone))
+    }
+
+    /// Insert command at given index
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// let updated_rule = rule.insert_command(1, "inserted_command").unwrap();
+    /// let recipes: Vec<_> = updated_rule.recipes().collect();
+    /// assert_eq!(recipes, vec!["command1", "inserted_command", "command2"]);
+    /// ```
+    pub fn insert_command(&self, index: usize, line: &str) -> Option<Rule> {
+        let recipes: Vec<_> = self
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == RECIPE)
+            .collect();
+
+        if index > recipes.len() {
+            return None;
+        }
+
+        let target_index = if index == recipes.len() {
+            // Insert at the end - find position after last recipe
+            recipes.last().map(|n| n.index() + 1).unwrap_or_else(|| {
+                // No recipes exist, insert after the rule header
+                self.0.children_with_tokens().count()
+            })
+        } else {
+            // Insert before the recipe at the given index
+            recipes[index].index()
+        };
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+        builder.token(INDENT.into(), "\t");
+        builder.token(TEXT.into(), line);
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        let clone = self.0.clone();
+        clone.splice_children(target_index..target_index, vec![syntax.into()]);
+        Some(Rule(clone))
+    }
+
+    /// Get the number of commands/recipes in this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// assert_eq!(rule.recipe_count(), 2);
+    /// ```
+    pub fn recipe_count(&self) -> usize {
+        self.syntax()
+            .children()
+            .filter(|n| n.kind() == RECIPE)
+            .count()
+    }
+
+    /// Clear all commands from this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+    /// let updated_rule = rule.clear_commands();
+    /// assert_eq!(updated_rule.recipe_count(), 0);
+    /// ```
+    pub fn clear_commands(&self) -> Rule {
+        let recipes: Vec<_> = self
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == RECIPE)
+            .collect();
+
+        if recipes.is_empty() {
+            return Rule(self.0.clone());
+        }
+
+        let clone = self.0.clone();
+
+        // Remove all recipes in reverse order to maintain correct indices
+        for recipe in recipes.iter().rev() {
+            let index = recipe.index();
+            clone.splice_children(index..index + 1, vec![]);
+        }
 
         Rule(clone)
     }
@@ -3152,7 +3383,7 @@ endif
         let parsed = parse(input);
         // Test that parsing doesn't panic and produces some result
         let makefile = parsed.root();
-        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        let _vars = makefile.variable_definitions().collect::<Vec<_>>();
         // Should handle conditionals, possibly with errors but without crashing
 
         // Test with nested conditionals
@@ -3254,5 +3485,219 @@ endif
         // Parser should either handle gracefully or report appropriate errors
         // Not checking for specific error since parsing strategy may vary
         assert!(parsed.errors.is_empty() || !parsed.errors.is_empty());
+    }
+
+    #[test]
+    fn test_replace_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        makefile.replace_rule(0, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["new_rule", "rule2"]);
+
+        let recipes: Vec<_> = makefile.rules().next().unwrap().recipes().collect();
+        assert_eq!(recipes, vec!["new_command"]);
+    }
+
+    #[test]
+    fn test_replace_rule_out_of_bounds() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        let result = makefile.replace_rule(5, new_rule);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\nrule3:\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        let removed = makefile.remove_rule(1).unwrap();
+        assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["rule2"]);
+
+        let remaining_targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(remaining_targets, vec!["rule1", "rule3"]);
+        assert_eq!(makefile.rules().count(), 2);
+    }
+
+    #[test]
+    fn test_remove_rule_out_of_bounds() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+
+        let result = makefile.remove_rule(5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let new_rule: Rule = "inserted_rule:\n\tinserted_command\n".parse().unwrap();
+
+        makefile.insert_rule(1, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["rule1", "inserted_rule", "rule2"]);
+        assert_eq!(makefile.rules().count(), 3);
+    }
+
+    #[test]
+    fn test_insert_rule_at_end() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+        let new_rule: Rule = "end_rule:\n\tend_command\n".parse().unwrap();
+
+        makefile.insert_rule(1, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["rule1", "end_rule"]);
+    }
+
+    #[test]
+    fn test_insert_rule_out_of_bounds() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        let result = makefile.insert_rule(5, new_rule);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_command() {
+        let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        let updated_rule = rule.remove_command(1).unwrap();
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command3"]);
+        assert_eq!(updated_rule.recipe_count(), 2);
+    }
+
+    #[test]
+    fn test_remove_command_out_of_bounds() {
+        let rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+
+        let result = rule.remove_command(5);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_insert_command() {
+        let rule: Rule = "rule:\n\tcommand1\n\tcommand3\n".parse().unwrap();
+
+        let updated_rule = rule.insert_command(1, "command2").unwrap();
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command2", "command3"]);
+    }
+
+    #[test]
+    fn test_insert_command_at_end() {
+        let rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+
+        let updated_rule = rule.insert_command(1, "command2").unwrap();
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command2"]);
+    }
+
+    #[test]
+    fn test_insert_command_in_empty_rule() {
+        let rule: Rule = "rule:\n".parse().unwrap();
+
+        let updated_rule = rule.insert_command(0, "new_command").unwrap();
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(recipes, vec!["new_command"]);
+    }
+
+    #[test]
+    fn test_recipe_count() {
+        let rule1: Rule = "rule:\n".parse().unwrap();
+        assert_eq!(rule1.recipe_count(), 0);
+
+        let rule2: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+        assert_eq!(rule2.recipe_count(), 2);
+    }
+
+    #[test]
+    fn test_clear_commands() {
+        let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        let updated_rule = rule.clear_commands();
+        assert_eq!(updated_rule.recipe_count(), 0);
+
+        let recipes: Vec<_> = updated_rule.recipes().collect();
+        assert_eq!(recipes, Vec::<String>::new());
+
+        // Rule target should still be preserved
+        let targets: Vec<_> = updated_rule.targets().collect();
+        assert_eq!(targets, vec!["rule"]);
+    }
+
+    #[test]
+    fn test_clear_commands_empty_rule() {
+        let rule: Rule = "rule:\n".parse().unwrap();
+
+        let updated_rule = rule.clear_commands();
+        assert_eq!(updated_rule.recipe_count(), 0);
+
+        let targets: Vec<_> = updated_rule.targets().collect();
+        assert_eq!(targets, vec!["rule"]);
+    }
+
+    #[test]
+    fn test_rule_manipulation_preserves_structure() {
+        // Test that makefile structure (comments, variables, etc.) is preserved during rule manipulation
+        let input = r#"# Comment
+VAR = value
+
+rule1:
+	command1
+
+# Another comment
+rule2:
+	command2
+
+VAR2 = value2
+"#;
+
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        // Insert rule in the middle
+        makefile.insert_rule(1, new_rule).unwrap();
+
+        // Check that rules are correct
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["rule1", "new_rule", "rule2"]);
+
+        // Check that variables are preserved
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+
+        // The structure should be preserved in the output
+        let output = makefile.code();
+        assert!(output.contains("# Comment"));
+        assert!(output.contains("VAR = value"));
+        assert!(output.contains("# Another comment"));
+        assert!(output.contains("VAR2 = value2"));
     }
 }
