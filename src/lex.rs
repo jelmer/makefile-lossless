@@ -88,7 +88,7 @@ impl<'a> Lexer<'a> {
                 ('\t', None) => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
-                    return Some((SyntaxKind::INDENT, "\t".into()));
+                    return Some((SyntaxKind::INDENT, "\t".to_string()));
                 }
                 (' ', None) => {
                     // Check if this is the start of a space-indented recipe (2 or 4 spaces)
@@ -144,23 +144,23 @@ impl<'a> Lexer<'a> {
                     }
                     '(' => {
                         self.input.next();
-                        Some((SyntaxKind::LPAREN, "(".into()))
+                        Some((SyntaxKind::LPAREN, "(".to_string()))
                     }
                     ')' => {
                         self.input.next();
-                        Some((SyntaxKind::RPAREN, ")".into()))
+                        Some((SyntaxKind::RPAREN, ")".to_string()))
                     }
                     '$' => {
                         self.input.next();
-                        Some((SyntaxKind::DOLLAR, "$".into()))
+                        Some((SyntaxKind::DOLLAR, "$".to_string()))
                     }
                     ',' => {
                         self.input.next();
-                        Some((SyntaxKind::COMMA, ",".into()))
+                        Some((SyntaxKind::COMMA, ",".to_string()))
                     }
                     '\\' => {
                         self.input.next();
-                        Some((SyntaxKind::BACKSLASH, "\\".into()))
+                        Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
                     _ => {
                         self.input.next();
@@ -183,8 +183,7 @@ impl Iterator for Lexer<'_> {
 }
 
 pub(crate) fn lex(input: &str) -> Vec<(SyntaxKind, String)> {
-    let mut lexer = Lexer::new(input);
-    lexer.by_ref().collect::<Vec<_>>()
+    Lexer::new(input).collect()
 }
 
 #[cfg(test)]
