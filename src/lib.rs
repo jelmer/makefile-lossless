@@ -26,7 +26,8 @@ mod lossless;
 mod parse;
 
 pub use lossless::{
-    Error, Identifier, Include, Lang, Makefile, ParseError, Rule, VariableDefinition,
+    ArchiveMember, ArchiveMembers, Error, Identifier, Include, Lang, Makefile, ParseError, Rule,
+    VariableDefinition,
 };
 pub use parse::Parse;
 
@@ -61,6 +62,10 @@ pub enum SyntaxKind {
     // Directives
     CONDITIONAL,
     INCLUDE,
+
+    // Archive members
+    ARCHIVE_MEMBERS, // Container for just the members inside parentheses
+    ARCHIVE_MEMBER,  // Individual member like "bar.o" or "baz.o"
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
