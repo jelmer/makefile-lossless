@@ -211,7 +211,12 @@ pub(crate) fn parse(text: &str) -> Parse {
         fn parse_rule_target(&mut self) -> bool {
             match self.current() {
                 Some(IDENTIFIER) => {
-                    self.bump();
+                    // Check if this is an archive member (e.g., libfoo.a(bar.o))
+                    if self.is_archive_member() {
+                        self.parse_archive_member();
+                    } else {
+                        self.bump();
+                    }
                     true
                 }
                 Some(DOLLAR) => {
@@ -225,10 +230,84 @@ pub(crate) fn parse(text: &str) -> Parse {
             }
         }
 
+        fn is_archive_member(&self) -> bool {
+            // Check if the current identifier is followed by a parenthesis
+            // Pattern: archive.a(member.o)
+            if self.tokens.len() < 2 {
+                return false;
+            }
+
+            // Look for pattern: IDENTIFIER LPAREN
+            let current_is_identifier = self.current() == Some(IDENTIFIER);
+            let next_is_lparen =
+                self.tokens.len() > 1 && self.tokens[self.tokens.len() - 2].0 == LPAREN;
+
+            current_is_identifier && next_is_lparen
+        }
+
+        fn parse_archive_member(&mut self) {
+            // We're parsing something like: libfoo.a(bar.o baz.o)
+            // Structure will be:
+            // - IDENTIFIER: libfoo.a
+            // - LPAREN
+            // - ARCHIVE_MEMBERS
+            //   - ARCHIVE_MEMBER: bar.o
+            //   - ARCHIVE_MEMBER: baz.o
+            // - RPAREN
+
+            // Parse archive name
+            if self.current() == Some(IDENTIFIER) {
+                self.bump();
+            }
+
+            // Parse opening parenthesis
+            if self.current() == Some(LPAREN) {
+                self.bump();
+
+                // Start the ARCHIVE_MEMBERS container for just the members
+                self.builder.start_node(ARCHIVE_MEMBERS.into());
+
+                // Parse member name(s) - each as an ARCHIVE_MEMBER node
+                while self.current().is_some() && self.current() != Some(RPAREN) {
+                    match self.current() {
+                        Some(IDENTIFIER) | Some(TEXT) => {
+                            // Start an individual member node
+                            self.builder.start_node(ARCHIVE_MEMBER.into());
+                            self.bump();
+                            self.builder.finish_node();
+                        }
+                        Some(WHITESPACE) => self.bump(),
+                        Some(DOLLAR) => {
+                            // Variable reference can also be a member
+                            self.builder.start_node(ARCHIVE_MEMBER.into());
+                            self.parse_variable_reference();
+                            self.builder.finish_node();
+                        }
+                        _ => break,
+                    }
+                }
+
+                // Finish the ARCHIVE_MEMBERS container
+                self.builder.finish_node();
+
+                // Parse closing parenthesis
+                if self.current() == Some(RPAREN) {
+                    self.bump();
+                } else {
+                    self.error("expected ')' to close archive member".to_string());
+                }
+            }
+        }
+
         fn parse_rule_dependencies(&mut self) {
             self.builder.start_node(EXPR.into());
             while self.current().is_some() && self.current() != Some(NEWLINE) {
-                self.bump();
+                match self.current() {
+                    Some(IDENTIFIER) if self.is_archive_member() => {
+                        self.parse_archive_member();
+                    }
+                    _ => self.bump(),
+                }
             }
             self.builder.finish_node();
         }
@@ -1207,6 +1286,43 @@ ast_node!(Rule, RULE);
 ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
+ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
+ast_node!(ArchiveMember, ARCHIVE_MEMBER);
+
+impl ArchiveMembers {
+    /// Get the archive name (e.g., "libfoo.a" from "libfoo.a(bar.o)")
+    pub fn archive_name(&self) -> Option<String> {
+        // Get the first identifier before the opening parenthesis
+        for element in self.syntax().children_with_tokens() {
+            if let Some(token) = element.as_token() {
+                if token.kind() == IDENTIFIER {
+                    return Some(token.text().to_string());
+                } else if token.kind() == LPAREN {
+                    // Reached the opening parenthesis without finding an identifier
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// Get all member nodes
+    pub fn members(&self) -> impl Iterator<Item = ArchiveMember> + '_ {
+        self.syntax().children().filter_map(ArchiveMember::cast)
+    }
+
+    /// Get all member names as strings
+    pub fn member_names(&self) -> Vec<String> {
+        self.members().map(|m| m.text()).collect()
+    }
+}
+
+impl ArchiveMember {
+    /// Get the text of this archive member
+    pub fn text(&self) -> String {
+        self.syntax().text().to_string().trim().to_string()
+    }
+}
 
 impl VariableDefinition {
     /// Get the name of the variable definition
@@ -1647,8 +1763,53 @@ impl Rule {
                         result.push(var_ref);
                     }
                 } else if t.kind() == IDENTIFIER {
-                    result.push(t.text().to_string());
+                    // Check if this identifier is followed by archive members
+                    let ident_text = t.text().to_string();
                     tokens.next(); // Consume the identifier
+
+                    // Peek ahead to see if we have archive member syntax
+                    if let Some(next) = tokens.peek() {
+                        if let Some(next_token) = next.as_token() {
+                            if next_token.kind() == LPAREN {
+                                // This is an archive member target, collect the whole thing
+                                let mut archive_target = ident_text;
+                                archive_target.push_str(next_token.text()); // Add '('
+                                tokens.next(); // Consume LPAREN
+
+                                // Collect everything until RPAREN
+                                while let Some(token) = tokens.peek() {
+                                    if let Some(node) = token.as_node() {
+                                        if node.kind() == ARCHIVE_MEMBERS {
+                                            archive_target.push_str(&node.text().to_string());
+                                            tokens.next();
+                                        } else {
+                                            tokens.next();
+                                        }
+                                    } else if let Some(t) = token.as_token() {
+                                        if t.kind() == RPAREN {
+                                            archive_target.push_str(t.text());
+                                            tokens.next();
+                                            break;
+                                        } else {
+                                            tokens.next();
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                result.push(archive_target);
+                            } else {
+                                // Regular identifier
+                                result.push(ident_text);
+                            }
+                        } else {
+                            // Regular identifier
+                            result.push(ident_text);
+                        }
+                    } else {
+                        // Regular identifier
+                        result.push(ident_text);
+                    }
                 } else {
                     tokens.next(); // Skip other token types
                 }
@@ -1684,7 +1845,13 @@ impl Rule {
                         // Process this expression node for prerequisites
                         let mut tokens = node.children_with_tokens().peekable();
                         while let Some(token) = tokens.peek().cloned() {
-                            if let Some(t) = token.as_token() {
+                            if let Some(node) = token.as_node() {
+                                if node.kind() == ARCHIVE_MEMBERS {
+                                    // Handle archive member syntax in dependencies
+                                    result.push(node.text().to_string());
+                                }
+                                tokens.next(); // Consume the node
+                            } else if let Some(t) = token.as_token() {
                                 if t.kind() == DOLLAR {
                                     if let Some(var_ref) =
                                         self.collect_variable_reference(&mut tokens)
@@ -3782,6 +3949,88 @@ rule2:
         let mut empty_rule2: Rule = "empty:\n".parse().unwrap();
         empty_rule2.clear_commands();
         assert_eq!(empty_rule2.recipe_count(), 0);
+    }
+
+    #[test]
+    fn test_archive_member_parsing() {
+        // Test basic archive member syntax
+        let input = "libfoo.a(bar.o): bar.c\n\tgcc -c bar.c -o bar.o\n\tar r libfoo.a bar.o\n";
+        let parsed = parse(input);
+        assert!(
+            parsed.errors.is_empty(),
+            "Should parse archive member without errors"
+        );
+
+        let makefile = parsed.root();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+
+        // Check that the target is recognized as an archive member
+        let target_text = rules[0].targets().next().unwrap();
+        assert_eq!(target_text, "libfoo.a(bar.o)");
+    }
+
+    #[test]
+    fn test_archive_member_multiple_members() {
+        // Test archive with multiple members
+        let input = "libfoo.a(bar.o baz.o): bar.c baz.c\n\tgcc -c bar.c baz.c\n\tar r libfoo.a bar.o baz.o\n";
+        let parsed = parse(input);
+        assert!(
+            parsed.errors.is_empty(),
+            "Should parse multiple archive members"
+        );
+
+        let makefile = parsed.root();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn test_archive_member_in_dependencies() {
+        // Test archive members in dependencies
+        let input =
+            "program: main.o libfoo.a(bar.o) libfoo.a(baz.o)\n\tgcc -o program main.o libfoo.a\n";
+        let parsed = parse(input);
+        assert!(
+            parsed.errors.is_empty(),
+            "Should parse archive members in dependencies"
+        );
+
+        let makefile = parsed.root();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn test_archive_member_with_variables() {
+        // Test archive members with variable references
+        let input = "$(LIB)($(OBJ)): $(SRC)\n\t$(CC) -c $(SRC)\n\t$(AR) r $(LIB) $(OBJ)\n";
+        let parsed = parse(input);
+        // Variable references in archive members should parse without errors
+        assert!(
+            parsed.errors.is_empty(),
+            "Should parse archive members with variables"
+        );
+    }
+
+    #[test]
+    fn test_archive_member_ast_access() {
+        // Test that we can access archive member nodes through the AST
+        let input = "libtest.a(foo.o bar.o): foo.c bar.c\n\tgcc -c foo.c bar.c\n";
+        let parsed = parse(input);
+        let makefile = parsed.root();
+
+        // Find archive member nodes in the syntax tree
+        let archive_member_count = makefile
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == ARCHIVE_MEMBERS)
+            .count();
+
+        assert!(
+            archive_member_count > 0,
+            "Should find ARCHIVE_MEMBERS nodes in AST"
+        );
     }
 
     #[test]
