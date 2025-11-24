@@ -53,11 +53,13 @@ pub enum SyntaxKind {
     ERROR,
 
     // composite nodes
-    ROOT, // The entire file
-    RULE, // A single rule
-    RECIPE,
-    VARIABLE,
-    EXPR,
+    ROOT,          // The entire file
+    RULE,          // A single rule
+    RECIPE,        // A command/recipe line
+    VARIABLE,      // A variable definition
+    EXPR,          // An expression (e.g., targets before colon, or old-style prerequisites)
+    PREREQUISITES, // Container for prerequisites after the colon
+    PREREQUISITE,  // A single prerequisite item
 
     // Directives
     CONDITIONAL,
