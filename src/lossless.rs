@@ -300,16 +300,61 @@ pub(crate) fn parse(text: &str) -> Parse {
         }
 
         fn parse_rule_dependencies(&mut self) {
-            self.builder.start_node(EXPR.into());
+            self.builder.start_node(PREREQUISITES.into());
+
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 match self.current() {
-                    Some(IDENTIFIER) if self.is_archive_member() => {
-                        self.parse_archive_member();
+                    Some(WHITESPACE) => {
+                        self.bump(); // Consume whitespace between prerequisites
                     }
-                    _ => self.bump(),
+                    Some(IDENTIFIER) => {
+                        // Start a new prerequisite node
+                        self.builder.start_node(PREREQUISITE.into());
+
+                        if self.is_archive_member() {
+                            self.parse_archive_member();
+                        } else {
+                            self.bump(); // Simple identifier
+                        }
+
+                        self.builder.finish_node(); // End PREREQUISITE
+                    }
+                    Some(DOLLAR) => {
+                        // Variable reference - parse it within a PREREQUISITE node
+                        self.builder.start_node(PREREQUISITE.into());
+
+                        // Parse the variable reference inline
+                        self.bump(); // Consume $
+
+                        if self.current() == Some(LPAREN) {
+                            self.bump(); // Consume (
+                            let mut paren_count = 1;
+
+                            while self.current().is_some() && paren_count > 0 {
+                                if self.current() == Some(LPAREN) {
+                                    paren_count += 1;
+                                } else if self.current() == Some(RPAREN) {
+                                    paren_count -= 1;
+                                }
+                                self.bump();
+                            }
+                        } else {
+                            // Single character variable like $X
+                            if self.current().is_some() {
+                                self.bump();
+                            }
+                        }
+
+                        self.builder.finish_node(); // End PREREQUISITE
+                    }
+                    _ => {
+                        // Other tokens (like comments) - just consume them
+                        self.bump();
+                    }
                 }
             }
-            self.builder.finish_node();
+
+            self.builder.finish_node(); // End PREREQUISITES
         }
 
         fn parse_rule_recipes(&mut self) {
@@ -1857,19 +1902,20 @@ impl FromStr for Makefile {
     }
 }
 
-// Helper function to build an EXPR node containing prerequisites
-fn build_prerequisites_expr(prereqs: &[String]) -> SyntaxNode {
+// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes
+fn build_prerequisites_node(prereqs: &[String]) -> SyntaxNode {
     let mut builder = GreenNodeBuilder::new();
-    builder.start_node(EXPR.into());
+    builder.start_node(PREREQUISITES.into());
 
-    if !prereqs.is_empty() {
-        builder.token(WHITESPACE.into(), " ");
-        for (i, prereq) in prereqs.iter().enumerate() {
-            if i > 0 {
-                builder.token(WHITESPACE.into(), " ");
-            }
-            builder.token(IDENTIFIER.into(), prereq);
+    for (i, prereq) in prereqs.iter().enumerate() {
+        if i > 0 {
+            builder.token(WHITESPACE.into(), " ");
         }
+
+        // Build each PREREQUISITE node
+        builder.start_node(PREREQUISITE.into());
+        builder.token(IDENTIFIER.into(), prereq);
+        builder.finish_node();
     }
 
     builder.finish_node();
@@ -2046,52 +2092,33 @@ impl Rule {
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
     pub fn prerequisites(&self) -> impl Iterator<Item = String> + '_ {
-        // Find the first occurrence of OPERATOR and collect the following EXPR nodes
+        // Find PREREQUISITES node after OPERATOR token
         let mut found_operator = false;
-        let mut result = Vec::new();
+        let mut prerequisites_node = None;
 
-        for token in self.syntax().children_with_tokens() {
-            if let Some(t) = token.as_token() {
-                if t.kind() == OPERATOR {
+        for element in self.syntax().children_with_tokens() {
+            if let Some(token) = element.as_token() {
+                if token.kind() == OPERATOR {
                     found_operator = true;
-                    continue;
                 }
-            }
-
-            if found_operator {
-                if let Some(node) = token.as_node() {
-                    if node.kind() == EXPR {
-                        // Process this expression node for prerequisites
-                        let mut tokens = node.children_with_tokens().peekable();
-                        while let Some(token) = tokens.peek().cloned() {
-                            if let Some(node) = token.as_node() {
-                                if node.kind() == ARCHIVE_MEMBERS {
-                                    // Handle archive member syntax in dependencies
-                                    result.push(node.text().to_string());
-                                }
-                                tokens.next(); // Consume the node
-                            } else if let Some(t) = token.as_token() {
-                                if t.kind() == DOLLAR {
-                                    if let Some(var_ref) =
-                                        self.collect_variable_reference(&mut tokens)
-                                    {
-                                        result.push(var_ref);
-                                    }
-                                } else if t.kind() == IDENTIFIER {
-                                    result.push(t.text().to_string());
-                                    tokens.next(); // Consume the identifier
-                                } else {
-                                    tokens.next(); // Skip other token types
-                                }
-                            } else {
-                                tokens.next(); // Skip other elements
-                            }
-                        }
-                        break; // Only process the first EXPR after the operator
-                    }
+            } else if let Some(node) = element.as_node() {
+                if found_operator && node.kind() == PREREQUISITES {
+                    prerequisites_node = Some(node.clone());
+                    break;
                 }
             }
         }
+
+        let result: Vec<String> = if let Some(prereqs) = prerequisites_node {
+            // Iterate over PREREQUISITE child nodes
+            prereqs
+                .children()
+                .filter(|child| child.kind() == PREREQUISITE)
+                .map(|child| child.text().to_string().trim().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         result.into_iter()
     }
@@ -2319,9 +2346,9 @@ impl Rule {
     /// assert!(!rule.remove_prerequisite("nonexistent").unwrap());
     /// ```
     pub fn remove_prerequisite(&mut self, target: &str) -> Result<bool, Error> {
-        // Find the EXPR node after the OPERATOR
+        // Find the PREREQUISITES node after the OPERATOR
         let mut found_operator = false;
-        let mut expr_node = None;
+        let mut prereqs_node = None;
 
         for child in self.syntax().children_with_tokens() {
             if let Some(token) = child.as_token() {
@@ -2329,14 +2356,14 @@ impl Rule {
                     found_operator = true;
                 }
             } else if let Some(node) = child.as_node() {
-                if found_operator && node.kind() == EXPR {
-                    expr_node = Some(node.clone());
+                if found_operator && node.kind() == PREREQUISITES {
+                    prereqs_node = Some(node.clone());
                     break;
                 }
             }
         }
 
-        let expr_node = match expr_node {
+        let prereqs_node = match prereqs_node {
             Some(node) => node,
             None => return Ok(false), // No prerequisites
         };
@@ -2355,12 +2382,14 @@ impl Rule {
             .filter(|p| p != target)
             .collect();
 
-        // Rebuild the EXPR node with the new prerequisites
-        let expr_index = expr_node.index();
-        let new_expr = build_prerequisites_expr(&new_prereqs);
+        // Rebuild the PREREQUISITES node with the new prerequisites
+        let prereqs_index = prereqs_node.index();
+        let new_prereqs_node = build_prerequisites_node(&new_prereqs);
 
-        self.0
-            .splice_children(expr_index..expr_index + 1, vec![new_expr.into()]);
+        self.0.splice_children(
+            prereqs_index..prereqs_index + 1,
+            vec![new_prereqs_node.into()],
+        );
 
         Ok(true)
     }
@@ -2390,8 +2419,8 @@ impl Rule {
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["new_dep1", "new_dep2"]);
     /// ```
     pub fn set_prerequisites(&mut self, prereqs: Vec<&str>) -> Result<(), Error> {
-        // Find the EXPR node after the OPERATOR, or the position to insert it
-        let mut expr_index = None;
+        // Find the PREREQUISITES node after the OPERATOR, or the position to insert it
+        let mut prereqs_index = None;
         let mut operator_found = false;
 
         for child in self.syntax().children_with_tokens() {
@@ -2400,21 +2429,22 @@ impl Rule {
                     operator_found = true;
                 }
             } else if let Some(node) = child.as_node() {
-                if operator_found && node.kind() == EXPR {
-                    expr_index = Some((node.index(), true)); // (index, exists)
+                if operator_found && node.kind() == PREREQUISITES {
+                    prereqs_index = Some((node.index(), true)); // (index, exists)
                     break;
                 }
             }
         }
 
-        // If we found an EXPR, replace it; otherwise insert after OPERATOR
-        let new_expr =
-            build_prerequisites_expr(&prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Build new PREREQUISITES node
+        let new_prereqs =
+            build_prerequisites_node(&prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
 
-        match expr_index {
+        match prereqs_index {
             Some((idx, true)) => {
-                // Replace existing EXPR
-                self.0.splice_children(idx..idx + 1, vec![new_expr.into()]);
+                // Replace existing PREREQUISITES
+                self.0
+                    .splice_children(idx..idx + 1, vec![new_prereqs.into()]);
             }
             _ => {
                 // Find position after OPERATOR to insert
@@ -2434,7 +2464,7 @@ impl Rule {
                     })?;
 
                 self.0
-                    .splice_children(insert_pos..insert_pos, vec![new_expr.into()]);
+                    .splice_children(insert_pos..insert_pos, vec![new_prereqs.into()]);
             }
         }
 
@@ -2574,8 +2604,9 @@ rule: dependency
     IDENTIFIER@18..22 "rule"
     OPERATOR@22..23 ":"
     WHITESPACE@23..24 " "
-    EXPR@24..34
-      IDENTIFIER@24..34 "dependency"
+    PREREQUISITES@24..34
+      PREREQUISITE@24..34
+        IDENTIFIER@24..34 "dependency"
     NEWLINE@34..35 "\n"
     RECIPE@35..44
       INDENT@35..36 "\t"
@@ -2648,10 +2679,12 @@ rule: dependency
     IDENTIFIER@0..4 "rule"
     OPERATOR@4..5 ":"
     WHITESPACE@5..6 " "
-    EXPR@6..29
-      IDENTIFIER@6..17 "dependency1"
+    PREREQUISITES@6..29
+      PREREQUISITE@6..17
+        IDENTIFIER@6..17 "dependency1"
       WHITESPACE@17..18 " "
-      IDENTIFIER@18..29 "dependency2"
+      PREREQUISITE@18..29
+        IDENTIFIER@18..29 "dependency2"
     NEWLINE@29..30 "\n"
     RECIPE@30..39
       INDENT@30..31 "\t"
