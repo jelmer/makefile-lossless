@@ -1345,6 +1345,58 @@ impl VariableDefinition {
             .find(|it| it.kind() == EXPR)
             .map(|it| it.text().into())
     }
+
+    /// Remove this variable definition from its parent makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// var.remove();
+    /// assert_eq!(makefile.variable_definitions().count(), 0);
+    /// ```
+    pub fn remove(&mut self) {
+        let index = self.syntax().index();
+        if let Some(parent) = self.syntax().parent() {
+            parent.splice_children(index..index + 1, vec![]);
+        }
+    }
+
+    /// Update the value of this variable definition while preserving the rest
+    /// (export prefix, operator, whitespace, etc.)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "export VAR := old_value\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// var.set_value("new_value");
+    /// assert_eq!(var.raw_value(), Some("new_value".to_string()));
+    /// assert!(makefile.code().contains("export VAR := new_value"));
+    /// ```
+    pub fn set_value(&mut self, new_value: &str) {
+        // Find the EXPR node containing the value
+        let expr_index = self
+            .syntax()
+            .children()
+            .find(|it| it.kind() == EXPR)
+            .map(|it| it.index());
+
+        if let Some(expr_idx) = expr_index {
+            // Build a new EXPR node with the new value
+            let mut builder = GreenNodeBuilder::new();
+            builder.start_node(EXPR.into());
+            builder.token(IDENTIFIER.into(), new_value);
+            builder.finish_node();
+
+            let new_expr = SyntaxNode::new_root_mut(builder.finish());
+
+            // Replace the old EXPR with the new one
+            self.0
+                .splice_children(expr_idx..expr_idx + 1, vec![new_expr.into()]);
+        }
+    }
 }
 
 impl Makefile {
@@ -1413,6 +1465,28 @@ impl Makefile {
         self.syntax()
             .children()
             .filter_map(VariableDefinition::cast)
+    }
+
+    /// Find all variables by name
+    ///
+    /// Returns an iterator over all variable definitions with the given name.
+    /// Makefiles can have multiple definitions of the same variable.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "VAR1 = value1\nVAR2 = value2\nVAR1 = value3\n".parse().unwrap();
+    /// let vars: Vec<_> = makefile.find_variable("VAR1").collect();
+    /// assert_eq!(vars.len(), 2);
+    /// assert_eq!(vars[0].raw_value(), Some("value1".to_string()));
+    /// assert_eq!(vars[1].raw_value(), Some("value3".to_string()));
+    /// ```
+    pub fn find_variable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = VariableDefinition> + 'a {
+        self.variable_definitions()
+            .filter(move |var| var.name().as_deref() == Some(name))
     }
 
     /// Add a new rule to the makefile
@@ -4080,5 +4154,155 @@ rule2:
         assert_eq!(final_recipes.len(), 2);
         assert!(final_recipes[0].contains("$(CC)"));
         assert!(final_recipes[1].contains("chmod"));
+    }
+
+    #[test]
+    fn test_variable_definition_remove() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Verify we have 3 variables
+        assert_eq!(makefile.variable_definitions().count(), 3);
+
+        // Remove the second variable
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        assert_eq!(var2.name(), Some("VAR2".to_string()));
+        var2.remove();
+
+        // Verify we now have 2 variables and VAR2 is gone
+        assert_eq!(makefile.variable_definitions().count(), 2);
+        let var_names: Vec<_> = makefile
+            .variable_definitions()
+            .filter_map(|v| v.name())
+            .collect();
+        assert_eq!(var_names, vec!["VAR1", "VAR3"]);
+    }
+
+    #[test]
+    fn test_variable_definition_set_value() {
+        let makefile: Makefile = "VAR = old_value\n".parse().unwrap();
+
+        let mut var = makefile
+            .variable_definitions()
+            .next()
+            .expect("Should have variable");
+        assert_eq!(var.raw_value(), Some("old_value".to_string()));
+
+        // Change the value
+        var.set_value("new_value");
+
+        // Verify the value changed
+        assert_eq!(var.raw_value(), Some("new_value".to_string()));
+        assert!(makefile.code().contains("VAR = new_value"));
+    }
+
+    #[test]
+    fn test_variable_definition_set_value_preserves_format() {
+        let makefile: Makefile = "export VAR := old_value\n".parse().unwrap();
+
+        let mut var = makefile
+            .variable_definitions()
+            .next()
+            .expect("Should have variable");
+        assert_eq!(var.raw_value(), Some("old_value".to_string()));
+
+        // Change the value
+        var.set_value("new_value");
+
+        // Verify the value changed but format preserved
+        assert_eq!(var.raw_value(), Some("new_value".to_string()));
+        let code = makefile.code();
+        assert!(code.contains("export"), "Should preserve export prefix");
+        assert!(code.contains(":="), "Should preserve := operator");
+        assert!(code.contains("new_value"), "Should have new value");
+    }
+
+    #[test]
+    fn test_makefile_find_variable() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find existing variable
+        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("VAR2".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
+
+        // Try to find non-existent variable
+        assert_eq!(makefile.find_variable("NONEXISTENT").count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_find_variable_with_export() {
+        let makefile: Makefile = r#"VAR1 = value1
+export VAR2 := value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find exported variable
+        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("VAR2".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_makefile_find_variable_multiple() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR1 = value2
+VAR2 = other
+VAR1 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find all VAR1 definitions
+        let vars: Vec<_> = makefile.find_variable("VAR1").collect();
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].raw_value(), Some("value1".to_string()));
+        assert_eq!(vars[1].raw_value(), Some("value2".to_string()));
+        assert_eq!(vars[2].raw_value(), Some("value3".to_string()));
+
+        // Find VAR2
+        let var2s: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(var2s.len(), 1);
+        assert_eq!(var2s[0].raw_value(), Some("other".to_string()));
+    }
+
+    #[test]
+    fn test_variable_remove_and_find() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find and remove VAR2
+        let mut var2 = makefile
+            .find_variable("VAR2")
+            .next()
+            .expect("Should find VAR2");
+        var2.remove();
+
+        // Verify VAR2 is gone
+        assert_eq!(makefile.find_variable("VAR2").count(), 0);
+
+        // Verify other variables still exist
+        assert_eq!(makefile.find_variable("VAR1").count(), 1);
+        assert_eq!(makefile.find_variable("VAR3").count(), 1);
     }
 }
