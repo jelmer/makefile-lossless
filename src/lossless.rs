@@ -1430,7 +1430,7 @@ impl Makefile {
     pub fn read<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
-        Ok(buf.parse()?)
+        buf.parse()
     }
 
     /// Read makefile from a reader, but allow syntax errors
@@ -1713,6 +1713,132 @@ impl Makefile {
                 .unwrap_or_default()
         })
     }
+
+    /// Find the first rule with a specific target name
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+    /// let rule = makefile.find_rule_by_target("rule2");
+    /// assert!(rule.is_some());
+    /// assert_eq!(rule.unwrap().targets().collect::<Vec<_>>(), vec!["rule2"]);
+    /// ```
+    pub fn find_rule_by_target(&self, target: &str) -> Option<Rule> {
+        self.rules()
+            .find(|rule| rule.targets().any(|t| t == target))
+    }
+
+    /// Find all rules with a specific target name
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n".parse().unwrap();
+    /// let rules: Vec<_> = makefile.find_rules_by_target("rule1").collect();
+    /// assert_eq!(rules.len(), 2);
+    /// ```
+    pub fn find_rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
+        self.rules_by_target(target)
+    }
+
+    /// Add a target to .PHONY (creates .PHONY rule if it doesn't exist)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile = Makefile::new();
+    /// makefile.add_phony_target("clean").unwrap();
+    /// assert!(makefile.is_phony("clean"));
+    /// ```
+    pub fn add_phony_target(&mut self, target: &str) -> Result<(), Error> {
+        // Find existing .PHONY rule
+        if let Some(mut phony_rule) = self.find_rule_by_target(".PHONY") {
+            // Check if target is already in prerequisites
+            if !phony_rule.prerequisites().any(|p| p == target) {
+                phony_rule.add_prerequisite(target)?;
+            }
+        } else {
+            // Create new .PHONY rule
+            let mut phony_rule = self.add_rule(".PHONY");
+            phony_rule.add_prerequisite(target)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a target from .PHONY (removes .PHONY rule if it becomes empty)
+    ///
+    /// Returns `true` if the target was found and removed, `false` if it wasn't in .PHONY.
+    /// If there are multiple .PHONY rules, it removes the target from the first rule that contains it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+    /// assert!(makefile.remove_phony_target("clean").unwrap());
+    /// assert!(!makefile.is_phony("clean"));
+    /// assert!(makefile.is_phony("test"));
+    /// ```
+    pub fn remove_phony_target(&mut self, target: &str) -> Result<bool, Error> {
+        // Find the first .PHONY rule that contains the target
+        let mut phony_rule = None;
+        for rule in self.rules_by_target(".PHONY") {
+            if rule.prerequisites().any(|p| p == target) {
+                phony_rule = Some(rule);
+                break;
+            }
+        }
+
+        let mut phony_rule = match phony_rule {
+            Some(rule) => rule,
+            None => return Ok(false),
+        };
+
+        // Count prerequisites before removal
+        let prereq_count = phony_rule.prerequisites().count();
+
+        // Remove the prerequisite
+        phony_rule.remove_prerequisite(target)?;
+
+        // Check if .PHONY has no more prerequisites, if so remove the rule
+        if prereq_count == 1 {
+            // We just removed the last prerequisite, so remove the entire rule
+            phony_rule.remove()?;
+        }
+
+        Ok(true)
+    }
+
+    /// Check if a target is marked as phony
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+    /// assert!(makefile.is_phony("clean"));
+    /// assert!(makefile.is_phony("test"));
+    /// assert!(!makefile.is_phony("build"));
+    /// ```
+    pub fn is_phony(&self, target: &str) -> bool {
+        // Check all .PHONY rules since there can be multiple
+        self.rules_by_target(".PHONY")
+            .any(|rule| rule.prerequisites().any(|p| p == target))
+    }
+
+    /// Get all phony targets
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
+    /// let phony_targets: Vec<_> = makefile.phony_targets().collect();
+    /// assert_eq!(phony_targets, vec!["clean", "test", "build"]);
+    /// ```
+    pub fn phony_targets(&self) -> impl Iterator<Item = String> + '_ {
+        // Collect from all .PHONY rules since there can be multiple
+        self.rules_by_target(".PHONY")
+            .flat_map(|rule| rule.prerequisites().collect::<Vec<_>>())
+    }
 }
 
 impl FromStr for Rule {
@@ -1729,6 +1855,25 @@ impl FromStr for Makefile {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Makefile::parse(s).to_result()
     }
+}
+
+// Helper function to build an EXPR node containing prerequisites
+fn build_prerequisites_expr(prereqs: &[String]) -> SyntaxNode {
+    let mut builder = GreenNodeBuilder::new();
+    builder.start_node(EXPR.into());
+
+    if !prereqs.is_empty() {
+        builder.token(WHITESPACE.into(), " ");
+        for (i, prereq) in prereqs.iter().enumerate() {
+            if i > 0 {
+                builder.token(WHITESPACE.into(), " ");
+            }
+            builder.token(IDENTIFIER.into(), prereq);
+        }
+    }
+
+    builder.finish_node();
+    SyntaxNode::new_root_mut(builder.finish())
 }
 
 impl Rule {
@@ -2159,6 +2304,167 @@ impl Rule {
             let index = recipe.index();
             self.0.splice_children(index..index + 1, vec![]);
         }
+    }
+
+    /// Remove a prerequisite from this rule
+    ///
+    /// Returns `true` if the prerequisite was found and removed, `false` if it wasn't found.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "target: dep1 dep2 dep3\n".parse().unwrap();
+    /// assert!(rule.remove_prerequisite("dep2").unwrap());
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1", "dep3"]);
+    /// assert!(!rule.remove_prerequisite("nonexistent").unwrap());
+    /// ```
+    pub fn remove_prerequisite(&mut self, target: &str) -> Result<bool, Error> {
+        // Find the EXPR node after the OPERATOR
+        let mut found_operator = false;
+        let mut expr_node = None;
+
+        for child in self.syntax().children_with_tokens() {
+            if let Some(token) = child.as_token() {
+                if token.kind() == OPERATOR {
+                    found_operator = true;
+                }
+            } else if let Some(node) = child.as_node() {
+                if found_operator && node.kind() == EXPR {
+                    expr_node = Some(node.clone());
+                    break;
+                }
+            }
+        }
+
+        let expr_node = match expr_node {
+            Some(node) => node,
+            None => return Ok(false), // No prerequisites
+        };
+
+        // Collect current prerequisites
+        let current_prereqs: Vec<String> = self.prerequisites().collect();
+
+        // Check if target exists
+        if !current_prereqs.iter().any(|p| p == target) {
+            return Ok(false);
+        }
+
+        // Filter out the target
+        let new_prereqs: Vec<String> = current_prereqs
+            .into_iter()
+            .filter(|p| p != target)
+            .collect();
+
+        // Rebuild the EXPR node with the new prerequisites
+        let expr_index = expr_node.index();
+        let new_expr = build_prerequisites_expr(&new_prereqs);
+
+        self.0
+            .splice_children(expr_index..expr_index + 1, vec![new_expr.into()]);
+
+        Ok(true)
+    }
+
+    /// Add a prerequisite to this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "target: dep1\n".parse().unwrap();
+    /// rule.add_prerequisite("dep2").unwrap();
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1", "dep2"]);
+    /// ```
+    pub fn add_prerequisite(&mut self, target: &str) -> Result<(), Error> {
+        let mut current_prereqs: Vec<String> = self.prerequisites().collect();
+        current_prereqs.push(target.to_string());
+        self.set_prerequisites(current_prereqs.iter().map(|s| s.as_str()).collect())
+    }
+
+    /// Set the prerequisites for this rule, replacing any existing ones
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "target: old_dep\n".parse().unwrap();
+    /// rule.set_prerequisites(vec!["new_dep1", "new_dep2"]).unwrap();
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["new_dep1", "new_dep2"]);
+    /// ```
+    pub fn set_prerequisites(&mut self, prereqs: Vec<&str>) -> Result<(), Error> {
+        // Find the EXPR node after the OPERATOR, or the position to insert it
+        let mut expr_index = None;
+        let mut operator_found = false;
+
+        for child in self.syntax().children_with_tokens() {
+            if let Some(token) = child.as_token() {
+                if token.kind() == OPERATOR {
+                    operator_found = true;
+                }
+            } else if let Some(node) = child.as_node() {
+                if operator_found && node.kind() == EXPR {
+                    expr_index = Some((node.index(), true)); // (index, exists)
+                    break;
+                }
+            }
+        }
+
+        // If we found an EXPR, replace it; otherwise insert after OPERATOR
+        let new_expr =
+            build_prerequisites_expr(&prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        match expr_index {
+            Some((idx, true)) => {
+                // Replace existing EXPR
+                self.0.splice_children(idx..idx + 1, vec![new_expr.into()]);
+            }
+            _ => {
+                // Find position after OPERATOR to insert
+                let insert_pos = self
+                    .syntax()
+                    .children_with_tokens()
+                    .position(|t| t.as_token().map(|t| t.kind() == OPERATOR).unwrap_or(false))
+                    .map(|p| p + 1)
+                    .ok_or_else(|| {
+                        Error::Parse(ParseError {
+                            errors: vec![ErrorInfo {
+                                message: "No operator found in rule".to_string(),
+                                line: 1,
+                                context: "set_prerequisites".to_string(),
+                            }],
+                        })
+                    })?;
+
+                self.0
+                    .splice_children(insert_pos..insert_pos, vec![new_expr.into()]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove this rule from its parent Makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// rule.remove().unwrap();
+    /// assert_eq!(makefile.rules().count(), 1);
+    /// ```
+    pub fn remove(self) -> Result<(), Error> {
+        let parent = self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Rule has no parent".to_string(),
+                    line: 1,
+                    context: "remove".to_string(),
+                }],
+            })
+        })?;
+
+        let index = self.syntax().index();
+        parent.splice_children(index..index + 1, vec![]);
+        Ok(())
     }
 }
 
@@ -4304,5 +4610,131 @@ VAR3 = value3
         // Verify other variables still exist
         assert_eq!(makefile.find_variable("VAR1").count(), 1);
         assert_eq!(makefile.find_variable("VAR3").count(), 1);
+    }
+
+    #[test]
+    fn test_rule_add_prerequisite() {
+        let mut rule: Rule = "target: dep1\n".parse().unwrap();
+        rule.add_prerequisite("dep2").unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_remove_prerequisite() {
+        let mut rule: Rule = "target: dep1 dep2 dep3\n".parse().unwrap();
+        assert!(rule.remove_prerequisite("dep2").unwrap());
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep3"]
+        );
+        assert!(!rule.remove_prerequisite("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_rule_set_prerequisites() {
+        let mut rule: Rule = "target: old_dep\n".parse().unwrap();
+        rule.set_prerequisites(vec!["new_dep1", "new_dep2"])
+            .unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["new_dep1", "new_dep2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_prerequisites_empty() {
+        let mut rule: Rule = "target: dep1 dep2\n".parse().unwrap();
+        rule.set_prerequisites(vec![]).unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>().len(), 0);
+    }
+
+    #[test]
+    fn test_rule_remove() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target("rule1").unwrap();
+        rule.remove().unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+        assert!(makefile.find_rule_by_target("rule1").is_none());
+        assert!(makefile.find_rule_by_target("rule2").is_some());
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target("rule2");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().collect::<Vec<_>>(), vec!["rule2"]);
+        assert!(makefile.find_rule_by_target("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n"
+            .parse()
+            .unwrap();
+        assert_eq!(makefile.find_rules_by_target("rule1").count(), 2);
+        assert_eq!(makefile.find_rules_by_target("rule2").count(), 1);
+        assert_eq!(makefile.find_rules_by_target("nonexistent").count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_add_phony_target() {
+        let mut makefile = Makefile::new();
+        makefile.add_phony_target("clean").unwrap();
+        assert!(makefile.is_phony("clean"));
+        assert_eq!(makefile.phony_targets().collect::<Vec<_>>(), vec!["clean"]);
+    }
+
+    #[test]
+    fn test_makefile_add_phony_target_existing() {
+        let mut makefile: Makefile = ".PHONY: test\n".parse().unwrap();
+        makefile.add_phony_target("clean").unwrap();
+        assert!(makefile.is_phony("test"));
+        assert!(makefile.is_phony("clean"));
+        let targets: Vec<_> = makefile.phony_targets().collect();
+        assert!(targets.contains(&"test".to_string()));
+        assert!(targets.contains(&"clean".to_string()));
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target() {
+        let mut makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        assert!(!makefile.is_phony("clean"));
+        assert!(makefile.is_phony("test"));
+        assert!(!makefile.remove_phony_target("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target_last() {
+        let mut makefile: Makefile = ".PHONY: clean\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        assert!(!makefile.is_phony("clean"));
+        // .PHONY rule should be removed entirely
+        assert!(makefile.find_rule_by_target(".PHONY").is_none());
+    }
+
+    #[test]
+    fn test_makefile_is_phony() {
+        let makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+        assert!(makefile.is_phony("clean"));
+        assert!(makefile.is_phony("test"));
+        assert!(!makefile.is_phony("build"));
+    }
+
+    #[test]
+    fn test_makefile_phony_targets() {
+        let makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
+        let phony_targets: Vec<_> = makefile.phony_targets().collect();
+        assert_eq!(phony_targets, vec!["clean", "test", "build"]);
+    }
+
+    #[test]
+    fn test_makefile_phony_targets_empty() {
+        let makefile = Makefile::new();
+        assert_eq!(makefile.phony_targets().count(), 0);
     }
 }
