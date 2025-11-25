@@ -1377,53 +1377,60 @@ impl ArchiveMember {
 /// - Up to 1 empty line (consecutive NEWLINE tokens)
 /// - Any WHITESPACE tokens between these elements
 fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
-    // Collect elements to remove by walking backward
-    let mut elements_to_remove = vec![];
+    let mut collected_elements = vec![];
+    let mut found_comment = false;
 
-    // Walk backward to find preceding comments and up to 1 empty line
+    // Walk backward to collect preceding comments, newlines, and whitespace
     let mut current = node.prev_sibling_or_token();
-    let mut consecutive_newlines = 0;
-
     while let Some(element) = current {
-        let should_include = match &element {
+        match &element {
             rowan::NodeOrToken::Token(token) => match token.kind() {
                 COMMENT => {
-                    // Don't remove shebang lines
                     if token.text().starts_with("#!") {
-                        false
-                    } else {
-                        consecutive_newlines = 0; // Reset count for empty lines before comments
-                        true
+                        break; // Don't remove shebang lines
                     }
+                    found_comment = true;
+                    collected_elements.push(element.clone());
                 }
-                NEWLINE => {
-                    consecutive_newlines += 1;
-                    // Include up to 1 empty line before the comment
-                    // Each standalone NEWLINE token represents one empty line
-                    consecutive_newlines <= 1
+                NEWLINE | WHITESPACE => {
+                    collected_elements.push(element.clone());
                 }
-                WHITESPACE => true,
-                _ => false, // Hit something else, stop
+                _ => break, // Hit something else, stop
             },
-            rowan::NodeOrToken::Node(_) => false, // Hit another node, stop
-        };
-
-        if !should_include {
-            break;
+            rowan::NodeOrToken::Node(_) => break, // Hit another node, stop
         }
-
-        elements_to_remove.push(element.clone());
         current = element.prev_sibling_or_token();
     }
 
-    // Remove elements one by one, starting from the node itself
+    // Remove the node first
     let node_index = node.index();
     parent.splice_children(node_index..node_index + 1, vec![]);
 
-    // Then remove preceding elements (in reverse order since indices shift)
-    for element in elements_to_remove {
-        let idx = element.index();
-        parent.splice_children(idx..idx + 1, vec![]);
+    // Only remove preceding elements if we found at least one comment
+    if found_comment {
+        let mut consecutive_newlines = 0;
+        for element in collected_elements.iter().rev() {
+            let should_remove = match element {
+                rowan::NodeOrToken::Token(token) => match token.kind() {
+                    COMMENT => {
+                        consecutive_newlines = 0;
+                        true
+                    }
+                    NEWLINE => {
+                        consecutive_newlines += 1;
+                        consecutive_newlines <= 1
+                    }
+                    WHITESPACE => true,
+                    _ => false,
+                },
+                _ => false,
+            };
+
+            if should_remove {
+                let idx = element.index();
+                parent.splice_children(idx..idx + 1, vec![]);
+            }
+        }
     }
 }
 
@@ -4870,6 +4877,25 @@ VAR3 = value3
             code,
             "VAR1 = value1\n\n# Comment about VAR3\nVAR3 = value3\n"
         );
+    }
+
+    #[test]
+    fn test_variable_remove_after_shebang_preserves_empty_line() {
+        let makefile: Makefile = r#"#!/usr/bin/make -f
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
+
+%:
+	dh $@
+"#
+        .parse()
+        .unwrap();
+
+        // Remove the variable
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.remove();
+
+        // Verify shebang is preserved and empty line after variable is preserved
+        assert_eq!(makefile.code(), "#!/usr/bin/make -f\n\n%:\n\tdh $@\n");
     }
 
     #[test]
