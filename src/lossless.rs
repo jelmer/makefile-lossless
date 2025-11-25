@@ -1369,6 +1369,59 @@ impl ArchiveMember {
     }
 }
 
+/// Helper function to remove a node along with its preceding comments and up to 1 empty line.
+///
+/// This walks backward from the node, removing:
+/// - The node itself
+/// - All preceding comments (COMMENT tokens)
+/// - Up to 1 empty line (consecutive NEWLINE tokens)
+/// - Any WHITESPACE tokens between these elements
+fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
+    // Collect elements to remove by walking backward
+    let mut elements_to_remove = vec![];
+
+    // Walk backward to find preceding comments and up to 1 empty line
+    let mut current = node.prev_sibling_or_token();
+    let mut consecutive_newlines = 0;
+
+    while let Some(element) = current {
+        let should_include = match &element {
+            rowan::NodeOrToken::Token(token) => match token.kind() {
+                COMMENT => {
+                    consecutive_newlines = 0; // Reset count for empty lines before comments
+                    true
+                }
+                NEWLINE => {
+                    consecutive_newlines += 1;
+                    // Include up to 1 empty line before the comment
+                    // Each standalone NEWLINE token represents one empty line
+                    consecutive_newlines <= 1
+                }
+                WHITESPACE => true,
+                _ => false, // Hit something else, stop
+            },
+            rowan::NodeOrToken::Node(_) => false, // Hit another node, stop
+        };
+
+        if !should_include {
+            break;
+        }
+
+        elements_to_remove.push(element.clone());
+        current = element.prev_sibling_or_token();
+    }
+
+    // Remove elements one by one, starting from the node itself
+    let node_index = node.index();
+    parent.splice_children(node_index..node_index + 1, vec![]);
+
+    // Then remove preceding elements (in reverse order since indices shift)
+    for element in elements_to_remove {
+        let idx = element.index();
+        parent.splice_children(idx..idx + 1, vec![]);
+    }
+}
+
 impl VariableDefinition {
     /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
@@ -1393,6 +1446,8 @@ impl VariableDefinition {
 
     /// Remove this variable definition from its parent makefile
     ///
+    /// This will also remove any preceding comments and up to 1 empty line before the variable.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1402,9 +1457,8 @@ impl VariableDefinition {
     /// assert_eq!(makefile.variable_definitions().count(), 0);
     /// ```
     pub fn remove(&mut self) {
-        let index = self.syntax().index();
         if let Some(parent) = self.syntax().parent() {
-            parent.splice_children(index..index + 1, vec![]);
+            remove_with_preceding_comments(self.syntax(), &parent);
         }
     }
 
@@ -2481,6 +2535,8 @@ impl Rule {
     /// rule.remove().unwrap();
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
+    ///
+    /// This will also remove any preceding comments and up to 1 empty line before the rule.
     pub fn remove(self) -> Result<(), Error> {
         let parent = self.syntax().parent().ok_or_else(|| {
             Error::Parse(ParseError {
@@ -2492,8 +2548,7 @@ impl Rule {
             })
         })?;
 
-        let index = self.syntax().index();
-        parent.splice_children(index..index + 1, vec![]);
+        remove_with_preceding_comments(self.syntax(), &parent);
         Ok(())
     }
 }
@@ -4643,6 +4698,124 @@ VAR3 = value3
         // Verify other variables still exist
         assert_eq!(makefile.find_variable("VAR1").count(), 1);
         assert_eq!(makefile.find_variable("VAR3").count(), 1);
+    }
+
+    #[test]
+    fn test_variable_remove_with_comment() {
+        let makefile: Makefile = r#"VAR1 = value1
+# This is a comment about VAR2
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR2
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        assert_eq!(var2.name(), Some("VAR2".to_string()));
+        var2.remove();
+
+        // Verify the comment is also removed
+        assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    }
+
+    #[test]
+    fn test_variable_remove_with_multiple_comments() {
+        let makefile: Makefile = r#"VAR1 = value1
+# Comment line 1
+# Comment line 2
+# Comment line 3
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR2
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        var2.remove();
+
+        // Verify all comments are removed
+        assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    }
+
+    #[test]
+    fn test_variable_remove_with_empty_line() {
+        let makefile: Makefile = r#"VAR1 = value1
+
+# Comment about VAR2
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR2
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        var2.remove();
+
+        // Verify comment and up to 1 empty line are removed
+        // Should have VAR1, then newline, then VAR3 (empty line removed)
+        assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    }
+
+    #[test]
+    fn test_variable_remove_with_multiple_empty_lines() {
+        let makefile: Makefile = r#"VAR1 = value1
+
+
+# Comment about VAR2
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR2
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        var2.remove();
+
+        // Verify comment and only 1 empty line are removed (one empty line preserved)
+        // Should preserve one empty line before where VAR2 was
+        assert_eq!(makefile.code(), "VAR1 = value1\n\nVAR3 = value3\n");
+    }
+
+    #[test]
+    fn test_rule_remove_with_comment() {
+        let makefile: Makefile = r#"rule1:
+	command1
+
+# Comment about rule2
+rule2:
+	command2
+rule3:
+	command3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove rule2
+        let rule2 = makefile.rules().nth(1).expect("Should have second rule");
+        rule2.remove().unwrap();
+
+        // Verify the comment is removed
+        // Note: The empty line after rule1 is part of rule1's text, not a sibling, so it's preserved
+        assert_eq!(
+            makefile.code(),
+            "rule1:\n\tcommand1\n\nrule3:\n\tcommand3\n"
+        );
     }
 
     #[test]
