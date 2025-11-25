@@ -1388,8 +1388,13 @@ fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
         let should_include = match &element {
             rowan::NodeOrToken::Token(token) => match token.kind() {
                 COMMENT => {
-                    consecutive_newlines = 0; // Reset count for empty lines before comments
-                    true
+                    // Don't remove shebang lines
+                    if token.text().starts_with("#!") {
+                        false
+                    } else {
+                        consecutive_newlines = 0; // Reset count for empty lines before comments
+                        true
+                    }
                 }
                 NEWLINE => {
                     consecutive_newlines += 1;
@@ -4816,6 +4821,28 @@ rule3:
             makefile.code(),
             "rule1:\n\tcommand1\n\nrule3:\n\tcommand3\n"
         );
+    }
+
+    #[test]
+    fn test_variable_remove_preserves_shebang() {
+        let makefile: Makefile = r#"#!/usr/bin/make -f
+# This is a regular comment
+VAR1 = value1
+VAR2 = value2
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR1
+        let mut var1 = makefile.variable_definitions().next().unwrap();
+        var1.remove();
+
+        // Verify the shebang is preserved but regular comment is removed
+        let code = makefile.code();
+        assert!(code.starts_with("#!/usr/bin/make -f"));
+        assert!(!code.contains("regular comment"));
+        assert!(!code.contains("VAR1"));
+        assert!(code.contains("VAR2"));
     }
 
     #[test]
