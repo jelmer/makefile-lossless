@@ -4846,6 +4846,33 @@ VAR2 = value2
     }
 
     #[test]
+    fn test_variable_remove_preserves_subsequent_comments() {
+        let makefile: Makefile = r#"VAR1 = value1
+# Comment about VAR2
+VAR2 = value2
+
+# Comment about VAR3
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Remove VAR2
+        let mut var2 = makefile
+            .variable_definitions()
+            .nth(1)
+            .expect("Should have second variable");
+        var2.remove();
+
+        // Verify preceding comment is removed but subsequent comment/empty line are preserved
+        let code = makefile.code();
+        assert_eq!(
+            code,
+            "VAR1 = value1\n\n# Comment about VAR3\nVAR3 = value3\n"
+        );
+    }
+
+    #[test]
     fn test_rule_add_prerequisite() {
         let mut rule: Rule = "target: dep1\n".parse().unwrap();
         rule.add_prerequisite("dep2").unwrap();
