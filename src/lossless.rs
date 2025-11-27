@@ -1448,6 +1448,13 @@ impl VariableDefinition {
         })
     }
 
+    /// Check if this variable definition is exported
+    pub fn is_export(&self) -> bool {
+        self.syntax()
+            .children_with_tokens()
+            .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+    }
+
     /// Get the raw value of the variable definition
     pub fn raw_value(&self) -> Option<String> {
         self.syntax()
@@ -4663,6 +4670,25 @@ VAR3 = value3
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("VAR2".to_string()));
         assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_variable_definition_is_export() {
+        let makefile: Makefile = r#"VAR1 = value1
+export VAR2 := value2
+export VAR3 = value3
+VAR4 := value4
+"#
+        .parse()
+        .unwrap();
+
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 4);
+
+        assert_eq!(vars[0].is_export(), false);
+        assert_eq!(vars[1].is_export(), true);
+        assert_eq!(vars[2].is_export(), true);
+        assert_eq!(vars[3].is_export(), false);
     }
 
     #[test]
