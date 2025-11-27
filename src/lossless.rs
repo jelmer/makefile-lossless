@@ -2725,6 +2725,92 @@ impl Rule {
         Ok(true)
     }
 
+    /// Add a target to this rule
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "target1: dependency\n\tcommand".parse().unwrap();
+    /// rule.add_target("target2").unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target1", "target2"]);
+    /// ```
+    pub fn add_target(&mut self, target: &str) -> Result<(), Error> {
+        let mut current_targets: Vec<String> = self.targets().collect();
+        current_targets.push(target.to_string());
+        self.set_targets(current_targets.iter().map(|s| s.as_str()).collect())
+    }
+
+    /// Set the targets for this rule, replacing any existing ones
+    ///
+    /// Returns an error if the targets list is empty (rules must have at least one target).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "old_target: dependency\n\tcommand".parse().unwrap();
+    /// rule.set_targets(vec!["new_target1", "new_target2"]).unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target1", "new_target2"]);
+    /// ```
+    pub fn set_targets(&mut self, targets: Vec<&str>) -> Result<(), Error> {
+        // Ensure targets list is not empty
+        if targets.is_empty() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot set empty targets list for a rule".to_string(),
+                    line: 1,
+                    context: "set_targets".to_string(),
+                }],
+            }));
+        }
+
+        // Find the TARGETS node
+        let mut targets_index = None;
+        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
+            if let Some(node) = child.as_node() {
+                if node.kind() == TARGETS {
+                    targets_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let targets_index = targets_index.ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "No TARGETS node found in rule".to_string(),
+                    line: 1,
+                    context: "set_targets".to_string(),
+                }],
+            })
+        })?;
+
+        // Build new targets node
+        let new_targets_node =
+            build_targets_node(&targets.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // Replace the TARGETS node
+        self.0.splice_children(
+            targets_index..targets_index + 1,
+            vec![new_targets_node.into()],
+        );
+
+        Ok(())
+    }
+
+    /// Check if this rule has a specific target
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "target1 target2: dependency\n\tcommand".parse().unwrap();
+    /// assert!(rule.has_target("target1"));
+    /// assert!(rule.has_target("target2"));
+    /// assert!(!rule.has_target("target3"));
+    /// ```
+    pub fn has_target(&self, target: &str) -> bool {
+        self.targets().any(|t| t == target)
+    }
+
     /// Remove a target from this rule
     ///
     /// Returns `Ok(true)` if the target was found and removed, `Ok(false)` if the target was not found.
@@ -5215,6 +5301,123 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
         let mut rule: Rule = "target: dep1 dep2\n".parse().unwrap();
         rule.set_prerequisites(vec![]).unwrap();
         assert_eq!(rule.prerequisites().collect::<Vec<_>>().len(), 0);
+    }
+
+    #[test]
+    fn test_rule_add_target() {
+        let mut rule: Rule = "target1: dep1\n".parse().unwrap();
+        rule.add_target("target2").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "target2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_targets() {
+        let mut rule: Rule = "old_target: dependency\n".parse().unwrap();
+        rule.set_targets(vec!["new_target1", "new_target2"])
+            .unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["new_target1", "new_target2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_targets_empty() {
+        let mut rule: Rule = "target: dep1\n".parse().unwrap();
+        let result = rule.set_targets(vec![]);
+        assert!(result.is_err());
+        // Verify target wasn't changed
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target"]);
+    }
+
+    #[test]
+    fn test_rule_has_target() {
+        let rule: Rule = "target1 target2: dependency\n".parse().unwrap();
+        assert!(rule.has_target("target1"));
+        assert!(rule.has_target("target2"));
+        assert!(!rule.has_target("target3"));
+        assert!(!rule.has_target("nonexistent"));
+    }
+
+    #[test]
+    fn test_rule_rename_target() {
+        let mut rule: Rule = "old_target: dependency\n".parse().unwrap();
+        assert!(rule.rename_target("old_target", "new_target").unwrap());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target"]);
+        // Try renaming non-existent target
+        assert!(!rule.rename_target("nonexistent", "something").unwrap());
+    }
+
+    #[test]
+    fn test_rule_rename_target_multiple() {
+        let mut rule: Rule = "target1 target2 target3: dependency\n".parse().unwrap();
+        assert!(rule.rename_target("target2", "renamed_target").unwrap());
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "renamed_target", "target3"]
+        );
+    }
+
+    #[test]
+    fn test_rule_remove_target() {
+        let mut rule: Rule = "target1 target2 target3: dependency\n".parse().unwrap();
+        assert!(rule.remove_target("target2").unwrap());
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "target3"]
+        );
+        // Try removing non-existent target
+        assert!(!rule.remove_target("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_rule_remove_target_last() {
+        let mut rule: Rule = "single_target: dependency\n".parse().unwrap();
+        let result = rule.remove_target("single_target");
+        assert!(result.is_err());
+        // Verify target wasn't removed
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["single_target"]);
+    }
+
+    #[test]
+    fn test_rule_target_manipulation_preserves_prerequisites() {
+        let mut rule: Rule = "target1 target2: dep1 dep2\n\tcommand".parse().unwrap();
+
+        // Remove a target
+        rule.remove_target("target1").unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target2"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        // Add a target
+        rule.add_target("target3").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target2", "target3"]
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        // Rename a target
+        rule.rename_target("target2", "renamed").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["renamed", "target3"]
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
     }
 
     #[test]
