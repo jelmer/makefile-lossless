@@ -58,6 +58,7 @@ pub enum SyntaxKind {
     RECIPE,        // A command/recipe line
     VARIABLE,      // A variable definition
     EXPR,          // An expression (e.g., targets before colon, or old-style prerequisites)
+    TARGETS,       // Container for targets before the colon
     PREREQUISITES, // Container for prerequisites after the colon
     PREREQUISITE,  // A single prerequisite item
 

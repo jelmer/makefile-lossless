@@ -409,9 +409,11 @@ pub(crate) fn parse(text: &str) -> Parse {
         fn parse_rule(&mut self) {
             self.builder.start_node(RULE.into());
 
-            // Parse target
+            // Parse targets in a TARGETS node
             self.skip_ws();
-            let has_target = self.parse_rule_target();
+            self.builder.start_node(TARGETS.into());
+            let has_target = self.parse_rule_targets();
+            self.builder.finish_node();
 
             // Find and consume the colon
             let has_colon = if has_target {
@@ -431,6 +433,37 @@ pub(crate) fn parse(text: &str) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        fn parse_rule_targets(&mut self) -> bool {
+            // Parse first target
+            let has_first_target = self.parse_rule_target();
+
+            if !has_first_target {
+                return false;
+            }
+
+            // Parse additional targets until we hit the colon
+            loop {
+                self.skip_ws();
+
+                // Check if we're at a colon
+                if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+                    break;
+                }
+
+                // Try to parse another target
+                match self.current() {
+                    Some(IDENTIFIER) | Some(DOLLAR) => {
+                        if !self.parse_rule_target() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            true
         }
 
         fn parse_comment(&mut self) {
@@ -1995,6 +2028,22 @@ fn build_prerequisites_node(prereqs: &[String]) -> SyntaxNode {
     SyntaxNode::new_root_mut(builder.finish())
 }
 
+// Helper function to build targets section (TARGETS node)
+fn build_targets_node(targets: &[String]) -> SyntaxNode {
+    let mut builder = GreenNodeBuilder::new();
+    builder.start_node(TARGETS.into());
+
+    for (i, target) in targets.iter().enumerate() {
+        if i > 0 {
+            builder.token(WHITESPACE.into(), " ");
+        }
+        builder.token(IDENTIFIER.into(), target);
+    }
+
+    builder.finish_node();
+    SyntaxNode::new_root_mut(builder.finish())
+}
+
 impl Rule {
     /// Parse rule text, returning a Parse result
     pub fn parse(text: &str) -> crate::Parse<Rule> {
@@ -2063,6 +2112,56 @@ impl Rule {
         None
     }
 
+    // Helper method to extract targets from a TARGETS node
+    fn extract_targets_from_node(node: &SyntaxNode) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current_target = String::new();
+        let mut in_parens = 0;
+
+        for child in node.children_with_tokens() {
+            if let Some(token) = child.as_token() {
+                match token.kind() {
+                    IDENTIFIER => {
+                        current_target.push_str(token.text());
+                    }
+                    WHITESPACE => {
+                        // Only treat whitespace as a delimiter if we're not inside parentheses
+                        if in_parens == 0 && !current_target.is_empty() {
+                            result.push(current_target.clone());
+                            current_target.clear();
+                        } else if in_parens > 0 {
+                            current_target.push_str(token.text());
+                        }
+                    }
+                    LPAREN => {
+                        in_parens += 1;
+                        current_target.push_str(token.text());
+                    }
+                    RPAREN => {
+                        in_parens -= 1;
+                        current_target.push_str(token.text());
+                    }
+                    DOLLAR => {
+                        current_target.push_str(token.text());
+                    }
+                    _ => {
+                        current_target.push_str(token.text());
+                    }
+                }
+            } else if let Some(child_node) = child.as_node() {
+                // Handle nested nodes like ARCHIVE_MEMBERS
+                current_target.push_str(&child_node.text().to_string());
+            }
+        }
+
+        // Push the last target if any
+        if !current_target.is_empty() {
+            result.push(current_target);
+        }
+
+        result
+    }
+
     /// Targets of this rule
     ///
     /// # Example
@@ -2073,6 +2172,23 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
     /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
+        // First check if there's a TARGETS node
+        for child in self.syntax().children_with_tokens() {
+            if let Some(node) = child.as_node() {
+                if node.kind() == TARGETS {
+                    // Extract targets from the TARGETS node
+                    return Self::extract_targets_from_node(node).into_iter();
+                }
+            }
+            // Stop at the operator
+            if let Some(token) = child.as_token() {
+                if token.kind() == OPERATOR {
+                    break;
+                }
+            }
+        }
+
+        // Fallback to old parsing logic for backward compatibility
         let mut result = Vec::new();
         let mut tokens = self
             .syntax()
@@ -2544,6 +2660,142 @@ impl Rule {
         Ok(())
     }
 
+    /// Rename a target in this rule
+    ///
+    /// Returns `Ok(true)` if the target was found and renamed, `Ok(false)` if the target was not found.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "old_target: dependency\n\tcommand".parse().unwrap();
+    /// rule.rename_target("old_target", "new_target").unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target"]);
+    /// ```
+    pub fn rename_target(&mut self, old_name: &str, new_name: &str) -> Result<bool, Error> {
+        // Collect current targets
+        let current_targets: Vec<String> = self.targets().collect();
+
+        // Check if the target to rename exists
+        if !current_targets.iter().any(|t| t == old_name) {
+            return Ok(false);
+        }
+
+        // Create new target list with the renamed target
+        let new_targets: Vec<String> = current_targets
+            .into_iter()
+            .map(|t| {
+                if t == old_name {
+                    new_name.to_string()
+                } else {
+                    t
+                }
+            })
+            .collect();
+
+        // Find the TARGETS node
+        let mut targets_index = None;
+        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
+            if let Some(node) = child.as_node() {
+                if node.kind() == TARGETS {
+                    targets_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let targets_index = targets_index.ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "No TARGETS node found in rule".to_string(),
+                    line: 1,
+                    context: "rename_target".to_string(),
+                }],
+            })
+        })?;
+
+        // Build new targets node
+        let new_targets_node = build_targets_node(&new_targets);
+
+        // Replace the TARGETS node
+        self.0.splice_children(
+            targets_index..targets_index + 1,
+            vec![new_targets_node.into()],
+        );
+
+        Ok(true)
+    }
+
+    /// Remove a target from this rule
+    ///
+    /// Returns `Ok(true)` if the target was found and removed, `Ok(false)` if the target was not found.
+    /// Returns an error if attempting to remove the last target (rules must have at least one target).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "target1 target2: dependency\n\tcommand".parse().unwrap();
+    /// rule.remove_target("target1").unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target2"]);
+    /// ```
+    pub fn remove_target(&mut self, target_name: &str) -> Result<bool, Error> {
+        // Collect current targets
+        let current_targets: Vec<String> = self.targets().collect();
+
+        // Check if the target exists
+        if !current_targets.iter().any(|t| t == target_name) {
+            return Ok(false);
+        }
+
+        // Filter out the target to remove
+        let new_targets: Vec<String> = current_targets
+            .into_iter()
+            .filter(|t| t != target_name)
+            .collect();
+
+        // If no targets remain, return an error
+        if new_targets.is_empty() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot remove all targets from a rule".to_string(),
+                    line: 1,
+                    context: "remove_target".to_string(),
+                }],
+            }));
+        }
+
+        // Find the TARGETS node
+        let mut targets_index = None;
+        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
+            if let Some(node) = child.as_node() {
+                if node.kind() == TARGETS {
+                    targets_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let targets_index = targets_index.ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "No TARGETS node found in rule".to_string(),
+                    line: 1,
+                    context: "remove_target".to_string(),
+                }],
+            })
+        })?;
+
+        // Build new targets node
+        let new_targets_node = build_targets_node(&new_targets);
+
+        // Replace the TARGETS node
+        self.0.splice_children(
+            targets_index..targets_index + 1,
+            vec![new_targets_node.into()],
+        );
+
+        Ok(true)
+    }
+
     /// Remove this rule from its parent Makefile
     ///
     /// # Example
@@ -2675,7 +2927,8 @@ rule: dependency
     NEWLINE@16..17 "\n"
   NEWLINE@17..18 "\n"
   RULE@18..44
-    IDENTIFIER@18..22 "rule"
+    TARGETS@18..22
+      IDENTIFIER@18..22 "rule"
     OPERATOR@22..23 ":"
     WHITESPACE@23..24 " "
     PREREQUISITES@24..34
@@ -2750,7 +3003,8 @@ rule: dependency
             format!("{:#?}", node),
             r#"ROOT@0..40
   RULE@0..40
-    IDENTIFIER@0..4 "rule"
+    TARGETS@0..4
+      IDENTIFIER@0..4 "rule"
     OPERATOR@4..5 ":"
     WHITESPACE@5..6 " "
     PREREQUISITES@6..29
