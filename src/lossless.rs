@@ -364,8 +364,10 @@ pub(crate) fn parse(text: &str) -> Parse {
                         self.parse_recipe_line();
                     }
                     Some(NEWLINE) => {
+                        // Don't break on newlines - just consume them and continue
+                        // looking for more recipe lines. This allows blank lines
+                        // and comment lines within recipes.
                         self.bump();
-                        break;
                     }
                     _ => break,
                 }
@@ -5505,5 +5507,50 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
     fn test_makefile_phony_targets_empty() {
         let makefile = Makefile::new();
         assert_eq!(makefile.phony_targets().count(), 0);
+    }
+
+    #[test]
+    fn test_recipe_with_leading_comments_and_blank_lines() {
+        // Regression test for bug where recipes with leading comments and blank lines
+        // were not parsed correctly. The parser would stop parsing recipes when it
+        // encountered a newline, missing subsequent recipe lines.
+        let makefile_text = r#"#!/usr/bin/make
+
+%:
+	dh $@
+
+override_dh_build:
+	# The next line is empty
+
+	dh_python3
+"#;
+        let makefile = Makefile::read_relaxed(makefile_text.as_bytes()).unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2, "Expected 2 rules");
+
+        // First rule: %
+        let rule0 = &rules[0];
+        assert_eq!(rule0.targets().collect::<Vec<_>>(), vec!["%"]);
+        assert_eq!(rule0.recipes().collect::<Vec<_>>(), vec!["dh $@"]);
+
+        // Second rule: override_dh_build
+        let rule1 = &rules[1];
+        assert_eq!(
+            rule1.targets().collect::<Vec<_>>(),
+            vec!["override_dh_build"]
+        );
+
+        // The key assertion: we should have at least the actual command recipe
+        let recipes: Vec<_> = rule1.recipes().collect();
+        assert!(
+            !recipes.is_empty(),
+            "Expected at least one recipe for override_dh_build, got none"
+        );
+        assert!(
+            recipes.contains(&"dh_python3".to_string()),
+            "Expected 'dh_python3' in recipes, got: {:?}",
+            recipes
+        );
     }
 }
