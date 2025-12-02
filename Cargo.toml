@@ -2,7 +2,7 @@
 name = "makefile-lossless"
 repository = "https://github.com/jelmer/makefile-lossless"
 description = "Lossless Parser for Makefiles"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
