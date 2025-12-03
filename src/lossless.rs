@@ -2349,17 +2349,25 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
     /// ```
     pub fn replace_command(&mut self, i: usize, line: &str) -> bool {
-        // Find the RECIPE with index i, then replace the line in it
-        let index = self
+        // Collect all RECIPE nodes that contain TEXT tokens (actual commands, not just comments)
+        // This matches the behavior of recipes() which only returns recipes with TEXT
+        let recipes: Vec<_> = self
             .syntax()
             .children()
-            .filter(|it| it.kind() == RECIPE)
-            .nth(i);
+            .filter(|n| {
+                n.kind() == RECIPE
+                    && n.children_with_tokens()
+                        .any(|t| t.as_token().map(|t| t.kind() == TEXT).unwrap_or(false))
+            })
+            .collect();
 
-        let index = match index {
-            Some(node) => node.index(),
-            None => return false,
-        };
+        if i >= recipes.len() {
+            return false;
+        }
+
+        // Get the target RECIPE node and its index among all siblings
+        let target_node = &recipes[i];
+        let target_index = target_node.index();
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
@@ -2371,7 +2379,7 @@ impl Rule {
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
         self.0
-            .splice_children(index..index + 1, vec![syntax.into()]);
+            .splice_children(target_index..target_index + 1, vec![syntax.into()]);
 
         true
     }
@@ -3195,6 +3203,31 @@ rule: dependency
 
         // The rule should have the same string representation
         assert_eq!(rule.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+    }
+
+    #[test]
+    fn test_replace_command_with_comments() {
+        // Regression test for bug where replace_command() inserts instead of replacing
+        // when the rule contains comments
+        let content = b"override_dh_strip:\n\t# no longer necessary after buster\n\tdh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'\n";
+
+        let makefile = Makefile::read_relaxed(&content[..]).unwrap();
+
+        let mut rule = makefile.rules().next().unwrap();
+
+        // Before replacement, there should be 1 recipe
+        assert_eq!(rule.recipes().count(), 1);
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["dh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'"]
+        );
+
+        // Replace the first (and only) recipe
+        assert!(rule.replace_command(0, "dh_strip"));
+
+        // After replacement, there should still be 1 recipe, not 2
+        assert_eq!(rule.recipes().count(), 1);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["dh_strip"]);
     }
 
     #[test]
