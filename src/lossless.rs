@@ -1286,14 +1286,6 @@ pub(crate) fn parse(text: &str) -> Parse {
 
             false
         }
-
-        // Helper to determine if we're running in the test environment
-        #[cfg(test)]
-        fn is_in_test_environment(&self) -> bool {
-            // Simple heuristic - check if the original text is short
-            // Test cases generally have very short makefile snippets
-            self.original_text.lines().count() < 20
-        }
     }
 
     let mut tokens = lex(text);
