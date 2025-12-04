@@ -1036,7 +1036,9 @@ pub(crate) fn parse(text: &str) -> Parse {
                     true
                 }
                 Some(NEWLINE) => {
+                    self.builder.start_node(BLANK_LINE.into());
                     self.bump();
+                    self.builder.finish_node();
                     true
                 }
                 Some(COMMENT) => {
@@ -1432,7 +1434,14 @@ fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
                 }
                 _ => break, // Hit something else, stop
             },
-            rowan::NodeOrToken::Node(_) => break, // Hit another node, stop
+            rowan::NodeOrToken::Node(n) => {
+                // Handle BLANK_LINE nodes which wrap newlines
+                if n.kind() == BLANK_LINE {
+                    collected_elements.push(element.clone());
+                } else {
+                    break; // Hit another node type, stop
+                }
+            }
         }
         current = element.prev_sibling_or_token();
     }
@@ -1458,7 +1467,15 @@ fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
                     WHITESPACE => true,
                     _ => false,
                 },
-                _ => false,
+                rowan::NodeOrToken::Node(n) => {
+                    // Handle BLANK_LINE nodes (count as newlines)
+                    if n.kind() == BLANK_LINE {
+                        consecutive_newlines += 1;
+                        consecutive_newlines <= 1
+                    } else {
+                        false
+                    }
+                }
             };
 
             if should_remove {
@@ -1661,7 +1678,25 @@ impl Makefile {
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
         let pos = self.0.children_with_tokens().count();
-        self.0.splice_children(pos..pos, vec![syntax.into()]);
+
+        // Add a blank line before the new rule if there are existing rules
+        // This maintains standard makefile formatting
+        let needs_blank_line = self.0.children().any(|c| c.kind() == RULE);
+
+        if needs_blank_line {
+            // Create a BLANK_LINE node
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+
+            self.0
+                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
+        } else {
+            self.0.splice_children(pos..pos, vec![syntax.into()]);
+        }
+
         // Use children().count() - 1 to get the last added child node
         // (not children_with_tokens().count() which includes tokens)
         Rule(self.0.children().last().unwrap())
@@ -2013,12 +2048,13 @@ impl FromStr for Makefile {
 }
 
 // Helper function to build a PREREQUISITES node containing PREREQUISITE nodes
-fn build_prerequisites_node(prereqs: &[String]) -> SyntaxNode {
+fn build_prerequisites_node(prereqs: &[String], include_leading_space: bool) -> SyntaxNode {
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(PREREQUISITES.into());
 
     for (i, prereq) in prereqs.iter().enumerate() {
-        if i > 0 {
+        // Add space: before first prerequisite if requested, and between all prerequisites
+        if (i == 0 && include_leading_space) || i > 0 {
             builder.token(WHITESPACE.into(), " ");
         }
 
@@ -2585,7 +2621,7 @@ impl Rule {
 
         // Rebuild the PREREQUISITES node with the new prerequisites
         let prereqs_index = prereqs_node.index();
-        let new_prereqs_node = build_prerequisites_node(&new_prereqs);
+        let new_prereqs_node = build_prerequisites_node(&new_prereqs, true);
 
         self.0.splice_children(
             prereqs_index..prereqs_index + 1,
@@ -2637,18 +2673,31 @@ impl Rule {
             }
         }
 
-        // Build new PREREQUISITES node
-        let new_prereqs =
-            build_prerequisites_node(&prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-
         match prereqs_index {
             Some((idx, true)) => {
-                // Replace existing PREREQUISITES
+                // Check if there's whitespace between OPERATOR and PREREQUISITES
+                let has_external_whitespace = self
+                    .syntax()
+                    .children_with_tokens()
+                    .skip_while(|e| !matches!(e.as_token().map(|t| t.kind()), Some(OPERATOR)))
+                    .nth(1) // Skip the OPERATOR itself and get next
+                    .map(|e| matches!(e.as_token().map(|t| t.kind()), Some(WHITESPACE)))
+                    .unwrap_or(false);
+
+                let new_prereqs = build_prerequisites_node(
+                    &prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    !has_external_whitespace, // Include leading space only if no external whitespace
+                );
                 self.0
                     .splice_children(idx..idx + 1, vec![new_prereqs.into()]);
             }
             _ => {
-                // Find position after OPERATOR to insert
+                // Insert new PREREQUISITES (need leading space inside node)
+                let new_prereqs = build_prerequisites_node(
+                    &prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    true, // Include leading space
+                );
+
                 let insert_pos = self
                     .syntax()
                     .children_with_tokens()
@@ -3023,7 +3072,8 @@ rule: dependency
     EXPR@11..16
       IDENTIFIER@11..16 "value"
     NEWLINE@16..17 "\n"
-  NEWLINE@17..18 "\n"
+  BLANK_LINE@17..18
+    NEWLINE@17..18 "\n"
   RULE@18..44
     TARGETS@18..22
       IDENTIFIER@18..22 "rule"
@@ -3165,6 +3215,32 @@ clean:
 
         // Should have one more rule now
         assert_eq!(makefile.rules().count(), initial_count + 1);
+    }
+
+    #[test]
+    fn test_add_rule_formatting() {
+        // Regression test for formatting issues when adding rules
+        let content = r#"build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+"#;
+
+        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let mut rule = makefile.add_rule("build-indep");
+        rule.add_prerequisite("build").unwrap();
+
+        let expected = r#"build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+
+build-indep: build
+"#;
+
+        assert_eq!(makefile.to_string(), expected);
     }
 
     #[test]
@@ -5333,6 +5409,18 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
             rule.prerequisites().collect::<Vec<_>>(),
             vec!["dep1", "dep2"]
         );
+        // Verify proper spacing
+        assert_eq!(rule.to_string(), "target: dep1 dep2\n");
+    }
+
+    #[test]
+    fn test_rule_add_prerequisite_to_rule_without_prereqs() {
+        // Regression test for missing space after colon when adding first prerequisite
+        let mut rule: Rule = "target:\n".parse().unwrap();
+        rule.add_prerequisite("dep1").unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1"]);
+        // Should have space after colon
+        assert_eq!(rule.to_string(), "target: dep1\n");
     }
 
     #[test]
