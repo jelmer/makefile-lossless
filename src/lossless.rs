@@ -67,6 +67,44 @@ impl From<ParseError> for Error {
     }
 }
 
+/// Match a target against a pattern using make-style wildcard matching.
+///
+/// Supports `%` as a wildcard that matches any sequence of characters.
+/// For example, `%.o` matches `foo.o`, `bar.o`, etc.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match against (e.g., "%.o")
+/// * `target` - The target name to check (e.g., "foo.o")
+///
+/// # Returns
+/// `true` if the target matches the pattern, `false` otherwise
+fn matches_pattern(pattern: &str, target: &str) -> bool {
+    // No wildcard means exact match
+    if !pattern.contains('%') {
+        return pattern == target;
+    }
+
+    // GNU make supports exactly one '%' which matches any NON-EMPTY substring
+    let parts: Vec<&str> = pattern.split('%').collect();
+
+    // Only handle single % (GNU make doesn't support multiple %)
+    if parts.len() != 2 {
+        // Multiple % or malformed pattern - just do exact match as fallback
+        return pattern == target;
+    }
+
+    let prefix = parts[0];
+    let suffix = parts[1];
+
+    // Target must be longer than prefix + suffix to have a non-empty stem
+    if target.len() <= prefix.len() + suffix.len() {
+        return false;
+    }
+
+    // Check that target starts with prefix and ends with suffix
+    target.starts_with(prefix) && target.ends_with(suffix)
+}
+
 /// Second, implementing the `Language` trait teaches rowan to convert between
 /// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
 /// "kinds" are values from our `enum SyntaxKind`, instead of plain u16 values.
@@ -1891,6 +1929,43 @@ impl Makefile {
     /// ```
     pub fn find_rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
         self.rules_by_target(target)
+    }
+
+    /// Find the first rule whose target matches the given pattern
+    ///
+    /// Supports make-style pattern matching where `%` in a rule's target acts as a wildcard.
+    /// For example, a rule with target `%.o` will match `foo.o`, `bar.o`, etc.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+    /// let rule = makefile.find_rule_by_target_pattern("foo.o");
+    /// assert!(rule.is_some());
+    /// ```
+    pub fn find_rule_by_target_pattern(&self, target: &str) -> Option<Rule> {
+        self.rules()
+            .find(|rule| rule.targets().any(|t| matches_pattern(&t, target)))
+    }
+
+    /// Find all rules whose targets match the given pattern
+    ///
+    /// Supports make-style pattern matching where `%` in a rule's target acts as a wildcard.
+    /// For example, a rule with target `%.o` will match `foo.o`, `bar.o`, etc.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n".parse().unwrap();
+    /// let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+    /// assert_eq!(rules.len(), 2);
+    /// ```
+    pub fn find_rules_by_target_pattern<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> impl Iterator<Item = Rule> + 'a {
+        self.rules()
+            .filter(move |rule| rule.targets().any(|t| matches_pattern(&t, target)))
     }
 
     /// Add a target to .PHONY (creates .PHONY rule if it doesn't exist)
@@ -5558,6 +5633,145 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
         assert_eq!(makefile.find_rules_by_target("rule1").count(), 2);
         assert_eq!(makefile.find_rules_by_target("rule2").count(), 1);
         assert_eq!(makefile.find_rules_by_target("nonexistent").count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_simple() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_no_match() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.c");
+        assert!(rule.is_none());
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_exact() {
+        let makefile: Makefile = "foo.o: foo.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "foo.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_prefix() {
+        let makefile: Makefile = "lib%.a: %.o\n\tar rcs $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("libfoo.a");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "lib%.a");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_suffix() {
+        let makefile: Makefile = "%_test.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo_test.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%_test.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_middle() {
+        let makefile: Makefile = "lib%_debug.a: %.o\n\tar rcs $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("libfoo_debug.a");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "lib%_debug.a");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_wildcard_only() {
+        let makefile: Makefile = "%: %.c\n\t$(CC) -o $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("anything");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%");
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_multiple() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n"
+            .parse()
+            .unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_mixed() {
+        let makefile: Makefile =
+            "%.o: %.c\n\t$(CC) -c $<\nfoo.o: foo.h\n\t$(CC) -c foo.c\nbar.txt: baz.txt\n\tcp $< $@\n"
+                .parse()
+                .unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 2); // Matches both %.o and foo.o
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.txt").collect();
+        assert_eq!(rules.len(), 1); // Only exact match
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_no_wildcard() {
+        let makefile: Makefile = "foo.o: foo.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 1);
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.o").collect();
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_matches_pattern_exact() {
+        assert!(matches_pattern("foo.o", "foo.o"));
+        assert!(!matches_pattern("foo.o", "bar.o"));
+    }
+
+    #[test]
+    fn test_matches_pattern_suffix() {
+        assert!(matches_pattern("%.o", "foo.o"));
+        assert!(matches_pattern("%.o", "bar.o"));
+        assert!(matches_pattern("%.o", "baz/qux.o"));
+        assert!(!matches_pattern("%.o", "foo.c"));
+    }
+
+    #[test]
+    fn test_matches_pattern_prefix() {
+        assert!(matches_pattern("lib%.a", "libfoo.a"));
+        assert!(matches_pattern("lib%.a", "libbar.a"));
+        assert!(!matches_pattern("lib%.a", "foo.a"));
+        assert!(!matches_pattern("lib%.a", "lib.a"));
+    }
+
+    #[test]
+    fn test_matches_pattern_middle() {
+        assert!(matches_pattern("lib%_debug.a", "libfoo_debug.a"));
+        assert!(matches_pattern("lib%_debug.a", "libbar_debug.a"));
+        assert!(!matches_pattern("lib%_debug.a", "libfoo.a"));
+        assert!(!matches_pattern("lib%_debug.a", "foo_debug.a"));
+    }
+
+    #[test]
+    fn test_matches_pattern_wildcard_only() {
+        assert!(matches_pattern("%", "anything"));
+        assert!(matches_pattern("%", "foo.o"));
+        // GNU make: stem must be non-empty, so "%" does NOT match ""
+        assert!(!matches_pattern("%", ""));
+    }
+
+    #[test]
+    fn test_matches_pattern_empty_stem() {
+        // GNU make: stem must be non-empty
+        assert!(!matches_pattern("%.o", ".o")); // stem would be empty
+        assert!(!matches_pattern("lib%", "lib")); // stem would be empty
+        assert!(!matches_pattern("lib%.a", "lib.a")); // stem would be empty
+    }
+
+    #[test]
+    fn test_matches_pattern_multiple_wildcards_not_supported() {
+        // GNU make does NOT support multiple % in pattern rules
+        // These should not match (fall back to exact match)
+        assert!(!matches_pattern("%foo%bar", "xfooybarz"));
+        assert!(!matches_pattern("lib%.so.%", "libfoo.so.1"));
     }
 
     #[test]
