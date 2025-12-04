@@ -69,6 +69,9 @@ pub enum SyntaxKind {
     // Archive members
     ARCHIVE_MEMBERS, // Container for just the members inside parentheses
     ARCHIVE_MEMBER,  // Individual member like "bar.o" or "baz.o"
+
+    // Blank lines
+    BLANK_LINE, // A blank line between top-level items
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
