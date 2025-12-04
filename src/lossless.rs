@@ -2655,9 +2655,16 @@ impl Rule {
             .filter(|p| p != target)
             .collect();
 
+        // Check if the existing PREREQUISITES node starts with whitespace
+        let has_leading_whitespace = prereqs_node
+            .children_with_tokens()
+            .next()
+            .map(|e| matches!(e.as_token().map(|t| t.kind()), Some(WHITESPACE)))
+            .unwrap_or(false);
+
         // Rebuild the PREREQUISITES node with the new prerequisites
         let prereqs_index = prereqs_node.index();
-        let new_prereqs_node = build_prerequisites_node(&new_prereqs, true);
+        let new_prereqs_node = build_prerequisites_node(&new_prereqs, has_leading_whitespace);
 
         self.0.splice_children(
             prereqs_index..prereqs_index + 1,
@@ -5830,6 +5837,14 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
     fn test_makefile_phony_targets_empty() {
         let makefile = Makefile::new();
         assert_eq!(makefile.phony_targets().count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_remove_first_phony_target_no_extra_space() {
+        let mut makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        let result = makefile.to_string();
+        assert_eq!(result, ".PHONY: test build\n");
     }
 
     #[test]
