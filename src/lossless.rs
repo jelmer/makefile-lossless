@@ -1662,7 +1662,9 @@ impl Makefile {
         let syntax = SyntaxNode::new_root_mut(builder.finish());
         let pos = self.0.children_with_tokens().count();
         self.0.splice_children(pos..pos, vec![syntax.into()]);
-        Rule(self.0.children().nth(pos).unwrap())
+        // Use children().count() - 1 to get the last added child node
+        // (not children_with_tokens().count() which includes tokens)
+        Rule(self.0.children().last().unwrap())
     }
 
     /// Read the makefile
@@ -3139,6 +3141,30 @@ rule: dependency
         );
 
         assert_eq!(makefile.to_string(), "rule:\n");
+    }
+
+    #[test]
+    fn test_add_rule_with_shebang() {
+        // Regression test for bug where add_rule() panics on makefiles with shebangs
+        let content = r#"#!/usr/bin/make -f
+
+build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+"#;
+
+        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let initial_count = makefile.rules().count();
+        assert_eq!(initial_count, 2);
+
+        // This should not panic
+        let rule = makefile.add_rule("build-indep");
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["build-indep"]);
+
+        // Should have one more rule now
+        assert_eq!(makefile.rules().count(), initial_count + 1);
     }
 
     #[test]
