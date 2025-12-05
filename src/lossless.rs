@@ -2126,6 +2126,72 @@ impl Rule {
         crate::Parse::<Rule>::parse_rule(text)
     }
 
+    /// Create a new rule with the given targets, prerequisites, and recipes
+    ///
+    /// # Arguments
+    /// * `targets` - A slice of target names
+    /// * `prerequisites` - A slice of prerequisite names (can be empty)
+    /// * `recipes` - A slice of recipe lines (can be empty)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    ///
+    /// let rule = Rule::new(&["all"], &["build", "test"], &["echo Done"]);
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["build", "test"]);
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo Done"]);
+    /// ```
+    pub fn new(targets: &[&str], prerequisites: &[&str], recipes: &[&str]) -> Rule {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RULE.into());
+
+        // Build targets
+        for (i, target) in targets.iter().enumerate() {
+            if i > 0 {
+                builder.token(WHITESPACE.into(), " ");
+            }
+            builder.token(IDENTIFIER.into(), target);
+        }
+
+        // Add colon
+        builder.token(OPERATOR.into(), ":");
+
+        // Build prerequisites
+        if !prerequisites.is_empty() {
+            builder.token(WHITESPACE.into(), " ");
+            builder.start_node(PREREQUISITES.into());
+
+            for (i, prereq) in prerequisites.iter().enumerate() {
+                if i > 0 {
+                    builder.token(WHITESPACE.into(), " ");
+                }
+                builder.start_node(PREREQUISITE.into());
+                builder.token(IDENTIFIER.into(), prereq);
+                builder.finish_node();
+            }
+
+            builder.finish_node();
+        }
+
+        // Add newline after rule declaration
+        builder.token(NEWLINE.into(), "\n");
+
+        // Build recipes
+        for recipe in recipes {
+            builder.start_node(RECIPE.into());
+            builder.token(INDENT.into(), "\t");
+            builder.token(TEXT.into(), recipe);
+            builder.token(NEWLINE.into(), "\n");
+            builder.finish_node();
+        }
+
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        Rule(syntax)
+    }
+
     // Helper method to collect variable references from tokens
     fn collect_variable_reference(
         &self,
@@ -5890,5 +5956,69 @@ override_dh_build:
             "Expected 'dh_python3' in recipes, got: {:?}",
             recipes
         );
+    }
+
+    #[test]
+    fn test_rule_parse_preserves_trailing_blank_lines() {
+        // Regression test: ensure that trailing blank lines are preserved
+        // when parsing a rule and using it with replace_rule()
+        let input = r#"override_dh_systemd_enable:
+	dh_systemd_enable -pracoon
+
+override_dh_install:
+	dh_install
+"#;
+
+        let mut mf: Makefile = input.parse().unwrap();
+
+        // Get first rule and convert to string
+        let rule = mf.rules().next().unwrap();
+        let rule_text = rule.to_string();
+
+        // Should include trailing blank line
+        assert_eq!(
+            rule_text,
+            "override_dh_systemd_enable:\n\tdh_systemd_enable -pracoon\n\n"
+        );
+
+        // Modify the text
+        let modified =
+            rule_text.replace("override_dh_systemd_enable:", "override_dh_installsystemd:");
+
+        // Parse back - should preserve trailing blank line
+        let new_rule: Rule = modified.parse().unwrap();
+        assert_eq!(
+            new_rule.to_string(),
+            "override_dh_installsystemd:\n\tdh_systemd_enable -pracoon\n\n"
+        );
+
+        // Replace in makefile
+        mf.replace_rule(0, new_rule).unwrap();
+
+        // Verify blank line is still present in output
+        let output = mf.to_string();
+        assert!(
+            output.contains(
+                "override_dh_installsystemd:\n\tdh_systemd_enable -pracoon\n\noverride_dh_install:"
+            ),
+            "Blank line between rules should be preserved. Got: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_rule_parse_round_trip_with_trailing_newlines() {
+        // Test that parsing and stringifying a rule preserves exact trailing newlines
+        let test_cases = vec![
+            "rule:\n\tcommand\n",     // One newline
+            "rule:\n\tcommand\n\n",   // Two newlines (blank line)
+            "rule:\n\tcommand\n\n\n", // Three newlines (two blank lines)
+        ];
+
+        for rule_text in test_cases {
+            let rule: Rule = rule_text.parse().unwrap();
+            let result = rule.to_string();
+            assert_eq!(rule_text, result, "Round-trip failed for {:?}", rule_text);
+        }
     }
 }
