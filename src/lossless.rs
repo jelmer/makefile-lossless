@@ -2126,6 +2126,72 @@ impl Rule {
         crate::Parse::<Rule>::parse_rule(text)
     }
 
+    /// Create a new rule with the given targets, prerequisites, and recipes
+    ///
+    /// # Arguments
+    /// * `targets` - A slice of target names
+    /// * `prerequisites` - A slice of prerequisite names (can be empty)
+    /// * `recipes` - A slice of recipe lines (can be empty)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    ///
+    /// let rule = Rule::new(&["all"], &["build", "test"], &["echo Done"]);
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["build", "test"]);
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo Done"]);
+    /// ```
+    pub fn new(targets: &[&str], prerequisites: &[&str], recipes: &[&str]) -> Rule {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RULE.into());
+
+        // Build targets
+        for (i, target) in targets.iter().enumerate() {
+            if i > 0 {
+                builder.token(WHITESPACE.into(), " ");
+            }
+            builder.token(IDENTIFIER.into(), target);
+        }
+
+        // Add colon
+        builder.token(OPERATOR.into(), ":");
+
+        // Build prerequisites
+        if !prerequisites.is_empty() {
+            builder.token(WHITESPACE.into(), " ");
+            builder.start_node(PREREQUISITES.into());
+
+            for (i, prereq) in prerequisites.iter().enumerate() {
+                if i > 0 {
+                    builder.token(WHITESPACE.into(), " ");
+                }
+                builder.start_node(PREREQUISITE.into());
+                builder.token(IDENTIFIER.into(), prereq);
+                builder.finish_node();
+            }
+
+            builder.finish_node();
+        }
+
+        // Add newline after rule declaration
+        builder.token(NEWLINE.into(), "\n");
+
+        // Build recipes
+        for recipe in recipes {
+            builder.start_node(RECIPE.into());
+            builder.token(INDENT.into(), "\t");
+            builder.token(TEXT.into(), recipe);
+            builder.token(NEWLINE.into(), "\n");
+            builder.finish_node();
+        }
+
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        Rule(syntax)
+    }
+
     // Helper method to collect variable references from tokens
     fn collect_variable_reference(
         &self,
