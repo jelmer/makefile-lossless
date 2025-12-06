@@ -26,8 +26,8 @@ mod lossless;
 mod parse;
 
 pub use lossless::{
-    ArchiveMember, ArchiveMembers, Error, Identifier, Include, Lang, Makefile, MakefileVariant,
-    ParseError, Rule, VariableDefinition,
+    ArchiveMember, ArchiveMembers, Conditional, Error, Identifier, Include, Lang, Makefile,
+    MakefileItem, MakefileVariant, ParseError, Rule, VariableDefinition,
 };
 pub use parse::Parse;
 

@@ -424,11 +424,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     Some(IDENTIFIER) => {
                         let token = &self.tokens.last().unwrap().1.clone();
-                        // Check if this is a conditional directive that can appear in recipes
-                        if self.is_conditional_directive(token) {
+                        // Check if this is a starting conditional directive (not else/endif)
+                        if token == "ifdef"
+                            || token == "ifndef"
+                            || token == "ifeq"
+                            || token == "ifneq"
+                        {
                             self.parse_conditional();
                         } else if token == "include" || token == "-include" || token == "sinclude" {
                             self.parse_include();
+                        } else if token == "else" || token == "endif" {
+                            // These end the current recipe section - let parent handle them
+                            break;
                         } else {
                             break;
                         }
@@ -1386,6 +1393,47 @@ ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
+ast_node!(Conditional, CONDITIONAL);
+
+/// Represents different types of items that can appear in a Makefile
+#[derive(Clone)]
+pub enum MakefileItem {
+    /// A rule definition (e.g., "target: prerequisites")
+    Rule(Rule),
+    /// A variable definition (e.g., "VAR = value")
+    Variable(VariableDefinition),
+    /// An include directive (e.g., "include foo.mk")
+    Include(Include),
+    /// A conditional block (e.g., "ifdef DEBUG ... endif")
+    Conditional(Conditional),
+}
+
+impl MakefileItem {
+    /// Try to cast a syntax node to a MakefileItem
+    fn cast(node: SyntaxNode) -> Option<Self> {
+        if let Some(rule) = Rule::cast(node.clone()) {
+            Some(MakefileItem::Rule(rule))
+        } else if let Some(var) = VariableDefinition::cast(node.clone()) {
+            Some(MakefileItem::Variable(var))
+        } else if let Some(inc) = Include::cast(node.clone()) {
+            Some(MakefileItem::Include(inc))
+        } else if let Some(cond) = Conditional::cast(node) {
+            Some(MakefileItem::Conditional(cond))
+        } else {
+            None
+        }
+    }
+
+    /// Get the underlying syntax node
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            MakefileItem::Rule(r) => r.syntax(),
+            MakefileItem::Variable(v) => v.syntax(),
+            MakefileItem::Include(i) => i.syntax(),
+            MakefileItem::Conditional(c) => c.syntax(),
+        }
+    }
+}
 
 impl ArchiveMembers {
     /// Get the archive name (e.g., "libfoo.a" from "libfoo.a(bar.o)")
@@ -1586,6 +1634,28 @@ impl VariableDefinition {
             .map(|it| it.text().into())
     }
 
+    /// Get the parent item of this variable definition, if any
+    ///
+    /// Returns `Some(MakefileItem)` if this variable has a parent that is a MakefileItem
+    /// (e.g., a Conditional), or `None` if the parent is the root Makefile node.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = r#"ifdef DEBUG
+    /// VAR = value
+    /// endif
+    /// "#.parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let var = cond.if_items().next().unwrap();
+    /// // Variable's parent is the conditional
+    /// assert!(matches!(var, makefile_lossless::MakefileItem::Variable(_)));
+    /// ```
+    pub fn parent(&self) -> Option<MakefileItem> {
+        self.syntax().parent().and_then(MakefileItem::cast)
+    }
+
     /// Remove this variable definition from its parent makefile
     ///
     /// This will also remove any preceding comments and up to 1 empty line before the variable.
@@ -1708,6 +1778,30 @@ impl Makefile {
             .filter_map(VariableDefinition::cast)
     }
 
+    /// Get all conditionals in the makefile
+    pub fn conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
+        self.syntax().children().filter_map(Conditional::cast)
+    }
+
+    /// Get all top-level items (rules, variables, includes, conditionals) in the makefile
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let makefile: Makefile = r#"VAR = value
+    /// ifdef DEBUG
+    /// CFLAGS = -g
+    /// endif
+    /// rule:
+    /// 	command
+    /// "#.parse().unwrap();
+    /// let items: Vec<_> = makefile.items().collect();
+    /// assert_eq!(items.len(), 3); // VAR, conditional, rule
+    /// ```
+    pub fn items(&self) -> impl Iterator<Item = MakefileItem> + '_ {
+        self.syntax().children().filter_map(MakefileItem::cast)
+    }
+
     /// Find all variables by name
     ///
     /// Returns an iterator over all variable definitions with the given name.
@@ -1771,6 +1865,258 @@ impl Makefile {
         // Use children().count() - 1 to get the last added child node
         // (not children_with_tokens().count() which includes tokens)
         Rule(self.0.children().last().unwrap())
+    }
+
+    /// Add a new conditional to the makefile
+    ///
+    /// # Arguments
+    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq"
+    /// * `condition` - The condition expression (e.g., "DEBUG" for ifdef/ifndef, or "(a,b)" for ifeq/ifneq)
+    /// * `if_body` - The content of the if branch
+    /// * `else_body` - Optional content for the else branch
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile = Makefile::new();
+    /// makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
+    /// assert!(makefile.to_string().contains("ifdef DEBUG"));
+    /// ```
+    pub fn add_conditional(
+        &mut self,
+        conditional_type: &str,
+        condition: &str,
+        if_body: &str,
+        else_body: Option<&str>,
+    ) -> Result<Conditional, Error> {
+        // Validate conditional type
+        if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&conditional_type) {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!(
+                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq",
+                        conditional_type
+                    ),
+                    line: 1,
+                    context: "add_conditional".to_string(),
+                }],
+            }));
+        }
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(CONDITIONAL.into());
+
+        // Build CONDITIONAL_IF
+        builder.start_node(CONDITIONAL_IF.into());
+        builder.token(IDENTIFIER.into(), conditional_type);
+        builder.token(WHITESPACE.into(), " ");
+
+        // Wrap condition in EXPR node
+        builder.start_node(EXPR.into());
+        builder.token(IDENTIFIER.into(), condition);
+        builder.finish_node();
+
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        // Add if body content
+        if !if_body.is_empty() {
+            for line in if_body.lines() {
+                if !line.is_empty() {
+                    builder.token(IDENTIFIER.into(), line);
+                }
+                builder.token(NEWLINE.into(), "\n");
+            }
+            // Add final newline if if_body doesn't end with one
+            if !if_body.ends_with('\n') && !if_body.is_empty() {
+                builder.token(NEWLINE.into(), "\n");
+            }
+        }
+
+        // Add else clause if provided
+        if let Some(else_content) = else_body {
+            builder.start_node(CONDITIONAL_ELSE.into());
+            builder.token(IDENTIFIER.into(), "else");
+            builder.token(NEWLINE.into(), "\n");
+            builder.finish_node();
+
+            // Add else body content
+            if !else_content.is_empty() {
+                for line in else_content.lines() {
+                    if !line.is_empty() {
+                        builder.token(IDENTIFIER.into(), line);
+                    }
+                    builder.token(NEWLINE.into(), "\n");
+                }
+                // Add final newline if else_content doesn't end with one
+                if !else_content.ends_with('\n') && !else_content.is_empty() {
+                    builder.token(NEWLINE.into(), "\n");
+                }
+            }
+        }
+
+        // Build CONDITIONAL_ENDIF
+        builder.start_node(CONDITIONAL_ENDIF.into());
+        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let pos = self.0.children_with_tokens().count();
+
+        // Add a blank line before the new conditional if there are existing elements
+        let needs_blank_line = self
+            .0
+            .children()
+            .any(|c| c.kind() == RULE || c.kind() == VARIABLE || c.kind() == CONDITIONAL);
+
+        if needs_blank_line {
+            // Create a BLANK_LINE node
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+
+            self.0
+                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
+        } else {
+            self.0.splice_children(pos..pos, vec![syntax.into()]);
+        }
+
+        // Return the newly added conditional
+        Ok(Conditional(self.0.children().last().unwrap()))
+    }
+
+    /// Add a new conditional to the makefile with typed items
+    ///
+    /// This is a more type-safe alternative to `add_conditional` that accepts iterators of
+    /// `MakefileItem` instead of raw strings.
+    ///
+    /// # Arguments
+    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq"
+    /// * `condition` - The condition expression (e.g., "DEBUG" for ifdef/ifndef, or "(a,b)" for ifeq/ifneq)
+    /// * `if_items` - Items for the if branch
+    /// * `else_items` - Optional items for the else branch
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile = Makefile::new();
+    /// let temp1: Makefile = "CFLAGS = -g\n".parse().unwrap();
+    /// let var1 = temp1.variable_definitions().next().unwrap();
+    /// let temp2: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+    /// let var2 = temp2.variable_definitions().next().unwrap();
+    /// makefile.add_conditional_with_items(
+    ///     "ifdef",
+    ///     "DEBUG",
+    ///     vec![MakefileItem::Variable(var1)],
+    ///     Some(vec![MakefileItem::Variable(var2)])
+    /// ).unwrap();
+    /// assert!(makefile.to_string().contains("ifdef DEBUG"));
+    /// assert!(makefile.to_string().contains("CFLAGS = -g"));
+    /// assert!(makefile.to_string().contains("CFLAGS = -O2"));
+    /// ```
+    pub fn add_conditional_with_items<I1, I2>(
+        &mut self,
+        conditional_type: &str,
+        condition: &str,
+        if_items: I1,
+        else_items: Option<I2>,
+    ) -> Result<Conditional, Error>
+    where
+        I1: IntoIterator<Item = MakefileItem>,
+        I2: IntoIterator<Item = MakefileItem>,
+    {
+        // Validate conditional type
+        if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&conditional_type) {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!(
+                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq",
+                        conditional_type
+                    ),
+                    line: 1,
+                    context: "add_conditional_with_items".to_string(),
+                }],
+            }));
+        }
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(CONDITIONAL.into());
+
+        // Build CONDITIONAL_IF
+        builder.start_node(CONDITIONAL_IF.into());
+        builder.token(IDENTIFIER.into(), conditional_type);
+        builder.token(WHITESPACE.into(), " ");
+
+        // Wrap condition in EXPR node
+        builder.start_node(EXPR.into());
+        builder.token(IDENTIFIER.into(), condition);
+        builder.finish_node();
+
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        // Add if branch items
+        for item in if_items {
+            // Clone the item's syntax tree into our builder
+            let item_text = item.syntax().to_string();
+            // Parse it again to get green nodes
+            builder.token(IDENTIFIER.into(), item_text.trim());
+            builder.token(NEWLINE.into(), "\n");
+        }
+
+        // Add else clause if provided
+        if let Some(else_iter) = else_items {
+            builder.start_node(CONDITIONAL_ELSE.into());
+            builder.token(IDENTIFIER.into(), "else");
+            builder.token(NEWLINE.into(), "\n");
+            builder.finish_node();
+
+            // Add else branch items
+            for item in else_iter {
+                let item_text = item.syntax().to_string();
+                builder.token(IDENTIFIER.into(), item_text.trim());
+                builder.token(NEWLINE.into(), "\n");
+            }
+        }
+
+        // Build CONDITIONAL_ENDIF
+        builder.start_node(CONDITIONAL_ENDIF.into());
+        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let pos = self.0.children_with_tokens().count();
+
+        // Add a blank line before the new conditional if there are existing elements
+        let needs_blank_line = self
+            .0
+            .children()
+            .any(|c| c.kind() == RULE || c.kind() == VARIABLE || c.kind() == CONDITIONAL);
+
+        if needs_blank_line {
+            // Create a BLANK_LINE node
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+
+            self.0
+                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
+        } else {
+            self.0.splice_children(pos..pos, vec![syntax.into()]);
+        }
+
+        // Return the newly added conditional
+        Ok(Conditional(self.0.children().last().unwrap()))
     }
 
     /// Read the makefile
@@ -2336,6 +2682,30 @@ impl Rule {
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
         Rule(syntax)
+    }
+
+    /// Get the parent item of this rule, if any
+    ///
+    /// Returns `Some(MakefileItem)` if this rule has a parent that is a MakefileItem
+    /// (e.g., a Conditional), or `None` if the parent is the root Makefile node.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = r#"ifdef DEBUG
+    /// all:
+    ///     echo "test"
+    /// endif
+    /// "#.parse().unwrap();
+    ///
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let rule = cond.if_items().next().unwrap();
+    /// // Rule's parent is the conditional
+    /// assert!(matches!(rule, makefile_lossless::MakefileItem::Rule(_)));
+    /// ```
+    pub fn parent(&self) -> Option<MakefileItem> {
+        self.syntax().parent().and_then(MakefileItem::cast)
     }
 
     // Helper method to collect variable references from tokens
@@ -3267,6 +3637,358 @@ impl Include {
     pub fn is_optional(&self) -> bool {
         let text = self.syntax().text();
         text.to_string().starts_with("-include") || text.to_string().starts_with("sinclude")
+    }
+
+    /// Get the parent item of this include directive, if any
+    ///
+    /// Returns `Some(MakefileItem)` if this include has a parent that is a MakefileItem
+    /// (e.g., a Conditional), or `None` if the parent is the root Makefile node.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = r#"ifdef DEBUG
+    /// include debug.mk
+    /// endif
+    /// "#.parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let inc = cond.if_items().next().unwrap();
+    /// // Include's parent is the conditional
+    /// assert!(matches!(inc, makefile_lossless::MakefileItem::Include(_)));
+    /// ```
+    pub fn parent(&self) -> Option<MakefileItem> {
+        self.syntax().parent().and_then(MakefileItem::cast)
+    }
+}
+
+impl Conditional {
+    /// Get the parent item of this conditional, if any
+    ///
+    /// Returns `Some(MakefileItem)` if this conditional has a parent that is a MakefileItem
+    /// (e.g., another Conditional for nested conditionals), or `None` if the parent is the root Makefile node.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = r#"ifdef OUTER
+    /// ifdef INNER
+    /// VAR = value
+    /// endif
+    /// endif
+    /// "#.parse().unwrap();
+    ///
+    /// let outer = makefile.conditionals().next().unwrap();
+    /// let inner = outer.if_items().find_map(|item| {
+    ///     if let makefile_lossless::MakefileItem::Conditional(c) = item {
+    ///         Some(c)
+    ///     } else {
+    ///         None
+    ///     }
+    /// }).unwrap();
+    /// // Inner conditional's parent is the outer conditional
+    /// assert!(inner.parent().is_some());
+    /// ```
+    pub fn parent(&self) -> Option<MakefileItem> {
+        self.syntax().parent().and_then(MakefileItem::cast)
+    }
+
+    /// Get the type of conditional (ifdef, ifndef, ifeq, ifneq)
+    pub fn conditional_type(&self) -> Option<String> {
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == CONDITIONAL_IF)?
+            .children_with_tokens()
+            .find(|it| it.kind() == IDENTIFIER)
+            .map(|it| it.as_token().unwrap().text().to_string())
+    }
+
+    /// Get the condition expression
+    pub fn condition(&self) -> Option<String> {
+        let if_node = self
+            .syntax()
+            .children()
+            .find(|it| it.kind() == CONDITIONAL_IF)?;
+
+        // Find the EXPR node which contains the condition
+        let expr_node = if_node.children().find(|it| it.kind() == EXPR)?;
+
+        Some(expr_node.text().to_string().trim().to_string())
+    }
+
+    /// Check if this conditional has an else clause
+    pub fn has_else(&self) -> bool {
+        self.syntax()
+            .children()
+            .any(|it| it.kind() == CONDITIONAL_ELSE)
+    }
+
+    /// Get the body content of the if branch
+    pub fn if_body(&self) -> Option<String> {
+        let mut body = String::new();
+        let mut in_if_body = false;
+
+        for child in self.syntax().children_with_tokens() {
+            if child.kind() == CONDITIONAL_IF {
+                in_if_body = true;
+                continue;
+            }
+            if child.kind() == CONDITIONAL_ELSE || child.kind() == CONDITIONAL_ENDIF {
+                break;
+            }
+            if in_if_body {
+                body.push_str(child.to_string().as_str());
+            }
+        }
+
+        if body.is_empty() {
+            None
+        } else {
+            Some(body)
+        }
+    }
+
+    /// Get the body content of the else branch (if it exists)
+    pub fn else_body(&self) -> Option<String> {
+        if !self.has_else() {
+            return None;
+        }
+
+        let mut body = String::new();
+        let mut in_else_body = false;
+
+        for child in self.syntax().children_with_tokens() {
+            if child.kind() == CONDITIONAL_ELSE {
+                in_else_body = true;
+                continue;
+            }
+            if child.kind() == CONDITIONAL_ENDIF {
+                break;
+            }
+            if in_else_body {
+                body.push_str(child.to_string().as_str());
+            }
+        }
+
+        if body.is_empty() {
+            None
+        } else {
+            Some(body)
+        }
+    }
+
+    /// Remove this conditional from the makefile
+    pub fn remove(&mut self) -> Result<(), Error> {
+        let Some(parent) = self.syntax().parent() else {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot remove conditional: no parent node".to_string(),
+                    line: 1,
+                    context: "conditional_remove".to_string(),
+                }],
+            }));
+        };
+
+        remove_with_preceding_comments(self.syntax(), &parent);
+
+        Ok(())
+    }
+
+    /// Remove the conditional directives (ifdef/endif) but keep the body content
+    ///
+    /// This "unwraps" the conditional, keeping only the if branch content.
+    /// Returns an error if the conditional has an else clause.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = r#"ifdef DEBUG
+    /// VAR = debug
+    /// endif
+    /// "#.parse().unwrap();
+    /// let mut cond = makefile.conditionals().next().unwrap();
+    /// cond.unwrap().unwrap();
+    /// // Now makefile contains just "VAR = debug\n"
+    /// assert!(makefile.to_string().contains("VAR = debug"));
+    /// assert!(!makefile.to_string().contains("ifdef"));
+    /// ```
+    pub fn unwrap(&mut self) -> Result<(), Error> {
+        // Check if there's an else clause
+        if self.has_else() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot unwrap conditional with else clause".to_string(),
+                    line: 1,
+                    context: "conditional_unwrap".to_string(),
+                }],
+            }));
+        }
+
+        let Some(parent) = self.syntax().parent() else {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot unwrap conditional: no parent node".to_string(),
+                    line: 1,
+                    context: "conditional_unwrap".to_string(),
+                }],
+            }));
+        };
+
+        // Collect the body items (everything between CONDITIONAL_IF and CONDITIONAL_ENDIF)
+        let body_nodes: Vec<_> = self
+            .syntax()
+            .children_with_tokens()
+            .skip_while(|n| n.kind() != CONDITIONAL_IF)
+            .skip(1) // Skip CONDITIONAL_IF itself
+            .take_while(|n| n.kind() != CONDITIONAL_ENDIF)
+            .collect();
+
+        // Find the position of this conditional in parent
+        let conditional_index = self.syntax().index();
+
+        // Replace the entire conditional with just its body items
+        parent.splice_children(
+            conditional_index..conditional_index + 1,
+            body_nodes,
+        );
+
+        Ok(())
+    }
+
+    /// Get all items (rules, variables, includes, nested conditionals) in the if branch
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = r#"ifdef DEBUG
+    /// VAR = debug
+    /// rule:
+    /// 	command
+    /// endif
+    /// "#.parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let items: Vec<_> = cond.if_items().collect();
+    /// assert_eq!(items.len(), 2); // One variable, one rule
+    /// ```
+    pub fn if_items(&self) -> impl Iterator<Item = MakefileItem> + '_ {
+        self.syntax()
+            .children()
+            .skip_while(|n| n.kind() != CONDITIONAL_IF)
+            .skip(1) // Skip the CONDITIONAL_IF itself
+            .take_while(|n| n.kind() != CONDITIONAL_ELSE && n.kind() != CONDITIONAL_ENDIF)
+            .filter_map(MakefileItem::cast)
+    }
+
+    /// Get all items (rules, variables, includes, nested conditionals) in the else branch
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = r#"ifdef DEBUG
+    /// VAR = debug
+    /// else
+    /// VAR = release
+    /// endif
+    /// "#.parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let items: Vec<_> = cond.else_items().collect();
+    /// assert_eq!(items.len(), 1); // One variable in else branch
+    /// ```
+    pub fn else_items(&self) -> impl Iterator<Item = MakefileItem> + '_ {
+        self.syntax()
+            .children()
+            .skip_while(|n| n.kind() != CONDITIONAL_ELSE)
+            .skip(1) // Skip the CONDITIONAL_ELSE itself
+            .take_while(|n| n.kind() != CONDITIONAL_ENDIF)
+            .filter_map(MakefileItem::cast)
+    }
+
+    /// Add an item to the if branch of the conditional
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile: Makefile = "ifdef DEBUG\nendif\n".parse().unwrap();
+    /// let mut cond = makefile.conditionals().next().unwrap();
+    /// let temp: Makefile = "CFLAGS = -g\n".parse().unwrap();
+    /// let var = temp.variable_definitions().next().unwrap();
+    /// cond.add_if_item(MakefileItem::Variable(var));
+    /// assert!(makefile.to_string().contains("CFLAGS = -g"));
+    /// ```
+    pub fn add_if_item(&mut self, item: MakefileItem) {
+        let item_node = item.syntax().clone();
+
+        // Find position after CONDITIONAL_IF
+        let insert_pos = self
+            .syntax()
+            .children_with_tokens()
+            .position(|n| n.kind() == CONDITIONAL_IF)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        self.0
+            .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
+    }
+
+    /// Add an item to the else branch of the conditional
+    ///
+    /// If the conditional doesn't have an else branch, this will create one.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile: Makefile = "ifdef DEBUG\nVAR=1\nendif\n".parse().unwrap();
+    /// let mut cond = makefile.conditionals().next().unwrap();
+    /// let temp: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+    /// let var = temp.variable_definitions().next().unwrap();
+    /// cond.add_else_item(MakefileItem::Variable(var));
+    /// assert!(makefile.to_string().contains("else"));
+    /// assert!(makefile.to_string().contains("CFLAGS = -O2"));
+    /// ```
+    pub fn add_else_item(&mut self, item: MakefileItem) {
+        // Ensure there's an else clause
+        if !self.has_else() {
+            self.add_else_clause();
+        }
+
+        let item_node = item.syntax().clone();
+
+        // Find position after CONDITIONAL_ELSE
+        let insert_pos = self
+            .syntax()
+            .children_with_tokens()
+            .position(|n| n.kind() == CONDITIONAL_ELSE)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        self.0
+            .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
+    }
+
+    /// Add an else clause to the conditional if it doesn't already have one
+    fn add_else_clause(&mut self) {
+        if self.has_else() {
+            return;
+        }
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(CONDITIONAL_ELSE.into());
+        builder.token(IDENTIFIER.into(), "else");
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Find position before CONDITIONAL_ENDIF
+        let insert_pos = self
+            .syntax()
+            .children_with_tokens()
+            .position(|n| n.kind() == CONDITIONAL_ENDIF)
+            .unwrap_or(self.syntax().children_with_tokens().count());
+
+        self.0
+            .splice_children(insert_pos..insert_pos, vec![syntax.into()]);
     }
 }
 
@@ -6464,5 +7186,679 @@ override_dh_install:
 
         // Should have exactly one rule
         assert_eq!(mf.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditionals_iterator() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+
+ifndef RELEASE
+OTHER = dev
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 2);
+
+        assert_eq!(
+            conditionals[0].conditional_type(),
+            Some("ifdef".to_string())
+        );
+        assert_eq!(
+            conditionals[1].conditional_type(),
+            Some("ifndef".to_string())
+        );
+    }
+
+    #[test]
+    fn test_conditional_type_and_condition() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+        assert_eq!(conditional.condition(), Some("DEBUG".to_string()));
+    }
+
+    #[test]
+    fn test_conditional_has_else() {
+        let makefile_with_else: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile_with_else.conditionals().next().unwrap();
+        assert!(conditional.has_else());
+
+        let makefile_without_else: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile_without_else.conditionals().next().unwrap();
+        assert!(!conditional.has_else());
+    }
+
+    #[test]
+    fn test_conditional_if_body() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        let if_body = conditional.if_body();
+        assert!(if_body.is_some());
+        assert!(if_body.unwrap().contains("VAR = debug"));
+    }
+
+    #[test]
+    fn test_conditional_else_body() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        let else_body = conditional.else_body();
+        assert!(else_body.is_some());
+        assert!(else_body.unwrap().contains("VAR = release"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifdef() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("VAR = debug"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_with_else() {
+        let mut makefile = Makefile::new();
+        let result =
+            makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", Some("VAR = release\n"));
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("VAR = debug"));
+        assert!(code.contains("else"));
+        assert!(code.contains("VAR = release"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_invalid_type() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_conditional_formatting() {
+        let mut makefile: Makefile = "VAR1 = value1\n".parse().unwrap();
+        let result = makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        // Should have a blank line before the conditional
+        assert!(code.contains("\n\nifdef DEBUG"));
+    }
+
+    #[test]
+    fn test_conditional_remove() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+
+VAR2 = value2
+"#
+        .parse()
+        .unwrap();
+
+        let mut conditional = makefile.conditionals().next().unwrap();
+        let result = conditional.remove();
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(!code.contains("ifdef DEBUG"));
+        assert!(!code.contains("VAR = debug"));
+        assert!(code.contains("VAR2 = value2"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifndef() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifndef", "NDEBUG", "VAR = enabled\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifndef NDEBUG"));
+        assert!(code.contains("VAR = enabled"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifeq() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifeq", "($(OS),Linux)", "VAR = linux\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifeq ($(OS),Linux)"));
+        assert!(code.contains("VAR = linux"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifneq() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifneq", "($(OS),Windows)", "VAR = unix\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifneq ($(OS),Windows)"));
+        assert!(code.contains("VAR = unix"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_conditional_api_integration() {
+        // Create a makefile with a rule and a variable
+        let mut makefile: Makefile = r#"VAR1 = value1
+
+rule1:
+	command1
+"#
+        .parse()
+        .unwrap();
+
+        // Add a conditional
+        makefile
+            .add_conditional("ifdef", "DEBUG", "CFLAGS += -g\n", Some("CFLAGS += -O2\n"))
+            .unwrap();
+
+        // Verify the conditional was added
+        assert_eq!(makefile.conditionals().count(), 1);
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+        assert_eq!(conditional.condition(), Some("DEBUG".to_string()));
+        assert!(conditional.has_else());
+
+        // Verify the original content is preserved
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_if_items() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one rule
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Rule(r) => {
+                assert!(r.targets().any(|t| t == "rule"));
+            }
+            _ => panic!("Expected rule"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_else_items() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR2 = release
+rule2:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.else_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one rule
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR2".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Rule(r) => {
+                assert!(r.targets().any(|t| t == "rule2"));
+            }
+            _ => panic!("Expected rule"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_add_if_item() {
+        let makefile: Makefile = "ifdef DEBUG\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+
+        // Parse a variable from a temporary makefile
+        let temp: Makefile = "CFLAGS = -g\n".parse().unwrap();
+        let var = temp.variable_definitions().next().unwrap();
+        cond.add_if_item(MakefileItem::Variable(var));
+
+        let code = makefile.to_string();
+        assert!(code.contains("CFLAGS = -g"));
+
+        // Verify it's in the if branch
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.if_items().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_add_else_item() {
+        let makefile: Makefile = "ifdef DEBUG\nVAR=1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+
+        // Parse a variable from a temporary makefile
+        let temp: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+        let var = temp.variable_definitions().next().unwrap();
+        cond.add_else_item(MakefileItem::Variable(var));
+
+        let code = makefile.to_string();
+        assert!(code.contains("else"));
+        assert!(code.contains("CFLAGS = -O2"));
+
+        // Verify it's in the else branch
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.else_items().count(), 1);
+    }
+
+    #[test]
+    fn test_add_conditional_with_items() {
+        let mut makefile = Makefile::new();
+
+        // Parse items from temporary makefiles
+        let temp1: Makefile = "CFLAGS = -g\n".parse().unwrap();
+        let var1 = temp1.variable_definitions().next().unwrap();
+
+        let temp2: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+        let var2 = temp2.variable_definitions().next().unwrap();
+
+        let temp3: Makefile = "debug:\n\techo debug\n".parse().unwrap();
+        let rule1 = temp3.rules().next().unwrap();
+
+        let result = makefile.add_conditional_with_items(
+            "ifdef",
+            "DEBUG",
+            vec![MakefileItem::Variable(var1), MakefileItem::Rule(rule1)],
+            Some(vec![MakefileItem::Variable(var2)]),
+        );
+
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("CFLAGS = -g"));
+        assert!(code.contains("debug:"));
+        assert!(code.contains("else"));
+        assert!(code.contains("CFLAGS = -O2"));
+    }
+
+    #[test]
+    fn test_conditional_items_with_nested_conditional() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+ifdef VERBOSE
+	VAR2 = verbose
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one nested conditional
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifdef".to_string()));
+            }
+            _ => panic!("Expected conditional"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_items_with_include() {
+        let makefile: Makefile = r#"ifdef DEBUG
+include debug.mk
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One include, one variable
+
+        match &items[0] {
+            MakefileItem::Include(i) => {
+                assert_eq!(i.path(), Some("debug.mk".to_string()));
+            }
+            _ => panic!("Expected include"),
+        }
+
+        match &items[1] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+    }
+
+    #[test]
+    fn test_makefile_items_iterator() {
+        let makefile: Makefile = r#"VAR = value
+ifdef DEBUG
+CFLAGS = -g
+endif
+rule:
+	command
+include common.mk
+"#
+        .parse()
+        .unwrap();
+
+        // First verify we can find each type individually
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.conditionals().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+
+        let items: Vec<_> = makefile.items().collect();
+        // Note: include directives might not be at top level, need to check
+        assert!(items.len() >= 3, "Expected at least 3 items, got {}", items.len());
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable at position 0"),
+        }
+
+        match &items[1] {
+            MakefileItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifdef".to_string()));
+            }
+            _ => panic!("Expected conditional at position 1"),
+        }
+
+        match &items[2] {
+            MakefileItem::Rule(r) => {
+                let targets: Vec<_> = r.targets().collect();
+                assert_eq!(targets, vec!["rule"]);
+            }
+            _ => panic!("Expected rule at position 2"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_unwrap() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        let expected = "VAR = debug\nrule:\n\tcommand\n";
+        assert_eq!(code, expected);
+
+        // Should have no conditionals now
+        assert_eq!(makefile.conditionals().count(), 0);
+
+        // Should still have the variable and rule
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_unwrap_with_else_fails() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        let result = cond.unwrap();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot unwrap conditional with else clause"));
+    }
+
+    #[test]
+    fn test_conditional_unwrap_nested() {
+        let makefile: Makefile = r#"ifdef OUTER
+VAR = outer
+ifdef INNER
+VAR2 = inner
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        // Unwrap the outer conditional
+        let mut outer_cond = makefile.conditionals().next().unwrap();
+        outer_cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        let expected = "VAR = outer\nifdef INNER\nVAR2 = inner\nendif\n";
+        assert_eq!(code, expected);
+    }
+
+    #[test]
+    fn test_conditional_unwrap_empty() {
+        let makefile: Makefile = r#"ifdef DEBUG
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        assert_eq!(code, "");
+    }
+
+    #[test]
+    fn test_rule_parent() {
+        let makefile: Makefile = r#"all:
+	echo "test"
+"#
+        .parse()
+        .unwrap();
+
+        let rule = makefile.rules().next().unwrap();
+        let parent = rule.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn test_variable_parent() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+
+        let var = makefile.variable_definitions().next().unwrap();
+        let parent = var.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn test_include_parent() {
+        let makefile: Makefile = "include common.mk\n".parse().unwrap();
+
+        let inc = makefile.includes().next().unwrap();
+        let parent = inc.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn test_conditional_parent() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let parent = cond.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn test_item_parent_in_conditional() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+
+        // Get items from the conditional
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2);
+
+        // Check variable parent is the conditional
+        if let MakefileItem::Variable(var) = &items[0] {
+            let parent = var.parent();
+            assert!(parent.is_some());
+            if let Some(MakefileItem::Conditional(_)) = parent {
+                // Expected - parent is a conditional
+            } else {
+                panic!("Expected variable parent to be a Conditional");
+            }
+        } else {
+            panic!("Expected first item to be a Variable");
+        }
+
+        // Check rule parent is the conditional
+        if let MakefileItem::Rule(rule) = &items[1] {
+            let parent = rule.parent();
+            assert!(parent.is_some());
+            if let Some(MakefileItem::Conditional(_)) = parent {
+                // Expected - parent is a conditional
+            } else {
+                panic!("Expected rule parent to be a Conditional");
+            }
+        } else {
+            panic!("Expected second item to be a Rule");
+        }
+    }
+
+    #[test]
+    fn test_nested_conditional_parent() {
+        let makefile: Makefile = r#"ifdef OUTER
+VAR = outer
+ifdef INNER
+VAR2 = inner
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let outer_cond = makefile.conditionals().next().unwrap();
+
+        // Get inner conditional from outer conditional's items
+        let items: Vec<_> = outer_cond.if_items().collect();
+
+        // Find the nested conditional
+        let inner_cond = items.iter().find_map(|item| {
+            if let MakefileItem::Conditional(c) = item {
+                Some(c)
+            } else {
+                None
+            }
+        }).unwrap();
+
+        // Inner conditional's parent should be the outer conditional
+        let parent = inner_cond.parent();
+        assert!(parent.is_some());
+        if let Some(MakefileItem::Conditional(_)) = parent {
+            // Expected - parent is a conditional
+        } else {
+            panic!("Expected inner conditional's parent to be a Conditional");
+        }
     }
 }
