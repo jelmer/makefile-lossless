@@ -753,7 +753,6 @@ pub(crate) fn parse(text: &str) -> Parse {
                 || token == "ifeq"
                 || token == "ifneq"
                 || token == "else"
-                || token == "elif"
                 || token == "endif"
         }
 
@@ -765,73 +764,54 @@ pub(crate) fn parse(text: &str) -> Parse {
                     self.parse_conditional();
                     true
                 }
-                "else" | "elif" => {
+                "else" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
-                        self.error(format!("{} without matching if", token));
+                        self.error("else without matching if".to_string());
                         // Always consume a token to guarantee progress
                         self.bump();
                         false
                     } else {
-                        // Consume the token
+                        // Start CONDITIONAL_ELSE node
+                        self.builder.start_node(CONDITIONAL_ELSE.into());
+
+                        // Consume the 'else' token
                         self.bump();
+                        self.skip_ws();
 
-                        // Parse an additional condition if this is an elif
-                        if token == "elif" {
-                            self.skip_ws();
-
-                            // Check various patterns of elif usage
-                            if self.current() == Some(IDENTIFIER) {
-                                let next_token = &self.tokens.last().unwrap().1;
-                                if next_token == "ifeq"
-                                    || next_token == "ifdef"
-                                    || next_token == "ifndef"
-                                    || next_token == "ifneq"
-                                {
-                                    // Parse the nested condition
-                                    match next_token.as_str() {
-                                        "ifdef" | "ifndef" => {
-                                            self.bump(); // Consume the directive token
-                                            self.skip_ws();
-                                            self.parse_simple_condition();
-                                        }
-                                        "ifeq" | "ifneq" => {
-                                            self.bump(); // Consume the directive token
-                                            self.skip_ws();
-                                            self.parse_parenthesized_expr();
-                                        }
-                                        _ => unreachable!(),
+                        // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
+                        if self.current() == Some(IDENTIFIER) {
+                            let next_token = &self.tokens.last().unwrap().1;
+                            if next_token == "ifdef"
+                                || next_token == "ifndef"
+                                || next_token == "ifeq"
+                                || next_token == "ifneq"
+                            {
+                                // This is "else ifdef", "else ifeq", etc.
+                                // Parse the conditional part
+                                match next_token.as_str() {
+                                    "ifdef" | "ifndef" => {
+                                        self.bump(); // Consume the directive token
+                                        self.skip_ws();
+                                        self.parse_simple_condition();
                                     }
-                                } else {
-                                    // Handle other patterns like "elif defined(X)"
-                                    self.builder.start_node(EXPR.into());
-                                    // Just consume tokens until newline - more permissive parsing
-                                    while self.current().is_some()
-                                        && self.current() != Some(NEWLINE)
-                                    {
-                                        self.bump();
+                                    "ifeq" | "ifneq" => {
+                                        self.bump(); // Consume the directive token
+                                        self.skip_ws();
+                                        self.parse_parenthesized_expr();
                                     }
-                                    self.builder.finish_node();
-                                    if self.current() == Some(NEWLINE) {
-                                        self.bump();
-                                    }
+                                    _ => unreachable!(),
                                 }
+                                // The newline will be consumed by the conditional body loop
                             } else {
-                                // Handle any other pattern permissively
-                                self.builder.start_node(EXPR.into());
-                                // Just consume tokens until newline
-                                while self.current().is_some() && self.current() != Some(NEWLINE) {
-                                    self.bump();
-                                }
-                                self.builder.finish_node();
-                                if self.current() == Some(NEWLINE) {
-                                    self.bump();
-                                }
+                                // Plain 'else' with something else after it (not a conditional keyword)
+                                // The newline will be consumed by the conditional body loop
                             }
                         } else {
-                            // For 'else', just expect EOL
-                            self.expect_eol();
+                            // Plain 'else' - the newline will be consumed by the conditional body loop
                         }
+
+                        self.builder.finish_node(); // finish CONDITIONAL_ELSE
                         true
                     }
                 }
@@ -844,6 +824,10 @@ pub(crate) fn parse(text: &str) -> Parse {
                         false
                     } else {
                         *depth -= 1;
+
+                        // Start CONDITIONAL_ENDIF node
+                        self.builder.start_node(CONDITIONAL_ENDIF.into());
+
                         // Consume the endif
                         self.bump();
 
@@ -877,6 +861,7 @@ pub(crate) fn parse(text: &str) -> Parse {
                         }
                         // If we're at EOF after endif, that's fine
 
+                        self.builder.finish_node(); // finish CONDITIONAL_ENDIF
                         true
                     }
                 }
@@ -887,10 +872,14 @@ pub(crate) fn parse(text: &str) -> Parse {
         fn parse_conditional(&mut self) {
             self.builder.start_node(CONDITIONAL.into());
 
+            // Start the initial conditional (ifdef/ifndef/ifeq/ifneq)
+            self.builder.start_node(CONDITIONAL_IF.into());
+
             // Parse the conditional keyword
             let Some(token) = self.parse_conditional_keyword() else {
                 self.skip_until_newline();
-                self.builder.finish_node();
+                self.builder.finish_node(); // finish CONDITIONAL_IF
+                self.builder.finish_node(); // finish CONDITIONAL
                 return;
             };
 
@@ -915,6 +904,8 @@ pub(crate) fn parse(text: &str) -> Parse {
             } else {
                 self.expect_eol();
             }
+
+            self.builder.finish_node(); // finish CONDITIONAL_IF
 
             // Parse the conditional body
             let mut depth = 1;
@@ -3139,11 +3130,11 @@ mod tests {
             Makefile::read_relaxed(&mut buf).expect("Failed to parse empty conditionals");
         assert!(makefile.code().contains("ifdef DEBUG"));
 
-        // Conditionals with elif
-        let code = "ifeq ($(OS),Windows)\n    EXT := .exe\nelif ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n";
+        // Conditionals with else ifeq
+        let code = "ifeq ($(OS),Windows)\n    EXT := .exe\nelse ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n";
         let mut buf = code.as_bytes();
         let makefile =
-            Makefile::read_relaxed(&mut buf).expect("Failed to parse conditionals with elif");
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse conditionals with else ifeq");
         assert!(makefile.code().contains("EXT"));
 
         // Invalid conditionals - this should generate parse errors but still produce a Makefile
@@ -4258,24 +4249,169 @@ all:: prerequisite2
     }
 
     #[test]
-    fn test_elif_directive() {
+    fn test_else_conditional_directives() {
+        // Test else ifeq
         let content = r#"
 ifeq ($(OS),Windows_NT)
     TARGET = windows
-elif ifeq ($(OS),Darwin)
+else ifeq ($(OS),Darwin)
     TARGET = macos
-elif ifeq ($(OS),Linux)
+else ifeq ($(OS),Linux)
     TARGET = linux
 else
     TARGET = unknown
 endif
 "#;
-        // Use relaxed parsing for now
         let mut buf = content.as_bytes();
-        let _makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse elif directive");
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifeq directive");
+        assert!(makefile.code().contains("else ifeq"));
+        assert!(makefile.code().contains("TARGET"));
 
-        // For now, just verify that the parsing doesn't panic
-        // We'll add more specific assertions once elif support is implemented
+        // Test else ifdef
+        let content = r#"
+ifdef WINDOWS
+    TARGET = windows
+else ifdef DARWIN
+    TARGET = macos
+else ifdef LINUX
+    TARGET = linux
+else
+    TARGET = unknown
+endif
+"#;
+        let mut buf = content.as_bytes();
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifdef directive");
+        assert!(makefile.code().contains("else ifdef"));
+
+        // Test else ifndef
+        let content = r#"
+ifndef NOWINDOWS
+    TARGET = windows
+else ifndef NODARWIN
+    TARGET = macos
+else
+    TARGET = linux
+endif
+"#;
+        let mut buf = content.as_bytes();
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifndef directive");
+        assert!(makefile.code().contains("else ifndef"));
+
+        // Test else ifneq
+        let content = r#"
+ifneq ($(OS),Windows_NT)
+    TARGET = not_windows
+else ifneq ($(OS),Darwin)
+    TARGET = not_macos
+else
+    TARGET = darwin
+endif
+"#;
+        let mut buf = content.as_bytes();
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifneq directive");
+        assert!(makefile.code().contains("else ifneq"));
+    }
+
+    #[test]
+    fn test_complex_else_conditionals() {
+        // Test complex nested else conditionals with mixed types
+        let content = r#"VAR1 := foo
+VAR2 := bar
+
+ifeq ($(VAR1),foo)
+    RESULT := foo_matched
+else ifdef VAR2
+    RESULT := var2_defined
+else ifndef VAR3
+    RESULT := var3_not_defined
+else
+    RESULT := final_else
+endif
+
+all:
+	@echo $(RESULT)
+"#;
+        let mut buf = content.as_bytes();
+        let makefile =
+            Makefile::read_relaxed(&mut buf).expect("Failed to parse complex else conditionals");
+
+        // Verify the structure is preserved
+        let code = makefile.code();
+        assert!(code.contains("ifeq ($(VAR1),foo)"));
+        assert!(code.contains("else ifdef VAR2"));
+        assert!(code.contains("else ifndef VAR3"));
+        assert!(code.contains("else"));
+        assert!(code.contains("endif"));
+        assert!(code.contains("RESULT"));
+
+        // Verify rules are still parsed correctly
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["all"]);
+    }
+
+    #[test]
+    fn test_conditional_token_structure() {
+        // Test that conditionals have proper token structure
+        let content = r#"ifdef VAR1
+X := 1
+else ifdef VAR2
+X := 2
+else
+X := 3
+endif
+"#;
+        let mut buf = content.as_bytes();
+        let makefile = Makefile::read_relaxed(&mut buf).unwrap();
+
+        // Check that we can traverse the syntax tree
+        let syntax = makefile.syntax();
+
+        // Find CONDITIONAL nodes
+        let mut found_conditional = false;
+        let mut found_conditional_if = false;
+        let mut found_conditional_else = false;
+        let mut found_conditional_endif = false;
+
+        fn check_node(
+            node: &SyntaxNode,
+            found_cond: &mut bool,
+            found_if: &mut bool,
+            found_else: &mut bool,
+            found_endif: &mut bool,
+        ) {
+            match node.kind() {
+                SyntaxKind::CONDITIONAL => *found_cond = true,
+                SyntaxKind::CONDITIONAL_IF => *found_if = true,
+                SyntaxKind::CONDITIONAL_ELSE => *found_else = true,
+                SyntaxKind::CONDITIONAL_ENDIF => *found_endif = true,
+                _ => {}
+            }
+
+            for child in node.children() {
+                check_node(&child, found_cond, found_if, found_else, found_endif);
+            }
+        }
+
+        check_node(
+            &syntax,
+            &mut found_conditional,
+            &mut found_conditional_if,
+            &mut found_conditional_else,
+            &mut found_conditional_endif,
+        );
+
+        assert!(found_conditional, "Should have CONDITIONAL node");
+        assert!(found_conditional_if, "Should have CONDITIONAL_IF node");
+        assert!(found_conditional_else, "Should have CONDITIONAL_ELSE node");
+        assert!(
+            found_conditional_endif,
+            "Should have CONDITIONAL_ENDIF node"
+        );
     }
 
     #[test]
