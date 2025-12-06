@@ -1320,7 +1320,7 @@ impl Parse {
 
 macro_rules! ast_node {
     ($ast:ident, $kind:ident) => {
-        #[derive(PartialEq, Eq, Hash)]
+        #[derive(Clone, PartialEq, Eq, Hash)]
         #[repr(transparent)]
         /// An AST node for $ast
         pub struct $ast(SyntaxNode);
@@ -6156,5 +6156,49 @@ override_dh_install:
             let result = rule.to_string();
             assert_eq!(rule_text, result, "Round-trip failed for {:?}", rule_text);
         }
+    }
+
+    #[test]
+    fn test_rule_clone() {
+        // Test that Rule can be cloned and produces an identical copy
+        let rule_text = "rule:\n\tcommand\n\n";
+        let rule: Rule = rule_text.parse().unwrap();
+        let cloned = rule.clone();
+
+        // Both should produce the same string representation
+        assert_eq!(rule.to_string(), cloned.to_string());
+        assert_eq!(rule.to_string(), rule_text);
+        assert_eq!(cloned.to_string(), rule_text);
+
+        // Verify targets and recipes are the same
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            cloned.targets().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            cloned.recipes().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_makefile_clone() {
+        // Test that Makefile and other AST nodes can be cloned
+        let input = "VAR = value\n\nrule:\n\tcommand\n";
+        let makefile: Makefile = input.parse().unwrap();
+        let cloned = makefile.clone();
+
+        // Both should produce the same string representation
+        assert_eq!(makefile.to_string(), cloned.to_string());
+        assert_eq!(makefile.to_string(), input);
+
+        // Verify rule count is the same
+        assert_eq!(makefile.rules().count(), cloned.rules().count());
+
+        // Verify variable definitions are the same
+        assert_eq!(
+            makefile.variable_definitions().count(),
+            cloned.variable_definitions().count()
+        );
     }
 }
