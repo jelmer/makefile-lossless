@@ -63,7 +63,10 @@ pub enum SyntaxKind {
     PREREQUISITE,  // A single prerequisite item
 
     // Directives
-    CONDITIONAL,
+    CONDITIONAL,       // The entire conditional block (ifdef...endif)
+    CONDITIONAL_IF,    // The initial conditional (ifdef/ifndef/ifeq/ifneq)
+    CONDITIONAL_ELSE,  // An else or else-conditional clause
+    CONDITIONAL_ENDIF, // The endif keyword
     INCLUDE,
 
     // Archive members

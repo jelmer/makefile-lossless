@@ -772,6 +772,9 @@ pub(crate) fn parse(text: &str) -> Parse {
                         self.bump();
                         false
                     } else {
+                        // Start CONDITIONAL_ELSE node
+                        self.builder.start_node(CONDITIONAL_ELSE.into());
+
                         // Consume the 'else' token
                         self.bump();
                         self.skip_ws();
@@ -807,6 +810,8 @@ pub(crate) fn parse(text: &str) -> Parse {
                         } else {
                             // Plain 'else' - the newline will be consumed by the conditional body loop
                         }
+
+                        self.builder.finish_node(); // finish CONDITIONAL_ELSE
                         true
                     }
                 }
@@ -819,6 +824,10 @@ pub(crate) fn parse(text: &str) -> Parse {
                         false
                     } else {
                         *depth -= 1;
+
+                        // Start CONDITIONAL_ENDIF node
+                        self.builder.start_node(CONDITIONAL_ENDIF.into());
+
                         // Consume the endif
                         self.bump();
 
@@ -852,6 +861,7 @@ pub(crate) fn parse(text: &str) -> Parse {
                         }
                         // If we're at EOF after endif, that's fine
 
+                        self.builder.finish_node(); // finish CONDITIONAL_ENDIF
                         true
                     }
                 }
@@ -862,10 +872,14 @@ pub(crate) fn parse(text: &str) -> Parse {
         fn parse_conditional(&mut self) {
             self.builder.start_node(CONDITIONAL.into());
 
+            // Start the initial conditional (ifdef/ifndef/ifeq/ifneq)
+            self.builder.start_node(CONDITIONAL_IF.into());
+
             // Parse the conditional keyword
             let Some(token) = self.parse_conditional_keyword() else {
                 self.skip_until_newline();
-                self.builder.finish_node();
+                self.builder.finish_node(); // finish CONDITIONAL_IF
+                self.builder.finish_node(); // finish CONDITIONAL
                 return;
             };
 
@@ -890,6 +904,8 @@ pub(crate) fn parse(text: &str) -> Parse {
             } else {
                 self.expect_eol();
             }
+
+            self.builder.finish_node(); // finish CONDITIONAL_IF
 
             // Parse the conditional body
             let mut depth = 1;
@@ -4336,6 +4352,66 @@ all:
         let rules: Vec<_> = makefile.rules().collect();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["all"]);
+    }
+
+    #[test]
+    fn test_conditional_token_structure() {
+        // Test that conditionals have proper token structure
+        let content = r#"ifdef VAR1
+X := 1
+else ifdef VAR2
+X := 2
+else
+X := 3
+endif
+"#;
+        let mut buf = content.as_bytes();
+        let makefile = Makefile::read_relaxed(&mut buf).unwrap();
+
+        // Check that we can traverse the syntax tree
+        let syntax = makefile.syntax();
+
+        // Find CONDITIONAL nodes
+        let mut found_conditional = false;
+        let mut found_conditional_if = false;
+        let mut found_conditional_else = false;
+        let mut found_conditional_endif = false;
+
+        fn check_node(
+            node: &SyntaxNode,
+            found_cond: &mut bool,
+            found_if: &mut bool,
+            found_else: &mut bool,
+            found_endif: &mut bool,
+        ) {
+            match node.kind() {
+                SyntaxKind::CONDITIONAL => *found_cond = true,
+                SyntaxKind::CONDITIONAL_IF => *found_if = true,
+                SyntaxKind::CONDITIONAL_ELSE => *found_else = true,
+                SyntaxKind::CONDITIONAL_ENDIF => *found_endif = true,
+                _ => {}
+            }
+
+            for child in node.children() {
+                check_node(&child, found_cond, found_if, found_else, found_endif);
+            }
+        }
+
+        check_node(
+            &syntax,
+            &mut found_conditional,
+            &mut found_conditional_if,
+            &mut found_conditional_else,
+            &mut found_conditional_endif,
+        );
+
+        assert!(found_conditional, "Should have CONDITIONAL node");
+        assert!(found_conditional_if, "Should have CONDITIONAL_IF node");
+        assert!(found_conditional_else, "Should have CONDITIONAL_ELSE node");
+        assert!(
+            found_conditional_endif,
+            "Should have CONDITIONAL_ENDIF node"
+        );
     }
 
     #[test]
