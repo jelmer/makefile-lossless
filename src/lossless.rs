@@ -1833,9 +1833,83 @@ impl Makefile {
             rules[index].index()
         };
 
-        // Insert the rule at the target index
+        // Build the nodes to insert
+        let mut nodes_to_insert = Vec::new();
+
+        // Determine if we need to add blank lines to maintain formatting consistency
+        if index == 0 && !rules.is_empty() {
+            // Inserting before the first rule - check if first rule has a blank line before it
+            // If so, we should add one after our new rule instead
+            // For now, just add the rule without a blank line before it
+            nodes_to_insert.push(new_rule.0.clone().into());
+
+            // Add a blank line after the new rule
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+            nodes_to_insert.push(blank_line.into());
+        } else if index < rules.len() {
+            // Inserting in the middle (before an existing rule)
+            // The syntax tree structure is: ... [maybe BLANK_LINE] RULE(target) ...
+            // We're inserting right before RULE(target)
+
+            // If there's a BLANK_LINE immediately before the target rule,
+            // it will stay there and separate the previous rule from our new rule.
+            // We don't need to add a BLANK_LINE before our new rule in that case.
+
+            // But we DO need to add a BLANK_LINE after our new rule to separate it
+            // from the target rule (which we're inserting before).
+
+            // Check if there's a blank line immediately before target_index
+            let has_blank_before = if target_index > 0 {
+                self.0
+                    .children_with_tokens()
+                    .nth(target_index - 1)
+                    .and_then(|n| n.as_node().map(|node| node.kind() == BLANK_LINE))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            // Only add a blank before if there isn't one already and we're not at the start
+            if !has_blank_before && index > 0 {
+                let mut bl_builder = GreenNodeBuilder::new();
+                bl_builder.start_node(BLANK_LINE.into());
+                bl_builder.token(NEWLINE.into(), "\n");
+                bl_builder.finish_node();
+                let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+                nodes_to_insert.push(blank_line.into());
+            }
+
+            // Add the new rule
+            nodes_to_insert.push(new_rule.0.clone().into());
+
+            // Always add a blank line after the new rule to separate it from the next rule
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+            nodes_to_insert.push(blank_line.into());
+        } else {
+            // Inserting at the end when there are existing rules
+            // Add a blank line before the new rule
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.finish_node();
+            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
+            nodes_to_insert.push(blank_line.into());
+
+            // Add the new rule
+            nodes_to_insert.push(new_rule.0.clone().into());
+        }
+
+        // Insert all nodes at the target index
         self.0
-            .splice_children(target_index..target_index, vec![new_rule.0.clone().into()]);
+            .splice_children(target_index..target_index, nodes_to_insert);
         Ok(())
     }
 
@@ -4939,6 +5013,32 @@ endif
 
         let result = makefile.insert_rule(5, new_rule);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_rule_preserves_blank_line_spacing_at_end() {
+        // Test that inserting at the end preserves blank line spacing
+        let input = "rule1:\n\tcommand1\n\nrule2:\n\tcommand2\n";
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule = Rule::new(&["rule3"], &[], &["command3"]);
+
+        makefile.insert_rule(2, new_rule).unwrap();
+
+        let expected = "rule1:\n\tcommand1\n\nrule2:\n\tcommand2\n\nrule3:\n\tcommand3\n";
+        assert_eq!(makefile.to_string(), expected);
+    }
+
+    #[test]
+    fn test_insert_rule_adds_blank_lines_when_missing() {
+        // Test that inserting adds blank lines even when input has none
+        let input = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n";
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule = Rule::new(&["rule3"], &[], &["command3"]);
+
+        makefile.insert_rule(2, new_rule).unwrap();
+
+        let expected = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n\nrule3:\n\tcommand3\n";
+        assert_eq!(makefile.to_string(), expected);
     }
 
     #[test]
