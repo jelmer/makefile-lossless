@@ -21,6 +21,7 @@
 //! assert_eq!(makefile.rules().count(), 3);
 //! ```
 
+mod ast;
 mod lex;
 mod lossless;
 mod parse;
