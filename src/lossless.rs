@@ -422,6 +422,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // and comment lines within recipes.
                         self.bump();
                     }
+                    Some(IDENTIFIER) => {
+                        let token = &self.tokens.last().unwrap().1.clone();
+                        // Check if this is a conditional directive that can appear in recipes
+                        if self.is_conditional_directive(token) {
+                            self.parse_conditional();
+                        } else if token == "include" || token == "-include" || token == "sinclude" {
+                            self.parse_include();
+                        } else {
+                            break;
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -916,9 +927,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
             if self.current() == Some(COMMENT) {
                 self.parse_comment();
-            } else {
-                self.expect_eol();
             }
+            // Note: expect_eol is already called by parse_simple_condition() and parse_parenthesized_expr()
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
 
@@ -6415,5 +6425,44 @@ override_dh_install:
             makefile.variable_definitions().count(),
             cloned.variable_definitions().count()
         );
+    }
+
+    #[test]
+    fn test_conditional_with_recipe_line() {
+        // Test that conditionals with recipe lines (tab-indented) work correctly
+        let input = "ifeq (,$(X))\n\t./run-tests\nendif\n";
+        let parsed = parse(input, None);
+
+        // Should parse without errors
+        assert!(
+            parsed.errors.is_empty(),
+            "Expected no parse errors, but got: {:?}",
+            parsed.errors
+        );
+
+        // Should preserve the code
+        let mf = parsed.root();
+        assert_eq!(mf.code(), input);
+    }
+
+    #[test]
+    fn test_conditional_in_rule_recipe() {
+        // Test conditional inside a rule's recipe section
+        let input = "override_dh_auto_test:\nifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))\n\t./run-tests\nendif\n";
+        let parsed = parse(input, None);
+
+        // Should parse without errors
+        assert!(
+            parsed.errors.is_empty(),
+            "Expected no parse errors, but got: {:?}",
+            parsed.errors
+        );
+
+        // Should preserve the code
+        let mf = parsed.root();
+        assert_eq!(mf.code(), input);
+
+        // Should have exactly one rule
+        assert_eq!(mf.rules().count(), 1);
     }
 }
