@@ -1412,6 +1412,53 @@ impl ArchiveMember {
     }
 }
 
+/// Helper function to trim trailing newlines from a RULE node.
+///
+/// This removes trailing NEWLINE tokens from the end of a RULE node to avoid
+/// extra blank lines at the end of a file when the last rule is removed.
+fn trim_trailing_newlines(node: &SyntaxNode) {
+    // Collect all trailing NEWLINE tokens at the end of the rule and within RECIPE nodes
+    let mut newlines_to_remove = vec![];
+    let mut current = node.last_child_or_token();
+
+    while let Some(element) = current {
+        match &element {
+            rowan::NodeOrToken::Token(token) if token.kind() == NEWLINE => {
+                newlines_to_remove.push(token.clone());
+                current = token.prev_sibling_or_token();
+            }
+            rowan::NodeOrToken::Node(n) if n.kind() == RECIPE => {
+                // Also check for trailing newlines in the RECIPE node
+                let mut recipe_current = n.last_child_or_token();
+                while let Some(recipe_element) = recipe_current {
+                    match &recipe_element {
+                        rowan::NodeOrToken::Token(token) if token.kind() == NEWLINE => {
+                            newlines_to_remove.push(token.clone());
+                            recipe_current = token.prev_sibling_or_token();
+                        }
+                        _ => break,
+                    }
+                }
+                break; // Stop after checking the last RECIPE node
+            }
+            _ => break,
+        }
+    }
+
+    // Remove all but one trailing newline (keep at least one)
+    // Remove from highest index to lowest to avoid index shifts
+    if newlines_to_remove.len() > 1 {
+        // Sort by index descending
+        newlines_to_remove.sort_by_key(|t| std::cmp::Reverse(t.index()));
+
+        for token in newlines_to_remove.iter().take(newlines_to_remove.len() - 1) {
+            let parent = token.parent().unwrap();
+            let idx = token.index();
+            parent.splice_children(idx..idx + 1, vec![]);
+        }
+    }
+}
+
 /// Helper function to remove a node along with its preceding comments and up to 1 empty line.
 ///
 /// This walks backward from the node, removing:
@@ -1452,43 +1499,51 @@ fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
         current = element.prev_sibling_or_token();
     }
 
-    // Remove the node first
-    let node_index = node.index();
-    parent.splice_children(node_index..node_index + 1, vec![]);
-
-    // Only remove preceding elements if we found at least one comment
-    if found_comment {
-        let mut consecutive_newlines = 0;
-        for element in collected_elements.iter().rev() {
-            let should_remove = match element {
-                rowan::NodeOrToken::Token(token) => match token.kind() {
-                    COMMENT => {
-                        consecutive_newlines = 0;
-                        true
-                    }
-                    NEWLINE => {
-                        consecutive_newlines += 1;
-                        consecutive_newlines <= 1
-                    }
-                    WHITESPACE => true,
-                    _ => false,
-                },
-                rowan::NodeOrToken::Node(n) => {
-                    // Handle BLANK_LINE nodes (count as newlines)
-                    if n.kind() == BLANK_LINE {
-                        consecutive_newlines += 1;
-                        consecutive_newlines <= 1
-                    } else {
-                        false
-                    }
+    // Determine which preceding elements to remove
+    // If we found comments, remove them along with up to 1 blank line
+    let mut elements_to_remove = vec![];
+    let mut consecutive_newlines = 0;
+    for element in collected_elements.iter().rev() {
+        let should_remove = match element {
+            rowan::NodeOrToken::Token(token) => match token.kind() {
+                COMMENT => {
+                    consecutive_newlines = 0;
+                    found_comment
                 }
-            };
-
-            if should_remove {
-                let idx = element.index();
-                parent.splice_children(idx..idx + 1, vec![]);
+                NEWLINE => {
+                    consecutive_newlines += 1;
+                    found_comment && consecutive_newlines <= 1
+                }
+                WHITESPACE => found_comment,
+                _ => false,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                // Handle BLANK_LINE nodes (count as newlines)
+                if n.kind() == BLANK_LINE {
+                    consecutive_newlines += 1;
+                    found_comment && consecutive_newlines <= 1
+                } else {
+                    false
+                }
             }
+        };
+
+        if should_remove {
+            elements_to_remove.push(element.clone());
         }
+    }
+
+    // Remove elements in reverse order (from highest index to lowest) to avoid index shifts
+    // Start with the node itself, then preceding elements
+    let mut all_to_remove = vec![rowan::NodeOrToken::Node(node.clone())];
+    all_to_remove.extend(elements_to_remove.into_iter().rev());
+
+    // Sort by index in descending order
+    all_to_remove.sort_by_key(|el| std::cmp::Reverse(el.index()));
+
+    for element in all_to_remove {
+        let idx = element.index();
+        parent.splice_children(idx..idx + 1, vec![]);
     }
 }
 
@@ -3145,6 +3200,8 @@ impl Rule {
     /// ```
     ///
     /// This will also remove any preceding comments and up to 1 empty line before the rule.
+    /// When removing the last rule in a makefile, this will also trim any trailing blank lines
+    /// from the previous rule to avoid leaving extra whitespace at the end of the file.
     pub fn remove(self) -> Result<(), Error> {
         let parent = self.syntax().parent().ok_or_else(|| {
             Error::Parse(ParseError {
@@ -3156,7 +3213,27 @@ impl Rule {
             })
         })?;
 
+        // Check if this is the last rule by seeing if there's any next sibling that's a RULE
+        let is_last_rule = self
+            .syntax()
+            .siblings(rowan::Direction::Next)
+            .skip(1) // Skip self
+            .all(|sibling| sibling.kind() != RULE);
+
         remove_with_preceding_comments(self.syntax(), &parent);
+
+        // If we removed the last rule, trim trailing newlines from the last remaining RULE
+        if is_last_rule {
+            // Find the last RULE node in the parent
+            if let Some(last_rule_node) = parent
+                .children()
+                .filter(|child| child.kind() == RULE)
+                .last()
+            {
+                trim_trailing_newlines(&last_rule_node);
+            }
+        }
+
         Ok(())
     }
 }
@@ -5944,6 +6021,23 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
         assert_eq!(makefile.rules().count(), 1);
         assert!(makefile.find_rule_by_target("rule1").is_none());
         assert!(makefile.find_rule_by_target("rule2").is_some());
+    }
+
+    #[test]
+    fn test_rule_remove_last_trims_blank_lines() {
+        // Regression test for bug where removing the last rule left trailing blank lines
+        let makefile: Makefile =
+            "%:\n\tdh $@\n\noverride_dh_missing:\n\tdh_missing --fail-missing\n"
+                .parse()
+                .unwrap();
+
+        // Remove the last rule (override_dh_missing)
+        let rule = makefile.find_rule_by_target("override_dh_missing").unwrap();
+        rule.remove().unwrap();
+
+        // Should not have trailing blank line
+        assert_eq!(makefile.code(), "%:\n\tdh $@\n");
+        assert_eq!(makefile.rules().count(), 1);
     }
 
     #[test]
