@@ -12,14 +12,16 @@ pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line_type: Option<LineType>,
     continuation: bool,
+    variant: Option<crate::lossless::MakefileVariant>,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
+    pub fn new(input: &'a str, variant: Option<crate::lossless::MakefileVariant>) -> Self {
         Lexer {
             input: input.chars().peekable(),
             continuation: false,
             line_type: None,
+            variant,
         }
     }
 
@@ -172,6 +174,31 @@ impl<'a> Lexer<'a> {
                         SyntaxKind::IDENTIFIER,
                         self.read_while(Self::is_valid_identifier_char),
                     )),
+                    '!' if matches!(
+                        self.variant,
+                        Some(crate::lossless::MakefileVariant::NMake)
+                    ) =>
+                    {
+                        // Handle NMake directives like !IF, !IFDEF, !ERROR, etc.
+                        self.input.next(); // consume '!'
+                        if let Some(&next_char) = self.input.peek() {
+                            if Self::is_valid_identifier_char(next_char) {
+                                // This is an NMake directive - return !IDENTIFIER as one token
+                                let ident = self.read_while(Self::is_valid_identifier_char);
+                                Some((SyntaxKind::IDENTIFIER, format!("!{}", ident)))
+                            } else if next_char == '=' {
+                                // != operator
+                                self.input.next();
+                                Some((SyntaxKind::OPERATOR, "!=".to_string()))
+                            } else {
+                                // Standalone ! is an error
+                                Some((SyntaxKind::ERROR, "!".to_string()))
+                            }
+                        } else {
+                            // ! at end of file
+                            Some((SyntaxKind::ERROR, "!".to_string()))
+                        }
+                    }
                     '"' | '\'' => {
                         if self.has_matching_close_quote(c) {
                             Some((SyntaxKind::QUOTE, self.read_quoted_string()))
@@ -241,8 +268,11 @@ impl Iterator for Lexer<'_> {
     }
 }
 
-pub(crate) fn lex(input: &str) -> Vec<(SyntaxKind, String)> {
-    Lexer::new(input).collect()
+pub(crate) fn lex(
+    input: &str,
+    variant: Option<crate::lossless::MakefileVariant>,
+) -> Vec<(SyntaxKind, String)> {
+    Lexer::new(input, variant).collect()
 }
 
 #[cfg(test)]
@@ -253,17 +283,20 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        assert_eq!(lex(""), vec![]);
+        assert_eq!(lex("", None), vec![]);
     }
 
     #[test]
     fn test_simple() {
         assert_eq!(
-            lex(r#"VARIABLE = value
+            lex(
+                r#"VARIABLE = value
 
 rule: prerequisite
 	recipe
-"#)
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -290,8 +323,11 @@ rule: prerequisite
     #[test]
     fn test_bare_export() {
         assert_eq!(
-            lex(r#"export
-"#)
+            lex(
+                r#"export
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -302,8 +338,11 @@ rule: prerequisite
     #[test]
     fn test_export() {
         assert_eq!(
-            lex(r#"export VARIABLE
-"#)
+            lex(
+                r#"export VARIABLE
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -319,8 +358,11 @@ rule: prerequisite
     #[test]
     fn test_export_assignment() {
         assert_eq!(
-            lex(r#"export VARIABLE := value
-"#)
+            lex(
+                r#"export VARIABLE := value
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -340,10 +382,13 @@ rule: prerequisite
     #[test]
     fn test_multiple_prerequisites() {
         assert_eq!(
-            lex(r#"rule: prerequisite1 prerequisite2
+            lex(
+                r#"rule: prerequisite1 prerequisite2
 	recipe
 
-"#)
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -366,7 +411,7 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            lex("VARIABLE ?= value\n")
+            lex("VARIABLE ?= value\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -384,9 +429,12 @@ rule: prerequisite
     #[test]
     fn test_conditional() {
         assert_eq!(
-            lex(r#"ifneq (a, b)
+            lex(
+                r#"ifneq (a, b)
 endif
-"#)
+"#,
+                None
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -409,7 +457,7 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            lex("VARIABLE = $(value)\n")
+            lex("VARIABLE = $(value)\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -430,7 +478,7 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            lex("VARIABLE = $(value)$(value2)\n")
+            lex("VARIABLE = $(value)$(value2)\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -485,13 +533,13 @@ override_dh_auto_clean:
 #EOF
     "#;
 
-        let _lexed = lex(text);
+        let _lexed = lex(text, None);
     }
 
     #[test]
     fn test_pattern_rule() {
         assert_eq!(
-            lex("%.o: %.c\n")
+            lex("%.o: %.c\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -508,7 +556,7 @@ override_dh_auto_clean:
     #[test]
     fn test_include_directive() {
         assert_eq!(
-            lex("-include .env\n")
+            lex("-include .env\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -524,7 +572,7 @@ override_dh_auto_clean:
     #[test]
     fn test_slash_in_identifier() {
         assert_eq!(
-            lex("usr/bin/foo: src/main.o\n")
+            lex("usr/bin/foo: src/main.o\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -539,9 +587,75 @@ override_dh_auto_clean:
     }
 
     #[test]
+    fn test_nmake_directives() {
+        use crate::lossless::MakefileVariant;
+
+        // Test NMake !IF directive
+        assert_eq!(
+            lex("!IF \"$(DEBUG)\" == \"1\"\n", Some(MakefileVariant::NMake))
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "!IF"),
+                (WHITESPACE, " "),
+                (QUOTE, "\"$(DEBUG)\""),
+                (WHITESPACE, " "),
+                (OPERATOR, "=="),
+                (WHITESPACE, " "),
+                (QUOTE, "\"1\""),
+                (NEWLINE, "\n"),
+            ]
+        );
+
+        // Test NMake !IFDEF directive
+        assert_eq!(
+            lex("!IFDEF DEBUG\n", Some(MakefileVariant::NMake))
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "!IFDEF"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
+
+        // Test NMake !ELSE and !ENDIF
+        assert_eq!(
+            lex("!ELSE\n!ENDIF\n", Some(MakefileVariant::NMake))
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "!ELSE"),
+                (NEWLINE, "\n"),
+                (IDENTIFIER, "!ENDIF"),
+                (NEWLINE, "\n"),
+            ]
+        );
+
+        // Test that ! without NMake variant produces error
+        assert_eq!(
+            lex("!IF DEBUG\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ERROR, "!"),
+                (IDENTIFIER, "IF"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_backslash_in_variable_continuation() {
         let input = "VAR ?= $(shell cmd | \\\n\t\tsed -rne 's,^V: ([^-]+).*,\\1,p')\n";
-        let tokens = lex(input);
+        let tokens = lex(input, None);
         // Check that the backslash before '1' is preserved
         let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(input, text, "Token text reconstruction differs from input");

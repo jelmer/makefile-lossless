@@ -829,13 +829,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_conditional_keyword(&mut self) -> Option<String> {
             if self.current() != Some(IDENTIFIER) {
                 self.error(
-                    "expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".to_string(),
+                    "expected conditional keyword (ifdef, ifndef, ifeq, ifneq, !IF, !IFDEF, or !IFNDEF)".to_string(),
                 );
                 return None;
             }
 
             let token = self.tokens.last().unwrap().1.clone();
-            if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
+            let token_lower = token.to_lowercase();
+
+            // Check if this is a valid conditional directive
+            let is_valid = if matches!(self.variant, Some(MakefileVariant::NMake)) {
+                // NMake directives (case-insensitive)
+                ["!if", "!ifdef", "!ifndef"].contains(&token_lower.as_str())
+            } else {
+                // GNU Make directives (case-sensitive)
+                ["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str())
+            };
+
+            if !is_valid {
                 self.error(format!("unknown conditional directive: {}", token));
                 return None;
             }
@@ -891,6 +902,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // We don't include else/endif here because they are handled within parse_conditional
             if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) {
                 token == "ifdef" || token == "ifndef" || token == "ifeq" || token == "ifneq"
+            } else if matches!(self.variant, Some(MakefileVariant::NMake)) {
+                // NMake directives are case-insensitive and start with !
+                // Handle !IF, !IFDEF, !IFNDEF (not !ELSEIF or !ELSE or !ENDIF)
+                let lower = token.to_lowercase();
+                lower == "!if" || lower == "!ifdef" || lower == "!ifndef"
             } else {
                 false
             }
@@ -898,7 +914,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         // Helper method to handle conditional token
         fn handle_conditional_token(&mut self, token: &str, depth: &mut usize) -> bool {
-            match token {
+            // For NMake, convert to lowercase for case-insensitive matching
+            let token_lower = token.to_lowercase();
+            let token_to_match = if matches!(self.variant, Some(MakefileVariant::NMake)) {
+                token_lower.as_str()
+            } else {
+                token
+            };
+
+            match token_to_match {
                 "ifdef" | "ifndef" | "ifeq" | "ifneq"
                     if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
                 {
@@ -907,10 +931,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_conditional();
                     true
                 }
-                "else" => {
+                "!ifdef" | "!ifndef" | "!if"
+                    if matches!(self.variant, Some(MakefileVariant::NMake)) =>
+                {
+                    *depth += 1;
+                    self.parse_conditional();
+                    true
+                }
+                "else" | "!else" | "!elseif" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
-                        self.error("else without matching if".to_string());
+                        self.error(format!("{} without matching if", token));
                         // Always consume a token to guarantee progress
                         self.bump();
                         false
@@ -918,12 +949,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Start CONDITIONAL_ELSE node
                         self.builder.start_node(CONDITIONAL_ELSE.into());
 
-                        // Consume the 'else' token
+                        // Consume the 'else' or '!else' or '!elseif' token
                         self.bump();
                         self.skip_ws();
 
-                        // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
-                        if self.current() == Some(IDENTIFIER) {
+                        // For NMake !ELSEIF, parse the condition
+                        if token_to_match == "!elseif" {
+                            // NMake !ELSEIF has a condition after it
+                            self.parse_simple_condition();
+                        } else if self.current() == Some(IDENTIFIER) {
+                            // Check if this is "else <conditional>" (GNU Make only)
                             let next_token = &self.tokens.last().unwrap().1;
                             if next_token == "ifdef"
                                 || next_token == "ifndef"
@@ -958,7 +993,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         true
                     }
                 }
-                "endif" => {
+                "endif" | "!endif" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
                         self.error("endif without matching if".to_string());
@@ -1032,14 +1067,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Parse the condition based on keyword type
             // Note: Both parse_simple_condition and parse_parenthesized_expr
             // handle consuming the newline at the end of the line
-            match token.as_str() {
-                "ifdef" | "ifndef" => {
+            let token_lower = token.to_lowercase();
+            let token_to_check = if matches!(self.variant, Some(MakefileVariant::NMake)) {
+                token_lower.as_str()
+            } else {
+                token.as_str()
+            };
+
+            match token_to_check {
+                "ifdef" | "ifndef" | "!ifdef" | "!ifndef" | "!if" => {
                     self.parse_simple_condition();
                 }
                 "ifeq" | "ifneq" => {
                     self.parse_parenthesized_expr();
                 }
-                _ => unreachable!("Invalid conditional token"),
+                _ => unreachable!("Invalid conditional token: {}", token),
             }
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
@@ -1192,9 +1234,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => false,
                 Some(IDENTIFIER) => {
                     let token = &self.tokens.last().unwrap().1;
-                    if self.is_conditional_directive(token)
-                        && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-                    {
+                    if self.is_conditional_directive(token) {
                         self.parse_conditional();
                         true
                     } else {
@@ -1432,7 +1472,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
     }
 
-    let mut tokens = lex(text);
+    let mut tokens = lex(text, variant);
 
     // Build token positions in forward order before reversing
     let mut token_positions = Vec::with_capacity(tokens.len());
@@ -7669,5 +7709,49 @@ mod test_continuation {
         let makefile_bsd = parsed_bsd.root();
         // Round-trip should still preserve the text even if not recognized as a conditional
         assert_eq!(makefile_bsd.code(), text);
+    }
+
+    #[test]
+    fn test_nmake_conditional_parsing() {
+        // Test basic NMake !IFDEF directive
+        let text = "!IFDEF DEBUG\nCFLAGS = -g\n!ENDIF\n";
+        let parsed = parse(text, Some(MakefileVariant::NMake));
+        assert!(
+            parsed.errors.is_empty(),
+            "NMake variant should parse NMake conditionals. Errors: {:?}",
+            parsed.errors
+        );
+        let makefile = parsed.root();
+        assert_eq!(makefile.code(), text);
+
+        // Test NMake !IF directive (case-insensitive)
+        let text_lower = "!if DEBUG\nCFLAGS = -g\n!endif\n";
+        let parsed_lower = parse(text_lower, Some(MakefileVariant::NMake));
+        assert!(
+            parsed_lower.errors.is_empty(),
+            "NMake directives should be case-insensitive. Errors: {:?}",
+            parsed_lower.errors
+        );
+        let makefile_lower = parsed_lower.root();
+        assert_eq!(makefile_lower.code(), text_lower);
+
+        // Test NMake !ELSEIF
+        let text_elseif = "!IFDEF DEBUG\nCFLAGS = -g\n!ELSEIF RELEASE\nCFLAGS = -O2\n!ENDIF\n";
+        let parsed_elseif = parse(text_elseif, Some(MakefileVariant::NMake));
+        assert!(
+            parsed_elseif.errors.is_empty(),
+            "NMake !ELSEIF should parse. Errors: {:?}",
+            parsed_elseif.errors
+        );
+        let makefile_elseif = parsed_elseif.root();
+        assert_eq!(makefile_elseif.code(), text_elseif);
+
+        // Test that NMake directives are NOT recognized without NMake variant
+        let text_nmake = "!IFDEF DEBUG\nCFLAGS = -g\n!ENDIF\n";
+        let parsed_none = parse(text_nmake, None);
+        // Without NMake variant, ! should be an error token
+        let makefile_none = parsed_none.root();
+        // Round-trip should preserve the text
+        assert_eq!(makefile_none.code(), text_nmake);
     }
 }
