@@ -83,7 +83,7 @@ unsafe impl<T> Sync for Parse<T> {}
 impl Parse<Makefile> {
     /// Parse makefile text, returning a Parse result
     pub fn parse_makefile(text: &str) -> Self {
-        let parsed = crate::lossless::parse(text);
+        let parsed = crate::lossless::parse(text, None);
         Parse::new(parsed.green_node, parsed.errors)
     }
 }
@@ -91,7 +91,7 @@ impl Parse<Makefile> {
 impl Parse<Rule> {
     /// Parse rule text, returning a Parse result
     pub fn parse_rule(text: &str) -> Self {
-        let parsed = crate::lossless::parse(text);
+        let parsed = crate::lossless::parse(text, None);
         Parse::new(parsed.green_node, parsed.errors)
     }
 

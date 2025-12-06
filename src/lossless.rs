@@ -67,6 +67,19 @@ impl From<ParseError> for Error {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The variant of makefile being parsed
+pub enum MakefileVariant {
+    /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
+    GNUMake,
+    /// BSD Make (FreeBSD, NetBSD, OpenBSD - uses .if/.ifdef/.ifndef directives)
+    BSDMake,
+    /// Microsoft nmake (Windows - uses !IF/!IFDEF/!IFNDEF directives)
+    NMake,
+    /// POSIX-compliant make (basic portable subset, no extensions)
+    POSIXMake,
+}
+
 /// Match a target against a pattern using make-style wildcard matching.
 ///
 /// Supports `%` as a wildcard that matches any sequence of characters.
@@ -138,7 +151,7 @@ pub(crate) struct Parse {
     pub(crate) errors: Vec<ErrorInfo>,
 }
 
-pub(crate) fn parse(text: &str) -> Parse {
+pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     struct Parser {
         /// input tokens, including whitespace,
         /// in *reverse* order.
@@ -150,6 +163,8 @@ pub(crate) fn parse(text: &str) -> Parse {
         errors: Vec<ErrorInfo>,
         /// The original text
         original_text: String,
+        /// The makefile variant
+        variant: Option<MakefileVariant>,
     }
 
     impl Parser {
@@ -1293,6 +1308,7 @@ pub(crate) fn parse(text: &str) -> Parse {
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
         original_text: text.to_string(),
+        variant,
     }
     .parse()
 }
@@ -1598,7 +1614,7 @@ impl Makefile {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
 
-        let parsed = parse(&buf);
+        let parsed = parse(&buf, None);
         Ok(parsed.root())
     }
 
@@ -1697,7 +1713,7 @@ impl Makefile {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
 
-        let parsed = parse(&buf);
+        let parsed = parse(&buf, None);
         if !parsed.errors.is_empty() {
             Err(Error::Parse(ParseError {
                 errors: parsed.errors,
@@ -3232,7 +3248,7 @@ mod tests {
 rule: dependency
 	command
 "#;
-        let parsed = parse(SIMPLE);
+        let parsed = parse(SIMPLE, None);
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
@@ -3284,7 +3300,7 @@ rule: dependency
     fn test_parse_export_assign() {
         const EXPORT: &str = r#"export VARIABLE := value
 "#;
-        let parsed = parse(EXPORT);
+        let parsed = parse(EXPORT, None);
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
@@ -3318,7 +3334,7 @@ rule: dependency
 	command
 
 "#;
-        let parsed = parse(MULTIPLE_PREREQUISITES);
+        let parsed = parse(MULTIPLE_PREREQUISITES, None);
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert_eq!(
@@ -3616,7 +3632,7 @@ build-indep: build
         let input = "rule target\n\tcommand";
 
         // Test both APIs with one input
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         let direct_error = &parsed.errors[0];
 
         // Verify error is detected with correct details
@@ -3790,7 +3806,10 @@ all: $(OBJS)
 
     #[test]
     fn test_include_directive() {
-        let parsed = parse("include config.mk\ninclude $(TOPDIR)/rules.mk\ninclude *.mk\n");
+        let parsed = parse(
+            "include config.mk\ninclude $(TOPDIR)/rules.mk\ninclude *.mk\n",
+            None,
+        );
         assert!(parsed.errors.is_empty());
         let node = parsed.syntax();
         assert!(format!("{:#?}", node).contains("INCLUDE@"));
@@ -3798,7 +3817,7 @@ all: $(OBJS)
 
     #[test]
     fn test_export_variables() {
-        let parsed = parse("export SHELL := /bin/bash\n");
+        let parsed = parse("export SHELL := /bin/bash\n", None);
         assert!(parsed.errors.is_empty());
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -3812,8 +3831,10 @@ all: $(OBJS)
 
     #[test]
     fn test_variable_scopes() {
-        let parsed =
-            parse("SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n");
+        let parsed = parse(
+            "SIMPLE = value\nIMMEDIATE := value\nCONDITIONAL ?= value\nAPPEND += value\n",
+            None,
+        );
         assert!(parsed.errors.is_empty());
         let makefile = parsed.root();
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -3827,7 +3848,7 @@ all: $(OBJS)
 
     #[test]
     fn test_pattern_rule_parsing() {
-        let parsed = parse("%.o: %.c\n\t$(CC) -c -o $@ $<\n");
+        let parsed = parse("%.o: %.c\n\t$(CC) -c -o $@ $<\n", None);
         assert!(parsed.errors.is_empty());
         let makefile = parsed.root();
         let rules = makefile.rules().collect::<Vec<_>>();
@@ -3840,7 +3861,7 @@ all: $(OBJS)
     fn test_include_variants() {
         // Test all variants of include directives
         let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\ninclude $(VAR)/generated.mk\n";
-        let parsed = parse(makefile_str);
+        let parsed = parse(makefile_str, None);
         assert!(parsed.errors.is_empty());
 
         // Get the syntax tree for inspection
@@ -3959,7 +3980,7 @@ all: $(OBJS)
     fn test_indented_text_outside_rules() {
         // Simple help target with echo commands
         let help_text = "help:\n\t@echo \"Available targets:\"\n\t@echo \"  help     show help\"\n";
-        let parsed = parse(help_text);
+        let parsed = parse(help_text, None);
         assert!(parsed.errors.is_empty());
 
         // Verify recipes are correctly parsed
@@ -3980,7 +4001,7 @@ all: $(OBJS)
         let recipe_comment = "build:\n\t# This is a comment\n\tgcc -o app main.c\n";
 
         // Parse the recipe
-        let parsed = parse(recipe_comment);
+        let parsed = parse(recipe_comment, None);
 
         // Verify no parsing errors
         assert!(
@@ -4026,7 +4047,7 @@ all: $(OBJS)
         let multiline = "SOURCES = main.c \\\n          util.c\n";
 
         // Parse the multiline variable
-        let parsed = parse(multiline);
+        let parsed = parse(multiline, None);
 
         // We can extract the variable even with errors (since backslash handling is not perfect)
         let root = parsed.root();
@@ -4037,7 +4058,7 @@ all: $(OBJS)
 
         // := assignment operator
         let operators = "CFLAGS := -Wall \\\n         -Werror\n";
-        let parsed_operators = parse(operators);
+        let parsed_operators = parse(operators, None);
 
         // Extract variable with := operator
         let root = parsed_operators.root();
@@ -4049,7 +4070,7 @@ all: $(OBJS)
 
         // += assignment operator
         let append = "LDFLAGS += -L/usr/lib \\\n          -lm\n";
-        let parsed_append = parse(append);
+        let parsed_append = parse(append, None);
 
         // Extract variable with += operator
         let root = parsed_append.root();
@@ -4065,7 +4086,7 @@ all: $(OBJS)
         // Test 1: File ending with blank lines
         let blank_lines = "VAR = value\n\n\n";
 
-        let parsed_blank = parse(blank_lines);
+        let parsed_blank = parse(blank_lines, None);
 
         // We should be able to extract the variable definition
         let root = parsed_blank.root();
@@ -4079,7 +4100,7 @@ all: $(OBJS)
         // Test 2: File ending with space
         let trailing_space = "VAR = value \n";
 
-        let parsed_space = parse(trailing_space);
+        let parsed_space = parse(trailing_space, None);
 
         // We should be able to extract the variable definition
         let root = parsed_space.root();
@@ -4093,7 +4114,7 @@ all: $(OBJS)
         // Test 3: No final newline
         let no_newline = "VAR = value";
 
-        let parsed_no_newline = parse(no_newline);
+        let parsed_no_newline = parse(no_newline, None);
 
         // Regardless of parsing errors, we should be able to extract the variable
         let root = parsed_no_newline.root();
@@ -4110,17 +4131,17 @@ all: $(OBJS)
     fn test_complex_variable_references() {
         // Simple function call
         let wildcard = "SOURCES = $(wildcard *.c)\n";
-        let parsed = parse(wildcard);
+        let parsed = parse(wildcard, None);
         assert!(parsed.errors.is_empty());
 
         // Nested variable reference
         let nested = "PREFIX = /usr\nBINDIR = $(PREFIX)/bin\n";
-        let parsed = parse(nested);
+        let parsed = parse(nested, None);
         assert!(parsed.errors.is_empty());
 
         // Function with complex arguments
         let patsubst = "OBJECTS = $(patsubst %.c,%.o,$(SOURCES))\n";
-        let parsed = parse(patsubst);
+        let parsed = parse(patsubst, None);
         assert!(parsed.errors.is_empty());
     }
 
@@ -4128,17 +4149,17 @@ all: $(OBJS)
     fn test_complex_variable_references_minimal() {
         // Simple function call
         let wildcard = "SOURCES = $(wildcard *.c)\n";
-        let parsed = parse(wildcard);
+        let parsed = parse(wildcard, None);
         assert!(parsed.errors.is_empty());
 
         // Nested variable reference
         let nested = "PREFIX = /usr\nBINDIR = $(PREFIX)/bin\n";
-        let parsed = parse(nested);
+        let parsed = parse(nested, None);
         assert!(parsed.errors.is_empty());
 
         // Function with complex arguments
         let patsubst = "OBJECTS = $(patsubst %.c,%.o,$(SOURCES))\n";
-        let parsed = parse(patsubst);
+        let parsed = parse(patsubst, None);
         assert!(parsed.errors.is_empty());
     }
 
@@ -4280,7 +4301,7 @@ build:
 	@echo "Building at: $(shell date)"
 	gcc -o program main.c
 "#;
-        let parsed = parse(content);
+        let parsed = parse(content, None);
         assert!(
             parsed.errors.is_empty(),
             "Failed to parse recipe with colon: {:?}",
@@ -4578,7 +4599,7 @@ OBJS := $(patsubst %.c,%.o,$(FILES))
 NAME := $(if $(PROGRAM),$(PROGRAM),a.out)
 HEADERS := ${wildcard *.h}
 "#;
-        let parsed = parse(content);
+        let parsed = parse(content, None);
         assert!(
             parsed.errors.is_empty(),
             "Failed to parse complex variable functions: {:?}",
@@ -4594,7 +4615,7 @@ PACKAGE = myapp
 TARBALL = $(PACKAGE)-$(VERSION).tar.gz
 INSTALL_PATH = $(shell echo $(PREFIX) | sed 's/\/$//')
 "#;
-        let parsed = parse(content);
+        let parsed = parse(content, None);
         assert!(
             parsed.errors.is_empty(),
             "Failed to parse nested variable expansions: {:?}",
@@ -4654,7 +4675,7 @@ clean:
 "#;
 
         // Parse the content
-        let parsed = parse(content);
+        let parsed = parse(content, None);
 
         // Check that parsing succeeded
         assert!(parsed.errors.is_empty(), "Expected no parsing errors");
@@ -4708,7 +4729,7 @@ clean:
 "#;
 
         // Parse the content
-        let parsed = parse(content);
+        let parsed = parse(content, None);
 
         // Verify parsing succeeded
         assert!(
@@ -4762,7 +4783,7 @@ clean:
         let content = "#line 2145\n.PHONY: $(PHONY)\n";
 
         // Parse the content
-        let result = parse(content);
+        let result = parse(content, None);
 
         // Verify no parsing errors
         assert!(
@@ -4789,12 +4810,12 @@ clean:
     fn test_skip_until_newline_behavior() {
         // Test the skip_until_newline function to cover the != vs == mutant
         let input = "text without newline";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // This should handle gracefully without infinite loops
         assert!(parsed.errors.is_empty() || !parsed.errors.is_empty());
 
         let input_with_newline = "text\nafter newline";
-        let parsed2 = parse(input_with_newline);
+        let parsed2 = parse(input_with_newline, None);
         assert!(parsed2.errors.is_empty() || !parsed2.errors.is_empty());
     }
 
@@ -4803,7 +4824,7 @@ clean:
     fn test_error_with_indent_token() {
         // Test the error logic with INDENT token to cover the ! deletion mutant
         let input = "\tinvalid indented line";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // Should produce an error about indented line not part of a rule
         assert!(!parsed.errors.is_empty());
 
@@ -4819,7 +4840,7 @@ ifndef VAR
     CFLAGS = -DTEST
 endif
 "#;
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // Test that parsing doesn't panic and produces some result
         let makefile = parsed.root();
         let _vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -4833,7 +4854,7 @@ ifdef DEBUG
     endif
 endif
 "#;
-        let parsed_nested = parse(nested);
+        let parsed_nested = parse(nested, None);
         // Test that parsing doesn't panic
         let _makefile = parsed_nested.root();
     }
@@ -4847,7 +4868,7 @@ ifdef VAR
     VALUE = 1
 endif
 "#;
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // Test that parsing doesn't panic and produces some result
         let makefile = parsed.root();
         let includes = makefile.includes().collect::<Vec<_>>();
@@ -4861,7 +4882,7 @@ ifndef VAR
     VALUE = default
 endif
 "#;
-        let parsed2 = parse(optional_include);
+        let parsed2 = parse(optional_include, None);
         // Test that parsing doesn't panic
         let _makefile = parsed2.root();
     }
@@ -4873,7 +4894,7 @@ endif
 VAR = $(call func,$(nested,arg),extra)
 COMPLEX = $(if $(condition),$(then_val),$(else_val))
 "#;
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         assert!(parsed.errors.is_empty());
 
         let makefile = parsed.root();
@@ -4890,7 +4911,7 @@ help:
 	@echo "Usage instructions"
 	@echo "More help text"
 "#;
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         assert!(parsed.errors.is_empty());
 
         let makefile = parsed.root();
@@ -4902,11 +4923,11 @@ help:
     #[test]
     fn test_edge_case_empty_input() {
         // Test with empty input
-        let parsed = parse("");
+        let parsed = parse("", None);
         assert!(parsed.errors.is_empty());
 
         // Test with only whitespace
-        let parsed2 = parse("   \n  \n");
+        let parsed2 = parse("   \n  \n", None);
         // Some parsers might report warnings/errors for whitespace-only input
         // Just ensure it doesn't crash
         let _makefile = parsed2.root();
@@ -4920,7 +4941,7 @@ ifdef
     # Missing condition variable
 endif
 "#;
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // Parser should either handle gracefully or report appropriate errors
         // Not checking for specific error since parsing strategy may vary
         assert!(parsed.errors.is_empty() || !parsed.errors.is_empty());
@@ -5265,7 +5286,7 @@ rule2:
     fn test_archive_member_parsing() {
         // Test basic archive member syntax
         let input = "libfoo.a(bar.o): bar.c\n\tgcc -c bar.c -o bar.o\n\tar r libfoo.a bar.o\n";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         assert!(
             parsed.errors.is_empty(),
             "Should parse archive member without errors"
@@ -5284,7 +5305,7 @@ rule2:
     fn test_archive_member_multiple_members() {
         // Test archive with multiple members
         let input = "libfoo.a(bar.o baz.o): bar.c baz.c\n\tgcc -c bar.c baz.c\n\tar r libfoo.a bar.o baz.o\n";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         assert!(
             parsed.errors.is_empty(),
             "Should parse multiple archive members"
@@ -5300,7 +5321,7 @@ rule2:
         // Test archive members in dependencies
         let input =
             "program: main.o libfoo.a(bar.o) libfoo.a(baz.o)\n\tgcc -o program main.o libfoo.a\n";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         assert!(
             parsed.errors.is_empty(),
             "Should parse archive members in dependencies"
@@ -5315,7 +5336,7 @@ rule2:
     fn test_archive_member_with_variables() {
         // Test archive members with variable references
         let input = "$(LIB)($(OBJ)): $(SRC)\n\t$(CC) -c $(SRC)\n\t$(AR) r $(LIB) $(OBJ)\n";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         // Variable references in archive members should parse without errors
         assert!(
             parsed.errors.is_empty(),
@@ -5327,7 +5348,7 @@ rule2:
     fn test_archive_member_ast_access() {
         // Test that we can access archive member nodes through the AST
         let input = "libtest.a(foo.o bar.o): foo.c bar.c\n\tgcc -c foo.c bar.c\n";
-        let parsed = parse(input);
+        let parsed = parse(input, None);
         let makefile = parsed.root();
 
         // Find archive member nodes in the syntax tree
