@@ -425,10 +425,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(IDENTIFIER) => {
                         let token = &self.tokens.last().unwrap().1.clone();
                         // Check if this is a starting conditional directive (not else/endif)
-                        if token == "ifdef"
+                        if (token == "ifdef"
                             || token == "ifndef"
                             || token == "ifeq"
-                            || token == "ifneq"
+                            || token == "ifneq")
+                            && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
                         {
                             self.parse_conditional();
                         } else if token == "include" || token == "-include" || token == "sinclude" {
@@ -792,7 +793,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         // Helper method to handle conditional token
         fn handle_conditional_token(&mut self, token: &str, depth: &mut usize) -> bool {
             match token {
-                "ifdef" | "ifndef" | "ifeq" | "ifneq" => {
+                "ifdef" | "ifndef" | "ifeq" | "ifneq"
+                    if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
+                {
                     *depth += 1;
                     self.parse_conditional();
                     true
@@ -1065,7 +1068,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            if token.starts_with("if") {
+            if token.starts_with("if")
+                && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
+            {
                 self.parse_conditional();
                 return true;
             }
@@ -1085,7 +1090,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => false,
                 Some(IDENTIFIER) => {
                     let token = &self.tokens.last().unwrap().1;
-                    if self.is_conditional_directive(token) {
+                    if self.is_conditional_directive(token)
+                        && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
+                    {
                         self.parse_conditional();
                         true
                     } else {
@@ -1417,10 +1424,8 @@ impl MakefileItem {
             Some(MakefileItem::Variable(var))
         } else if let Some(inc) = Include::cast(node.clone()) {
             Some(MakefileItem::Include(inc))
-        } else if let Some(cond) = Conditional::cast(node) {
-            Some(MakefileItem::Conditional(cond))
         } else {
-            None
+            Conditional::cast(node).map(MakefileItem::Conditional)
         }
     }
 
@@ -1431,6 +1436,49 @@ impl MakefileItem {
             MakefileItem::Variable(v) => v.syntax(),
             MakefileItem::Include(i) => i.syntax(),
             MakefileItem::Conditional(c) => c.syntax(),
+        }
+    }
+}
+
+/// Represents different types of items that can appear in a Rule's body
+#[derive(Clone)]
+pub enum RuleItem {
+    /// A recipe line (command to execute)
+    Recipe(String),
+    /// A conditional block within the rule
+    Conditional(Conditional),
+}
+
+impl std::fmt::Debug for RuleItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleItem::Recipe(text) => f.debug_tuple("Recipe").field(text).finish(),
+            RuleItem::Conditional(_) => f
+                .debug_tuple("Conditional")
+                .field(&"<Conditional>")
+                .finish(),
+        }
+    }
+}
+
+impl RuleItem {
+    /// Try to cast a syntax node to a RuleItem
+    fn cast(node: SyntaxNode) -> Option<Self> {
+        match node.kind() {
+            RECIPE => {
+                // Extract the recipe text from the RECIPE node
+                let text = node.children_with_tokens().find_map(|it| {
+                    if let Some(token) = it.as_token() {
+                        if token.kind() == TEXT {
+                            return Some(token.text().to_string());
+                        }
+                    }
+                    None
+                })?;
+                Some(RuleItem::Recipe(text))
+            }
+            CONDITIONAL => Conditional::cast(node).map(RuleItem::Conditional),
+            _ => None,
         }
     }
 }
@@ -2995,6 +3043,49 @@ impl Rule {
             })
     }
 
+    /// Get all items (recipe lines and conditionals) in the rule's body
+    ///
+    /// This method iterates through the rule's body and yields both recipe lines
+    /// and any conditionals that appear within the rule.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Rule, RuleItem};
+    ///
+    /// let rule_text = r#"test:
+    /// 	echo "before"
+    /// ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+    /// 	./run-tests
+    /// endif
+    /// 	echo "after"
+    /// "#;
+    /// let rule: Rule = rule_text.parse().unwrap();
+    ///
+    /// let items: Vec<_> = rule.items().collect();
+    /// assert_eq!(items.len(), 3); // recipe, conditional, recipe
+    ///
+    /// match &items[0] {
+    ///     RuleItem::Recipe(r) => assert_eq!(r, "echo \"before\""),
+    ///     _ => panic!("Expected recipe"),
+    /// }
+    ///
+    /// match &items[1] {
+    ///     RuleItem::Conditional(_) => {},
+    ///     _ => panic!("Expected conditional"),
+    /// }
+    ///
+    /// match &items[2] {
+    ///     RuleItem::Recipe(r) => assert_eq!(r, "echo \"after\""),
+    ///     _ => panic!("Expected recipe"),
+    /// }
+    /// ```
+    pub fn items(&self) -> impl Iterator<Item = RuleItem> + '_ {
+        self.syntax()
+            .children()
+            .filter(|n| n.kind() == RECIPE || n.kind() == CONDITIONAL)
+            .filter_map(RuleItem::cast)
+    }
+
     /// Replace the command at index i with a new line
     ///
     /// # Example
@@ -3848,10 +3939,7 @@ impl Conditional {
         let conditional_index = self.syntax().index();
 
         // Replace the entire conditional with just its body items
-        parent.splice_children(
-            conditional_index..conditional_index + 1,
-            body_nodes,
-        );
+        parent.splice_children(conditional_index..conditional_index + 1, body_nodes);
 
         Ok(())
     }
@@ -7189,6 +7277,77 @@ override_dh_install:
     }
 
     #[test]
+    fn test_rule_items() {
+        use crate::RuleItem;
+
+        // Test rule with both recipes and conditionals
+        let input = r#"test:
+	echo "before"
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	./run-tests
+endif
+	echo "after"
+"#;
+        let rule: Rule = input.parse().unwrap();
+
+        let items: Vec<_> = rule.items().collect();
+        assert_eq!(
+            items.len(),
+            3,
+            "Expected 3 items: recipe, conditional, recipe"
+        );
+
+        // Check first item is a recipe
+        match &items[0] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo \"before\""),
+            RuleItem::Conditional(_) => panic!("Expected recipe, got conditional"),
+        }
+
+        // Check second item is a conditional
+        match &items[1] {
+            RuleItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifeq".to_string()));
+            }
+            RuleItem::Recipe(_) => panic!("Expected conditional, got recipe"),
+        }
+
+        // Check third item is a recipe
+        match &items[2] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo \"after\""),
+            RuleItem::Conditional(_) => panic!("Expected recipe, got conditional"),
+        }
+
+        // Test rule with only recipes (no conditionals)
+        let simple_rule: Rule = "simple:\n\techo one\n\techo two\n".parse().unwrap();
+        let simple_items: Vec<_> = simple_rule.items().collect();
+        assert_eq!(simple_items.len(), 2);
+
+        match &simple_items[0] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo one"),
+            _ => panic!("Expected recipe"),
+        }
+
+        match &simple_items[1] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo two"),
+            _ => panic!("Expected recipe"),
+        }
+
+        // Test rule with only conditional (no plain recipes)
+        let cond_only: Rule = "condtest:\nifeq (a,b)\n\techo yes\nendif\n"
+            .parse()
+            .unwrap();
+        let cond_items: Vec<_> = cond_only.items().collect();
+        assert_eq!(cond_items.len(), 1);
+
+        match &cond_items[0] {
+            RuleItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifeq".to_string()));
+            }
+            _ => panic!("Expected conditional"),
+        }
+    }
+
+    #[test]
     fn test_conditionals_iterator() {
         let makefile: Makefile = r#"ifdef DEBUG
 VAR = debug
@@ -7625,7 +7784,11 @@ include common.mk
 
         let items: Vec<_> = makefile.items().collect();
         // Note: include directives might not be at top level, need to check
-        assert!(items.len() >= 3, "Expected at least 3 items, got {}", items.len());
+        assert!(
+            items.len() >= 3,
+            "Expected at least 3 items, got {}",
+            items.len()
+        );
 
         match &items[0] {
             MakefileItem::Variable(v) => {
@@ -7844,13 +8007,16 @@ endif
         let items: Vec<_> = outer_cond.if_items().collect();
 
         // Find the nested conditional
-        let inner_cond = items.iter().find_map(|item| {
-            if let MakefileItem::Conditional(c) = item {
-                Some(c)
-            } else {
-                None
-            }
-        }).unwrap();
+        let inner_cond = items
+            .iter()
+            .find_map(|item| {
+                if let MakefileItem::Conditional(c) = item {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
 
         // Inner conditional's parent should be the outer conditional
         let parent = inner_cond.parent();
