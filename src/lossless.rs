@@ -67,6 +67,19 @@ impl From<ParseError> for Error {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The variant of makefile being parsed
+pub enum MakefileVariant {
+    /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
+    GNUMake,
+    /// BSD Make (FreeBSD, NetBSD, OpenBSD - uses .if/.ifdef/.ifndef directives)
+    BSDMake,
+    /// Microsoft nmake (Windows - uses !IF/!IFDEF/!IFNDEF directives)
+    NMake,
+    /// POSIX-compliant make (basic portable subset, no extensions)
+    POSIXMake,
+}
+
 /// Match a target against a pattern using make-style wildcard matching.
 ///
 /// Supports `%` as a wildcard that matches any sequence of characters.
