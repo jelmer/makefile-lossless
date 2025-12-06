@@ -886,12 +886,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         // Helper to check if a token is a conditional directive
         fn is_conditional_directive(&self, token: &str) -> bool {
-            token == "ifdef"
-                || token == "ifndef"
-                || token == "ifeq"
-                || token == "ifneq"
-                || token == "else"
-                || token == "endif"
+            // GNU Make conditionals are only recognized when variant is None or GNUMake
+            // Only check for the starting conditionals (ifdef/ifndef/ifeq/ifneq)
+            // We don't include else/endif here because they are handled within parse_conditional
+            if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) {
+                token == "ifdef" || token == "ifndef" || token == "ifeq" || token == "ifneq"
+            } else {
+                false
+            }
         }
 
         // Helper method to handle conditional token
@@ -1028,6 +1030,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
 
             // Parse the condition based on keyword type
+            // Note: Both parse_simple_condition and parse_parenthesized_expr
+            // handle consuming the newline at the end of the line
             match token.as_str() {
                 "ifdef" | "ifndef" => {
                     self.parse_simple_condition();
@@ -1037,13 +1041,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 _ => unreachable!("Invalid conditional token"),
             }
-
-            // Skip any trailing whitespace and check for inline comments
-            self.skip_ws();
-            if self.current() == Some(COMMENT) {
-                self.parse_comment();
-            }
-            // Note: expect_eol is already called by parse_simple_condition() and parse_parenthesized_expr()
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
 
@@ -7641,5 +7638,36 @@ mod test_continuation {
             });
             assert_eq!(parsed.to_string(), src, "round-trip mismatch for {src:?}");
         }
+    }
+
+    #[test]
+    fn test_variant_conditional_parsing() {
+        // Test that GNU Make conditionals are recognized with GNUMake variant
+        let text = "ifdef DEBUG\nCFLAGS = -g\nendif\n";
+        let parsed_gnu = parse(text, Some(MakefileVariant::GNUMake));
+        assert!(
+            parsed_gnu.errors.is_empty(),
+            "GNUMake variant should parse GNU conditionals. Errors: {:?}",
+            parsed_gnu.errors
+        );
+        let makefile_gnu = parsed_gnu.root();
+        assert_eq!(makefile_gnu.code(), text);
+
+        // Test that GNU Make conditionals are recognized with None variant
+        let parsed_none = parse(text, None);
+        assert!(
+            parsed_none.errors.is_empty(),
+            "None variant should parse GNU conditionals. Errors: {:?}",
+            parsed_none.errors
+        );
+        let makefile_none = parsed_none.root();
+        assert_eq!(makefile_none.code(), text);
+
+        // Test that GNU Make conditionals are NOT recognized with other variants
+        let parsed_bsd = parse(text, Some(MakefileVariant::BSDMake));
+        // With BSDMake variant, "ifdef" should be treated as a regular identifier, not a conditional
+        let makefile_bsd = parsed_bsd.root();
+        // Round-trip should still preserve the text even if not recognized as a conditional
+        assert_eq!(makefile_bsd.code(), text);
     }
 }
