@@ -12,16 +12,18 @@ pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line_type: Option<LineType>,
     continuation: bool,
-    variant: Option<crate::lossless::MakefileVariant>,
+    variant: Option<crate::MakefileVariant>,
+    at_line_start: bool,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str, variant: Option<crate::lossless::MakefileVariant>) -> Self {
+    pub fn new(input: &'a str, variant: Option<crate::MakefileVariant>) -> Self {
         Lexer {
             input: input.chars().peekable(),
             continuation: false,
             line_type: None,
             variant,
+            at_line_start: true,
         }
     }
 
@@ -64,6 +66,43 @@ impl<'a> Lexer<'a> {
                 return true;
             }
         }
+        false
+    }
+
+    fn is_keyword(&self, text: &str) -> bool {
+        // Check for GNU Make keywords
+        if matches!(
+            self.variant,
+            None | Some(crate::MakefileVariant::GNUMake)
+        )
+            && matches!(
+                text,
+                "ifdef"
+                    | "ifndef"
+                    | "ifeq"
+                    | "ifneq"
+                    | "else"
+                    | "endif"
+                    | "export"
+                    | "unexport"
+                    | "include"
+                    | "-include"
+                    | "sinclude"
+            ) {
+                return true;
+            }
+
+        // Check for NMake keywords (case-insensitive)
+        if matches!(self.variant, Some(crate::MakefileVariant::NMake)) {
+            let lower = text.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "!if" | "!ifdef" | "!ifndef" | "!else" | "!elseif" | "!endif"
+            ) {
+                return true;
+            }
+        }
+
         false
     }
 
@@ -151,9 +190,11 @@ impl<'a> Lexer<'a> {
             match c {
                 c if Self::is_newline(c) => {
                     self.line_type = None;
+                    self.at_line_start = true;
                     return Some((SyntaxKind::NEWLINE, self.input.next()?.to_string()));
                 }
                 '#' => {
+                    self.at_line_start = false;
                     return Some((
                         SyntaxKind::COMMENT,
                         self.read_while(|c| !Self::is_newline(c)),
@@ -164,19 +205,27 @@ impl<'a> Lexer<'a> {
 
             match self.line_type.unwrap() {
                 LineType::Recipe => {
+                    self.at_line_start = false;
                     Some((SyntaxKind::TEXT, self.read_while(|c| !Self::is_newline(c))))
                 }
                 LineType::Other => match c {
                     c if Self::is_whitespace(c) => {
+                        // Whitespace doesn't change at_line_start (we skip it)
                         Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
                     }
-                    c if Self::is_valid_identifier_char(c) => Some((
-                        SyntaxKind::IDENTIFIER,
-                        self.read_while(Self::is_valid_identifier_char),
-                    )),
+                    c if Self::is_valid_identifier_char(c) => {
+                        let text = self.read_while(Self::is_valid_identifier_char);
+                        let kind = if self.at_line_start && self.is_keyword(&text) {
+                            SyntaxKind::KEYWORD
+                        } else {
+                            SyntaxKind::IDENTIFIER
+                        };
+                        self.at_line_start = false;
+                        Some((kind, text))
+                    }
                     '!' if matches!(
                         self.variant,
-                        Some(crate::lossless::MakefileVariant::NMake)
+                        Some(crate::MakefileVariant::NMake)
                     ) =>
                     {
                         // Handle NMake directives like !IF, !IFDEF, !ERROR, etc.
@@ -185,21 +234,32 @@ impl<'a> Lexer<'a> {
                             if Self::is_valid_identifier_char(next_char) {
                                 // This is an NMake directive - return !IDENTIFIER as one token
                                 let ident = self.read_while(Self::is_valid_identifier_char);
-                                Some((SyntaxKind::IDENTIFIER, format!("!{}", ident)))
+                                let text = format!("!{}", ident);
+                                let kind = if self.at_line_start && self.is_keyword(&text) {
+                                    SyntaxKind::KEYWORD
+                                } else {
+                                    SyntaxKind::IDENTIFIER
+                                };
+                                self.at_line_start = false;
+                                Some((kind, text))
                             } else if next_char == '=' {
                                 // != operator
                                 self.input.next();
+                                self.at_line_start = false;
                                 Some((SyntaxKind::OPERATOR, "!=".to_string()))
                             } else {
                                 // Standalone ! is an error
+                                self.at_line_start = false;
                                 Some((SyntaxKind::ERROR, "!".to_string()))
                             }
                         } else {
                             // ! at end of file
+                            self.at_line_start = false;
                             Some((SyntaxKind::ERROR, "!".to_string()))
                         }
                     }
                     '"' | '\'' => {
+                        self.at_line_start = false;
                         if self.has_matching_close_quote(c) {
                             Some((SyntaxKind::QUOTE, self.read_quoted_string()))
                         } else {
@@ -210,6 +270,7 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     ':' | '=' | '?' | '+' => {
+                        self.at_line_start = false;
                         let text = self.input.next().unwrap().to_string()
                             + self
                                 .read_while(|c| c == ':' || c == '=' || c == '?')
@@ -217,10 +278,12 @@ impl<'a> Lexer<'a> {
                         Some((SyntaxKind::OPERATOR, text))
                     }
                     '(' => {
+                        self.at_line_start = false;
                         self.input.next();
                         Some((SyntaxKind::LPAREN, "(".to_string()))
                     }
                     ')' => {
+                        self.at_line_start = false;
                         self.input.next();
                         Some((SyntaxKind::RPAREN, ")".to_string()))
                     }
@@ -233,14 +296,17 @@ impl<'a> Lexer<'a> {
                         Some((SyntaxKind::RBRACE, "}".to_string()))
                     }
                     '$' => {
+                        self.at_line_start = false;
                         self.input.next();
                         Some((SyntaxKind::DOLLAR, "$".to_string()))
                     }
                     ',' => {
+                        self.at_line_start = false;
                         self.input.next();
                         Some((SyntaxKind::COMMA, ",".to_string()))
                     }
                     '\\' => {
+                        self.at_line_start = false;
                         self.input.next();
                         // If the next character is a newline, this is a line continuation
                         if self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
@@ -249,6 +315,7 @@ impl<'a> Lexer<'a> {
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
                     _ => {
+                        self.at_line_start = false;
                         self.input.next();
                         Some((SyntaxKind::ERROR, c.to_string()))
                     }
@@ -270,7 +337,7 @@ impl Iterator for Lexer<'_> {
 
 pub(crate) fn lex(
     input: &str,
-    variant: Option<crate::lossless::MakefileVariant>,
+    variant: Option<crate::MakefileVariant>,
 ) -> Vec<(SyntaxKind, String)> {
     Lexer::new(input, variant).collect()
 }
@@ -331,7 +398,7 @@ rule: prerequisite
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
-            vec![(IDENTIFIER, "export"), (NEWLINE, "\n"),]
+            vec![(KEYWORD, "export"), (NEWLINE, "\n"),]
         );
     }
 
@@ -347,7 +414,7 @@ rule: prerequisite
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "export"),
+                (KEYWORD, "export"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, "VARIABLE"),
                 (NEWLINE, "\n"),
@@ -367,7 +434,7 @@ rule: prerequisite
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "export"),
+                (KEYWORD, "export"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -439,7 +506,7 @@ endif
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "ifneq"),
+                (KEYWORD, "ifneq"),
                 (WHITESPACE, " "),
                 (LPAREN, "("),
                 (IDENTIFIER, "a"),
@@ -448,7 +515,7 @@ endif
                 (IDENTIFIER, "b"),
                 (RPAREN, ")"),
                 (NEWLINE, "\n"),
-                (IDENTIFIER, "endif"),
+                (KEYWORD, "endif"),
                 (NEWLINE, "\n"),
             ]
         );
@@ -561,7 +628,7 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "-include"),
+                (KEYWORD, "-include"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, ".env"),
                 (NEWLINE, "\n"),
@@ -588,7 +655,7 @@ override_dh_auto_clean:
 
     #[test]
     fn test_nmake_directives() {
-        use crate::lossless::MakefileVariant;
+        use crate::MakefileVariant;
 
         // Test NMake !IF directive
         assert_eq!(
@@ -597,7 +664,7 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "!IF"),
+                (KEYWORD, "!IF"),
                 (WHITESPACE, " "),
                 (QUOTE, "\"$(DEBUG)\""),
                 (WHITESPACE, " "),
@@ -615,7 +682,7 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "!IFDEF"),
+                (KEYWORD, "!IFDEF"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, "DEBUG"),
                 (NEWLINE, "\n"),
@@ -629,9 +696,9 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (IDENTIFIER, "!ELSE"),
+                (KEYWORD, "!ELSE"),
                 (NEWLINE, "\n"),
-                (IDENTIFIER, "!ENDIF"),
+                (KEYWORD, "!ENDIF"),
                 (NEWLINE, "\n"),
             ]
         );

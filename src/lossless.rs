@@ -441,15 +441,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         newline_count = 0;
                         self.parse_comment();
                     }
-                    Some(IDENTIFIER) => {
+                    Some(KEYWORD) => {
                         let token = &self.tokens.last().unwrap().1.clone();
-                        // Check if this is a starting conditional directive
-                        if (token == "ifdef"
-                            || token == "ifndef"
-                            || token == "ifeq"
-                            || token == "ifneq")
-                            && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-                        {
+                        // Check if this is a conditional directive
+                        if self.is_conditional_directive(token) {
                             // If we're not inside a conditional (depth == 0) and there's a blank line,
                             // this is a top-level conditional, not part of the rule
                             if conditional_depth == 0 && newline_count >= 1 {
@@ -612,7 +607,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Handle export prefix if present
             self.skip_ws();
-            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "export" {
+            if self.current() == Some(KEYWORD) && self.tokens.last().unwrap().1 == "export" {
                 self.bump();
                 self.skip_ws();
             }
@@ -827,7 +822,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_conditional_keyword(&mut self) -> Option<String> {
-            if self.current() != Some(IDENTIFIER) {
+            if self.current() != Some(KEYWORD) {
                 self.error(
                     "expected conditional keyword (ifdef, ifndef, ifeq, ifneq, !IF, !IFDEF, or !IFNDEF)".to_string(),
                 );
@@ -1111,15 +1106,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.error("unterminated conditional (missing endif)".to_string());
                         break;
                     }
-                    Some(IDENTIFIER) => {
+                    Some(KEYWORD) => {
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
                             if token == "include" || token == "-include" || token == "sinclude" {
                                 self.parse_include();
                             } else {
+                                // export/unexport
                                 self.parse_normal_content();
                             }
                         }
+                    }
+                    Some(IDENTIFIER) => {
+                        self.parse_normal_content();
                     }
                     Some(INDENT) => self.parse_recipe_line(),
                     Some(WHITESPACE) => self.bump(),
@@ -1155,7 +1154,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
-            if self.current() != Some(IDENTIFIER)
+            if self.current() != Some(KEYWORD)
                 || (!["include", "-include", "sinclude"]
                     .contains(&self.tokens.last().unwrap().1.as_str()))
             {
@@ -1206,21 +1205,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_identifier_token(&mut self) -> bool {
             let token = &self.tokens.last().unwrap().1;
 
-            // Handle special cases first
+            // Handle pattern rules (e.g., %.o: %.c)
             if token.starts_with("%") {
                 self.parse_rule();
-                return true;
-            }
-
-            if token.starts_with("if")
-                && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-            {
-                self.parse_conditional();
-                return true;
-            }
-
-            if token == "include" || token == "-include" || token == "sinclude" {
-                self.parse_include();
                 return true;
             }
 
@@ -1232,15 +1219,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_token(&mut self) -> bool {
             match self.current() {
                 None => false,
-                Some(IDENTIFIER) => {
+                Some(KEYWORD) => {
+                    // Keywords are conditionals, export, or include directives
                     let token = &self.tokens.last().unwrap().1;
                     if self.is_conditional_directive(token) {
                         self.parse_conditional();
-                        true
+                    } else if token == "include" || token == "-include" || token == "sinclude" {
+                        self.parse_include();
                     } else {
-                        self.parse_identifier_token()
+                        // export/unexport - treat as normal content (variable assignment)
+                        self.parse_normal_content();
                     }
+                    true
                 }
+                Some(IDENTIFIER) => self.parse_identifier_token(),
                 Some(DOLLAR) => {
                     self.parse_normal_content();
                     true
@@ -1343,6 +1335,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 match kind {
                     NEWLINE => break,
+                    KEYWORD if text == "export" => seen_export = true,
                     IDENTIFIER if text == "export" => seen_export = true,
                     IDENTIFIER if !seen_identifier => seen_identifier = true,
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
@@ -2347,6 +2340,7 @@ pub(crate) fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxN
     }
 }
 
+
 impl FromStr for Rule {
     type Err = crate::Error;
 
@@ -2362,6 +2356,46 @@ impl FromStr for Makefile {
         Makefile::parse(s).to_result()
     }
 }
+
+// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes
+fn build_prerequisites_node(prereqs: &[String], include_leading_space: bool) -> SyntaxNode {
+    let mut builder = GreenNodeBuilder::new();
+    builder.start_node(PREREQUISITES.into());
+
+    for (i, prereq) in prereqs.iter().enumerate() {
+        // Add space: before first prerequisite if requested, and between all prerequisites
+        if (i == 0 && include_leading_space) || i > 0 {
+            builder.token(WHITESPACE.into(), " ");
+        }
+
+        // Build each PREREQUISITE node
+        builder.start_node(PREREQUISITE.into());
+        builder.token(IDENTIFIER.into(), prereq);
+        builder.finish_node();
+    }
+
+    builder.finish_node();
+    SyntaxNode::new_root_mut(builder.finish())
+}
+
+// Helper function to build targets section (TARGETS node)
+fn build_targets_node(targets: &[String]) -> SyntaxNode {
+    let mut builder = GreenNodeBuilder::new();
+    builder.start_node(TARGETS.into());
+
+    for (i, target) in targets.iter().enumerate() {
+        if i > 0 {
+            builder.token(WHITESPACE.into(), " ");
+        }
+        builder.token(IDENTIFIER.into(), target);
+    }
+
+    builder.finish_node();
+    SyntaxNode::new_root_mut(builder.finish())
+}
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -2489,7 +2523,7 @@ rule: dependency
             format!("{:#?}", node),
             r#"ROOT@0..25
   VARIABLE@0..25
-    IDENTIFIER@0..6 "export"
+    KEYWORD@0..6 "export"
     WHITESPACE@6..7 " "
     IDENTIFIER@7..15 "VARIABLE"
     WHITESPACE@15..16 " "

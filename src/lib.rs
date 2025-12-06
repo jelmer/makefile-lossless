@@ -60,6 +60,7 @@ pub enum MakefileVariant {
 #[allow(missing_docs)]
 pub enum SyntaxKind {
     IDENTIFIER = 0,
+    KEYWORD, // Keywords like ifdef, export, include, !IF, etc.
     INDENT,
     TEXT,
     WHITESPACE,
