@@ -1,6 +1,6 @@
 use crate::lossless::{
-    matches_pattern, parse, Conditional, Error, ErrorInfo, Include,
-    Makefile, MakefileItem, ParseError, Rule, SyntaxNode, VariableDefinition,
+    matches_pattern, parse, Conditional, Error, ErrorInfo, Include, Makefile, MakefileItem,
+    ParseError, Rule, SyntaxNode, VariableDefinition,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;

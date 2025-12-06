@@ -1,11 +1,54 @@
 use crate::lossless::{
-    build_prerequisites_node, build_targets_node,
-    remove_with_preceding_comments, trim_trailing_newlines, Error, ErrorInfo,
-    Makefile, MakefileItem, ParseError, Rule, RuleItem, SyntaxElement, SyntaxNode,
+    build_prerequisites_node, build_targets_node, remove_with_preceding_comments,
+    trim_trailing_newlines, Conditional, Error, ErrorInfo, Makefile, MakefileItem, ParseError,
+    Rule, SyntaxElement, SyntaxNode,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
+
+/// Represents different types of items that can appear in a Rule's body
+#[derive(Clone)]
+pub enum RuleItem {
+    /// A recipe line (command to execute)
+    Recipe(String),
+    /// A conditional block within the rule
+    Conditional(Conditional),
+}
+
+impl std::fmt::Debug for RuleItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleItem::Recipe(text) => f.debug_tuple("Recipe").field(text).finish(),
+            RuleItem::Conditional(_) => f
+                .debug_tuple("Conditional")
+                .field(&"<Conditional>")
+                .finish(),
+        }
+    }
+}
+
+impl RuleItem {
+    /// Try to cast a syntax node to a RuleItem
+    pub(crate) fn cast(node: SyntaxNode) -> Option<Self> {
+        match node.kind() {
+            RECIPE => {
+                // Extract the recipe text from the RECIPE node
+                let text = node.children_with_tokens().find_map(|it| {
+                    if let Some(token) = it.as_token() {
+                        if token.kind() == TEXT {
+                            return Some(token.text().to_string());
+                        }
+                    }
+                    None
+                })?;
+                Some(RuleItem::Recipe(text))
+            }
+            CONDITIONAL => Conditional::cast(node).map(RuleItem::Conditional),
+            _ => None,
+        }
+    }
+}
 
 impl Rule {
     /// Parse rule text, returning a Parse result
