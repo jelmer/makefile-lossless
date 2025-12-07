@@ -1,4 +1,5 @@
-use crate::lossless::{remove_with_preceding_comments, MakefileItem, VariableDefinition};
+use super::makefile::MakefileItem;
+use crate::lossless::{remove_with_preceding_comments, VariableDefinition};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};

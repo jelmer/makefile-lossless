@@ -26,10 +26,11 @@ mod lex;
 mod lossless;
 mod parse;
 
+pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Error, Identifier, Include, Lang, Makefile,
-    MakefileItem, MakefileVariant, ParseError, Rule, VariableDefinition,
+    MakefileVariant, ParseError, Rule, VariableDefinition,
 };
 pub use parse::Parse;
 

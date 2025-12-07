@@ -1,6 +1,5 @@
-use crate::lossless::{
-    remove_with_preceding_comments, Conditional, Error, ErrorInfo, MakefileItem, ParseError,
-};
+use super::makefile::MakefileItem;
+use crate::lossless::{remove_with_preceding_comments, Conditional, Error, ErrorInfo, ParseError};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};

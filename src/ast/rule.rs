@@ -1,7 +1,8 @@
+use super::makefile::MakefileItem;
 use crate::lossless::{
     build_prerequisites_node, build_targets_node, remove_with_preceding_comments,
-    trim_trailing_newlines, Conditional, Error, ErrorInfo, Makefile, MakefileItem, ParseError,
-    Rule, SyntaxElement, SyntaxNode,
+    trim_trailing_newlines, Conditional, Error, ErrorInfo, Makefile, ParseError, Rule,
+    SyntaxElement, SyntaxNode,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;

@@ -1402,44 +1402,6 @@ ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
 
-/// Represents different types of items that can appear in a Makefile
-#[derive(Clone)]
-pub enum MakefileItem {
-    /// A rule definition (e.g., "target: prerequisites")
-    Rule(Rule),
-    /// A variable definition (e.g., "VAR = value")
-    Variable(VariableDefinition),
-    /// An include directive (e.g., "include foo.mk")
-    Include(Include),
-    /// A conditional block (e.g., "ifdef DEBUG ... endif")
-    Conditional(Conditional),
-}
-
-impl MakefileItem {
-    /// Try to cast a syntax node to a MakefileItem
-    pub(crate) fn cast(node: SyntaxNode) -> Option<Self> {
-        if let Some(rule) = Rule::cast(node.clone()) {
-            Some(MakefileItem::Rule(rule))
-        } else if let Some(var) = VariableDefinition::cast(node.clone()) {
-            Some(MakefileItem::Variable(var))
-        } else if let Some(inc) = Include::cast(node.clone()) {
-            Some(MakefileItem::Include(inc))
-        } else {
-            Conditional::cast(node).map(MakefileItem::Conditional)
-        }
-    }
-
-    /// Get the underlying syntax node
-    pub(crate) fn syntax(&self) -> &SyntaxNode {
-        match self {
-            MakefileItem::Rule(r) => r.syntax(),
-            MakefileItem::Variable(v) => v.syntax(),
-            MakefileItem::Include(i) => i.syntax(),
-            MakefileItem::Conditional(c) => c.syntax(),
-        }
-    }
-}
-
 ///
 /// This removes trailing NEWLINE tokens from the end of a RULE node to avoid
 /// extra blank lines at the end of a file when the last rule is removed.
@@ -1633,6 +1595,7 @@ pub(crate) fn build_targets_node(targets: &[String]) -> SyntaxNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::makefile::MakefileItem;
 
     #[test]
     fn test_conditionals() {

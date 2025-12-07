@@ -1,4 +1,5 @@
-use crate::lossless::{Include, MakefileItem};
+use super::makefile::MakefileItem;
+use crate::lossless::Include;
 use crate::SyntaxKind::EXPR;
 use rowan::ast::AstNode;
 
