@@ -330,3 +330,24 @@ impl Conditional {
             .splice_children(insert_pos..insert_pos, vec![syntax.into()]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::Makefile;
+
+    #[test]
+    fn test_conditional_parent() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let parent = cond.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+}

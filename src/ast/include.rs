@@ -40,3 +40,19 @@ impl Include {
         self.syntax().parent().and_then(MakefileItem::cast)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::Makefile;
+
+    #[test]
+    fn test_include_parent() {
+        let makefile: Makefile = "include common.mk\n".parse().unwrap();
+
+        let inc = makefile.includes().next().unwrap();
+        let parent = inc.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+}

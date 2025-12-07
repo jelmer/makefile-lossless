@@ -108,3 +108,19 @@ impl VariableDefinition {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::Makefile;
+
+    #[test]
+    fn test_variable_parent() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+
+        let var = makefile.variable_definitions().next().unwrap();
+        let parent = var.parent();
+        // Parent is ROOT node which doesn't cast to MakefileItem
+        assert!(parent.is_none());
+    }
+}
