@@ -1,7 +1,8 @@
 use crate::lossless::{
-    matches_pattern, parse, Conditional, Error, ErrorInfo, Include, Makefile, ParseError, Rule,
-    SyntaxNode, VariableDefinition,
+    parse, Conditional, Error, ErrorInfo, Include, Makefile, ParseError, Rule, SyntaxNode,
+    VariableDefinition,
 };
+use crate::pattern::matches_pattern;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;

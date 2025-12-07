@@ -1,4 +1,5 @@
 use crate::lex::lex;
+use crate::MakefileVariant;
 use crate::SyntaxKind;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -67,58 +68,6 @@ impl From<ParseError> for Error {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// The variant of makefile being parsed
-pub enum MakefileVariant {
-    /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
-    GNUMake,
-    /// BSD Make (FreeBSD, NetBSD, OpenBSD - uses .if/.ifdef/.ifndef directives)
-    BSDMake,
-    /// Microsoft nmake (Windows - uses !IF/!IFDEF/!IFNDEF directives)
-    NMake,
-    /// POSIX-compliant make (basic portable subset, no extensions)
-    POSIXMake,
-}
-
-/// Match a target against a pattern using make-style wildcard matching.
-///
-/// Supports `%` as a wildcard that matches any sequence of characters.
-/// For example, `%.o` matches `foo.o`, `bar.o`, etc.
-///
-/// # Arguments
-/// * `pattern` - The pattern to match against (e.g., "%.o")
-/// * `target` - The target name to check (e.g., "foo.o")
-///
-/// # Returns
-/// `true` if the target matches the pattern, `false` otherwise
-pub(crate) fn matches_pattern(pattern: &str, target: &str) -> bool {
-    // No wildcard means exact match
-    if !pattern.contains('%') {
-        return pattern == target;
-    }
-
-    // GNU make supports exactly one '%' which matches any NON-EMPTY substring
-    let parts: Vec<&str> = pattern.split('%').collect();
-
-    // Only handle single % (GNU make doesn't support multiple %)
-    if parts.len() != 2 {
-        // Multiple % or malformed pattern - just do exact match as fallback
-        return pattern == target;
-    }
-
-    let prefix = parts[0];
-    let suffix = parts[1];
-
-    // Target must be longer than prefix + suffix to have a non-empty stem
-    if target.len() <= prefix.len() + suffix.len() {
-        return false;
-    }
-
-    // Check that target starts with prefix and ends with suffix
-    target.starts_with(prefix) && target.ends_with(suffix)
-}
-
-/// Second, implementing the `Language` trait teaches rowan to convert between
 /// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
 /// "kinds" are values from our `enum SyntaxKind`, instead of plain u16 values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1596,6 +1545,7 @@ pub(crate) fn build_targets_node(targets: &[String]) -> SyntaxNode {
 mod tests {
     use super::*;
     use crate::ast::makefile::MakefileItem;
+    use crate::pattern::matches_pattern;
 
     #[test]
     fn test_conditionals() {

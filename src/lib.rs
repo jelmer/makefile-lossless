@@ -25,14 +25,28 @@ mod ast;
 mod lex;
 mod lossless;
 mod parse;
+mod pattern;
 
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Error, Identifier, Include, Lang, Makefile,
-    MakefileVariant, ParseError, Rule, VariableDefinition,
+    ParseError, Rule, VariableDefinition,
 };
 pub use parse::Parse;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The variant of makefile being parsed
+pub enum MakefileVariant {
+    /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
+    GNUMake,
+    /// BSD Make (FreeBSD, NetBSD, OpenBSD - uses .if/.ifdef/.ifndef directives)
+    BSDMake,
+    /// Microsoft nmake (Windows - uses !IF/!IFDEF/!IFNDEF directives)
+    NMake,
+    /// POSIX-compliant make (basic portable subset, no extensions)
+    POSIXMake,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(non_camel_case_types)]
