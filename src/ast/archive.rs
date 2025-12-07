@@ -40,7 +40,7 @@ impl ArchiveMember {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lossless::{parse, Makefile};
+    use crate::lossless::parse;
     use crate::SyntaxKind::ARCHIVE_MEMBERS;
 
     #[test]

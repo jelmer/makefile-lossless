@@ -43,7 +43,7 @@ impl Include {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use crate::lossless::Makefile;
 
     #[test]
