@@ -5252,7 +5252,6 @@ endif
     }
 
     #[test]
-    #[test]
     fn test_item_parent_in_conditional() {
         let makefile: Makefile = r#"ifdef DEBUG
 VAR = debug
