@@ -1,7 +1,7 @@
 use super::makefile::MakefileItem;
 use crate::lossless::{
     remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error, ErrorInfo,
-    Makefile, ParseError, Rule, SyntaxElement, SyntaxNode,
+    Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -468,6 +468,32 @@ impl Rule {
                     })
                 })
             })
+    }
+
+    /// Get recipe nodes with line/column information
+    ///
+    /// Returns an iterator over `Recipe` AST nodes, which support the `line()`, `column()`,
+    /// and `line_col()` methods to get position information.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    ///
+    /// let rule_text = "test:\n\techo line1\n\techo line2\n";
+    /// let rule: Rule = rule_text.parse().unwrap();
+    ///
+    /// let recipe_nodes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert_eq!(recipe_nodes.len(), 2);
+    /// assert_eq!(recipe_nodes[0].text(), "echo line1");
+    /// assert_eq!(recipe_nodes[0].line(), 1); // 0-indexed
+    /// assert_eq!(recipe_nodes[1].text(), "echo line2");
+    /// assert_eq!(recipe_nodes[1].line(), 2);
+    /// ```
+    pub fn recipe_nodes(&self) -> impl Iterator<Item = Recipe> {
+        self.syntax()
+            .children()
+            .filter(|it| it.kind() == RECIPE)
+            .filter_map(Recipe::cast)
     }
 
     /// Get all items (recipe lines and conditionals) in the rule's body

@@ -1422,12 +1422,31 @@ macro_rules! ast_node {
 
 ast_node!(Makefile, ROOT);
 ast_node!(Rule, RULE);
+ast_node!(Recipe, RECIPE);
 ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
+
+impl Recipe {
+    /// Get the text content of this recipe line (the command to execute)
+    pub fn text(&self) -> String {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| {
+                if let Some(token) = it.as_token() {
+                    if token.kind() == TEXT {
+                        return Some(token.text().to_string());
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
 
 ///
 /// This removes trailing NEWLINE tokens from the end of a RULE node to avoid
@@ -5817,5 +5836,59 @@ endif
         assert_eq!(conditionals.len(), 2);
         assert_eq!(conditionals[0].line(), 0);
         assert_eq!(conditionals[1].line(), 3);
+    }
+
+    #[test]
+    fn test_recipe_line_tracking() {
+        let text = r#"build:
+	echo "Building..."
+	gcc -o app main.c
+	echo "Done"
+
+test:
+	./run-tests
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        // Test first rule's recipes
+        let rule1 = makefile.rules().next().expect("Should have first rule");
+        let recipes: Vec<_> = rule1.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 3);
+
+        assert_eq!(recipes[0].text(), "echo \"Building...\"");
+        assert_eq!(recipes[0].line(), 1);
+        assert_eq!(recipes[0].column(), 0);
+
+        assert_eq!(recipes[1].text(), "gcc -o app main.c");
+        assert_eq!(recipes[1].line(), 2);
+        assert_eq!(recipes[1].column(), 0);
+
+        assert_eq!(recipes[2].text(), "echo \"Done\"");
+        assert_eq!(recipes[2].line(), 3);
+        assert_eq!(recipes[2].column(), 0);
+
+        // Test second rule's recipes
+        let rule2 = makefile.rules().nth(1).expect("Should have second rule");
+        let recipes2: Vec<_> = rule2.recipe_nodes().collect();
+        assert_eq!(recipes2.len(), 1);
+
+        assert_eq!(recipes2[0].text(), "./run-tests");
+        assert_eq!(recipes2[0].line(), 6);
+        assert_eq!(recipes2[0].column(), 0);
+    }
+
+    #[test]
+    fn test_recipe_with_variables_line_tracking() {
+        let text = r#"install:
+	mkdir -p $(DESTDIR)
+	cp $(BINARY) $(DESTDIR)/
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().expect("Should have rule");
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].line(), 1);
+        assert_eq!(recipes[1].line(), 2);
     }
 }
