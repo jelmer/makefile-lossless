@@ -360,33 +360,67 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_rule_recipes(&mut self) {
+            // Track how many levels deep we are in conditionals that started in this rule
+            let mut conditional_depth = 0;
+            // Also track consecutive newlines to detect blank lines
+            let mut newline_count = 0;
+
             loop {
                 match self.current() {
                     Some(INDENT) => {
+                        newline_count = 0;
                         self.parse_recipe_line();
                     }
                     Some(NEWLINE) => {
-                        // Don't break on newlines - just consume them and continue
-                        // looking for more recipe lines. This allows blank lines
-                        // and comment lines within recipes.
+                        newline_count += 1;
                         self.bump();
+                    }
+                    Some(COMMENT) => {
+                        // Comments after blank lines should not be part of the rule
+                        if conditional_depth == 0 && newline_count >= 1 {
+                            break;
+                        }
+                        newline_count = 0;
+                        self.parse_comment();
                     }
                     Some(IDENTIFIER) => {
                         let token = &self.tokens.last().unwrap().1.clone();
-                        // Check if this is a starting conditional directive (not else/endif)
+                        // Check if this is a starting conditional directive
                         if (token == "ifdef"
                             || token == "ifndef"
                             || token == "ifeq"
                             || token == "ifneq")
                             && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
                         {
+                            // If we're not inside a conditional (depth == 0) and there's a blank line,
+                            // this is a top-level conditional, not part of the rule
+                            if conditional_depth == 0 && newline_count >= 1 {
+                                break;
+                            }
+                            newline_count = 0;
+                            conditional_depth += 1;
                             self.parse_conditional();
+                            // parse_conditional() handles the entire conditional including endif,
+                            // so we need to decrement after it returns
+                            conditional_depth -= 1;
                         } else if token == "include" || token == "-include" || token == "sinclude" {
+                            // Includes can appear in rules, with same blank line logic
+                            if conditional_depth == 0 && newline_count >= 1 {
+                                break;
+                            }
+                            newline_count = 0;
                             self.parse_include();
                         } else if token == "else" || token == "endif" {
-                            // These end the current recipe section - let parent handle them
+                            // These should only appear if we're inside a conditional
+                            // If we see them at depth 0, something is wrong, so break
                             break;
                         } else {
+                            // Any other identifier at depth 0 means the rule is over
+                            if conditional_depth == 0 {
+                                break;
+                            }
+                            // Otherwise, it's content inside a conditional (variable assignment, etc.)
+                            // Let it be handled by parse_normal_content
                             break;
                         }
                     }
@@ -1307,6 +1341,32 @@ impl Parse {
     }
 }
 
+/// Calculate line and column (both 0-indexed) for the given offset in the tree.
+/// Column is measured in bytes from the start of the line.
+fn line_col_at_offset(node: &SyntaxNode, offset: rowan::TextSize) -> (usize, usize) {
+    let root = node.ancestors().last().unwrap_or_else(|| node.clone());
+    let mut line = 0;
+    let mut last_newline_offset = rowan::TextSize::from(0);
+
+    for element in root.preorder_with_tokens() {
+        if let rowan::WalkEvent::Enter(rowan::NodeOrToken::Token(token)) = element {
+            if token.text_range().start() >= offset {
+                break;
+            }
+
+            // Count newlines and track position of last one
+            for (idx, _) in token.text().match_indices('\n') {
+                line += 1;
+                last_newline_offset =
+                    token.text_range().start() + rowan::TextSize::from((idx + 1) as u32);
+            }
+        }
+    }
+
+    let column: usize = (offset - last_newline_offset).into();
+    (line, column)
+}
+
 macro_rules! ast_node {
     ($ast:ident, $kind:ident) => {
         #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1331,6 +1391,24 @@ macro_rules! ast_node {
 
             fn syntax(&self) -> &SyntaxNode {
                 &self.0
+            }
+        }
+
+        impl $ast {
+            /// Get the line number (0-indexed) where this node starts.
+            pub fn line(&self) -> usize {
+                line_col_at_offset(&self.0, self.0.text_range().start()).0
+            }
+
+            /// Get the column number (0-indexed, in bytes) where this node starts.
+            pub fn column(&self) -> usize {
+                line_col_at_offset(&self.0, self.0.text_range().start()).1
+            }
+
+            /// Get both line and column (0-indexed) where this node starts.
+            /// Returns (line, column) where column is measured in bytes from the start of the line.
+            pub fn line_col(&self) -> (usize, usize) {
+                line_col_at_offset(&self.0, self.0.text_range().start())
             }
         }
 
@@ -5332,5 +5410,412 @@ endif
         } else {
             panic!("Expected inner conditional's parent to be a Conditional");
         }
+    }
+
+    #[test]
+    fn test_line_col() {
+        let text = r#"# Comment at line 0
+VAR1 = value1
+VAR2 = value2
+
+rule1: dep1 dep2
+	command1
+	command2
+
+rule2:
+	command3
+
+ifdef DEBUG
+CFLAGS = -g
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        // Test variable definition line numbers
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+
+        // VAR1 starts at line 1
+        assert_eq!(vars[0].line(), 1);
+        assert_eq!(vars[0].column(), 0);
+        assert_eq!(vars[0].line_col(), (1, 0));
+
+        // VAR2 starts at line 2
+        assert_eq!(vars[1].line(), 2);
+        assert_eq!(vars[1].column(), 0);
+
+        // Test rule line numbers
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2);
+
+        // rule1 starts at line 4
+        assert_eq!(rules[0].line(), 4);
+        assert_eq!(rules[0].column(), 0);
+        assert_eq!(rules[0].line_col(), (4, 0));
+
+        // rule2 starts at line 8
+        assert_eq!(rules[1].line(), 8);
+        assert_eq!(rules[1].column(), 0);
+
+        // Test conditional line numbers
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+
+        // ifdef DEBUG starts at line 11
+        assert_eq!(conditionals[0].line(), 11);
+        assert_eq!(conditionals[0].column(), 0);
+        assert_eq!(conditionals[0].line_col(), (11, 0));
+    }
+
+    #[test]
+    fn test_line_col_multiline() {
+        let text = "SOURCES = \\\n\tfile1.c \\\n\tfile2.c\n\ntarget: $(SOURCES)\n\tgcc -o target $(SOURCES)\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        // Variable definition starts at line 0
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].line(), 0);
+        assert_eq!(vars[0].column(), 0);
+
+        // Rule starts at line 4
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].line(), 4);
+        assert_eq!(rules[0].column(), 0);
+    }
+
+    #[test]
+    fn test_line_col_includes() {
+        let text = "VAR = value\n\ninclude config.mk\n-include optional.mk\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        // Variable at line 0
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars[0].line(), 0);
+
+        // Includes at lines 2 and 3
+        let includes: Vec<_> = makefile.includes().collect();
+        assert_eq!(includes.len(), 2);
+        assert_eq!(includes[0].line(), 2);
+        assert_eq!(includes[0].column(), 0);
+        assert_eq!(includes[1].line(), 3);
+        assert_eq!(includes[1].column(), 0);
+    }
+
+    #[test]
+    fn test_conditional_in_rule_vs_toplevel() {
+        // Conditional immediately after rule (no blank line) - part of rule
+        let text1 = r#"rule:
+	command
+ifeq (,$(X))
+	test
+endif
+"#;
+        let makefile: Makefile = text1.parse().unwrap();
+        let rules: Vec<_> = makefile.rules().collect();
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            conditionals.len(),
+            0,
+            "Conditional should be part of rule, not top-level"
+        );
+
+        // Conditional after blank line - top-level
+        let text2 = r#"rule:
+	command
+
+ifeq (,$(X))
+	test
+endif
+"#;
+        let makefile: Makefile = text2.parse().unwrap();
+        let rules: Vec<_> = makefile.rules().collect();
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            conditionals.len(),
+            1,
+            "Conditional after blank line should be top-level"
+        );
+        assert_eq!(conditionals[0].line(), 3);
+    }
+
+    #[test]
+    fn test_nested_conditionals_line_tracking() {
+        let text = r#"ifdef OUTER
+VAR1 = value1
+ifdef INNER
+VAR2 = value2
+endif
+VAR3 = value3
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(
+            conditionals.len(),
+            1,
+            "Only outer conditional should be top-level"
+        );
+        assert_eq!(conditionals[0].line(), 0);
+        assert_eq!(conditionals[0].column(), 0);
+    }
+
+    #[test]
+    fn test_conditional_else_line_tracking() {
+        let text = r#"VAR1 = before
+
+ifdef DEBUG
+DEBUG_FLAGS = -g
+else
+DEBUG_FLAGS = -O2
+endif
+
+VAR2 = after
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(conditionals[0].line(), 2);
+        assert_eq!(conditionals[0].column(), 0);
+    }
+
+    #[test]
+    fn test_broken_conditional_endif_without_if() {
+        // endif without matching if - parser should handle gracefully
+        let text = "VAR = value\nendif\n";
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        // Should parse without crashing
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].line(), 0);
+    }
+
+    #[test]
+    fn test_broken_conditional_else_without_if() {
+        // else without matching if
+        let text = "VAR = value\nelse\nVAR2 = other\n";
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        // Should parse without crashing
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert!(vars.len() >= 1, "Should parse at least the first variable");
+        assert_eq!(vars[0].line(), 0);
+    }
+
+    #[test]
+    fn test_broken_conditional_missing_endif() {
+        // ifdef without matching endif
+        let text = r#"ifdef DEBUG
+DEBUG_FLAGS = -g
+VAR = value
+"#;
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        // Should parse without crashing
+        assert!(makefile.code().contains("ifdef DEBUG"));
+    }
+
+    #[test]
+    fn test_multiple_conditionals_line_tracking() {
+        let text = r#"ifdef A
+VAR_A = a
+endif
+
+ifdef B
+VAR_B = b
+endif
+
+ifdef C
+VAR_C = c
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 3);
+        assert_eq!(conditionals[0].line(), 0);
+        assert_eq!(conditionals[1].line(), 4);
+        assert_eq!(conditionals[2].line(), 8);
+    }
+
+    #[test]
+    fn test_conditional_with_multiple_else_ifeq() {
+        let text = r#"ifeq ($(OS),Windows)
+EXT = .exe
+else ifeq ($(OS),Linux)
+EXT = .bin
+else
+EXT = .out
+endif
+"#;
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(conditionals[0].line(), 0);
+        assert_eq!(conditionals[0].column(), 0);
+    }
+
+    #[test]
+    fn test_conditional_types_line_tracking() {
+        let text = r#"ifdef VAR1
+A = 1
+endif
+
+ifndef VAR2
+B = 2
+endif
+
+ifeq ($(X),y)
+C = 3
+endif
+
+ifneq ($(Y),n)
+D = 4
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 4);
+
+        assert_eq!(conditionals[0].line(), 0); // ifdef
+        assert_eq!(
+            conditionals[0].conditional_type(),
+            Some("ifdef".to_string())
+        );
+
+        assert_eq!(conditionals[1].line(), 4); // ifndef
+        assert_eq!(
+            conditionals[1].conditional_type(),
+            Some("ifndef".to_string())
+        );
+
+        assert_eq!(conditionals[2].line(), 8); // ifeq
+        assert_eq!(conditionals[2].conditional_type(), Some("ifeq".to_string()));
+
+        assert_eq!(conditionals[3].line(), 12); // ifneq
+        assert_eq!(
+            conditionals[3].conditional_type(),
+            Some("ifneq".to_string())
+        );
+    }
+
+    #[test]
+    fn test_conditional_in_rule_with_recipes() {
+        let text = r#"test:
+	echo "start"
+ifdef VERBOSE
+	echo "verbose mode"
+endif
+	echo "end"
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].line(), 0);
+        // Conditional is part of the rule, not top-level
+        assert_eq!(conditionals.len(), 0);
+    }
+
+    #[test]
+    fn test_broken_conditional_double_else() {
+        // Two else clauses in one conditional
+        let text = r#"ifdef DEBUG
+A = 1
+else
+B = 2
+else
+C = 3
+endif
+"#;
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        // Should parse without crashing, though it's malformed
+        assert!(makefile.code().contains("ifdef DEBUG"));
+    }
+
+    #[test]
+    fn test_broken_conditional_mismatched_nesting() {
+        // Mismatched nesting - more endifs than ifs
+        let text = r#"ifdef A
+VAR = value
+endif
+endif
+"#;
+        let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+
+        // Should parse without crashing
+        // The extra endif will be parsed separately, so we may get more than 1 item
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert!(
+            conditionals.len() >= 1,
+            "Should parse at least the first conditional"
+        );
+    }
+
+    #[test]
+    fn test_conditional_with_comment_line_tracking() {
+        let text = r#"# This is a comment
+ifdef DEBUG
+# Another comment
+CFLAGS = -g
+endif
+# Final comment
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(conditionals[0].line(), 1);
+        assert_eq!(conditionals[0].column(), 0);
+    }
+
+    #[test]
+    fn test_conditional_after_variable_with_blank_lines() {
+        let text = r#"VAR1 = value1
+
+
+ifdef DEBUG
+VAR2 = value2
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].line(), 0);
+
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(conditionals[0].line(), 3);
+    }
+
+    #[test]
+    fn test_empty_conditional_line_tracking() {
+        let text = r#"ifdef DEBUG
+endif
+
+ifndef RELEASE
+endif
+"#;
+        let makefile: Makefile = text.parse().unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 2);
+        assert_eq!(conditionals[0].line(), 0);
+        assert_eq!(conditionals[1].line(), 3);
     }
 }
