@@ -1446,6 +1446,225 @@ impl Recipe {
             .collect::<Vec<_>>()
             .join("")
     }
+
+    /// Get the parent rule containing this recipe
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// let parent = recipe.parent().unwrap();
+    /// assert_eq!(parent.targets().collect::<Vec<_>>(), vec!["all"]);
+    /// ```
+    pub fn parent(&self) -> Option<Rule> {
+        self.syntax().parent().and_then(Rule::cast)
+    }
+
+    /// Check if this recipe has the silent prefix (@)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t@echo hello\n\techo world\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert!(recipes[0].is_silent());
+    /// assert!(!recipes[1].is_silent());
+    /// ```
+    pub fn is_silent(&self) -> bool {
+        let text = self.text();
+        text.starts_with('@') || text.starts_with("-@") || text.starts_with("+@")
+    }
+
+    /// Check if this recipe has the ignore-errors prefix (-)
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t-echo hello\n\techo world\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert!(recipes[0].is_ignore_errors());
+    /// assert!(!recipes[1].is_ignore_errors());
+    /// ```
+    pub fn is_ignore_errors(&self) -> bool {
+        let text = self.text();
+        text.starts_with('-') || text.starts_with("@-") || text.starts_with("+-")
+    }
+
+    /// Set the command prefix for this recipe
+    ///
+    /// The prefix can contain `@` (silent), `-` (ignore errors), and/or `+` (always execute).
+    /// Pass an empty string to remove all prefixes.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.set_prefix("@");
+    /// assert_eq!(recipe.text(), "@echo hello");
+    /// assert!(recipe.is_silent());
+    /// ```
+    pub fn set_prefix(&mut self, prefix: &str) {
+        let text = self.text();
+
+        // Strip existing prefix characters
+        let stripped = text.trim_start_matches(['@', '-', '+']);
+
+        // Build new text with the new prefix
+        let new_text = format!("{}{}", prefix, stripped);
+
+        self.replace_text(&new_text);
+    }
+
+    /// Replace the text content of this recipe line
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.replace_text("echo world");
+    /// assert_eq!(recipe.text(), "echo world");
+    /// ```
+    pub fn replace_text(&mut self, new_text: &str) {
+        let node = self.syntax();
+        let parent = node.parent().expect("Recipe node must have a parent");
+        let node_index = node.index();
+
+        // Build a new RECIPE node with the new text
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+
+        // Preserve the existing INDENT token if present
+        if let Some(indent_token) = node
+            .children_with_tokens()
+            .find(|it| it.as_token().map(|t| t.kind() == INDENT).unwrap_or(false))
+        {
+            builder.token(INDENT.into(), indent_token.as_token().unwrap().text());
+        } else {
+            builder.token(INDENT.into(), "\t");
+        }
+
+        builder.token(TEXT.into(), new_text);
+
+        // Preserve the existing NEWLINE token if present
+        if let Some(newline_token) = node
+            .children_with_tokens()
+            .find(|it| it.as_token().map(|t| t.kind() == NEWLINE).unwrap_or(false))
+        {
+            builder.token(NEWLINE.into(), newline_token.as_token().unwrap().text());
+        } else {
+            builder.token(NEWLINE.into(), "\n");
+        }
+
+        builder.finish_node();
+        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Replace the old node with the new one
+        parent.splice_children(node_index..node_index + 1, vec![new_syntax.into()]);
+
+        // Update self to point to the new node
+        // Note: index() returns position among all siblings (nodes + tokens)
+        // so we need to use children_with_tokens() and filter for the node
+        *self = parent
+            .children_with_tokens()
+            .nth(node_index)
+            .and_then(|element| element.into_node())
+            .and_then(Recipe::cast)
+            .expect("New recipe node should exist at the same index");
+    }
+
+    /// Insert a new recipe line before this one
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo world\n".parse().unwrap();
+    /// let mut rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.insert_before("echo hello");
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hello", "echo world"]);
+    /// ```
+    pub fn insert_before(&self, text: &str) {
+        let node = self.syntax();
+        let parent = node.parent().expect("Recipe node must have a parent");
+        let node_index = node.index();
+
+        // Build a new RECIPE node
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+        builder.token(INDENT.into(), "\t");
+        builder.token(TEXT.into(), text);
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Insert before this recipe
+        parent.splice_children(node_index..node_index, vec![new_syntax.into()]);
+    }
+
+    /// Insert a new recipe line after this one
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let mut rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.insert_after("echo world");
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hello", "echo world"]);
+    /// ```
+    pub fn insert_after(&self, text: &str) {
+        let node = self.syntax();
+        let parent = node.parent().expect("Recipe node must have a parent");
+        let node_index = node.index();
+
+        // Build a new RECIPE node
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(RECIPE.into());
+        builder.token(INDENT.into(), "\t");
+        builder.token(TEXT.into(), text);
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Insert after this recipe
+        parent.splice_children(node_index + 1..node_index + 1, vec![new_syntax.into()]);
+    }
+
+    /// Remove this recipe line from its parent
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n\techo world\n".parse().unwrap();
+    /// let mut rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.remove();
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo world"]);
+    /// ```
+    pub fn remove(&self) {
+        let node = self.syntax();
+        let parent = node.parent().expect("Recipe node must have a parent");
+        let node_index = node.index();
+
+        // Remove this recipe node from its parent
+        parent.splice_children(node_index..node_index + 1, vec![]);
+    }
 }
 
 ///
@@ -5890,5 +6109,322 @@ test:
         assert_eq!(recipes.len(), 2);
         assert_eq!(recipes[0].line(), 1);
         assert_eq!(recipes[1].line(), 2);
+    }
+
+    #[test]
+    fn test_recipe_text_no_leading_tab() {
+        // Test that Recipe::text() does not include the leading tab
+        let text = "test:\n\techo hello\n\t\techo nested\n\t  echo with spaces\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().expect("Should have rule");
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 3);
+
+        // Debug: print syntax tree for the first recipe
+        eprintln!("Recipe 0 syntax tree:\n{:#?}", recipes[0].syntax());
+
+        // First recipe: single tab
+        assert_eq!(recipes[0].text(), "echo hello");
+
+        // Second recipe: double tab (nested)
+        eprintln!("Recipe 1 syntax tree:\n{:#?}", recipes[1].syntax());
+        assert_eq!(recipes[1].text(), "\techo nested");
+
+        // Third recipe: tab followed by spaces
+        eprintln!("Recipe 2 syntax tree:\n{:#?}", recipes[2].syntax());
+        assert_eq!(recipes[2].text(), "  echo with spaces");
+    }
+
+    #[test]
+    fn test_recipe_parent() {
+        let makefile: Makefile = "all: dep\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+
+        let parent = recipe.parent().expect("Recipe should have parent");
+        assert_eq!(parent.targets().collect::<Vec<_>>(), vec!["all"]);
+        assert_eq!(parent.prerequisites().collect::<Vec<_>>(), vec!["dep"]);
+    }
+
+    #[test]
+    fn test_recipe_is_silent_various_prefixes() {
+        let makefile: Makefile = r#"test:
+	@echo silent
+	-echo ignore
+	+echo always
+	@-echo silent_ignore
+	-@echo ignore_silent
+	+@echo always_silent
+	echo normal
+"#.parse().unwrap();
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 7);
+        assert!(recipes[0].is_silent(), "@echo should be silent");
+        assert!(!recipes[1].is_silent(), "-echo should not be silent");
+        assert!(!recipes[2].is_silent(), "+echo should not be silent");
+        assert!(recipes[3].is_silent(), "@-echo should be silent");
+        assert!(recipes[4].is_silent(), "-@echo should be silent");
+        assert!(recipes[5].is_silent(), "+@echo should be silent");
+        assert!(!recipes[6].is_silent(), "echo should not be silent");
+    }
+
+    #[test]
+    fn test_recipe_is_ignore_errors_various_prefixes() {
+        let makefile: Makefile = r#"test:
+	@echo silent
+	-echo ignore
+	+echo always
+	@-echo silent_ignore
+	-@echo ignore_silent
+	+-echo always_ignore
+	echo normal
+"#.parse().unwrap();
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 7);
+        assert!(!recipes[0].is_ignore_errors(), "@echo should not ignore errors");
+        assert!(recipes[1].is_ignore_errors(), "-echo should ignore errors");
+        assert!(!recipes[2].is_ignore_errors(), "+echo should not ignore errors");
+        assert!(recipes[3].is_ignore_errors(), "@-echo should ignore errors");
+        assert!(recipes[4].is_ignore_errors(), "-@echo should ignore errors");
+        assert!(recipes[5].is_ignore_errors(), "+-echo should ignore errors");
+        assert!(!recipes[6].is_ignore_errors(), "echo should not ignore errors");
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_add() {
+        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("@");
+        assert_eq!(recipe.text(), "@echo hello");
+        assert!(recipe.is_silent());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_change() {
+        let mut makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("-");
+        assert_eq!(recipe.text(), "-echo hello");
+        assert!(!recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_remove() {
+        let mut makefile: Makefile = "all:\n\t@-echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("");
+        assert_eq!(recipe.text(), "echo hello");
+        assert!(!recipe.is_silent());
+        assert!(!recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_combinations() {
+        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("@-");
+        assert_eq!(recipe.text(), "@-echo hello");
+        assert!(recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+
+        recipe.set_prefix("-@");
+        assert_eq!(recipe.text(), "-@echo hello");
+        assert!(recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_replace_text_basic() {
+        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.replace_text("echo world");
+        assert_eq!(recipe.text(), "echo world");
+
+        // Verify it's still accessible from the rule
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo world"]);
+    }
+
+    #[test]
+    fn test_recipe_replace_text_with_prefix() {
+        let mut makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.replace_text("@echo goodbye");
+        assert_eq!(recipe.text(), "@echo goodbye");
+        assert!(recipe.is_silent());
+    }
+
+    #[test]
+    fn test_recipe_insert_before_single() {
+        let mut makefile: Makefile = "all:\n\techo world\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.insert_before("echo hello");
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["echo hello", "echo world"]);
+    }
+
+    #[test]
+    fn test_recipe_insert_before_multiple() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        // Insert before the second recipe
+        recipes[1].insert_before("echo middle");
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo one", "echo middle", "echo two", "echo three"]);
+    }
+
+    #[test]
+    fn test_recipe_insert_before_first() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        recipes[0].insert_before("echo zero");
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo zero", "echo one", "echo two"]);
+    }
+
+    #[test]
+    fn test_recipe_insert_after_single() {
+        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.insert_after("echo world");
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["echo hello", "echo world"]);
+    }
+
+    #[test]
+    fn test_recipe_insert_after_multiple() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        // Insert after the second recipe
+        recipes[1].insert_after("echo middle");
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo one", "echo two", "echo middle", "echo three"]);
+    }
+
+    #[test]
+    fn test_recipe_insert_after_last() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        recipes[1].insert_after("echo three");
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo one", "echo two", "echo three"]);
+    }
+
+    #[test]
+    fn test_recipe_remove_single() {
+        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.remove();
+
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().count(), 0);
+    }
+
+    #[test]
+    fn test_recipe_remove_first() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        recipes[0].remove();
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo two", "echo three"]);
+    }
+
+    #[test]
+    fn test_recipe_remove_middle() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        recipes[1].remove();
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo one", "echo three"]);
+    }
+
+    #[test]
+    fn test_recipe_remove_last() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        recipes[2].remove();
+
+        let rule = makefile.rules().next().unwrap();
+        let new_recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(new_recipes, vec!["echo one", "echo two"]);
+    }
+
+    #[test]
+    fn test_recipe_multiple_operations() {
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        // Replace text
+        recipe.replace_text("echo modified");
+        assert_eq!(recipe.text(), "echo modified");
+
+        // Add prefix
+        recipe.set_prefix("@");
+        assert_eq!(recipe.text(), "@echo modified");
+
+        // Insert after
+        recipe.insert_after("echo three");
+
+        // Verify all changes
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["@echo modified", "echo three", "echo two"]);
     }
 }
