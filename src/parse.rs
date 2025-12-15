@@ -56,16 +56,14 @@ impl<T> Parse<T> {
         }
     }
 
-    /// Get the parsed syntax tree, panicking if there are errors
+    /// Get the parsed syntax tree
+    ///
+    /// Returns the tree even if there are parse errors. Use `errors()` or `ok()` to check
+    /// for errors separately if needed.
     pub fn tree(&self) -> T
     where
         T: AstNode<Language = crate::lossless::Lang>,
     {
-        assert!(
-            self.errors.is_empty(),
-            "tried to get tree with errors: {:?}",
-            self.errors
-        );
         let node = SyntaxNode::new_root_mut(self.green.clone());
         T::cast(node).expect("root node has wrong type")
     }
