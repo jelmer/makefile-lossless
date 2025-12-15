@@ -634,18 +634,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        // Helper method to parse a parenthesized expression
+        // Helper method to parse a conditional comparison (ifeq/ifneq)
+        // Supports both syntaxes: (arg1,arg2) and "arg1" "arg2"
         fn parse_parenthesized_expr(&mut self) {
             self.builder.start_node(EXPR.into());
 
-            if self.current() != Some(LPAREN) {
-                self.error("expected opening parenthesis".to_string());
-                self.builder.finish_node();
-                return;
+            // Check if we have parenthesized or quoted syntax
+            if self.current() == Some(LPAREN) {
+                // Parenthesized syntax: ifeq (arg1,arg2)
+                self.bump(); // Consume opening paren
+                self.parse_parenthesized_expr_internal(false);
+            } else if self.current() == Some(QUOTE) {
+                // Quoted syntax: ifeq "arg1" "arg2" or ifeq 'arg1' 'arg2'
+                self.parse_quoted_comparison();
+            } else {
+                self.error("expected opening parenthesis or quote".to_string());
             }
 
-            self.bump(); // Consume opening paren
-            self.parse_parenthesized_expr_internal(false);
             self.builder.finish_node();
         }
 
@@ -692,6 +697,31 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.skip_ws();
                 self.expect_eol();
             }
+        }
+
+        // Helper method to parse quoted comparison for ifeq/ifneq
+        // Handles: "arg1" "arg2" or 'arg1' 'arg2'
+        fn parse_quoted_comparison(&mut self) {
+            // First quoted string - lexer already tokenized the entire string
+            if self.current() == Some(QUOTE) {
+                self.bump(); // Consume the entire first quoted string token
+            } else {
+                self.error("expected first quoted argument".to_string());
+            }
+
+            // Skip whitespace between the two arguments
+            self.skip_ws();
+
+            // Second quoted string - lexer already tokenized the entire string
+            if self.current() == Some(QUOTE) {
+                self.bump(); // Consume the entire second quoted string token
+            } else {
+                self.error("expected second quoted argument".to_string());
+            }
+
+            // Skip trailing whitespace and expect end of line
+            self.skip_ws();
+            self.expect_eol();
         }
 
         // Handle parsing a quoted string - combines common quoting logic
@@ -6157,7 +6187,9 @@ test:
 	-@echo ignore_silent
 	+@echo always_silent
 	echo normal
-"#.parse().unwrap();
+"#
+        .parse()
+        .unwrap();
 
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
@@ -6182,19 +6214,30 @@ test:
 	-@echo ignore_silent
 	+-echo always_ignore
 	echo normal
-"#.parse().unwrap();
+"#
+        .parse()
+        .unwrap();
 
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
         assert_eq!(recipes.len(), 7);
-        assert!(!recipes[0].is_ignore_errors(), "@echo should not ignore errors");
+        assert!(
+            !recipes[0].is_ignore_errors(),
+            "@echo should not ignore errors"
+        );
         assert!(recipes[1].is_ignore_errors(), "-echo should ignore errors");
-        assert!(!recipes[2].is_ignore_errors(), "+echo should not ignore errors");
+        assert!(
+            !recipes[2].is_ignore_errors(),
+            "+echo should not ignore errors"
+        );
         assert!(recipes[3].is_ignore_errors(), "@-echo should ignore errors");
         assert!(recipes[4].is_ignore_errors(), "-@echo should ignore errors");
         assert!(recipes[5].is_ignore_errors(), "+-echo should ignore errors");
-        assert!(!recipes[6].is_ignore_errors(), "echo should not ignore errors");
+        assert!(
+            !recipes[6].is_ignore_errors(),
+            "echo should not ignore errors"
+        );
     }
 
     #[test]
@@ -6289,7 +6332,9 @@ test:
 
     #[test]
     fn test_recipe_insert_before_multiple() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+            .parse()
+            .unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6298,7 +6343,10 @@ test:
 
         let rule = makefile.rules().next().unwrap();
         let new_recipes: Vec<_> = rule.recipes().collect();
-        assert_eq!(new_recipes, vec!["echo one", "echo middle", "echo two", "echo three"]);
+        assert_eq!(
+            new_recipes,
+            vec!["echo one", "echo middle", "echo two", "echo three"]
+        );
     }
 
     #[test]
@@ -6329,7 +6377,9 @@ test:
 
     #[test]
     fn test_recipe_insert_after_multiple() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+            .parse()
+            .unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6338,7 +6388,10 @@ test:
 
         let rule = makefile.rules().next().unwrap();
         let new_recipes: Vec<_> = rule.recipes().collect();
-        assert_eq!(new_recipes, vec!["echo one", "echo two", "echo middle", "echo three"]);
+        assert_eq!(
+            new_recipes,
+            vec!["echo one", "echo two", "echo middle", "echo three"]
+        );
     }
 
     #[test]
@@ -6368,7 +6421,9 @@ test:
 
     #[test]
     fn test_recipe_remove_first() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+            .parse()
+            .unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6381,7 +6436,9 @@ test:
 
     #[test]
     fn test_recipe_remove_middle() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+            .parse()
+            .unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6394,7 +6451,9 @@ test:
 
     #[test]
     fn test_recipe_remove_last() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n".parse().unwrap();
+        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+            .parse()
+            .unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
