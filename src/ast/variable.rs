@@ -236,7 +236,6 @@ mod tests {
         assert_eq!(var.assignment_operator(), Some("+=".to_string()));
     }
 
-
     #[test]
     fn test_assignment_operator_export() {
         let makefile: Makefile = "export VAR := value\n".parse().unwrap();

@@ -904,4 +904,164 @@ impl Makefile {
         self.rules_by_target(".PHONY")
             .flat_map(|rule| rule.prerequisites().collect::<Vec<_>>())
     }
+
+    /// Add a new include directive at the beginning of the makefile
+    ///
+    /// # Arguments
+    /// * `path` - The file path to include (e.g., "config.mk")
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile = Makefile::new();
+    /// makefile.add_include("config.mk");
+    /// assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["config.mk"]);
+    /// ```
+    pub fn add_include(&mut self, path: &str) -> Include {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.token(IDENTIFIER.into(), "include");
+        builder.token(WHITESPACE.into(), " ");
+
+        // Wrap path in EXPR node
+        builder.start_node(EXPR.into());
+        builder.token(IDENTIFIER.into(), path);
+        builder.finish_node();
+
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Insert at the beginning (position 0)
+        self.syntax().splice_children(0..0, vec![syntax.into()]);
+
+        // Return the newly added include (first child)
+        Include::cast(self.syntax().children().next().unwrap()).unwrap()
+    }
+
+    /// Insert an include directive at a specific position
+    ///
+    /// The position is relative to other top-level items (rules, variables, includes, conditionals).
+    ///
+    /// # Arguments
+    /// * `index` - The position to insert at (0 = beginning, items().count() = end)
+    /// * `path` - The file path to include (e.g., "config.mk")
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR = value\nrule:\n\tcommand\n".parse().unwrap();
+    /// makefile.insert_include(1, "config.mk").unwrap();
+    /// let items: Vec<_> = makefile.items().collect();
+    /// assert_eq!(items.len(), 3); // VAR, include, rule
+    /// ```
+    pub fn insert_include(&mut self, index: usize, path: &str) -> Result<Include, Error> {
+        let items: Vec<_> = self.syntax().children().collect();
+
+        if index > items.len() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!("Index {} out of bounds (max {})", index, items.len()),
+                    line: 1,
+                    context: "insert_include".to_string(),
+                }],
+            }));
+        }
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.token(IDENTIFIER.into(), "include");
+        builder.token(WHITESPACE.into(), " ");
+
+        // Wrap path in EXPR node
+        builder.start_node(EXPR.into());
+        builder.token(IDENTIFIER.into(), path);
+        builder.finish_node();
+
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        let target_index = if index == items.len() {
+            // Insert at the end
+            self.syntax().children_with_tokens().count()
+        } else {
+            // Insert before the item at the given index
+            items[index].index()
+        };
+
+        // Insert the include node
+        self.syntax()
+            .splice_children(target_index..target_index, vec![syntax.into()]);
+
+        // Find and return the newly added include
+        // It should be at the child index we inserted at
+        Ok(Include::cast(self.syntax().children().nth(index).unwrap()).unwrap())
+    }
+
+    /// Insert an include directive after a specific MakefileItem
+    ///
+    /// This is useful when you want to insert an include relative to another item in the makefile.
+    ///
+    /// # Arguments
+    /// * `after` - The MakefileItem to insert after
+    /// * `path` - The file path to include (e.g., "config.mk")
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR1 = value1\nVAR2 = value2\n".parse().unwrap();
+    /// let first_var = makefile.items().next().unwrap();
+    /// makefile.insert_include_after(&first_var, "config.mk").unwrap();
+    /// let paths: Vec<_> = makefile.included_files().collect();
+    /// assert_eq!(paths, vec!["config.mk"]);
+    /// ```
+    pub fn insert_include_after(
+        &mut self,
+        after: &MakefileItem,
+        path: &str,
+    ) -> Result<Include, Error> {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.token(IDENTIFIER.into(), "include");
+        builder.token(WHITESPACE.into(), " ");
+
+        // Wrap path in EXPR node
+        builder.start_node(EXPR.into());
+        builder.token(IDENTIFIER.into(), path);
+        builder.finish_node();
+
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let syntax = SyntaxNode::new_root_mut(builder.finish());
+
+        // Find the position of the item to insert after
+        let after_syntax = after.syntax();
+        let target_index = after_syntax.index() + 1;
+
+        // Insert the include node after the target item
+        self.syntax()
+            .splice_children(target_index..target_index, vec![syntax.into()]);
+
+        // Find and return the newly added include
+        // It should be the child immediately after the 'after' item
+        let after_child_index = self
+            .syntax()
+            .children()
+            .position(|child| child.text_range() == after_syntax.text_range())
+            .ok_or_else(|| {
+                Error::Parse(ParseError {
+                    errors: vec![ErrorInfo {
+                        message: "Could not find the reference item".to_string(),
+                        line: 1,
+                        context: "insert_include_after".to_string(),
+                    }],
+                })
+            })?;
+
+        Ok(Include::cast(self.syntax().children().nth(after_child_index + 1).unwrap()).unwrap())
+    }
 }
