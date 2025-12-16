@@ -2877,7 +2877,7 @@ CFLAGS := -Wall -O2 \
         // Check that we can extract variables even with errors
         let vars = makefile.variable_definitions().collect::<Vec<_>>();
         assert!(
-            vars.len() >= 1,
+            !vars.is_empty(),
             "Expected at least 1 variable, found {}",
             vars.len()
         );
@@ -3159,7 +3159,7 @@ endif
         }
 
         check_node(
-            &syntax,
+            syntax,
             &mut found_conditional,
             &mut found_conditional_if,
             &mut found_conditional_else,
@@ -3539,7 +3539,7 @@ endif
         let makefile = parsed.root();
         let includes = makefile.includes().collect::<Vec<_>>();
         // Should recognize include directive
-        assert!(includes.len() >= 1 || parsed.errors.len() > 0);
+        assert!(!includes.is_empty() || !parsed.errors.is_empty());
 
         // Test with -include
         let optional_include = r#"
@@ -3956,7 +3956,7 @@ rule2:
         // Add 100 rules
         for i in 0..100 {
             let rule_name = format!("rule{}", i);
-            let _rule = makefile
+            makefile
                 .add_rule(&rule_name)
                 .push_command(&format!("command{}", i));
         }
@@ -4113,10 +4113,10 @@ VAR4 := value4
         let vars: Vec<_> = makefile.variable_definitions().collect();
         assert_eq!(vars.len(), 4);
 
-        assert_eq!(vars[0].is_export(), false);
-        assert_eq!(vars[1].is_export(), true);
-        assert_eq!(vars[2].is_export(), true);
-        assert_eq!(vars[3].is_export(), false);
+        assert!(!vars[0].is_export());
+        assert!(vars[1].is_export());
+        assert!(vars[2].is_export());
+        assert!(!vars[3].is_export());
     }
 
     #[test]
@@ -5874,7 +5874,7 @@ VAR2 = after
 
         // Should parse without crashing
         let vars: Vec<_> = makefile.variable_definitions().collect();
-        assert!(vars.len() >= 1, "Should parse at least the first variable");
+        assert!(!vars.is_empty(), "Should parse at least the first variable");
         assert_eq!(vars[0].line(), 0);
     }
 
@@ -6028,7 +6028,7 @@ endif
         // The extra endif will be parsed separately, so we may get more than 1 item
         let conditionals: Vec<_> = makefile.conditionals().collect();
         assert!(
-            conditionals.len() >= 1,
+            !conditionals.is_empty(),
             "Should parse at least the first conditional"
         );
     }
@@ -6242,7 +6242,7 @@ test:
 
     #[test]
     fn test_recipe_set_prefix_add() {
-        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6253,7 +6253,7 @@ test:
 
     #[test]
     fn test_recipe_set_prefix_change() {
-        let mut makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6265,7 +6265,7 @@ test:
 
     #[test]
     fn test_recipe_set_prefix_remove() {
-        let mut makefile: Makefile = "all:\n\t@-echo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\t@-echo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6277,7 +6277,7 @@ test:
 
     #[test]
     fn test_recipe_set_prefix_combinations() {
-        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6294,7 +6294,7 @@ test:
 
     #[test]
     fn test_recipe_replace_text_basic() {
-        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6308,7 +6308,7 @@ test:
 
     #[test]
     fn test_recipe_replace_text_with_prefix() {
-        let mut makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6319,7 +6319,7 @@ test:
 
     #[test]
     fn test_recipe_insert_before_single() {
-        let mut makefile: Makefile = "all:\n\techo world\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo world\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6332,7 +6332,7 @@ test:
 
     #[test]
     fn test_recipe_insert_before_multiple() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
             .parse()
             .unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -6351,7 +6351,7 @@ test:
 
     #[test]
     fn test_recipe_insert_before_first() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6364,7 +6364,7 @@ test:
 
     #[test]
     fn test_recipe_insert_after_single() {
-        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6377,7 +6377,7 @@ test:
 
     #[test]
     fn test_recipe_insert_after_multiple() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
             .parse()
             .unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -6396,7 +6396,7 @@ test:
 
     #[test]
     fn test_recipe_insert_after_last() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -6409,7 +6409,7 @@ test:
 
     #[test]
     fn test_recipe_remove_single() {
-        let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let recipe = rule.recipe_nodes().next().unwrap();
 
@@ -6421,7 +6421,7 @@ test:
 
     #[test]
     fn test_recipe_remove_first() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
             .parse()
             .unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -6436,7 +6436,7 @@ test:
 
     #[test]
     fn test_recipe_remove_middle() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
             .parse()
             .unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -6451,7 +6451,7 @@ test:
 
     #[test]
     fn test_recipe_remove_last() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n\techo three\n"
             .parse()
             .unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -6466,7 +6466,7 @@ test:
 
     #[test]
     fn test_recipe_multiple_operations() {
-        let mut makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
