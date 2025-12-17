@@ -43,6 +43,310 @@ impl MakefileItem {
             MakefileItem::Conditional(c) => c.syntax(),
         }
     }
+
+    /// Replace this MakefileItem with another MakefileItem
+    ///
+    /// This preserves the position of the original item but replaces its content
+    /// with the new item. Preceding comments are preserved.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile: Makefile = "VAR1 = old\nrule:\n\tcommand\n".parse().unwrap();
+    /// let temp: Makefile = "VAR2 = new\n".parse().unwrap();
+    /// let new_var = temp.variable_definitions().next().unwrap();
+    /// let mut first_item = makefile.items().next().unwrap();
+    /// first_item.replace(MakefileItem::Variable(new_var)).unwrap();
+    /// assert!(makefile.to_string().contains("VAR2 = new"));
+    /// assert!(!makefile.to_string().contains("VAR1"));
+    /// ```
+    pub fn replace(&mut self, new_item: MakefileItem) -> Result<(), Error> {
+        let parent = self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot replace item without parent".to_string(),
+                    line: 1,
+                    context: "MakefileItem::replace".to_string(),
+                }],
+            })
+        })?;
+
+        let current_index = self.syntax().index();
+
+        // Replace the current node with the new item's syntax
+        parent.splice_children(
+            current_index..current_index + 1,
+            vec![new_item.syntax().clone().into()],
+        );
+
+        // Update self to point to the new item
+        *self = new_item;
+
+        Ok(())
+    }
+
+    /// Add a comment before this MakefileItem
+    ///
+    /// The comment text should not include the leading '#' character.
+    /// Multiple comment lines can be added by calling this method multiple times.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+    /// let mut item = makefile.items().next().unwrap();
+    /// item.add_comment("This is a variable").unwrap();
+    /// assert!(makefile.to_string().contains("# This is a variable"));
+    /// ```
+    pub fn add_comment(&mut self, comment_text: &str) -> Result<(), Error> {
+        let parent = self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot add comment to item without parent".to_string(),
+                    line: 1,
+                    context: "MakefileItem::add_comment".to_string(),
+                }],
+            })
+        })?;
+
+        let current_index = self.syntax().index();
+
+        // Parse a temporary makefile with just the comment to get properly formatted tokens
+        let comment_line = format!("# {}\n", comment_text);
+        let temp_makefile = crate::lossless::parse(&comment_line, None);
+        let root = temp_makefile.root();
+
+        // Extract just the COMMENT token and ONE newline
+        let mut elements = Vec::new();
+        let mut found_comment = false;
+        for element in root.syntax().children_with_tokens() {
+            if let rowan::NodeOrToken::Token(token) = element {
+                if token.kind() == COMMENT {
+                    elements.push(rowan::NodeOrToken::Token(token));
+                    found_comment = true;
+                } else if token.kind() == NEWLINE && found_comment && elements.len() == 1 {
+                    // Only take the first newline immediately after the comment
+                    elements.push(rowan::NodeOrToken::Token(token));
+                    break;
+                }
+            }
+        }
+
+        // Insert comment and newline before the current item
+        parent.splice_children(current_index..current_index, elements);
+
+        Ok(())
+    }
+
+    /// Get all preceding comments for this MakefileItem
+    ///
+    /// Returns an iterator of comment strings (without the leading '#' and whitespace).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
+    /// let item = makefile.items().next().unwrap();
+    /// let comments: Vec<_> = item.preceding_comments().collect();
+    /// assert_eq!(comments.len(), 2);
+    /// assert_eq!(comments[0], "Comment 1");
+    /// assert_eq!(comments[1], "Comment 2");
+    /// ```
+    pub fn preceding_comments(&self) -> impl Iterator<Item = String> {
+        let mut comments = Vec::new();
+        let mut current = self.syntax().prev_sibling_or_token();
+
+        while let Some(element) = current {
+            match &element {
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    let text = token.text();
+                    if !text.starts_with("#!") {
+                        // Strip leading '# ' or '#'
+                        let comment_text = text
+                            .strip_prefix("# ")
+                            .or_else(|| text.strip_prefix('#'))
+                            .unwrap_or(text)
+                            .to_string();
+                        comments.push(comment_text);
+                    }
+                }
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == NEWLINE || token.kind() == WHITESPACE => {}
+                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {}
+                _ => break,
+            }
+            current = element.prev_sibling_or_token();
+        }
+
+        // Reverse to get comments in the order they appear
+        comments.reverse();
+        comments.into_iter()
+    }
+
+    /// Remove all preceding comments for this MakefileItem
+    ///
+    /// Returns the number of comments removed.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
+    /// let mut item = makefile.items().next().unwrap();
+    /// let count = item.remove_comments().unwrap();
+    /// assert_eq!(count, 2);
+    /// assert!(!makefile.to_string().contains("# Comment"));
+    /// ```
+    pub fn remove_comments(&mut self) -> Result<usize, Error> {
+        let parent = self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot remove comments from item without parent".to_string(),
+                    line: 1,
+                    context: "MakefileItem::remove_comments".to_string(),
+                }],
+            })
+        })?;
+
+        let mut collected_elements = Vec::new();
+        let mut comment_count = 0;
+        let mut current = self.syntax().prev_sibling_or_token();
+
+        // First, collect all preceding elements that might be related to comments
+        while let Some(element) = current {
+            match &element {
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    if !token.text().starts_with("#!") {
+                        comment_count += 1;
+                        collected_elements.push(element.clone());
+                    } else {
+                        break; // Don't remove shebang lines
+                    }
+                }
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
+                {
+                    // Collect newlines/whitespace to analyze later
+                    collected_elements.push(element.clone());
+                }
+                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
+                    // Collect blank lines
+                    collected_elements.push(element.clone());
+                }
+                _ => break, // Hit something else, stop
+            }
+            current = element.prev_sibling_or_token();
+        }
+
+        // Now decide what to actually remove - similar to remove_with_preceding_comments
+        // We remove comments and up to 1 blank line worth of newlines
+        let mut elements_to_remove = Vec::new();
+        let mut consecutive_newlines = 0;
+        for element in collected_elements.iter().rev() {
+            let should_remove = match element {
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    consecutive_newlines = 0;
+                    true // Remove comments
+                }
+                rowan::NodeOrToken::Token(token) if token.kind() == NEWLINE => {
+                    consecutive_newlines += 1;
+                    comment_count > 0 && consecutive_newlines <= 1
+                }
+                rowan::NodeOrToken::Token(token) if token.kind() == WHITESPACE => comment_count > 0,
+                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
+                    consecutive_newlines += 1;
+                    comment_count > 0 && consecutive_newlines <= 1
+                }
+                _ => false,
+            };
+
+            if should_remove {
+                elements_to_remove.push(element.clone());
+            }
+        }
+
+        // Remove elements in reverse order (from highest index to lowest)
+        elements_to_remove.sort_by_key(|el| std::cmp::Reverse(el.index()));
+        for element in elements_to_remove {
+            let idx = element.index();
+            parent.splice_children(idx..idx + 1, vec![]);
+        }
+
+        Ok(comment_count)
+    }
+
+    /// Modify the first preceding comment for this MakefileItem
+    ///
+    /// Returns `true` if a comment was found and modified, `false` if no comment exists.
+    /// The comment text should not include the leading '#' character.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
+    /// let mut item = makefile.items().next().unwrap();
+    /// let modified = item.modify_comment("New comment").unwrap();
+    /// assert!(modified);
+    /// assert!(makefile.to_string().contains("# New comment"));
+    /// assert!(!makefile.to_string().contains("# Old comment"));
+    /// ```
+    pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
+        let parent = self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot modify comment for item without parent".to_string(),
+                    line: 1,
+                    context: "MakefileItem::modify_comment".to_string(),
+                }],
+            })
+        })?;
+
+        // Find the first preceding comment (closest to the item)
+        let mut current = self.syntax().prev_sibling_or_token();
+        let mut comment_element = None;
+
+        while let Some(element) = current {
+            match &element {
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    if !token.text().starts_with("#!") {
+                        comment_element = Some(element.clone());
+                    }
+                    break;
+                }
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == NEWLINE || token.kind() == WHITESPACE => {}
+                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {}
+                _ => break,
+            }
+            current = element.prev_sibling_or_token();
+        }
+
+        if let Some(element) = comment_element {
+            let idx = element.index();
+
+            // Parse a temporary makefile with just the comment to get a properly formatted token
+            let comment_line = format!("# {}\n", new_comment_text);
+            let temp_makefile = crate::lossless::parse(&comment_line, None);
+            let root = temp_makefile.root();
+
+            // Extract the comment token from the parsed makefile
+            let new_comment_token = root
+                .syntax()
+                .children_with_tokens()
+                .find(|element| {
+                    if let rowan::NodeOrToken::Token(token) = element {
+                        token.kind() == COMMENT
+                    } else {
+                        false
+                    }
+                })
+                .unwrap();
+
+            parent.splice_children(idx..idx + 1, vec![new_comment_token]);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 impl Makefile {
@@ -1063,5 +1367,214 @@ impl Makefile {
             })?;
 
         Ok(Include::cast(self.syntax().children().nth(after_child_index + 1).unwrap()).unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_makefile_item_replace_variable_with_variable() {
+        let mut makefile: Makefile = "VAR1 = old\nrule:\n\tcommand\n".parse().unwrap();
+        let temp: Makefile = "VAR2 = new\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item.replace(MakefileItem::Variable(new_var)).unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR2 = new\nrule:\n\tcommand\n");
+    }
+
+    #[test]
+    fn test_makefile_item_replace_variable_with_rule() {
+        let mut makefile: Makefile = "VAR1 = value\nrule1:\n\tcommand1\n".parse().unwrap();
+        let temp: Makefile = "new_rule:\n\tnew_command\n".parse().unwrap();
+        let new_rule = temp.rules().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item.replace(MakefileItem::Rule(new_rule)).unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "new_rule:\n\tnew_command\nrule1:\n\tcommand1\n");
+    }
+
+    #[test]
+    fn test_makefile_item_replace_preserves_position() {
+        let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\nVAR3 = third\n"
+            .parse()
+            .unwrap();
+        let temp: Makefile = "NEW = replacement\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+
+        // Replace the second item
+        let mut second_item = makefile.items().nth(1).unwrap();
+        second_item
+            .replace(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let items: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].name(), Some("VAR1".to_string()));
+        assert_eq!(items[1].name(), Some("NEW".to_string()));
+        assert_eq!(items[2].name(), Some("VAR3".to_string()));
+    }
+
+    #[test]
+    fn test_makefile_item_add_comment() {
+        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        item.add_comment("This is a variable").unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "# This is a variable\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_add_multiple_comments() {
+        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        item.add_comment("Comment 1").unwrap();
+        // Note: After modifying the tree, we need to get a fresh reference
+        let mut item = makefile.items().next().unwrap();
+        item.add_comment("Comment 2").unwrap();
+
+        let result = makefile.to_string();
+        // Comments are added before the item, so adding Comment 2 after Comment 1
+        // results in Comment 1 appearing first (furthest from item), then Comment 2
+        assert_eq!(result, "# Comment 1\n# Comment 2\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_preceding_comments() {
+        let makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
+        let item = makefile.items().next().unwrap();
+        let comments: Vec<_> = item.preceding_comments().collect();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0], "Comment 1");
+        assert_eq!(comments[1], "Comment 2");
+    }
+
+    #[test]
+    fn test_makefile_item_preceding_comments_no_comments() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let item = makefile.items().next().unwrap();
+        let comments: Vec<_> = item.preceding_comments().collect();
+        assert_eq!(comments.len(), 0);
+    }
+
+    #[test]
+    fn test_makefile_item_preceding_comments_ignores_shebang() {
+        let makefile: Makefile = "#!/usr/bin/make\n# Real comment\nVAR = value\n"
+            .parse()
+            .unwrap();
+        let item = makefile.items().next().unwrap();
+        let comments: Vec<_> = item.preceding_comments().collect();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0], "Real comment");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments() {
+        let mut makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
+        // Get a fresh reference to the item to ensure we have the current tree state
+        let mut item = makefile.items().next().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 2);
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments_no_comments() {
+        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(makefile.to_string(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_modify_comment() {
+        let mut makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        let modified = item.modify_comment("New comment").unwrap();
+
+        assert_eq!(modified, true);
+        let result = makefile.to_string();
+        assert_eq!(result, "# New comment\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_modify_comment_no_comment() {
+        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        let modified = item.modify_comment("New comment").unwrap();
+
+        assert_eq!(modified, false);
+        assert_eq!(makefile.to_string(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_modify_comment_modifies_closest() {
+        let mut makefile: Makefile = "# Comment 1\n# Comment 2\n# Comment 3\nVAR = value\n"
+            .parse()
+            .unwrap();
+        let mut item = makefile.items().next().unwrap();
+        let modified = item.modify_comment("Modified").unwrap();
+
+        assert_eq!(modified, true);
+        let result = makefile.to_string();
+        assert_eq!(
+            result,
+            "# Comment 1\n# Comment 2\n# Modified\nVAR = value\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_comment_workflow() {
+        // Test adding, modifying, and removing comments in sequence
+        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+
+        // Add a comment
+        item.add_comment("Initial comment").unwrap();
+        assert_eq!(makefile.to_string(), "# Initial comment\nVAR = value\n");
+
+        // Get a fresh reference after modification
+        let mut item = makefile.items().next().unwrap();
+        // Modify it
+        item.modify_comment("Updated comment").unwrap();
+        assert_eq!(makefile.to_string(), "# Updated comment\nVAR = value\n");
+
+        // Get a fresh reference after modification
+        let mut item = makefile.items().next().unwrap();
+        // Remove it
+        let count = item.remove_comments().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(makefile.to_string(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_replace_with_comments() {
+        let mut makefile: Makefile = "# Comment for VAR1\nVAR1 = old\nrule:\n\tcommand\n"
+            .parse()
+            .unwrap();
+        let temp: Makefile = "VAR2 = new\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+
+        // Verify comment exists before replace
+        let comments: Vec<_> = first_item.preceding_comments().collect();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0], "Comment for VAR1");
+
+        // Replace the item
+        first_item.replace(MakefileItem::Variable(new_var)).unwrap();
+
+        let result = makefile.to_string();
+        // The comment should still be there (replace preserves preceding comments)
+        assert_eq!(result, "# Comment for VAR1\nVAR2 = new\nrule:\n\tcommand\n");
     }
 }
