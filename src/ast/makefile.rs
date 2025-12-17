@@ -44,6 +44,100 @@ impl MakefileItem {
         }
     }
 
+    /// Helper to get parent node or return an appropriate error
+    fn get_parent_or_error(&self, action: &str, method: &str) -> Result<SyntaxNode, Error> {
+        self.syntax().parent().ok_or_else(|| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: format!("Cannot {} item without parent", action),
+                    line: 1,
+                    context: format!("MakefileItem::{}", method),
+                }],
+            })
+        })
+    }
+
+    /// Check if a token is a regular comment (not a shebang)
+    fn is_regular_comment(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> bool {
+        token.kind() == COMMENT && !token.text().starts_with("#!")
+    }
+
+    /// Extract comment text from a comment token, removing '#' prefix
+    fn extract_comment_text(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> String {
+        let text = token.text();
+        text.strip_prefix("# ")
+            .or_else(|| text.strip_prefix('#'))
+            .unwrap_or(text)
+            .to_string()
+    }
+
+    /// Helper to find all preceding comment-related elements up to the first non-comment element
+    ///
+    /// Returns elements in reverse order (from closest to furthest from the item)
+    fn collect_preceding_comment_elements(
+        &self,
+    ) -> Vec<rowan::NodeOrToken<SyntaxNode, rowan::SyntaxToken<crate::lossless::Lang>>> {
+        let mut elements = Vec::new();
+        let mut current = self.syntax().prev_sibling_or_token();
+
+        while let Some(element) = current {
+            match &element {
+                rowan::NodeOrToken::Token(token) if Self::is_regular_comment(token) => {
+                    elements.push(element.clone());
+                }
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
+                {
+                    elements.push(element.clone());
+                }
+                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
+                    elements.push(element.clone());
+                }
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    // Hit a shebang, stop here
+                    break;
+                }
+                _ => break,
+            }
+            current = element.prev_sibling_or_token();
+        }
+
+        elements
+    }
+
+    /// Helper to parse comment text and extract properly formatted comment tokens
+    fn parse_comment_tokens(
+        comment_text: &str,
+    ) -> (
+        rowan::SyntaxToken<crate::lossless::Lang>,
+        Option<rowan::SyntaxToken<crate::lossless::Lang>>,
+    ) {
+        let comment_line = format!("# {}\n", comment_text);
+        let temp_makefile = crate::lossless::parse(&comment_line, None);
+        let root = temp_makefile.root();
+
+        let mut comment_token = None;
+        let mut newline_token = None;
+        let mut found_comment = false;
+
+        for element in root.syntax().children_with_tokens() {
+            if let rowan::NodeOrToken::Token(token) = element {
+                if token.kind() == COMMENT {
+                    comment_token = Some(token);
+                    found_comment = true;
+                } else if token.kind() == NEWLINE && found_comment && newline_token.is_none() {
+                    newline_token = Some(token);
+                    break;
+                }
+            }
+        }
+
+        (
+            comment_token.expect("Failed to extract comment token"),
+            newline_token,
+        )
+    }
+
     /// Replace this MakefileItem with another MakefileItem
     ///
     /// This preserves the position of the original item but replaces its content
@@ -61,16 +155,7 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("VAR1"));
     /// ```
     pub fn replace(&mut self, new_item: MakefileItem) -> Result<(), Error> {
-        let parent = self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    message: "Cannot replace item without parent".to_string(),
-                    line: 1,
-                    context: "MakefileItem::replace".to_string(),
-                }],
-            })
-        })?;
-
+        let parent = self.get_parent_or_error("replace", "replace")?;
         let current_index = self.syntax().index();
 
         // Replace the current node with the new item's syntax
@@ -99,37 +184,15 @@ impl MakefileItem {
     /// assert!(makefile.to_string().contains("# This is a variable"));
     /// ```
     pub fn add_comment(&mut self, comment_text: &str) -> Result<(), Error> {
-        let parent = self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    message: "Cannot add comment to item without parent".to_string(),
-                    line: 1,
-                    context: "MakefileItem::add_comment".to_string(),
-                }],
-            })
-        })?;
-
+        let parent = self.get_parent_or_error("add comment to", "add_comment")?;
         let current_index = self.syntax().index();
 
-        // Parse a temporary makefile with just the comment to get properly formatted tokens
-        let comment_line = format!("# {}\n", comment_text);
-        let temp_makefile = crate::lossless::parse(&comment_line, None);
-        let root = temp_makefile.root();
+        // Get properly formatted comment tokens
+        let (comment_token, newline_token) = Self::parse_comment_tokens(comment_text);
 
-        // Extract just the COMMENT token and ONE newline
-        let mut elements = Vec::new();
-        let mut found_comment = false;
-        for element in root.syntax().children_with_tokens() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    elements.push(rowan::NodeOrToken::Token(token));
-                    found_comment = true;
-                } else if token.kind() == NEWLINE && found_comment && elements.len() == 1 {
-                    // Only take the first newline immediately after the comment
-                    elements.push(rowan::NodeOrToken::Token(token));
-                    break;
-                }
-            }
+        let mut elements = vec![rowan::NodeOrToken::Token(comment_token)];
+        if let Some(newline) = newline_token {
+            elements.push(rowan::NodeOrToken::Token(newline));
         }
 
         // Insert comment and newline before the current item
@@ -153,33 +216,18 @@ impl MakefileItem {
     /// assert_eq!(comments[1], "Comment 2");
     /// ```
     pub fn preceding_comments(&self) -> impl Iterator<Item = String> {
+        let elements = self.collect_preceding_comment_elements();
         let mut comments = Vec::new();
-        let mut current = self.syntax().prev_sibling_or_token();
 
-        while let Some(element) = current {
-            match &element {
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    let text = token.text();
-                    if !text.starts_with("#!") {
-                        // Strip leading '# ' or '#'
-                        let comment_text = text
-                            .strip_prefix("# ")
-                            .or_else(|| text.strip_prefix('#'))
-                            .unwrap_or(text)
-                            .to_string();
-                        comments.push(comment_text);
-                    }
+        // Process elements in reverse order (furthest to closest)
+        for element in elements.iter().rev() {
+            if let rowan::NodeOrToken::Token(token) = element {
+                if token.kind() == COMMENT {
+                    comments.push(Self::extract_comment_text(token));
                 }
-                rowan::NodeOrToken::Token(token)
-                    if token.kind() == NEWLINE || token.kind() == WHITESPACE => {}
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {}
-                _ => break,
             }
-            current = element.prev_sibling_or_token();
         }
 
-        // Reverse to get comments in the order they appear
-        comments.reverse();
         comments.into_iter()
     }
 
@@ -197,47 +245,20 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Comment"));
     /// ```
     pub fn remove_comments(&mut self) -> Result<usize, Error> {
-        let parent = self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    message: "Cannot remove comments from item without parent".to_string(),
-                    line: 1,
-                    context: "MakefileItem::remove_comments".to_string(),
-                }],
-            })
-        })?;
+        let parent = self.get_parent_or_error("remove comments from", "remove_comments")?;
+        let collected_elements = self.collect_preceding_comment_elements();
 
-        let mut collected_elements = Vec::new();
+        // Count the comments
         let mut comment_count = 0;
-        let mut current = self.syntax().prev_sibling_or_token();
-
-        // First, collect all preceding elements that might be related to comments
-        while let Some(element) = current {
-            match &element {
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    if !token.text().starts_with("#!") {
-                        comment_count += 1;
-                        collected_elements.push(element.clone());
-                    } else {
-                        break; // Don't remove shebang lines
-                    }
+        for element in collected_elements.iter() {
+            if let rowan::NodeOrToken::Token(token) = element {
+                if token.kind() == COMMENT {
+                    comment_count += 1;
                 }
-                rowan::NodeOrToken::Token(token)
-                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
-                {
-                    // Collect newlines/whitespace to analyze later
-                    collected_elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
-                    // Collect blank lines
-                    collected_elements.push(element.clone());
-                }
-                _ => break, // Hit something else, stop
             }
-            current = element.prev_sibling_or_token();
         }
 
-        // Now decide what to actually remove - similar to remove_with_preceding_comments
+        // Determine which elements to remove - similar to remove_with_preceding_comments
         // We remove comments and up to 1 blank line worth of newlines
         let mut elements_to_remove = Vec::new();
         let mut consecutive_newlines = 0;
@@ -290,58 +311,25 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Old comment"));
     /// ```
     pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
-        let parent = self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    message: "Cannot modify comment for item without parent".to_string(),
-                    line: 1,
-                    context: "MakefileItem::modify_comment".to_string(),
-                }],
-            })
-        })?;
+        let parent = self.get_parent_or_error("modify comment for", "modify_comment")?;
 
         // Find the first preceding comment (closest to the item)
-        let mut current = self.syntax().prev_sibling_or_token();
-        let mut comment_element = None;
-
-        while let Some(element) = current {
-            match &element {
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    if !token.text().starts_with("#!") {
-                        comment_element = Some(element.clone());
-                    }
-                    break;
-                }
-                rowan::NodeOrToken::Token(token)
-                    if token.kind() == NEWLINE || token.kind() == WHITESPACE => {}
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {}
-                _ => break,
+        let collected_elements = self.collect_preceding_comment_elements();
+        let comment_element = collected_elements.iter().find(|element| {
+            if let rowan::NodeOrToken::Token(token) = element {
+                token.kind() == COMMENT
+            } else {
+                false
             }
-            current = element.prev_sibling_or_token();
-        }
+        });
 
         if let Some(element) = comment_element {
             let idx = element.index();
-
-            // Parse a temporary makefile with just the comment to get a properly formatted token
-            let comment_line = format!("# {}\n", new_comment_text);
-            let temp_makefile = crate::lossless::parse(&comment_line, None);
-            let root = temp_makefile.root();
-
-            // Extract the comment token from the parsed makefile
-            let new_comment_token = root
-                .syntax()
-                .children_with_tokens()
-                .find(|element| {
-                    if let rowan::NodeOrToken::Token(token) = element {
-                        token.kind() == COMMENT
-                    } else {
-                        false
-                    }
-                })
-                .unwrap();
-
-            parent.splice_children(idx..idx + 1, vec![new_comment_token]);
+            let (new_comment_token, _) = Self::parse_comment_tokens(new_comment_text);
+            parent.splice_children(
+                idx..idx + 1,
+                vec![rowan::NodeOrToken::Token(new_comment_token)],
+            );
             Ok(true)
         } else {
             Ok(false)
