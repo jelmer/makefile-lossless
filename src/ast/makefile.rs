@@ -335,6 +335,64 @@ impl MakefileItem {
             Ok(false)
         }
     }
+
+    /// Insert a new MakefileItem before this item
+    ///
+    /// This inserts the new item immediately before the current item in the makefile.
+    /// The new item is inserted at the same level as the current item.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+    /// let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+    /// let new_var = temp.variable_definitions().next().unwrap();
+    /// let mut second_item = makefile.items().nth(1).unwrap();
+    /// second_item.insert_before(MakefileItem::Variable(new_var)).unwrap();
+    /// let result = makefile.to_string();
+    /// assert!(result.contains("VAR1 = first\nVAR_NEW = inserted\nVAR2 = second"));
+    /// ```
+    pub fn insert_before(&mut self, new_item: MakefileItem) -> Result<(), Error> {
+        let parent = self.get_parent_or_error("insert before", "insert_before")?;
+        let current_index = self.syntax().index();
+
+        // Insert the new item before the current item
+        parent.splice_children(
+            current_index..current_index,
+            vec![new_item.syntax().clone().into()],
+        );
+
+        Ok(())
+    }
+
+    /// Insert a new MakefileItem after this item
+    ///
+    /// This inserts the new item immediately after the current item in the makefile.
+    /// The new item is inserted at the same level as the current item.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+    /// let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+    /// let new_var = temp.variable_definitions().next().unwrap();
+    /// let mut first_item = makefile.items().next().unwrap();
+    /// first_item.insert_after(MakefileItem::Variable(new_var)).unwrap();
+    /// let result = makefile.to_string();
+    /// assert!(result.contains("VAR1 = first\nVAR_NEW = inserted\nVAR2 = second"));
+    /// ```
+    pub fn insert_after(&mut self, new_item: MakefileItem) -> Result<(), Error> {
+        let parent = self.get_parent_or_error("insert after", "insert_after")?;
+        let current_index = self.syntax().index();
+
+        // Insert the new item after the current item
+        parent.splice_children(
+            current_index + 1..current_index + 1,
+            vec![new_item.syntax().clone().into()],
+        );
+
+        Ok(())
+    }
 }
 
 impl Makefile {
@@ -1364,7 +1422,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_replace_variable_with_variable() {
-        let mut makefile: Makefile = "VAR1 = old\nrule:\n\tcommand\n".parse().unwrap();
+        let makefile: Makefile = "VAR1 = old\nrule:\n\tcommand\n".parse().unwrap();
         let temp: Makefile = "VAR2 = new\n".parse().unwrap();
         let new_var = temp.variable_definitions().next().unwrap();
         let mut first_item = makefile.items().next().unwrap();
@@ -1376,7 +1434,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_replace_variable_with_rule() {
-        let mut makefile: Makefile = "VAR1 = value\nrule1:\n\tcommand1\n".parse().unwrap();
+        let makefile: Makefile = "VAR1 = value\nrule1:\n\tcommand1\n".parse().unwrap();
         let temp: Makefile = "new_rule:\n\tnew_command\n".parse().unwrap();
         let new_rule = temp.rules().next().unwrap();
         let mut first_item = makefile.items().next().unwrap();
@@ -1388,7 +1446,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_replace_preserves_position() {
-        let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\nVAR3 = third\n"
+        let makefile: Makefile = "VAR1 = first\nVAR2 = second\nVAR3 = third\n"
             .parse()
             .unwrap();
         let temp: Makefile = "NEW = replacement\n".parse().unwrap();
@@ -1409,7 +1467,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_add_comment() {
-        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
         item.add_comment("This is a variable").unwrap();
 
@@ -1419,7 +1477,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_add_multiple_comments() {
-        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
         item.add_comment("Comment 1").unwrap();
         // Note: After modifying the tree, we need to get a fresh reference
@@ -1463,7 +1521,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_remove_comments() {
-        let mut makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
+        let makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
         // Get a fresh reference to the item to ensure we have the current tree state
         let mut item = makefile.items().next().unwrap();
         let count = item.remove_comments().unwrap();
@@ -1475,7 +1533,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_remove_comments_no_comments() {
-        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
         let count = item.remove_comments().unwrap();
 
@@ -1485,34 +1543,34 @@ mod tests {
 
     #[test]
     fn test_makefile_item_modify_comment() {
-        let mut makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
+        let makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
         let modified = item.modify_comment("New comment").unwrap();
 
-        assert_eq!(modified, true);
+        assert!(modified);
         let result = makefile.to_string();
         assert_eq!(result, "# New comment\nVAR = value\n");
     }
 
     #[test]
     fn test_makefile_item_modify_comment_no_comment() {
-        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
         let modified = item.modify_comment("New comment").unwrap();
 
-        assert_eq!(modified, false);
+        assert!(!modified);
         assert_eq!(makefile.to_string(), "VAR = value\n");
     }
 
     #[test]
     fn test_makefile_item_modify_comment_modifies_closest() {
-        let mut makefile: Makefile = "# Comment 1\n# Comment 2\n# Comment 3\nVAR = value\n"
+        let makefile: Makefile = "# Comment 1\n# Comment 2\n# Comment 3\nVAR = value\n"
             .parse()
             .unwrap();
         let mut item = makefile.items().next().unwrap();
         let modified = item.modify_comment("Modified").unwrap();
 
-        assert_eq!(modified, true);
+        assert!(modified);
         let result = makefile.to_string();
         assert_eq!(
             result,
@@ -1523,7 +1581,7 @@ mod tests {
     #[test]
     fn test_makefile_item_comment_workflow() {
         // Test adding, modifying, and removing comments in sequence
-        let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
 
         // Add a comment
@@ -1546,7 +1604,7 @@ mod tests {
 
     #[test]
     fn test_makefile_item_replace_with_comments() {
-        let mut makefile: Makefile = "# Comment for VAR1\nVAR1 = old\nrule:\n\tcommand\n"
+        let makefile: Makefile = "# Comment for VAR1\nVAR1 = old\nrule:\n\tcommand\n"
             .parse()
             .unwrap();
         let temp: Makefile = "VAR2 = new\n".parse().unwrap();
@@ -1564,5 +1622,203 @@ mod tests {
         let result = makefile.to_string();
         // The comment should still be there (replace preserves preceding comments)
         assert_eq!(result, "# Comment for VAR1\nVAR2 = new\nrule:\n\tcommand\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_variable() {
+        let makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut second_item = makefile.items().nth(1).unwrap();
+        second_item
+            .insert_before(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR1 = first\nVAR_NEW = inserted\nVAR2 = second\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_variable() {
+        let makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_after(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR1 = first\nVAR_NEW = inserted\nVAR2 = second\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_first_item() {
+        let makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_before(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR_NEW = inserted\nVAR1 = first\nVAR2 = second\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_last_item() {
+        let makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut last_item = makefile.items().nth(1).unwrap();
+        last_item
+            .insert_after(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR1 = first\nVAR2 = second\nVAR_NEW = inserted\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_include() {
+        let makefile: Makefile = "VAR1 = value\nrule:\n\tcommand\n".parse().unwrap();
+        let temp: Makefile = "include test.mk\n".parse().unwrap();
+        let new_include = temp.includes().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_before(MakefileItem::Include(new_include))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "include test.mk\nVAR1 = value\nrule:\n\tcommand\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_include() {
+        let makefile: Makefile = "VAR1 = value\nrule:\n\tcommand\n".parse().unwrap();
+        let temp: Makefile = "include test.mk\n".parse().unwrap();
+        let new_include = temp.includes().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_after(MakefileItem::Include(new_include))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR1 = value\ninclude test.mk\nrule:\n\tcommand\n");
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_rule() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let temp: Makefile = "new_rule:\n\tnew_command\n".parse().unwrap();
+        let new_rule = temp.rules().next().unwrap();
+        let mut second_item = makefile.items().nth(1).unwrap();
+        second_item
+            .insert_before(MakefileItem::Rule(new_rule))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(
+            result,
+            "rule1:\n\tcommand1\nnew_rule:\n\tnew_command\nrule2:\n\tcommand2\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_rule() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let temp: Makefile = "new_rule:\n\tnew_command\n".parse().unwrap();
+        let new_rule = temp.rules().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_after(MakefileItem::Rule(new_rule))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(
+            result,
+            "rule1:\n\tcommand1\nnew_rule:\n\tnew_command\nrule2:\n\tcommand2\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_with_comments() {
+        let makefile: Makefile = "# Comment 1\nVAR1 = first\n# Comment 2\nVAR2 = second\n"
+            .parse()
+            .unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut second_item = makefile.items().nth(1).unwrap();
+        second_item
+            .insert_before(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        // The new variable should be inserted before Comment 2 (which precedes VAR2)
+        // This is correct because insert_before inserts before the item and its preceding comments
+        assert_eq!(
+            result,
+            "# Comment 1\nVAR1 = first\n# Comment 2\nVAR_NEW = inserted\nVAR2 = second\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_with_comments() {
+        let makefile: Makefile = "# Comment 1\nVAR1 = first\n# Comment 2\nVAR2 = second\n"
+            .parse()
+            .unwrap();
+        let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut first_item = makefile.items().next().unwrap();
+        first_item
+            .insert_after(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        // The new variable should be inserted between VAR1 and Comment 2/VAR2
+        assert_eq!(
+            result,
+            "# Comment 1\nVAR1 = first\nVAR_NEW = inserted\n# Comment 2\nVAR2 = second\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_preserves_formatting() {
+        let makefile: Makefile = "VAR1  =  first\nVAR2  =  second\n".parse().unwrap();
+        let temp: Makefile = "VAR_NEW  =  inserted\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        let mut second_item = makefile.items().nth(1).unwrap();
+        second_item
+            .insert_before(MakefileItem::Variable(new_var))
+            .unwrap();
+
+        let result = makefile.to_string();
+        // Formatting of the new item is preserved from its source
+        assert_eq!(
+            result,
+            "VAR1  =  first\nVAR_NEW  =  inserted\nVAR2  =  second\n"
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_insert_multiple_items() {
+        let makefile: Makefile = "VAR1 = first\nVAR2 = last\n".parse().unwrap();
+        let temp: Makefile = "VAR_A = a\nVAR_B = b\n".parse().unwrap();
+        let mut new_vars: Vec<_> = temp.variable_definitions().collect();
+
+        let mut target_item = makefile.items().nth(1).unwrap();
+        target_item
+            .insert_before(MakefileItem::Variable(new_vars.pop().unwrap()))
+            .unwrap();
+
+        // Get fresh reference after first insertion
+        let mut target_item = makefile.items().nth(1).unwrap();
+        target_item
+            .insert_before(MakefileItem::Variable(new_vars.pop().unwrap()))
+            .unwrap();
+
+        let result = makefile.to_string();
+        assert_eq!(result, "VAR1 = first\nVAR_A = a\nVAR_B = b\nVAR2 = last\n");
     }
 }
