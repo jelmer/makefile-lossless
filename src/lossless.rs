@@ -809,7 +809,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "ifdef" | "ifndef" | "ifeq" | "ifneq"
                     if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
                 {
-                    *depth += 1;
+                    // Don't increment depth here - parse_conditional manages its own depth internally
+                    // Incrementing here causes the outer conditional to never exit its loop
                     self.parse_conditional();
                     true
                 }
@@ -5465,7 +5466,8 @@ include common.mk
         .unwrap();
 
         // First verify we can find each type individually
-        assert_eq!(makefile.variable_definitions().count(), 1);
+        // variable_definitions() is recursive, so it finds VAR and CFLAGS (inside conditional)
+        assert_eq!(makefile.variable_definitions().count(), 2);
         assert_eq!(makefile.conditionals().count(), 1);
         assert_eq!(makefile.rules().count(), 1);
 
@@ -5700,8 +5702,9 @@ endif
         let makefile: Makefile = text.parse().unwrap();
 
         // Test variable definition line numbers
+        // variable_definitions() is recursive, so it finds VAR1, VAR2, and CFLAGS (inside conditional)
         let vars: Vec<_> = makefile.variable_definitions().collect();
-        assert_eq!(vars.len(), 2);
+        assert_eq!(vars.len(), 3);
 
         // VAR1 starts at line 1
         assert_eq!(vars[0].line(), 1);
@@ -5711,6 +5714,10 @@ endif
         // VAR2 starts at line 2
         assert_eq!(vars[1].line(), 2);
         assert_eq!(vars[1].column(), 0);
+
+        // CFLAGS starts at line 12 (inside ifdef DEBUG)
+        assert_eq!(vars[2].line(), 12);
+        assert_eq!(vars[2].column(), 0);
 
         // Test rule line numbers
         let rules: Vec<_> = makefile.rules().collect();
@@ -6064,8 +6071,10 @@ endif
         let vars: Vec<_> = makefile.variable_definitions().collect();
         let conditionals: Vec<_> = makefile.conditionals().collect();
 
-        assert_eq!(vars.len(), 1);
-        assert_eq!(vars[0].line(), 0);
+        // variable_definitions() is recursive, so it finds VAR1 and VAR2 (inside conditional)
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].line(), 0); // VAR1
+        assert_eq!(vars[1].line(), 4); // VAR2
 
         assert_eq!(conditionals.len(), 1);
         assert_eq!(conditionals[0].line(), 3);

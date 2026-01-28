@@ -6,6 +6,7 @@ use crate::pattern::matches_pattern;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
+use std::collections::VecDeque;
 
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
@@ -395,6 +396,62 @@ impl MakefileItem {
     }
 }
 
+// Internal trait for extracting specific item types from MakefileItem
+trait ExtractFromItem: Sized {
+    fn extract(item: MakefileItem) -> Option<Self>;
+}
+
+impl ExtractFromItem for Rule {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Rule(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for VariableDefinition {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Variable(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+// Internal stack-based iterator for recursively collecting items from conditionals
+struct RecursiveItemsIter<T> {
+    stack: VecDeque<MakefileItem>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> RecursiveItemsIter<T> {
+    fn new(items: impl Iterator<Item = MakefileItem>) -> Self {
+        Self {
+            stack: items.collect(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(item) = self.stack.pop_front() {
+            if let MakefileItem::Conditional(ref cond) = item {
+                // Push in natural order since we pop from front
+                self.stack.extend(cond.if_items());
+                self.stack.extend(cond.else_items());
+            }
+            if let Some(extracted) = T::extract(item) {
+                return Some(extracted);
+            }
+        }
+        None
+    }
+}
+
 impl Makefile {
     /// Create a new empty makefile
     pub fn new() -> Makefile {
@@ -447,7 +504,7 @@ impl Makefile {
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
     pub fn rules(&self) -> impl Iterator<Item = Rule> + '_ {
-        self.syntax().children().filter_map(Rule::cast)
+        RecursiveItemsIter::new(self.items())
     }
 
     /// Get all rules that have a specific target
@@ -457,15 +514,16 @@ impl Makefile {
     }
 
     /// Get all variable definitions in the makefile
-    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
-        self.syntax()
-            .children()
-            .filter_map(VariableDefinition::cast)
+    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> + '_ {
+        RecursiveItemsIter::new(self.items())
     }
 
-    /// Get all conditionals in the makefile
+    /// Get all conditionals in the makefile (top-level only)
     pub fn conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
-        self.syntax().children().filter_map(Conditional::cast)
+        self.items().filter_map(|item| match item {
+            MakefileItem::Conditional(c) => Some(c),
+            _ => None,
+        })
     }
 
     /// Get all top-level items (rules, variables, includes, conditionals) in the makefile
@@ -1820,5 +1878,45 @@ mod tests {
 
         let result = makefile.to_string();
         assert_eq!(result, "VAR1 = first\nVAR_A = a\nVAR_B = b\nVAR2 = last\n");
+    }
+
+    #[test]
+    fn test_rules_after_nested_conditionals() {
+        // Test for bug where .rules() returns no rules after nested conditionals
+        // This was reported in https://bugs.debian.org/1126511
+        let makefile_content = r#"#!/usr/bin/make -f
+
+ifeq ($(filter nodoc, $(DEB_BUILD_OPTIONS)),)
+ifneq ($(shell which valadoc),)
+  BUILD_DOC:=-Ddocs=true
+endif
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	echo test
+"#;
+        let makefile: Makefile = makefile_content.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        let targets: Vec<Vec<_>> = rules.iter().map(|r| r.targets().collect()).collect();
+        assert_eq!(
+            rules.len(),
+            2,
+            "Expected 2 rules (% and override_dh_auto_configure), got {} rules with targets: {:?}",
+            rules.len(),
+            targets
+        );
+
+        assert_eq!(targets[0], vec!["%"]);
+        assert_eq!(targets[1], vec!["override_dh_auto_configure"]);
+
+        // Also test that pattern matching works
+        assert!(makefile.find_rule_by_target_pattern("build-arch").is_some());
+        assert!(makefile
+            .find_rule_by_target_pattern("build-indep")
+            .is_some());
     }
 }
