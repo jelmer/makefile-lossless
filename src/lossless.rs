@@ -196,15 +196,46 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             self.bump();
 
-            // Parse the recipe content by consuming all tokens until newline
-            // This makes it more permissive with various token types
-            while self.current().is_some() && self.current() != Some(NEWLINE) {
-                self.bump();
-            }
+            // Parse the recipe content, handling line continuations (backslash at end of line)
+            loop {
+                let mut last_text_content: Option<String> = None;
 
-            // Expect newline at the end
-            if self.current() == Some(NEWLINE) {
-                self.bump();
+                // Consume all tokens until newline, tracking the last TEXT token's content
+                while self.current().is_some() && self.current() != Some(NEWLINE) {
+                    // Save the text content if this is a TEXT token
+                    if self.current() == Some(TEXT) {
+                        if let Some((_kind, text)) = self.tokens.last() {
+                            last_text_content = Some(text.clone());
+                        }
+                    }
+                    self.bump();
+                }
+
+                // Consume the newline
+                if self.current() == Some(NEWLINE) {
+                    self.bump();
+                }
+
+                // Check if the last TEXT token ended with a backslash (continuation)
+                let is_continuation = last_text_content
+                    .as_ref()
+                    .map(|text| text.trim_end().ends_with('\\'))
+                    .unwrap_or(false);
+
+                if is_continuation {
+                    // This is a continuation line - consume the indent of the next line and continue
+                    if self.current() == Some(INDENT) {
+                        self.bump();
+                        // Continue parsing the next line
+                        continue;
+                    } else {
+                        // If there's no indent after a backslash, that's unusual but we'll stop here
+                        break;
+                    }
+                } else {
+                    // No continuation - we're done
+                    break;
+                }
             }
 
             self.builder.finish_node();
@@ -1463,12 +1494,75 @@ ast_node!(Conditional, CONDITIONAL);
 
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
+    ///
+    /// This returns only the TEXT tokens, excluding comments and whitespace.
+    /// For comment-only lines, this returns an empty string.
     pub fn text(&self) -> String {
         self.syntax()
             .children_with_tokens()
             .filter_map(|it| {
                 if let Some(token) = it.as_token() {
                     if token.kind() == TEXT {
+                        return Some(token.text().to_string());
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Get the comment content of this recipe line, if any
+    ///
+    /// Returns the comment text (including the '#' character) if this recipe
+    /// line contains a comment, or None if there is no comment.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t# This is a comment\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert_eq!(recipes[0].comment(), Some("# This is a comment".to_string()));
+    /// assert_eq!(recipes[1].comment(), None);
+    /// ```
+    pub fn comment(&self) -> Option<String> {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| {
+                if let Some(token) = it.as_token() {
+                    if token.kind() == COMMENT {
+                        return Some(token.text().to_string());
+                    }
+                }
+                None
+            })
+            .next()
+    }
+
+    /// Get the full content of this recipe line
+    ///
+    /// Returns all content including command text, comments, and internal whitespace,
+    /// but excluding the leading indent. This is useful for getting the complete
+    /// content of a recipe line regardless of whether it's a command, comment, or both.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\techo hello # inline comment\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// assert_eq!(recipe.full(), "echo hello # inline comment");
+    /// ```
+    pub fn full(&self) -> String {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| {
+                if let Some(token) = it.as_token() {
+                    // Include TEXT and COMMENT tokens, but skip INDENT and NEWLINE
+                    if token.kind() == TEXT || token.kind() == COMMENT {
                         return Some(token.text().to_string());
                     }
                 }
@@ -2174,19 +2268,23 @@ build-indep: build
 
         let mut rule = makefile.rules().next().unwrap();
 
-        // Before replacement, there should be 1 recipe
-        assert_eq!(rule.recipes().count(), 1);
+        // Before replacement, there should be 2 recipe nodes (comment + command)
+        assert_eq!(rule.recipe_nodes().count(), 2);
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes[0].text(), ""); // comment-only
         assert_eq!(
-            rule.recipes().collect::<Vec<_>>(),
-            vec!["dh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'"]
+            recipes[1].text(),
+            "dh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'"
         );
 
-        // Replace the first (and only) recipe
-        assert!(rule.replace_command(0, "dh_strip"));
+        // Replace the second recipe (index 1, the actual command)
+        assert!(rule.replace_command(1, "dh_strip"));
 
-        // After replacement, there should still be 1 recipe, not 2
-        assert_eq!(rule.recipes().count(), 1);
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["dh_strip"]);
+        // After replacement, there should still be 2 recipe nodes
+        assert_eq!(rule.recipe_nodes().count(), 2);
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes[0].text(), ""); // comment still there
+        assert_eq!(recipes[1].text(), "dh_strip");
     }
 
     #[test]
@@ -2690,22 +2788,20 @@ all: $(OBJS)
         );
 
         // Check recipes are parsed correctly
-        // The parser appears to filter out comment lines from recipes
-        // and only keeps actual command lines
-        let recipes = build_rule.recipes().collect::<Vec<_>>();
+        // recipes() now returns all recipe nodes including comment-only lines
+        let recipes = build_rule.recipe_nodes().collect::<Vec<_>>();
+        assert_eq!(recipes.len(), 2, "Should find two recipe nodes");
+
+        // First recipe should be comment-only
+        assert_eq!(recipes[0].text(), "");
         assert_eq!(
-            recipes.len(),
-            1,
-            "Should find exactly one recipe line (comment lines are filtered)"
+            recipes[0].comment(),
+            Some("# This is a comment".to_string())
         );
-        assert!(
-            recipes[0].contains("gcc -o app"),
-            "Recipe should be the command line"
-        );
-        assert!(
-            !recipes[0].contains("This is a comment"),
-            "Comments should not be included in recipe lines"
-        );
+
+        // Second recipe should be the command
+        assert_eq!(recipes[1].text(), "gcc -o app main.c");
+        assert_eq!(recipes[1].comment(), None);
     }
 
     #[test]
@@ -6494,5 +6590,154 @@ test:
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["@echo modified", "echo three", "echo two"]);
+    }
+}
+
+#[cfg(test)]
+mod test_continuation {
+    use super::*;
+
+    #[test]
+    fn test_recipe_continuation_lines() {
+        let makefile_content = r#"override_dh_autoreconf:
+	set -x; [ -f binoculars-ng/src/Hkl/H5.hs.orig ] || \
+	  dpkg --compare-versions '$(HDF5_VERSION)' '<<' 1.12.0 || \
+	  sed -i.orig 's/H5L_info_t/H5L_info1_t/g;s/h5l_iterate/h5l_iterate1/g' binoculars-ng/src/Hkl/H5.hs
+	dh_autoreconf
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        // Should have 2 recipe nodes: one multi-line command and one single-line
+        assert_eq!(recipes.len(), 2);
+
+        // First recipe should contain all three physical lines joined together
+        let expected_first = "set -x; [ -f binoculars-ng/src/Hkl/H5.hs.orig ] || \\  dpkg --compare-versions '$(HDF5_VERSION)' '<<' 1.12.0 || \\  sed -i.orig 's/H5L_info_t/H5L_info1_t/g;s/h5l_iterate/h5l_iterate1/g' binoculars-ng/src/Hkl/H5.hs";
+        assert_eq!(recipes[0].text(), expected_first);
+
+        // Second recipe should be the standalone dh_autoreconf line
+        assert_eq!(recipes[1].text(), "dh_autoreconf");
+    }
+
+    #[test]
+    fn test_simple_continuation() {
+        let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].text(), "echo hello && \\  echo world");
+    }
+
+    #[test]
+    fn test_multiple_continuations() {
+        let makefile_content = "test:\n\techo line1 && \\\n\t  echo line2 && \\\n\t  echo line3 && \\\n\t  echo line4\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(
+            recipes[0].text(),
+            "echo line1 && \\  echo line2 && \\  echo line3 && \\  echo line4"
+        );
+    }
+
+    #[test]
+    fn test_continuation_round_trip() {
+        let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let output = makefile.to_string();
+
+        // Should preserve the exact content
+        assert_eq!(output, makefile_content);
+    }
+
+    #[test]
+    fn test_continuation_with_silent_prefix() {
+        let makefile_content = "test:\n\t@echo hello && \\\n\t  echo world\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].text(), "@echo hello && \\  echo world");
+        assert!(recipes[0].is_silent());
+    }
+
+    #[test]
+    fn test_mixed_continued_and_non_continued() {
+        let makefile_content = r#"test:
+	echo first
+	echo second && \
+	  echo third
+	echo fourth
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 3);
+        assert_eq!(recipes[0].text(), "echo first");
+        assert_eq!(recipes[1].text(), "echo second && \\  echo third");
+        assert_eq!(recipes[2].text(), "echo fourth");
+    }
+
+    #[test]
+    fn test_continuation_replace_command() {
+        let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+
+        // Replace the multi-line command
+        rule.replace_command(0, "echo replaced");
+
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].text(), "echo replaced");
+        assert_eq!(recipes[1].text(), "echo done");
+    }
+
+    #[test]
+    fn test_continuation_count() {
+        let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+
+        // Even though there are 3 physical lines, there should be 2 logical recipe nodes
+        assert_eq!(rule.recipe_count(), 2);
+        assert_eq!(rule.recipe_nodes().count(), 2);
+
+        // recipes() should return one string per logical recipe node
+        let recipes_list: Vec<_> = rule.recipes().collect();
+        assert_eq!(
+            recipes_list,
+            vec!["echo hello && \\  echo world", "echo done"]
+        );
+    }
+
+    #[test]
+    fn test_backslash_in_middle_of_line() {
+        // Backslash not at end should not trigger continuation
+        let makefile_content = "test:\n\techo hello\\nworld\n\techo done\n";
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].text(), "echo hello\\nworld");
+        assert_eq!(recipes[1].text(), "echo done");
     }
 }

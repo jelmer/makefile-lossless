@@ -454,20 +454,7 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
     /// ```
     pub fn recipes(&self) -> impl Iterator<Item = String> {
-        self.syntax()
-            .children()
-            .filter(|it| it.kind() == RECIPE)
-            .flat_map(|it| {
-                it.children_with_tokens().filter_map(|it| {
-                    it.as_token().and_then(|t| {
-                        if t.kind() == TEXT {
-                            Some(t.text().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-            })
+        self.recipe_nodes().map(|r| r.text())
     }
 
     /// Get recipe nodes with line/column information
@@ -549,16 +536,11 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
     /// ```
     pub fn replace_command(&mut self, i: usize, line: &str) -> bool {
-        // Collect all RECIPE nodes that contain TEXT tokens (actual commands, not just comments)
-        // This matches the behavior of recipes() which only returns recipes with TEXT
+        // Collect all RECIPE nodes (matching the indexing used by recipe_nodes())
         let recipes: Vec<_> = self
             .syntax()
             .children()
-            .filter(|n| {
-                n.kind() == RECIPE
-                    && n.children_with_tokens()
-                        .any(|t| t.as_token().map(|t| t.kind() == TEXT).unwrap_or(false))
-            })
+            .filter(|n| n.kind() == RECIPE)
             .collect();
 
         if i >= recipes.len() {
