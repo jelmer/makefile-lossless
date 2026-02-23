@@ -1495,21 +1495,64 @@ ast_node!(Conditional, CONDITIONAL);
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
     ///
-    /// This returns only the TEXT tokens, excluding comments and whitespace.
+    /// For single-line recipes, this returns the command text excluding the
+    /// leading tab and trailing newline.
+    ///
+    /// For multi-line recipes (with backslash continuations), this returns the
+    /// full text including the internal newlines and continuation-line indentation,
+    /// but still excluding the leading tab of the first line and the final newline.
+    /// This preserves the exact content needed for a lossless round-trip.
+    ///
     /// For comment-only lines, this returns an empty string.
     pub fn text(&self) -> String {
-        self.syntax()
+        let tokens: Vec<_> = self
+            .syntax()
             .children_with_tokens()
-            .filter_map(|it| {
-                if let Some(token) = it.as_token() {
-                    if token.kind() == TEXT {
-                        return Some(token.text().to_string());
-                    }
+            .filter_map(|it| it.as_token().cloned())
+            .collect();
+
+        if tokens.is_empty() {
+            return String::new();
+        }
+
+        // Skip the first token if it's the leading INDENT
+        let start = if tokens.first().map(|t| t.kind()) == Some(INDENT) {
+            1
+        } else {
+            0
+        };
+
+        // Skip the last token if it's the trailing NEWLINE
+        let end = if tokens.last().map(|t| t.kind()) == Some(NEWLINE) {
+            tokens.len() - 1
+        } else {
+            tokens.len()
+        };
+
+        // Include TEXT, NEWLINE (internal continuation), and INDENT (continuation indent) tokens,
+        // but skip COMMENT tokens (those are returned by comment()).
+        // For INDENT tokens after a continuation newline, strip the leading tab character.
+        let mut after_newline = false;
+        tokens[start..end]
+            .iter()
+            .filter_map(|t| match t.kind() {
+                TEXT => {
+                    after_newline = false;
+                    Some(t.text().to_string())
                 }
-                None
+                NEWLINE => {
+                    after_newline = true;
+                    Some(t.text().to_string())
+                }
+                INDENT if after_newline => {
+                    after_newline = false;
+                    // Strip the leading tab from continuation-line indentation
+                    let text = t.text();
+                    Some(text.strip_prefix('\t').unwrap_or(text).to_string())
+                }
+                _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .collect()
     }
 
     /// Get the comment content of this recipe line, if any
@@ -6614,8 +6657,9 @@ mod test_continuation {
         // Should have 2 recipe nodes: one multi-line command and one single-line
         assert_eq!(recipes.len(), 2);
 
-        // First recipe should contain all three physical lines joined together
-        let expected_first = "set -x; [ -f binoculars-ng/src/Hkl/H5.hs.orig ] || \\  dpkg --compare-versions '$(HDF5_VERSION)' '<<' 1.12.0 || \\  sed -i.orig 's/H5L_info_t/H5L_info1_t/g;s/h5l_iterate/h5l_iterate1/g' binoculars-ng/src/Hkl/H5.hs";
+        // First recipe should contain all three physical lines with newlines preserved,
+        // and the leading tab stripped from each continuation line
+        let expected_first = "set -x; [ -f binoculars-ng/src/Hkl/H5.hs.orig ] || \\\n  dpkg --compare-versions '$(HDF5_VERSION)' '<<' 1.12.0 || \\\n  sed -i.orig 's/H5L_info_t/H5L_info1_t/g;s/h5l_iterate/h5l_iterate1/g' binoculars-ng/src/Hkl/H5.hs";
         assert_eq!(recipes[0].text(), expected_first);
 
         // Second recipe should be the standalone dh_autoreconf line
@@ -6631,7 +6675,7 @@ mod test_continuation {
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
         assert_eq!(recipes.len(), 1);
-        assert_eq!(recipes[0].text(), "echo hello && \\  echo world");
+        assert_eq!(recipes[0].text(), "echo hello && \\\n  echo world");
     }
 
     #[test]
@@ -6645,7 +6689,7 @@ mod test_continuation {
         assert_eq!(recipes.len(), 1);
         assert_eq!(
             recipes[0].text(),
-            "echo line1 && \\  echo line2 && \\  echo line3 && \\  echo line4"
+            "echo line1 && \\\n  echo line2 && \\\n  echo line3 && \\\n  echo line4"
         );
     }
 
@@ -6669,7 +6713,7 @@ mod test_continuation {
         let recipes: Vec<_> = rule.recipe_nodes().collect();
 
         assert_eq!(recipes.len(), 1);
-        assert_eq!(recipes[0].text(), "@echo hello && \\  echo world");
+        assert_eq!(recipes[0].text(), "@echo hello && \\\n  echo world");
         assert!(recipes[0].is_silent());
     }
 
@@ -6688,7 +6732,7 @@ mod test_continuation {
 
         assert_eq!(recipes.len(), 3);
         assert_eq!(recipes[0].text(), "echo first");
-        assert_eq!(recipes[1].text(), "echo second && \\  echo third");
+        assert_eq!(recipes[1].text(), "echo second && \\\n  echo third");
         assert_eq!(recipes[2].text(), "echo fourth");
     }
 
@@ -6723,7 +6767,7 @@ mod test_continuation {
         let recipes_list: Vec<_> = rule.recipes().collect();
         assert_eq!(
             recipes_list,
-            vec!["echo hello && \\  echo world", "echo done"]
+            vec!["echo hello && \\\n  echo world", "echo done"]
         );
     }
 
@@ -6739,5 +6783,67 @@ mod test_continuation {
         assert_eq!(recipes.len(), 2);
         assert_eq!(recipes[0].text(), "echo hello\\nworld");
         assert_eq!(recipes[1].text(), "echo done");
+    }
+
+    #[test]
+    fn test_shell_for_loop_with_continuation() {
+        // Regression test for Debian bug #1128608 / GitHub issue (if any)
+        // Ensures shell for loops with backslash continuations are treated as
+        // a single recipe node and preserve the 'done' statement
+        let makefile_content = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+
+        // Should have exactly 1 recipe node containing the entire for loop
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 1);
+
+        // The recipe text should contain the complete for loop including 'done'
+        let recipe_text = recipes[0].text();
+        let expected_recipe = "for i in foo bar; do \\\n\tpod2man --section=1 $$i ; \\\ndone";
+        assert_eq!(recipe_text, expected_recipe);
+
+        // Round-trip should preserve the complete structure
+        let output = makefile.to_string();
+        assert_eq!(output, makefile_content);
+    }
+
+    #[test]
+    fn test_shell_for_loop_remove_command() {
+        // Regression test: removing other commands shouldn't affect 'done'
+        // This simulates lintian-brush modifying debian/rules files
+        let makefile_content = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+	echo "Done with man pages"
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+
+        // Should have 2 recipe nodes: the for loop and the echo
+        assert_eq!(rule.recipe_count(), 2);
+
+        // Remove the second command (the echo)
+        rule.remove_command(1);
+
+        // Should now have only the for loop
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 1);
+
+        // The for loop should still be complete with 'done'
+        let output = makefile.to_string();
+        let expected_output = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+"#;
+        assert_eq!(output, expected_output);
     }
 }
