@@ -6784,4 +6784,66 @@ mod test_continuation {
         assert_eq!(recipes[0].text(), "echo hello\\nworld");
         assert_eq!(recipes[1].text(), "echo done");
     }
+
+    #[test]
+    fn test_shell_for_loop_with_continuation() {
+        // Regression test for Debian bug #1128608 / GitHub issue (if any)
+        // Ensures shell for loops with backslash continuations are treated as
+        // a single recipe node and preserve the 'done' statement
+        let makefile_content = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let rule = makefile.rules().next().unwrap();
+
+        // Should have exactly 1 recipe node containing the entire for loop
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 1);
+
+        // The recipe text should contain the complete for loop including 'done'
+        let recipe_text = recipes[0].text();
+        let expected_recipe = "for i in foo bar; do \\\n\tpod2man --section=1 $$i ; \\\ndone";
+        assert_eq!(recipe_text, expected_recipe);
+
+        // Round-trip should preserve the complete structure
+        let output = makefile.to_string();
+        assert_eq!(output, makefile_content);
+    }
+
+    #[test]
+    fn test_shell_for_loop_remove_command() {
+        // Regression test: removing other commands shouldn't affect 'done'
+        // This simulates lintian-brush modifying debian/rules files
+        let makefile_content = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+	echo "Done with man pages"
+"#;
+
+        let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+
+        // Should have 2 recipe nodes: the for loop and the echo
+        assert_eq!(rule.recipe_count(), 2);
+
+        // Remove the second command (the echo)
+        rule.remove_command(1);
+
+        // Should now have only the for loop
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes.len(), 1);
+
+        // The for loop should still be complete with 'done'
+        let output = makefile.to_string();
+        let expected_output = r#"override_dh_installman:
+	for i in foo bar; do \
+		pod2man --section=1 $$i ; \
+	done
+"#;
+        assert_eq!(output, expected_output);
+    }
 }
