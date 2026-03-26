@@ -470,16 +470,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            // Look ahead for a colon
+            // Look ahead for a colon on the same line
             let has_colon = self
                 .tokens
                 .iter()
                 .rev()
+                .take_while(|(kind, _)| *kind != NEWLINE)
                 .any(|(kind, text)| *kind == OPERATOR && text == ":");
 
             if has_colon {
-                // Consume tokens until we find the colon
-                while self.current().is_some() {
+                // Consume tokens until we find the colon (staying on same line)
+                while self.current().is_some() && self.current() != Some(NEWLINE) {
                     if self.current() == Some(OPERATOR)
                         && self.tokens.last().map(|(_, text)| text.as_str()) == Some(":")
                     {
@@ -620,6 +621,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     } else {
                         self.error(format!("invalid assignment operator: {}", op));
                     }
+                }
+                // Bare "export VARNAME" without assignment operator is valid GNU Make
+                Some(NEWLINE) => {
+                    self.bump();
+                }
+                None => {
+                    // EOF after export VARNAME is fine
                 }
                 _ => self.error("expected assignment operator".to_string()),
             }
@@ -1257,7 +1265,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 pos = pos.saturating_sub(1);
             }
-            false
+            // Bare "export VARNAME" (without assignment operator) is a valid GNU Make directive
+            seen_export
         }
 
         /// Advance one token, adding it to the current branch of the tree builder.
@@ -2635,6 +2644,156 @@ all: $(OBJS)
             .find(|v| v.name() == Some("SHELL".to_string()))
             .unwrap();
         assert!(shell_var.raw_value().unwrap().contains("bin/bash"));
+    }
+
+    #[test]
+    fn test_bare_export_variable() {
+        // "export VARNAME" without assignment operator is a valid GNU Make directive
+        // that exports a previously-defined variable.
+        let parsed = parse(
+            "DEB_CFLAGS_MAINT_APPEND = -Wno-error\nexport DEB_CFLAGS_MAINT_APPEND\n\n%:\n\tdh $@\n",
+            None,
+        );
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let makefile = parsed.root();
+        // The bare export should be parsed as a variable, not a rule
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        // The pattern rule should be found
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].targets().any(|t| t == "%"));
+        // build-arch should match via the pattern rule
+        assert!(makefile.find_rule_by_target_pattern("build-arch").is_some());
+    }
+
+    #[test]
+    fn test_bare_export_at_eof() {
+        // Bare "export VARNAME" at end of file (no trailing newline)
+        let parsed = parse("VAR = value\nexport VAR", None);
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(makefile.rules().count(), 0);
+    }
+
+    #[test]
+    fn test_bare_export_does_not_eat_include() {
+        // Bare "export VARNAME" must not consume subsequent include directives
+        let parsed = parse(
+            "VAR = value\nexport VAR\ninclude other.mk\n",
+            None,
+        );
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let makefile = parsed.root();
+        assert_eq!(makefile.includes().count(), 1);
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["other.mk"]
+        );
+    }
+
+    #[test]
+    fn test_bare_export_multiple() {
+        // Multiple bare exports in a row
+        let parsed = parse(
+            "A = 1\nB = 2\nexport A\nexport B\n\nall:\n\techo done\n",
+            None,
+        );
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let makefile = parsed.root();
+        assert_eq!(makefile.variable_definitions().count(), 4);
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].targets().any(|t| t == "all"));
+    }
+
+    #[test]
+    fn test_parse_error_does_not_cross_lines() {
+        // A line that fails to parse as a rule (no colon) must not
+        // consume tokens from subsequent lines.
+        let parsed = parse(
+            "notarule\n\nbuild-arch:\n\techo arch\n",
+            None,
+        );
+        let makefile = parsed.root();
+        let rules = makefile.rules().collect::<Vec<_>>();
+        // The "notarule" line may produce an error, but build-arch must still be found
+        assert!(
+            rules.iter().any(|r| r.targets().any(|t| t == "build-arch")),
+            "build-arch rule should be parsed despite earlier error; rules: {:?}",
+            rules.iter().map(|r| r.targets().collect::<Vec<_>>()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_pyfai_rules_full() {
+        // Real-world pyFAI debian/rules that triggered #1131043
+        let input = "\
+#!/usr/bin/make -f
+
+export DH_VERBOSE=1
+export PYBUILD_NAME=pyfai
+
+DEB_CFLAGS_MAINT_APPEND = -Wno-error=incompatible-pointer-types
+export DEB_CFLAGS_MAINT_APPEND
+
+PY3VER := $(shell py3versions -dv)
+
+include /usr/share/dpkg/pkg-info.mk # sets SOURCE_DATE_EPOCH
+
+%:
+\tdh $@ --buildsystem=pybuild
+
+override_dh_auto_build-arch:
+\tPYBUILD_BUILD_ARGS=\"-Ccompile-args=--verbose\" dh_auto_build
+
+override_dh_auto_build-indep: override_dh_auto_build-arch
+\tsphinx-build -N -bhtml doc/source build/html
+
+override_dh_auto_test:
+
+execute_after_dh_auto_install:
+\tdh_install -p pyfai debian/python3-pyfai/usr/bin /usr
+";
+        let parsed = parse(input, None);
+        let makefile = parsed.root();
+
+        // Include must be detected
+        assert_eq!(makefile.includes().count(), 1);
+
+        // Pattern rule must be found
+        assert!(
+            makefile.find_rule_by_target_pattern("build-arch").is_some(),
+            "build-arch should match via %: pattern rule"
+        );
+        assert!(
+            makefile.find_rule_by_target_pattern("build-indep").is_some(),
+            "build-indep should match via %: pattern rule"
+        );
+
+        // All override/execute_after rules must be found
+        let rule_targets: Vec<Vec<String>> = makefile
+            .rules()
+            .map(|r| r.targets().collect())
+            .collect();
+        assert!(
+            rule_targets.iter().any(|t| t.contains(&"%".to_string())),
+            "missing %: rule; got: {:?}", rule_targets
+        );
+        assert!(
+            rule_targets.iter().any(|t| t.contains(&"override_dh_auto_build-arch".to_string())),
+            "missing override_dh_auto_build-arch; got: {:?}", rule_targets
+        );
+        assert!(
+            rule_targets.iter().any(|t| t.contains(&"override_dh_auto_test".to_string())),
+            "missing override_dh_auto_test; got: {:?}", rule_targets
+        );
+        assert!(
+            rule_targets.iter().any(|t| t.contains(&"execute_after_dh_auto_install".to_string())),
+            "missing execute_after_dh_auto_install; got: {:?}", rule_targets
+        );
     }
 
     #[test]
