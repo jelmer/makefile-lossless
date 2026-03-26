@@ -26,6 +26,7 @@ mod lex;
 mod lossless;
 mod parse;
 mod pattern;
+mod text;
 
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
@@ -34,6 +35,7 @@ pub use lossless::{
     ParseError, Rule, VariableDefinition,
 };
 pub use parse::Parse;
+pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// The variant of makefile being parsed
