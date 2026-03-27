@@ -68,6 +68,25 @@ impl From<ParseError> for Error {
     }
 }
 
+/// A positioned parse error containing location information.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PositionedParseError {
+    /// The error message
+    pub message: String,
+    /// The text range where the error occurred
+    pub range: rowan::TextRange,
+    /// Optional error code for categorization
+    pub code: Option<String>,
+}
+
+impl std::fmt::Display for PositionedParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PositionedParseError {}
+
 /// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
 /// "kinds" are values from our `enum SyntaxKind`, instead of plain u16 values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,8 +115,8 @@ use rowan::GreenNodeBuilder;
 #[derive(Debug)]
 pub(crate) struct Parse {
     pub(crate) green_node: GreenNode,
-    #[allow(unused)]
     pub(crate) errors: Vec<ErrorInfo>,
+    pub(crate) positioned_errors: Vec<PositionedParseError>,
 }
 
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
@@ -110,6 +129,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// the list of syntax errors we've accumulated
         /// so far.
         errors: Vec<ErrorInfo>,
+        /// positioned errors with location information
+        positioned_errors: Vec<PositionedParseError>,
+        /// Token positions (start, end) in forward order, indexed by forward token index
+        token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
+        /// current token index into token_positions (counting from the end since tokens are in reverse)
+        current_token_index: usize,
         /// The original text
         original_text: String,
         /// The makefile variant
@@ -153,15 +178,39 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             };
 
             self.errors.push(ErrorInfo {
-                message,
+                message: message.clone(),
                 line,
                 context,
             });
+
+            self.add_positioned_error(message, None);
 
             if self.current().is_some() {
                 self.bump();
             }
             self.builder.finish_node();
+        }
+
+        /// Add a positioned error at the current token position
+        fn add_positioned_error(&mut self, message: String, code: Option<String>) {
+            let range = if self.current_token_index < self.token_positions.len() {
+                let (start, end) = self.token_positions[self.current_token_index];
+                rowan::TextRange::new(start, end)
+            } else {
+                // Default to end of text if no current token
+                let end = self
+                    .token_positions
+                    .last()
+                    .map(|(_, end)| *end)
+                    .unwrap_or_else(|| rowan::TextSize::from(0));
+                rowan::TextRange::new(end, end)
+            };
+
+            self.positioned_errors.push(PositionedParseError {
+                message,
+                range,
+                code,
+            });
         }
 
         fn get_line_number_for_position(&self, position: usize) -> usize {
@@ -1243,6 +1292,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             Parse {
                 green_node: self.builder.finish(),
                 errors: self.errors,
+                positioned_errors: self.positioned_errors,
             }
         }
 
@@ -1278,6 +1328,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn bump(&mut self) {
             let (kind, text) = self.tokens.pop().unwrap();
             self.builder.token(kind.into(), text.as_str());
+            if self.current_token_index > 0 {
+                self.current_token_index -= 1;
+            }
         }
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
@@ -1385,11 +1438,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     }
 
     let mut tokens = lex(text);
+
+    // Build token positions in forward order before reversing
+    let mut token_positions = Vec::with_capacity(tokens.len());
+    let mut position = rowan::TextSize::from(0);
+    for (_kind, text) in &tokens {
+        let start = position;
+        let end = start + rowan::TextSize::of(text.as_str());
+        token_positions.push((start, end));
+        position = end;
+    }
+
+    let current_token_index = tokens.len().saturating_sub(1);
     tokens.reverse();
     Parser {
         tokens,
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
+        positioned_errors: Vec::new(),
+        token_positions,
+        current_token_index,
         original_text: text.to_string(),
         variant,
     }
@@ -6899,6 +6967,77 @@ test:
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["@echo modified", "echo three", "echo two"]);
+    }
+
+    #[test]
+    fn test_from_str_relaxed_valid() {
+        let input = "all: foo\n\tfoo bar\n";
+        let (makefile, errors) = Makefile::from_str_relaxed(input);
+        assert!(errors.is_empty());
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_from_str_relaxed_with_errors() {
+        // "rule target\n\tcommand" produces a parse error (missing colon)
+        let input = "rule target\n\tcommand\n";
+        let (makefile, errors) = Makefile::from_str_relaxed(input);
+        assert!(!errors.is_empty());
+        // Round-trip preserves all text
+        assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_positioned_errors_have_valid_ranges() {
+        let input = "rule target\n\tcommand\n";
+        let parsed = Makefile::parse(input);
+        assert!(!parsed.ok());
+
+        let positioned = parsed.positioned_errors();
+        assert!(!positioned.is_empty());
+
+        for err in positioned {
+            // Range should be within the input
+            let start: u32 = err.range.start().into();
+            let end: u32 = err.range.end().into();
+            assert!(start <= end);
+            assert!((end as usize) <= input.len());
+        }
+    }
+
+    #[test]
+    fn test_positioned_errors_point_to_error_location() {
+        let input = "rule target\n\tcommand\n";
+        let parsed = Makefile::parse(input);
+        assert!(!parsed.ok());
+
+        let positioned = parsed.positioned_errors();
+        assert!(!positioned.is_empty());
+
+        let err = &positioned[0];
+        let start: usize = err.range.start().into();
+        let end: usize = err.range.end().into();
+        // The error should point somewhere in the input
+        let error_text = &input[start..end];
+        assert!(!error_text.is_empty());
+
+        // Tree should still be accessible
+        let tree = parsed.tree();
+        assert_eq!(tree.to_string(), input);
+    }
+
+    #[test]
+    fn test_tree_with_errors_preserves_text() {
+        let input = "rule target\n\tcommand\nVAR = value\n";
+        let parsed = Makefile::parse(input);
+        assert!(!parsed.ok());
+
+        let tree = parsed.tree();
+        assert_eq!(tree.to_string(), input);
+
+        // Valid parts should still be accessible
+        assert_eq!(tree.variable_definitions().count(), 1);
     }
 }
 

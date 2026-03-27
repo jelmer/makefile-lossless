@@ -36,7 +36,7 @@ impl MakefileItem {
     }
 
     /// Get the underlying syntax node
-    pub(crate) fn syntax(&self) -> &SyntaxNode {
+    pub fn syntax(&self) -> &SyntaxNode {
         match self {
             MakefileItem::Rule(r) => r.syntax(),
             MakefileItem::Variable(v) => v.syntax(),
@@ -495,6 +495,26 @@ impl Makefile {
         Ok(parsed.root())
     }
 
+    /// Parse a makefile from a string, allowing syntax errors.
+    ///
+    /// Returns the parsed makefile and a list of errors. The makefile tree is
+    /// always returned, even if there are parse errors, enabling error-resilient
+    /// tooling that can work with partial or invalid input.
+    pub fn from_str_relaxed(s: &str) -> (Self, Vec<ErrorInfo>) {
+        let parsed = parse(s, None);
+        (parsed.root(), parsed.errors)
+    }
+
+    /// Read a makefile from a file path, allowing syntax errors.
+    ///
+    /// Returns the parsed makefile and a list of errors.
+    pub fn from_file_relaxed(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, Vec<ErrorInfo>), std::io::Error> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self::from_str_relaxed(&text))
+    }
+
     /// Retrieve the rules in the makefile
     ///
     /// # Example
@@ -588,6 +608,37 @@ impl Makefile {
         self.syntax()
             .descendants()
             .filter_map(VariableReference::cast)
+    }
+
+    /// Get all top-level items that overlap with the given text range.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "CC = gcc\nall: build\n\techo done\n".parse().unwrap();
+    /// let range = TextRange::new(0.into(), 8.into());
+    /// let items: Vec<_> = makefile.items_in_range(range).collect();
+    /// assert_eq!(items.len(), 1);
+    /// ```
+    pub fn items_in_range(
+        &self,
+        range: rowan::TextRange,
+    ) -> impl Iterator<Item = MakefileItem> + '_ {
+        self.items().filter(move |item| {
+            let item_range = item.syntax().text_range();
+            item_range.start() < range.end() && range.start() < item_range.end()
+        })
+    }
+
+    /// Get all variable references that overlap with the given text range.
+    pub fn variable_references_in_range(
+        &self,
+        range: rowan::TextRange,
+    ) -> impl Iterator<Item = VariableReference> + '_ {
+        self.variable_references().filter(move |var_ref| {
+            let ref_range = var_ref.text_range();
+            ref_range.start() < range.end() && range.start() < ref_range.end()
+        })
     }
 
     /// Add a new rule to the makefile

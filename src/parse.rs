@@ -1,6 +1,6 @@
 //! Parse wrapper type following rust-analyzer's pattern for thread-safe storage in Salsa.
 
-use crate::lossless::{Error, ErrorInfo, Makefile, ParseError, Rule};
+use crate::lossless::{Error, ErrorInfo, Makefile, ParseError, PositionedParseError, Rule};
 use rowan::ast::AstNode;
 use rowan::{GreenNode, SyntaxNode};
 use std::marker::PhantomData;
@@ -13,15 +13,21 @@ use std::marker::PhantomData;
 pub struct Parse<T> {
     green: GreenNode,
     errors: Vec<ErrorInfo>,
+    positioned_errors: Vec<PositionedParseError>,
     _ty: PhantomData<T>,
 }
 
 impl<T> Parse<T> {
-    /// Create a new Parse result from a GreenNode and errors
-    pub fn new(green: GreenNode, errors: Vec<ErrorInfo>) -> Self {
+    /// Create a new Parse result from a GreenNode, errors, and positioned errors
+    pub fn new(
+        green: GreenNode,
+        errors: Vec<ErrorInfo>,
+        positioned_errors: Vec<PositionedParseError>,
+    ) -> Self {
         Parse {
             green,
             errors,
+            positioned_errors,
             _ty: PhantomData,
         }
     }
@@ -34,6 +40,11 @@ impl<T> Parse<T> {
     /// Get the syntax errors
     pub fn errors(&self) -> &[ErrorInfo] {
         &self.errors
+    }
+
+    /// Get parse errors with position information
+    pub fn positioned_errors(&self) -> &[PositionedParseError] {
+        &self.positioned_errors
     }
 
     /// Check if there are any errors
@@ -58,8 +69,9 @@ impl<T> Parse<T> {
 
     /// Get the parsed syntax tree
     ///
-    /// Returns the tree even if there are parse errors. Use `errors()` or `ok()` to check
-    /// for errors separately if needed.
+    /// Returns the tree even if there are parse errors. Use `errors()`,
+    /// `positioned_errors()`, or `ok()` to check for errors separately if needed.
+    /// This allows for error-resilient tooling that can work with partial/invalid input.
     pub fn tree(&self) -> T
     where
         T: AstNode<Language = crate::lossless::Lang>,
@@ -82,7 +94,7 @@ impl Parse<Makefile> {
     /// Parse makefile text, returning a Parse result
     pub fn parse_makefile(text: &str) -> Self {
         let parsed = crate::lossless::parse(text, None);
-        Parse::new(parsed.green_node, parsed.errors)
+        Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
     }
 }
 
@@ -90,7 +102,7 @@ impl Parse<Rule> {
     /// Parse rule text, returning a Parse result
     pub fn parse_rule(text: &str) -> Self {
         let parsed = crate::lossless::parse(text, None);
-        Parse::new(parsed.green_node, parsed.errors)
+        Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
     }
 
     /// Convert to a Result, extracting a single rule from the makefile
