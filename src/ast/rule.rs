@@ -183,6 +183,25 @@ impl Rule {
         self.syntax().parent().and_then(MakefileItem::cast)
     }
 
+    /// Check if this is a double-colon rule (`target:: prereqs`).
+    ///
+    /// Double-colon rules allow multiple recipe blocks for the same target,
+    /// each executed independently when its prerequisites are newer.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "all:: dep1\n\techo first\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// assert!(rule.is_double_colon());
+    /// ```
+    pub fn is_double_colon(&self) -> bool {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .any(|t| t.kind() == OPERATOR && t.text() == "::")
+    }
+
     // Helper method to collect variable references from tokens
     fn collect_variable_reference(
         &self,

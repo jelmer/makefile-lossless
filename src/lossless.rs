@@ -442,8 +442,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Skip whitespace before colon
             self.skip_ws();
 
-            // Check if we're at a colon
-            if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+            // Check if we're at a colon or double-colon
+            if self.current() == Some(OPERATOR)
+                && matches!(self.tokens.last().unwrap().1.as_str(), ":" | "::")
+            {
                 self.bump();
                 return true;
             }
@@ -454,13 +456,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .iter()
                 .rev()
                 .take_while(|(kind, _)| *kind != NEWLINE)
-                .any(|(kind, text)| *kind == OPERATOR && text == ":");
+                .any(|(kind, text)| *kind == OPERATOR && (text == ":" || text == "::"));
 
             if has_colon {
                 // Consume tokens until we find the colon (staying on same line)
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
                     if self.current() == Some(OPERATOR)
-                        && self.tokens.last().map(|(_, text)| text.as_str()) == Some(":")
+                        && matches!(
+                            self.tokens.last().map(|(_, text)| text.as_str()),
+                            Some(":" | "::")
+                        )
                     {
                         self.bump();
                         return true;
@@ -1258,7 +1263,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
                         return seen_identifier || seen_export
                     }
-                    OPERATOR if text == ":" => return false, // It's a rule if we see a colon first
+                    OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
                     WHITESPACE => (),
                     _ if seen_export => return true, // Everything after export is part of the assignment
                     _ => return false,
@@ -3366,10 +3371,7 @@ build:
     }
 
     #[test]
-    #[ignore]
     fn test_double_colon_rules() {
-        // This test is ignored because double colon rules aren't fully supported yet.
-        // A proper implementation would require more extensive changes to the parser.
         let content = r#"
 %.o :: %.c
 	$(CC) -c $< -o $@
@@ -3381,21 +3383,35 @@ all:: prerequisite1
 all:: prerequisite2
 	@echo "Second rule for all"
 "#;
-        let mut buf = content.as_bytes();
-        let makefile =
-            Makefile::read_relaxed(&mut buf).expect("Failed to parse double colon rules");
-
-        // Check that we can extract rules even with errors
-        let rules = makefile.rules().collect::<Vec<_>>();
-        assert!(!rules.is_empty(), "Expected at least one rule");
-
-        // The all rule might be parsed incorrectly but should exist in some form
-        let all_rules = rules
-            .iter()
-            .filter(|r| r.targets().any(|t| t.contains("all")));
+        let parsed = parse(content, None);
         assert!(
-            all_rules.count() > 0,
-            "Expected to find at least one rule containing 'all'"
+            parsed.errors.is_empty(),
+            "Failed to parse double colon rules: {:?}",
+            parsed.errors
+        );
+
+        let makefile = parsed.root();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 3);
+
+        // All rules should be double-colon
+        for rule in &rules {
+            assert!(rule.is_double_colon());
+        }
+
+        // Check targets
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["%.o"]);
+        assert_eq!(rules[1].targets().collect::<Vec<_>>(), vec!["all"]);
+        assert_eq!(rules[2].targets().collect::<Vec<_>>(), vec!["all"]);
+
+        // Check prerequisites
+        assert_eq!(
+            rules[1].prerequisites().collect::<Vec<_>>(),
+            vec!["prerequisite1"]
+        );
+        assert_eq!(
+            rules[2].prerequisites().collect::<Vec<_>>(),
+            vec!["prerequisite2"]
         );
     }
 
