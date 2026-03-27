@@ -31,10 +31,11 @@ mod text;
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use lossless::{
-    ArchiveMember, ArchiveMembers, Conditional, Error, Identifier, Include, Lang, Makefile,
-    ParseError, Rule, VariableDefinition, VariableReference,
+    ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
+    Makefile, ParseError, PositionedParseError, Rule, VariableDefinition, VariableReference,
 };
 pub use parse::Parse;
+pub use rowan::TextRange;
 pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

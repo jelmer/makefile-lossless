@@ -36,7 +36,7 @@ impl MakefileItem {
     }
 
     /// Get the underlying syntax node
-    pub(crate) fn syntax(&self) -> &SyntaxNode {
+    pub fn syntax(&self) -> &SyntaxNode {
         match self {
             MakefileItem::Rule(r) => r.syntax(),
             MakefileItem::Variable(v) => v.syntax(),
@@ -495,6 +495,26 @@ impl Makefile {
         Ok(parsed.root())
     }
 
+    /// Parse a makefile from a string, allowing syntax errors.
+    ///
+    /// Returns the parsed makefile and a list of errors. The makefile tree is
+    /// always returned, even if there are parse errors, enabling error-resilient
+    /// tooling that can work with partial or invalid input.
+    pub fn from_str_relaxed(s: &str) -> (Self, Vec<ErrorInfo>) {
+        let parsed = parse(s, None);
+        (parsed.root(), parsed.errors)
+    }
+
+    /// Read a makefile from a file path, allowing syntax errors.
+    ///
+    /// Returns the parsed makefile and a list of errors.
+    pub fn from_file_relaxed(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, Vec<ErrorInfo>), std::io::Error> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self::from_str_relaxed(&text))
+    }
+
     /// Retrieve the rules in the makefile
     ///
     /// # Example
@@ -588,6 +608,63 @@ impl Makefile {
         self.syntax()
             .descendants()
             .filter_map(VariableReference::cast)
+    }
+
+    /// Get all top-level items that overlap with the given text range.
+    ///
+    /// Since items are stored in document order, this skips items entirely
+    /// before the range and stops once past it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "CC = gcc\nall: build\n\techo done\n".parse().unwrap();
+    /// let range = TextRange::new(0.into(), 8.into());
+    /// let items: Vec<_> = makefile.items_in_range(range).collect();
+    /// assert_eq!(items.len(), 1);
+    /// ```
+    pub fn items_in_range(
+        &self,
+        range: rowan::TextRange,
+    ) -> impl Iterator<Item = MakefileItem> + '_ {
+        self.items()
+            .skip_while(move |item| item.syntax().text_range().end() <= range.start())
+            .take_while(move |item| item.syntax().text_range().start() < range.end())
+    }
+
+    /// Get all variable references that overlap with the given text range.
+    ///
+    /// Only walks descendants of top-level items that overlap the range,
+    /// rather than scanning the entire tree.
+    pub fn variable_references_in_range(
+        &self,
+        range: rowan::TextRange,
+    ) -> impl Iterator<Item = VariableReference> + '_ {
+        self.items_in_range(range).flat_map(|item| {
+            item.syntax()
+                .descendants()
+                .filter_map(VariableReference::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Get all rules that overlap with the given text range.
+    pub fn rules_in_range(&self, range: rowan::TextRange) -> impl Iterator<Item = Rule> + '_ {
+        self.items_in_range(range).filter_map(|item| match item {
+            MakefileItem::Rule(r) => Some(r),
+            _ => None,
+        })
+    }
+
+    /// Get all variable definitions that overlap with the given text range.
+    pub fn variable_definitions_in_range(
+        &self,
+        range: rowan::TextRange,
+    ) -> impl Iterator<Item = VariableDefinition> + '_ {
+        self.items_in_range(range).filter_map(|item| match item {
+            MakefileItem::Variable(v) => Some(v),
+            _ => None,
+        })
     }
 
     /// Add a new rule to the makefile
@@ -1941,5 +2018,103 @@ override_dh_auto_configure:
         assert!(makefile
             .find_rule_by_target_pattern("build-indep")
             .is_some());
+    }
+
+    #[test]
+    fn test_items_in_range_single_item() {
+        let input = "CC = gcc\n\nall: build\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range covering just the variable definition "CC = gcc\n"
+        let range = rowan::TextRange::new(0.into(), 8.into());
+        let items: Vec<_> = makefile.items_in_range(range).collect();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], MakefileItem::Variable(_)));
+    }
+
+    #[test]
+    fn test_items_in_range_multiple_items() {
+        let input = "CC = gcc\n\nall: build\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range covering the whole file
+        let range = rowan::TextRange::new(0.into(), (input.len() as u32).into());
+        let items: Vec<_> = makefile.items_in_range(range).collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_items_in_range_no_overlap() {
+        let input = "CC = gcc\n\nall: build\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range in the blank line between items
+        let range = rowan::TextRange::new(9.into(), 10.into());
+        let items: Vec<_> = makefile.items_in_range(range).collect();
+        assert_eq!(items.len(), 0);
+    }
+
+    #[test]
+    fn test_items_in_range_partial_overlap() {
+        let input = "CC = gcc\nLD = ld\nall: build\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range overlapping end of first var and start of second
+        let range = rowan::TextRange::new(5.into(), 12.into());
+        let items: Vec<_> = makefile.items_in_range(range).collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_rules_in_range() {
+        let input = "CC = gcc\nall: build\n\techo done\nclean:\n\trm -rf build\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range covering the whole file
+        let range = rowan::TextRange::new(0.into(), (input.len() as u32).into());
+        let rules: Vec<_> = makefile.rules_in_range(range).collect();
+        assert_eq!(rules.len(), 2);
+
+        // Range covering only the variable
+        let range = rowan::TextRange::new(0.into(), 9.into());
+        let rules: Vec<_> = makefile.rules_in_range(range).collect();
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_variable_definitions_in_range() {
+        let input = "CC = gcc\nLD = ld\nall: build\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+        // Range covering the two variable definitions
+        let range = rowan::TextRange::new(0.into(), 17.into());
+        let vars: Vec<_> = makefile.variable_definitions_in_range(range).collect();
+        assert_eq!(vars.len(), 2);
+
+        // Range covering only the rule
+        let range = rowan::TextRange::new(17.into(), (input.len() as u32).into());
+        let vars: Vec<_> = makefile.variable_definitions_in_range(range).collect();
+        assert_eq!(vars.len(), 0);
+    }
+
+    #[test]
+    fn test_variable_references_in_range() {
+        let input = "CFLAGS = $(BASE) -Wall\nall: $(TARGETS)\n\techo done\n";
+        let makefile: Makefile = input.parse().unwrap();
+
+        // Full range should find the same refs as variable_references()
+        let all_refs: Vec<_> = makefile.variable_references().collect();
+        let range = rowan::TextRange::new(0.into(), (input.len() as u32).into());
+        let refs: Vec<_> = makefile.variable_references_in_range(range).collect();
+        assert_eq!(refs.len(), all_refs.len());
+
+        // Range covering only the variable definition should find $(BASE)
+        // Find the actual end of the variable item
+        let var_item = makefile.items().next().unwrap();
+        let var_end: u32 = var_item.syntax().text_range().end().into();
+        let range = rowan::TextRange::new(0.into(), var_end.into());
+        let refs: Vec<_> = makefile.variable_references_in_range(range).collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("BASE".to_string()));
+
+        // Range covering only the rule should find $(TARGETS)
+        let range = rowan::TextRange::new(var_end.into(), (input.len() as u32).into());
+        let refs: Vec<_> = makefile.variable_references_in_range(range).collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("TARGETS".to_string()));
     }
 }
