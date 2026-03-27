@@ -355,29 +355,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(DOLLAR) => {
                         // Variable reference - parse it within a PREREQUISITE node
                         self.builder.start_node(PREREQUISITE.into());
-
-                        // Parse the variable reference inline
-                        self.bump(); // Consume $
-
-                        if self.current() == Some(LPAREN) {
-                            self.bump(); // Consume (
-                            let mut paren_count = 1;
-
-                            while self.current().is_some() && paren_count > 0 {
-                                if self.current() == Some(LPAREN) {
-                                    paren_count += 1;
-                                } else if self.current() == Some(RPAREN) {
-                                    paren_count -= 1;
-                                }
-                                self.bump();
-                            }
-                        } else {
-                            // Single character variable like $X
-                            if self.current().is_some() {
-                                self.bump();
-                            }
-                        }
-
+                        self.parse_variable_reference();
                         self.builder.finish_node(); // End PREREQUISITE
                     }
                     _ => {
@@ -605,10 +583,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                         self.skip_ws();
 
-                        // Parse value
+                        // Parse value, creating nested EXPR nodes for variable references
                         self.builder.start_node(EXPR.into());
                         while self.current().is_some() && self.current() != Some(NEWLINE) {
-                            self.bump();
+                            if self.current() == Some(DOLLAR) {
+                                self.parse_variable_reference();
+                            } else {
+                                self.bump();
+                            }
                         }
                         self.builder.finish_node();
 
@@ -639,35 +621,53 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(EXPR.into());
             self.bump(); // Consume $
 
-            if self.current() == Some(LPAREN) {
-                self.bump(); // Consume (
+            if self.current() == Some(LPAREN) || self.current() == Some(LBRACE) {
+                let is_brace = self.current() == Some(LBRACE);
+                self.bump(); // Consume ( or {
 
-                // Start by checking if this is a function like $(shell ...)
-                let mut is_function = false;
+                if is_brace {
+                    // For ${...}, consume until matching }
+                    while self.current().is_some() && self.current() != Some(RBRACE) {
+                        if self.current() == Some(DOLLAR) {
+                            self.parse_variable_reference();
+                        } else {
+                            self.bump();
+                        }
+                    }
+                    if self.current() == Some(RBRACE) {
+                        self.bump(); // Consume }
+                    }
+                } else {
+                    // Start by checking if this is a function like $(shell ...)
+                    let mut is_function = false;
 
-                if self.current() == Some(IDENTIFIER) {
-                    let function_name = &self.tokens.last().unwrap().1;
-                    // Common makefile functions
-                    let known_functions = [
-                        "shell", "wildcard", "call", "eval", "file", "abspath", "dir",
-                    ];
-                    if known_functions.contains(&function_name.as_str()) {
-                        is_function = true;
+                    if self.current() == Some(IDENTIFIER) {
+                        let function_name = &self.tokens.last().unwrap().1;
+                        // Common makefile functions
+                        let known_functions = [
+                            "shell", "wildcard", "call", "eval", "file", "abspath", "dir",
+                        ];
+                        if known_functions.contains(&function_name.as_str()) {
+                            is_function = true;
+                        }
+                    }
+
+                    if is_function {
+                        // Preserve the function name
+                        self.bump();
+
+                        // Parse the rest of the function call, handling nested variable references
+                        self.consume_balanced_parens(1);
+                    } else {
+                        // Handle regular variable references
+                        self.parse_parenthesized_expr_internal(true);
                     }
                 }
-
-                if is_function {
-                    // Preserve the function name
-                    self.bump();
-
-                    // Parse the rest of the function call, handling nested variable references
-                    self.consume_balanced_parens(1);
-                } else {
-                    // Handle regular variable references
-                    self.parse_parenthesized_expr_internal(true);
-                }
+            } else if self.current().is_some() && self.current() != Some(NEWLINE) {
+                // Single character variable like $X or $$
+                self.bump();
             } else {
-                self.error("expected ( after $ in variable reference".to_string());
+                self.error("expected variable name after $".to_string());
             }
 
             self.builder.finish_node();
@@ -1500,6 +1500,90 @@ ast_node!(Include, INCLUDE);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
+
+/// A reference to a variable in the makefile, e.g. `$(FOO)` or `${BAR}`.
+///
+/// This wraps an EXPR syntax node whose first token is `$` followed by `(` or `{`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct VariableReference(SyntaxNode);
+
+impl VariableReference {
+    /// Try to cast a syntax node into a VariableReference.
+    ///
+    /// Returns `Some` if the node is an EXPR whose first token is `$` followed by
+    /// `(`, `{`, or an identifier (for single-character variables like `$X`).
+    pub fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if syntax.kind() != EXPR {
+            return None;
+        }
+        let mut tokens = syntax
+            .children_with_tokens()
+            .filter_map(|it| it.into_token());
+        let first = tokens.next()?;
+        if first.kind() != DOLLAR {
+            return None;
+        }
+        // Accept $(...), ${...}, or $X (single-char)
+        tokens.next()?;
+        Some(Self(syntax))
+    }
+
+    /// Get the syntax node backing this variable reference.
+    pub fn syntax(&self) -> &SyntaxNode {
+        &self.0
+    }
+
+    /// Get the name of the referenced variable.
+    ///
+    /// For simple references like `$(FOO)`, returns `"FOO"`.
+    /// For function calls like `$(wildcard *.c)`, returns `"wildcard"`.
+    ///
+    /// Note: Variable references inside recipes are not parsed into the syntax tree
+    /// (recipes are stored as raw text). This only finds references in variable values,
+    /// prerequisites, and targets.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "CFLAGS = $(BASE_FLAGS) -Wall\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
+    /// ```
+    pub fn name(&self) -> Option<String> {
+        // After $ and (, the first IDENTIFIER token is the variable/function name
+        self.0
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == IDENTIFIER)
+            .map(|t| t.text().to_string())
+    }
+
+    /// Get the line number (0-indexed) where this reference starts.
+    pub fn line(&self) -> usize {
+        line_col_at_offset(&self.0, self.0.text_range().start()).0
+    }
+
+    /// Get the column number (0-indexed, in bytes) where this reference starts.
+    pub fn column(&self) -> usize {
+        line_col_at_offset(&self.0, self.0.text_range().start()).1
+    }
+
+    /// Get both line and column (0-indexed) where this reference starts.
+    pub fn line_col(&self) -> (usize, usize) {
+        line_col_at_offset(&self.0, self.0.text_range().start())
+    }
+
+    /// Get the text range of this reference in the source.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.0.text_range()
+    }
+}
+
+impl core::fmt::Display for VariableReference {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(f, "{}", self.0.text())
+    }
+}
 
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
@@ -2681,10 +2765,7 @@ all: $(OBJS)
     #[test]
     fn test_bare_export_does_not_eat_include() {
         // Bare "export VARNAME" must not consume subsequent include directives
-        let parsed = parse(
-            "VAR = value\nexport VAR\ninclude other.mk\n",
-            None,
-        );
+        let parsed = parse("VAR = value\nexport VAR\ninclude other.mk\n", None);
         assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
         let makefile = parsed.root();
         assert_eq!(makefile.includes().count(), 1);
@@ -2713,17 +2794,17 @@ all: $(OBJS)
     fn test_parse_error_does_not_cross_lines() {
         // A line that fails to parse as a rule (no colon) must not
         // consume tokens from subsequent lines.
-        let parsed = parse(
-            "notarule\n\nbuild-arch:\n\techo arch\n",
-            None,
-        );
+        let parsed = parse("notarule\n\nbuild-arch:\n\techo arch\n", None);
         let makefile = parsed.root();
         let rules = makefile.rules().collect::<Vec<_>>();
         // The "notarule" line may produce an error, but build-arch must still be found
         assert!(
             rules.iter().any(|r| r.targets().any(|t| t == "build-arch")),
             "build-arch rule should be parsed despite earlier error; rules: {:?}",
-            rules.iter().map(|r| r.targets().collect::<Vec<_>>()).collect::<Vec<_>>()
+            rules
+                .iter()
+                .map(|r| r.targets().collect::<Vec<_>>())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2769,30 +2850,40 @@ execute_after_dh_auto_install:
             "build-arch should match via %: pattern rule"
         );
         assert!(
-            makefile.find_rule_by_target_pattern("build-indep").is_some(),
+            makefile
+                .find_rule_by_target_pattern("build-indep")
+                .is_some(),
             "build-indep should match via %: pattern rule"
         );
 
         // All override/execute_after rules must be found
-        let rule_targets: Vec<Vec<String>> = makefile
-            .rules()
-            .map(|r| r.targets().collect())
-            .collect();
+        let rule_targets: Vec<Vec<String>> =
+            makefile.rules().map(|r| r.targets().collect()).collect();
         assert!(
             rule_targets.iter().any(|t| t.contains(&"%".to_string())),
-            "missing %: rule; got: {:?}", rule_targets
+            "missing %: rule; got: {:?}",
+            rule_targets
         );
         assert!(
-            rule_targets.iter().any(|t| t.contains(&"override_dh_auto_build-arch".to_string())),
-            "missing override_dh_auto_build-arch; got: {:?}", rule_targets
+            rule_targets
+                .iter()
+                .any(|t| t.contains(&"override_dh_auto_build-arch".to_string())),
+            "missing override_dh_auto_build-arch; got: {:?}",
+            rule_targets
         );
         assert!(
-            rule_targets.iter().any(|t| t.contains(&"override_dh_auto_test".to_string())),
-            "missing override_dh_auto_test; got: {:?}", rule_targets
+            rule_targets
+                .iter()
+                .any(|t| t.contains(&"override_dh_auto_test".to_string())),
+            "missing override_dh_auto_test; got: {:?}",
+            rule_targets
         );
         assert!(
-            rule_targets.iter().any(|t| t.contains(&"execute_after_dh_auto_install".to_string())),
-            "missing execute_after_dh_auto_install; got: {:?}", rule_targets
+            rule_targets
+                .iter()
+                .any(|t| t.contains(&"execute_after_dh_auto_install".to_string())),
+            "missing execute_after_dh_auto_install; got: {:?}",
+            rule_targets
         );
     }
 
@@ -7004,5 +7095,112 @@ mod test_continuation {
 	done
 "#;
         assert_eq!(output, expected_output);
+    }
+
+    #[test]
+    fn test_variable_reference_paren() {
+        let makefile: Makefile = "CFLAGS = $(BASE_FLAGS) -Wall\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
+        assert_eq!(refs[0].to_string(), "$(BASE_FLAGS)");
+    }
+
+    #[test]
+    fn test_variable_reference_brace() {
+        let makefile: Makefile = "CFLAGS = ${BASE_FLAGS} -Wall\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
+        assert_eq!(refs[0].to_string(), "${BASE_FLAGS}");
+    }
+
+    #[test]
+    fn test_variable_reference_in_prerequisites() {
+        let makefile: Makefile = "all: $(TARGETS)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
+        assert!(names.contains(&"TARGETS".to_string()));
+    }
+
+    #[test]
+    fn test_variable_reference_multiple() {
+        let makefile: Makefile =
+            "CFLAGS = $(BASE_FLAGS) -Wall\nLDFLAGS = $(BASE_LDFLAGS) -lm\nall: $(TARGETS)\n"
+                .parse()
+                .unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
+        assert!(names.contains(&"BASE_FLAGS".to_string()));
+        assert!(names.contains(&"BASE_LDFLAGS".to_string()));
+        assert!(names.contains(&"TARGETS".to_string()));
+    }
+
+    #[test]
+    fn test_variable_reference_nested() {
+        let makefile: Makefile = "FOO = $($(INNER))\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
+        assert!(names.contains(&"INNER".to_string()));
+    }
+
+    #[test]
+    fn test_variable_reference_line_col() {
+        let makefile: Makefile = "A = 1\nB = $(FOO)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("FOO".to_string()));
+        assert_eq!(refs[0].line(), 1);
+        assert_eq!(refs[0].column(), 4);
+        assert_eq!(refs[0].line_col(), (1, 4));
+    }
+
+    #[test]
+    fn test_variable_reference_no_refs() {
+        let makefile: Makefile = "A = hello\nall:\n\techo done\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 0);
+    }
+
+    #[test]
+    fn test_variable_reference_mixed_styles() {
+        let makefile: Makefile = "A = $(FOO) ${BAR}\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"FOO".to_string()));
+        assert!(names.contains(&"BAR".to_string()));
+    }
+
+    #[test]
+    fn test_brace_variable_in_prerequisites() {
+        let makefile: Makefile = "all: ${OBJS}\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name(), Some("OBJS".to_string()));
+    }
+
+    #[test]
+    fn test_parse_brace_variable_roundtrip() {
+        let input = "CFLAGS = ${BASE_FLAGS} -Wall\n";
+        let makefile: Makefile = input.parse().unwrap();
+        assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_parse_nested_variable_in_value_roundtrip() {
+        let input = "FOO = $(BAR) baz $(QUUX)\n";
+        let makefile: Makefile = input.parse().unwrap();
+        assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_lex_braces() {
+        use crate::lex::lex;
+        let tokens = lex("${FOO}");
+        let kinds: Vec<_> = tokens.iter().map(|(k, _)| *k).collect();
+        assert!(kinds.contains(&DOLLAR));
+        assert!(kinds.contains(&LBRACE));
+        assert!(kinds.contains(&RBRACE));
     }
 }

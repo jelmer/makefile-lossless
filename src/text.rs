@@ -142,8 +142,8 @@ mod tests {
     #[test]
     fn test_is_in_prerequisites() {
         let text = "all: build test\n\techo ok\n";
-        assert!(!is_in_prerequisites(text, 0));  // 'a' in target
-        assert!(is_in_prerequisites(text, 5));   // 'b' in prerequisites
+        assert!(!is_in_prerequisites(text, 0)); // 'a' in target
+        assert!(is_in_prerequisites(text, 5)); // 'b' in prerequisites
         assert!(!is_in_prerequisites(text, 17)); // 'e' in recipe
     }
 
