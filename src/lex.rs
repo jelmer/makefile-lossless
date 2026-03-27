@@ -150,6 +150,14 @@ impl<'a> Lexer<'a> {
                         self.input.next();
                         Some((SyntaxKind::RPAREN, ")".to_string()))
                     }
+                    '{' => {
+                        self.input.next();
+                        Some((SyntaxKind::LBRACE, "{".to_string()))
+                    }
+                    '}' => {
+                        self.input.next();
+                        Some((SyntaxKind::RBRACE, "}".to_string()))
+                    }
                     '$' => {
                         self.input.next();
                         Some((SyntaxKind::DOLLAR, "$".to_string()))

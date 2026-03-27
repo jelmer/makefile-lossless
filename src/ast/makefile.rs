@@ -1,6 +1,6 @@
 use crate::lossless::{
     parse, Conditional, Error, ErrorInfo, Include, Makefile, ParseError, Rule, SyntaxNode,
-    VariableDefinition,
+    VariableDefinition, VariableReference,
 };
 use crate::pattern::matches_pattern;
 use crate::SyntaxKind::*;
@@ -565,6 +565,29 @@ impl Makefile {
     ) -> impl Iterator<Item = VariableDefinition> + 'a {
         self.variable_definitions()
             .filter(move |var| var.name().as_deref() == Some(name))
+    }
+
+    /// Get all variable references in the makefile.
+    ///
+    /// Walks the entire syntax tree to find all `$(VAR)` and `${VAR}` references
+    /// in variable values, prerequisites, and targets.
+    ///
+    /// Note: Variable references inside recipes are not included, since recipes
+    /// are stored as raw text in the syntax tree.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "CFLAGS = $(BASE_FLAGS) -Wall\nall: $(TARGETS)\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
+    /// assert!(names.contains(&"BASE_FLAGS".to_string()));
+    /// assert!(names.contains(&"TARGETS".to_string()));
+    /// ```
+    pub fn variable_references(&self) -> impl Iterator<Item = VariableReference> + '_ {
+        self.syntax()
+            .descendants()
+            .filter_map(VariableReference::cast)
     }
 
     /// Add a new rule to the makefile
