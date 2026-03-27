@@ -33,6 +33,7 @@ impl<'a> Lexer<'a> {
         c.is_ascii_alphabetic()
             || c.is_ascii_digit()
             || c == '_'
+            || c == '/'
             || c == '.'
             || c == '-'
             || c == '%'
@@ -465,6 +466,23 @@ override_dh_auto_clean:
                 (IDENTIFIER, "-include"),
                 (WHITESPACE, " "),
                 (IDENTIFIER, ".env"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_slash_in_identifier() {
+        assert_eq!(
+            lex("usr/bin/foo: src/main.o\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "usr/bin/foo"),
+                (OPERATOR, ":"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "src/main.o"),
                 (NEWLINE, "\n"),
             ]
         );
