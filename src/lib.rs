@@ -22,6 +22,7 @@
 //! ```
 
 mod ast;
+mod incremental;
 mod lex;
 mod lossless;
 mod parse;
@@ -30,6 +31,7 @@ mod text;
 
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
+pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
     Makefile, ParseError, PositionedParseError, Rule, VariableDefinition, VariableReference,
