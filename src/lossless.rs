@@ -1631,6 +1631,158 @@ impl VariableReference {
             .map(|t| t.text().to_string())
     }
 
+    /// Check if this is a function call rather than a simple variable reference.
+    ///
+    /// Returns `true` if the content after the function name contains whitespace
+    /// or commas, indicating arguments (e.g. `$(subst a,b,text)` vs `$(CC)`).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "FILES = $(wildcard *.c)\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// assert!(refs[0].is_function_call());
+    /// ```
+    pub fn is_function_call(&self) -> bool {
+        let mut tokens = self
+            .0
+            .children_with_tokens()
+            .filter_map(|it| it.into_token());
+
+        // Skip $ and opening paren/brace
+        let Some(dollar) = tokens.next() else {
+            return false;
+        };
+        if dollar.kind() != DOLLAR {
+            return false;
+        }
+        let Some(open) = tokens.next() else {
+            return false;
+        };
+        if open.kind() != LPAREN && open.kind() != LBRACE {
+            return false;
+        }
+
+        // Skip the function name (first IDENTIFIER)
+        let Some(ident) = tokens.next() else {
+            return false;
+        };
+        if ident.kind() != IDENTIFIER {
+            return false;
+        }
+
+        // If the next token is whitespace or comma, it's a function call
+        match tokens.next() {
+            Some(t) => t.kind() == WHITESPACE || t.kind() == COMMA,
+            None => false,
+        }
+    }
+
+    /// Count the number of comma-separated arguments in a function call.
+    ///
+    /// Returns 0 for simple variable references. For function calls, counts
+    /// the commas at depth 0 (not inside nested parentheses) plus 1.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// assert_eq!(refs[0].argument_count(), 3);
+    /// ```
+    pub fn argument_count(&self) -> usize {
+        if !self.is_function_call() {
+            return 0;
+        }
+
+        let mut commas = 0;
+        let mut depth = 0;
+        let mut past_name = false;
+
+        for element in self.0.children_with_tokens() {
+            let Some(token) = element.as_token() else {
+                // Child nodes (nested EXPR) don't contain top-level commas
+                continue;
+            };
+            match token.kind() {
+                IDENTIFIER if !past_name => {
+                    past_name = true;
+                }
+                DOLLAR | LPAREN | LBRACE if !past_name => {}
+                LPAREN => depth += 1,
+                RPAREN if depth > 0 => depth -= 1,
+                COMMA if depth == 0 && past_name => commas += 1,
+                _ => {}
+            }
+        }
+
+        if past_name {
+            commas + 1
+        } else {
+            0
+        }
+    }
+
+    /// Determine which argument (0-based) the given byte offset falls into.
+    ///
+    /// Returns `None` if the offset is not inside this reference or if this
+    /// is not a function call.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// // offset 12 is 'a' (first arg), offset 14 is 'b' (second arg), offset 16 is 't' (third arg)
+    /// assert_eq!(refs[0].argument_index_at_offset(12), Some(0));
+    /// assert_eq!(refs[0].argument_index_at_offset(14), Some(1));
+    /// assert_eq!(refs[0].argument_index_at_offset(16), Some(2));
+    /// ```
+    pub fn argument_index_at_offset(&self, offset: usize) -> Option<usize> {
+        if !self.is_function_call() {
+            return None;
+        }
+
+        let ref_start: usize = self.0.text_range().start().into();
+        let ref_end: usize = self.0.text_range().end().into();
+        if offset < ref_start || offset > ref_end {
+            return None;
+        }
+
+        let mut arg_index = 0;
+        let mut depth = 0;
+        let mut past_name = false;
+
+        for element in self.0.children_with_tokens() {
+            let Some(token) = element.as_token() else {
+                continue;
+            };
+            let token_end: usize = token.text_range().end().into();
+
+            match token.kind() {
+                IDENTIFIER if !past_name => {
+                    past_name = true;
+                }
+                DOLLAR | LPAREN | LBRACE if !past_name => {}
+                LPAREN => depth += 1,
+                RPAREN if depth > 0 => depth -= 1,
+                COMMA if depth == 0 && past_name => {
+                    if offset < token_end {
+                        return Some(arg_index);
+                    }
+                    arg_index += 1;
+                }
+                _ => {}
+            }
+        }
+
+        if past_name {
+            Some(arg_index)
+        } else {
+            None
+        }
+    }
+
     /// Get the line number (0-indexed) where this reference starts.
     pub fn line(&self) -> usize {
         line_col_at_offset(&self.0, self.0.text_range().start()).0
@@ -7347,6 +7499,90 @@ mod test_continuation {
         let input = "FOO = $(BAR) baz $(QUUX)\n";
         let makefile: Makefile = input.parse().unwrap();
         assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_is_function_call() {
+        let makefile: Makefile = "FILES = $(wildcard *.c)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].is_function_call());
+    }
+
+    #[test]
+    fn test_is_function_call_simple_variable() {
+        let makefile: Makefile = "CFLAGS = $(CC)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert!(!refs[0].is_function_call());
+    }
+
+    #[test]
+    fn test_is_function_call_with_commas() {
+        let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].is_function_call());
+    }
+
+    #[test]
+    fn test_is_function_call_braces() {
+        let makefile: Makefile = "FILES = ${wildcard *.c}\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].is_function_call());
+    }
+
+    #[test]
+    fn test_argument_count_simple_variable() {
+        let makefile: Makefile = "CFLAGS = $(CC)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs[0].argument_count(), 0);
+    }
+
+    #[test]
+    fn test_argument_count_one_arg() {
+        let makefile: Makefile = "FILES = $(wildcard *.c)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs[0].argument_count(), 1);
+    }
+
+    #[test]
+    fn test_argument_count_three_args() {
+        let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs[0].argument_count(), 3);
+    }
+
+    #[test]
+    fn test_argument_index_at_offset_subst() {
+        let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        // "X = $(subst a,b,text)"
+        //  0123456789012345678901
+        //              ^first arg (offset 12)
+        //                ^second arg (offset 14)
+        //                  ^third arg (offset 16)
+        assert_eq!(refs[0].argument_index_at_offset(12), Some(0));
+        assert_eq!(refs[0].argument_index_at_offset(14), Some(1));
+        assert_eq!(refs[0].argument_index_at_offset(16), Some(2));
+    }
+
+    #[test]
+    fn test_argument_index_at_offset_outside() {
+        let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        // Before the reference
+        assert_eq!(refs[0].argument_index_at_offset(0), None);
+        // After the reference
+        assert_eq!(refs[0].argument_index_at_offset(22), None);
+    }
+
+    #[test]
+    fn test_argument_index_at_offset_simple_variable() {
+        let makefile: Makefile = "CFLAGS = $(CC)\n".parse().unwrap();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        assert_eq!(refs[0].argument_index_at_offset(11), None);
     }
 
     #[test]
