@@ -452,6 +452,82 @@ impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
     }
 }
 
+/// Iterator over blocks of consecutive comment lines in a makefile.
+struct CommentBlockIter {
+    elements: Vec<rowan::NodeOrToken<SyntaxNode, rowan::SyntaxToken<crate::lossless::Lang>>>,
+    pos: usize,
+}
+
+impl CommentBlockIter {
+    fn new(root: &SyntaxNode) -> Self {
+        Self {
+            elements: root.children_with_tokens().collect(),
+            pos: 0,
+        }
+    }
+}
+
+impl Iterator for CommentBlockIter {
+    type Item = rowan::TextRange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Find the start of the next comment
+        while self.pos < self.elements.len() {
+            if let Some(token) = self.elements[self.pos].as_token() {
+                if token.kind() == COMMENT {
+                    break;
+                }
+            }
+            self.pos += 1;
+        }
+
+        if self.pos >= self.elements.len() {
+            return None;
+        }
+
+        let block_start = self.elements[self.pos]
+            .as_token()
+            .unwrap()
+            .text_range()
+            .start();
+        let mut block_end = self.elements[self.pos]
+            .as_token()
+            .unwrap()
+            .text_range()
+            .end();
+        let mut comment_count = 1;
+        self.pos += 1;
+
+        // Extend the block through consecutive comments (with whitespace/newlines/blank lines between)
+        while self.pos < self.elements.len() {
+            match &self.elements[self.pos] {
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
+                {
+                    self.pos += 1;
+                }
+                rowan::NodeOrToken::Node(node) if node.kind() == BLANK_LINE => {
+                    self.pos += 1;
+                }
+                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
+                    block_end = token.text_range().end();
+                    comment_count += 1;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Only return blocks with 2+ comment lines
+        if comment_count >= 2 {
+            Some(rowan::TextRange::new(block_start, block_end))
+        } else {
+            // Single comment line — skip it and try next
+            self.next()
+        }
+    }
+}
+
 impl Makefile {
     /// Create a new empty makefile
     pub fn new() -> Makefile {
@@ -665,6 +741,22 @@ impl Makefile {
             MakefileItem::Variable(v) => Some(v),
             _ => None,
         })
+    }
+
+    /// Get all blocks of consecutive comment lines in the makefile.
+    ///
+    /// Returns the text range of each block. A comment block is two or more
+    /// consecutive comment lines (separated only by whitespace or blank lines).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "# line 1\n# line 2\n# line 3\nall:\n\techo done\n".parse().unwrap();
+    /// let blocks: Vec<_> = makefile.comment_blocks().collect();
+    /// assert_eq!(blocks.len(), 1);
+    /// ```
+    pub fn comment_blocks(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        CommentBlockIter::new(self.syntax())
     }
 
     /// Add a new rule to the makefile
@@ -2116,5 +2208,49 @@ override_dh_auto_configure:
         let refs: Vec<_> = makefile.variable_references_in_range(range).collect();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name(), Some("TARGETS".to_string()));
+    }
+
+    #[test]
+    fn test_comment_blocks_single_block() {
+        let makefile: Makefile = "# line 1\n# line 2\n# line 3\nall:\n\techo done\n"
+            .parse()
+            .unwrap();
+        let blocks: Vec<_> = makefile.comment_blocks().collect();
+        assert_eq!(blocks.len(), 1);
+        let text = &makefile.to_string()[std::ops::Range::from(blocks[0])];
+        assert!(text.contains("# line 1"));
+        assert!(text.contains("# line 3"));
+    }
+
+    #[test]
+    fn test_comment_blocks_multiple_blocks() {
+        let makefile: Makefile =
+            "# block 1a\n# block 1b\nVAR = value\n# block 2a\n# block 2b\nall:\n\techo done\n"
+                .parse()
+                .unwrap();
+        let blocks: Vec<_> = makefile.comment_blocks().collect();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_comment_blocks_no_blocks() {
+        let makefile: Makefile = "VAR = value\nall:\n\techo done\n".parse().unwrap();
+        let blocks: Vec<_> = makefile.comment_blocks().collect();
+        assert_eq!(blocks.len(), 0);
+    }
+
+    #[test]
+    fn test_comment_blocks_single_comment_not_a_block() {
+        let makefile: Makefile = "# just one line\nVAR = value\n".parse().unwrap();
+        let blocks: Vec<_> = makefile.comment_blocks().collect();
+        assert_eq!(blocks.len(), 0);
+    }
+
+    #[test]
+    fn test_comment_blocks_with_blank_line_between() {
+        let makefile: Makefile = "# line 1\n\n# line 2\nVAR = value\n".parse().unwrap();
+        let blocks: Vec<_> = makefile.comment_blocks().collect();
+        // Blank lines between comments should still form a block
+        assert_eq!(blocks.len(), 1);
     }
 }

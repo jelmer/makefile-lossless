@@ -13,6 +13,23 @@ impl Include {
             .map(|it| it.text().to_string().trim().to_string())
     }
 
+    /// Get the text range of the path portion of the include directive.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "include config.mk\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// let range = inc.path_range().unwrap();
+    /// assert_eq!(&makefile.to_string()[std::ops::Range::from(range)], "config.mk");
+    /// ```
+    pub fn path_range(&self) -> Option<rowan::TextRange> {
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == EXPR)
+            .map(|it| it.text_range())
+    }
+
     /// Check if this is an optional include (-include or sinclude)
     pub fn is_optional(&self) -> bool {
         let text = self.syntax().text();
@@ -433,6 +450,39 @@ mod tests {
         assert_eq!(inc.path(), Some("new.mk".to_string()));
         assert!(inc.is_optional());
         assert_eq!(makefile.to_string(), "-include new.mk\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_include_path_range() {
+        let makefile: Makefile = "include config.mk\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        let range = inc.path_range().unwrap();
+        assert_eq!(
+            &makefile.to_string()[std::ops::Range::from(range)],
+            "config.mk"
+        );
+    }
+
+    #[test]
+    fn test_include_path_range_optional() {
+        let makefile: Makefile = "-include optional.mk\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        let range = inc.path_range().unwrap();
+        assert_eq!(
+            &makefile.to_string()[std::ops::Range::from(range)],
+            "optional.mk"
+        );
+    }
+
+    #[test]
+    fn test_include_path_range_sinclude() {
+        let makefile: Makefile = "sinclude silent.mk\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        let range = inc.path_range().unwrap();
+        assert_eq!(
+            &makefile.to_string()[std::ops::Range::from(range)],
+            "silent.mk"
+        );
     }
 
     #[test]
