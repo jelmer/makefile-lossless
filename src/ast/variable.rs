@@ -4,6 +4,22 @@ use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
 
+/// Recursively rebuild a syntax node into a GreenNodeBuilder.
+fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNode) {
+    builder.start_node(node.kind().into());
+    for child in node.children_with_tokens() {
+        match child {
+            rowan::NodeOrToken::Token(token) => {
+                builder.token(token.kind().into(), token.text());
+            }
+            rowan::NodeOrToken::Node(child_node) => {
+                rebuild_node(builder, &child_node);
+            }
+        }
+    }
+    builder.finish_node();
+}
+
 impl VariableDefinition {
     /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
@@ -125,14 +141,7 @@ impl VariableDefinition {
                     builder.token(token.kind().into(), token.text());
                 }
                 rowan::NodeOrToken::Node(node) => {
-                    // For nodes (like EXPR), rebuild them by iterating their structure
-                    builder.start_node(node.kind().into());
-                    for node_child in node.children_with_tokens() {
-                        if let rowan::NodeOrToken::Token(token) = node_child {
-                            builder.token(token.kind().into(), token.text());
-                        }
-                    }
-                    builder.finish_node();
+                    rebuild_node(&mut builder, &node);
                 }
             }
         }
@@ -316,5 +325,18 @@ mod tests {
         assert!(var.is_export());
         assert_eq!(var.name(), Some("VAR".to_string()));
         assert_eq!(makefile.code(), "export VAR ?= new_value\n");
+    }
+
+    #[test]
+    fn test_set_assignment_operator_preserves_shell_call() {
+        let makefile: Makefile =
+            "DEB_HOST_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("?=");
+        assert_eq!(var.assignment_operator(), Some("?=".to_string()));
+        assert_eq!(
+            makefile.code(),
+            "DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)\n"
+        );
     }
 }
