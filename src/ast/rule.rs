@@ -1169,3 +1169,16 @@ impl Default for Makefile {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Makefile;
+
+    #[test]
+    fn test_rules_with_pipe_in_shell_continuation() {
+        let input = "VAR ?= $(shell cmd | \\\n\t\tsed -e 's/foo/bar/')\n\n%:\n\tdh $@\n";
+        let (makefile, _errors) = Makefile::from_str_relaxed(input);
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1, "Expected 1 rule");
+    }
+}

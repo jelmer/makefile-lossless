@@ -34,7 +34,8 @@ pub use ast::rule::RuleItem;
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
-    Makefile, ParseError, PositionedParseError, Rule, VariableDefinition, VariableReference,
+    Makefile, ParseError, PositionedParseError, Recipe, Rule, VariableDefinition,
+    VariableReference,
 };
 pub use parse::Parse;
 pub use rowan::TextRange;

@@ -11,12 +11,14 @@ enum LineType {
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line_type: Option<LineType>,
+    continuation: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         Lexer {
             input: input.chars().peekable(),
+            continuation: false,
             line_type: None,
         }
     }
@@ -86,12 +88,19 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<(SyntaxKind, String)> {
         if let Some(&c) = self.input.peek() {
             match (c, self.line_type) {
-                ('\t', None) => {
+                ('\t', None) if !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, "\t".to_string()));
                 }
-                (' ', None) => {
+                ('\t', None) => {
+                    // Continuation line: tab is indent but not a recipe
+                    self.input.next();
+                    self.line_type = Some(LineType::Other);
+                    self.continuation = false;
+                    return Some((SyntaxKind::INDENT, "\t".to_string()));
+                }
+                (' ', None) if !self.continuation => {
                     // Check if this is the start of a space-indented recipe (2 or 4 spaces)
                     let spaces = self.read_while(|ch| ch == ' ');
                     if spaces.len() >= 2 {
@@ -103,8 +112,16 @@ impl<'a> Lexer<'a> {
                         return Some((SyntaxKind::WHITESPACE, spaces));
                     }
                 }
+                (' ', None) => {
+                    // Continuation line: spaces are indent but not a recipe
+                    let spaces = self.read_while(|ch| ch == ' ');
+                    self.line_type = Some(LineType::Other);
+                    self.continuation = false;
+                    return Some((SyntaxKind::INDENT, spaces));
+                }
                 (_, None) => {
                     self.line_type = Some(LineType::Other);
+                    self.continuation = false;
                 }
                 (_, _) => {}
             }
@@ -169,6 +186,10 @@ impl<'a> Lexer<'a> {
                     }
                     '\\' => {
                         self.input.next();
+                        // If the next character is a newline, this is a line continuation
+                        if self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
+                            self.continuation = true;
+                        }
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
                     _ => {
