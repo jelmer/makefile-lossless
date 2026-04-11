@@ -329,8 +329,9 @@ mod tests {
 
     #[test]
     fn test_set_assignment_operator_preserves_shell_call() {
-        let makefile: Makefile =
-            "DEB_HOST_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)\n".parse().unwrap();
+        let makefile: Makefile = "DEB_HOST_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)\n"
+            .parse()
+            .unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
