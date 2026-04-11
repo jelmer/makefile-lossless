@@ -1873,6 +1873,31 @@ impl Recipe {
             .collect()
     }
 
+    /// Get the indentation string of this recipe line.
+    ///
+    /// Returns the leading indentation (typically a tab character) of this recipe line,
+    /// or `None` if no indent token is present.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// assert_eq!(recipe.indent(), Some("\t".to_string()));
+    /// ```
+    pub fn indent(&self) -> Option<String> {
+        self.syntax().children_with_tokens().find_map(|it| {
+            if let Some(token) = it.as_token() {
+                if token.kind() == INDENT {
+                    return Some(token.text().to_string());
+                }
+            }
+            None
+        })
+    }
+
     /// Get the comment content of this recipe line, if any
     ///
     /// Returns the comment text (including the '#' character) if this recipe
