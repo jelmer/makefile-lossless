@@ -52,9 +52,9 @@ impl<'a> Lexer<'a> {
                 self.input.next();
                 break;
             } else if c == '\\' {
+                result.push(c);
                 self.input.next(); // Consume backslash
                 if let Some(next) = self.input.next() {
-                    // Handle any escaped character, not just quotes
                     result.push(next);
                 }
             } else if c == '$' {
@@ -507,5 +507,14 @@ override_dh_auto_clean:
                 (NEWLINE, "\n"),
             ]
         );
+    }
+
+    #[test]
+    fn test_backslash_in_variable_continuation() {
+        let input = "VAR ?= $(shell cmd | \\\n\t\tsed -rne 's,^V: ([^-]+).*,\\1,p')\n";
+        let tokens = lex(input);
+        // Check that the backslash before '1' is preserved
+        let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(input, text, "Token text reconstruction differs from input");
     }
 }
