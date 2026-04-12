@@ -1181,4 +1181,24 @@ mod tests {
         let rules: Vec<_> = makefile.rules().collect();
         assert_eq!(rules.len(), 1, "Expected 1 rule");
     }
+
+    #[test]
+    fn test_roundtrip_with_backslash_in_variable_continuation() {
+        let input = "DEB_UPSTREAM_VERSION ?= $(shell dpkg-parsechangelog | \\\n\
+                     \t\t\t  sed -rne 's,^Version: ([^-]+).*,\\1,p')\n\
+                     \n\
+                     %:\n\
+                     \tdh $@ --with autoreconf\n\
+                     \n\
+                     override_dh_strip:\n\
+                     \tdh_strip --dbg-package=f2fs-tools-dbg\n";
+        let (makefile, errors) = Makefile::from_str_relaxed(input);
+        assert!(errors.is_empty(), "Unexpected parse errors: {:?}", errors);
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2, "Expected 2 rules, got {}", rules.len());
+
+        let output = makefile.to_string();
+        assert_eq!(input, output, "Round-trip failed");
+    }
 }
