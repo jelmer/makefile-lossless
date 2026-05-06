@@ -817,12 +817,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.expect_eol();
         }
 
-        // Handle parsing a quoted string - combines common quoting logic
+        // Handle parsing a quoted string. The lexer emits the entire quoted
+        // string (including both delimiters) as a single QUOTE token, so we
+        // just consume that one token.
         fn parse_quoted_string(&mut self) {
-            self.bump(); // Consume the quote
-            while !self.is_at_eof() && self.current() != Some(QUOTE) {
-                self.bump();
-            }
             if self.current() == Some(QUOTE) {
                 self.bump();
             }
@@ -7618,5 +7616,30 @@ mod test_continuation {
         assert!(kinds.contains(&DOLLAR));
         assert!(kinds.contains(&LBRACE));
         assert!(kinds.contains(&RBRACE));
+    }
+
+    #[test]
+    fn test_parse_quoted_string_inside_function_call() {
+        // The lexer emits a balanced quoted string as one QUOTE token, so a
+        // quoted argument with embedded parentheses must not break paren
+        // balance tracking inside a $(...) expression. Lone or asymmetric
+        // quotes (it's, foo'bar) must not swallow the rest of the line.
+        let cases = [
+            "X = $(if a,'foo')\n",
+            "X = $(if a,'foo (bar)')\n",
+            "X = $(if a,'(')\n",
+            "X = $(if a,')')\n",
+            "X = $(if $(SKIP),-k 'not ($(call f,$(s),$(SKIP)))')\n",
+            "X = foo'bar\nY = baz\n",
+            "X = it's fine\n",
+            "X = $(if a,it's)\n",
+            "X = '\nY = bar\n",
+        ];
+        for src in cases {
+            let parsed: Makefile = src.parse().unwrap_or_else(|e| {
+                panic!("failed to parse {src:?}: {e:?}");
+            });
+            assert_eq!(parsed.to_string(), src, "round-trip mismatch for {src:?}");
+        }
     }
 }
