@@ -41,6 +41,30 @@ impl<'a> Lexer<'a> {
             || c == '%'
     }
 
+    /// Check whether a matching close-quote appears on the current line.
+    /// Make doesn't treat quotes as syntactic; we only group them so that
+    /// embedded parens don't confuse $(...) parsing. If the quote is
+    /// unterminated (or asymmetric, like `it's`), grouping would do more
+    /// harm than good — so we only group when there's a partner on the
+    /// same line. A backslash escapes the next character.
+    fn has_matching_close_quote(&self, quote: char) -> bool {
+        let mut probe = self.input.clone();
+        probe.next(); // Skip the opening quote we already peeked.
+        while let Some(c) = probe.next() {
+            if Self::is_newline(c) {
+                return false;
+            }
+            if c == '\\' {
+                probe.next();
+                continue;
+            }
+            if c == quote {
+                return true;
+            }
+        }
+        false
+    }
+
     fn read_quoted_string(&mut self) -> String {
         let mut result = String::new();
         let quote = self.input.next().unwrap(); // Consume opening quote
@@ -57,10 +81,6 @@ impl<'a> Lexer<'a> {
                 if let Some(next) = self.input.next() {
                     result.push(next);
                 }
-            } else if c == '$' {
-                // Handle variable references inside quotes
-                result.push(c);
-                self.input.next();
             } else {
                 result.push(c);
                 self.input.next();
@@ -152,7 +172,16 @@ impl<'a> Lexer<'a> {
                         SyntaxKind::IDENTIFIER,
                         self.read_while(Self::is_valid_identifier_char),
                     )),
-                    '"' | '\'' => Some((SyntaxKind::QUOTE, self.read_quoted_string())),
+                    '"' | '\'' => {
+                        if self.has_matching_close_quote(c) {
+                            Some((SyntaxKind::QUOTE, self.read_quoted_string()))
+                        } else {
+                            // Lone quote — emit as a single-character QUOTE
+                            // token so paren counting in $(...) still works.
+                            self.input.next();
+                            Some((SyntaxKind::QUOTE, c.to_string()))
+                        }
+                    }
                     ':' | '=' | '?' | '+' => {
                         let text = self.input.next().unwrap().to_string()
                             + self
