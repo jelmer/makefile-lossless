@@ -42,7 +42,7 @@ impl Conditional {
             .children()
             .find(|it| it.kind() == CONDITIONAL_IF)?
             .children_with_tokens()
-            .find(|it| it.kind() == IDENTIFIER)
+            .find(|it| it.kind() == KEYWORD || it.kind() == IDENTIFIER)
             .map(|it| it.as_token().unwrap().text().to_string())
     }
 

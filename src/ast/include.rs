@@ -133,12 +133,12 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
     pub fn set_optional(&mut self, optional: bool) {
-        use crate::SyntaxKind::INCLUDE;
+        use crate::SyntaxKind::{IDENTIFIER, KEYWORD};
 
-        // Find the first IDENTIFIER token (which is the include keyword)
+        // Find the first KEYWORD or IDENTIFIER token (which is the include keyword)
         let keyword_token = self.syntax().children_with_tokens().find(|it| {
             it.as_token()
-                .map(|t| t.kind() == IDENTIFIER)
+                .map(|t| t.kind() == KEYWORD || t.kind() == IDENTIFIER)
                 .unwrap_or(false)
         });
 
@@ -172,15 +172,15 @@ impl Include {
 
             // Rebuild the entire INCLUDE node, replacing just the keyword token
             let mut builder = GreenNodeBuilder::new();
-            builder.start_node(INCLUDE.into());
+            builder.start_node(crate::SyntaxKind::INCLUDE.into());
 
             for child in self.syntax().children_with_tokens() {
                 match child {
                     rowan::NodeOrToken::Token(tok)
-                        if tok.kind() == IDENTIFIER && tok.text() == current_text =>
+                        if (tok.kind() == KEYWORD || tok.kind() == IDENTIFIER) && tok.text() == current_text =>
                     {
-                        // Replace the include keyword
-                        builder.token(IDENTIFIER.into(), new_keyword);
+                        // Replace the include keyword with the same token type
+                        builder.token(tok.kind().into(), new_keyword);
                     }
                     rowan::NodeOrToken::Token(tok) => {
                         // Copy other tokens as-is

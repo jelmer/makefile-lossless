@@ -2357,44 +2357,6 @@ impl FromStr for Makefile {
     }
 }
 
-// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes
-fn build_prerequisites_node(prereqs: &[String], include_leading_space: bool) -> SyntaxNode {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(PREREQUISITES.into());
-
-    for (i, prereq) in prereqs.iter().enumerate() {
-        // Add space: before first prerequisite if requested, and between all prerequisites
-        if (i == 0 && include_leading_space) || i > 0 {
-            builder.token(WHITESPACE.into(), " ");
-        }
-
-        // Build each PREREQUISITE node
-        builder.start_node(PREREQUISITE.into());
-        builder.token(IDENTIFIER.into(), prereq);
-        builder.finish_node();
-    }
-
-    builder.finish_node();
-    SyntaxNode::new_root_mut(builder.finish())
-}
-
-// Helper function to build targets section (TARGETS node)
-fn build_targets_node(targets: &[String]) -> SyntaxNode {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(TARGETS.into());
-
-    for (i, target) in targets.iter().enumerate() {
-        if i > 0 {
-            builder.token(WHITESPACE.into(), " ");
-        }
-        builder.token(IDENTIFIER.into(), target);
-    }
-
-    builder.finish_node();
-    SyntaxNode::new_root_mut(builder.finish())
-}
-
-
 
 
 #[cfg(test)]
@@ -7682,7 +7644,7 @@ mod test_continuation {
     #[test]
     fn test_lex_braces() {
         use crate::lex::lex;
-        let tokens = lex("${FOO}");
+        let tokens = lex("${FOO}", None);
         let kinds: Vec<_> = tokens.iter().map(|(k, _)| *k).collect();
         assert!(kinds.contains(&DOLLAR));
         assert!(kinds.contains(&LBRACE));
