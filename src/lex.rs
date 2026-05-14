@@ -71,10 +71,7 @@ impl<'a> Lexer<'a> {
 
     fn is_keyword(&self, text: &str) -> bool {
         // Check for GNU Make keywords
-        if matches!(
-            self.variant,
-            None | Some(crate::MakefileVariant::GNUMake)
-        )
+        if matches!(self.variant, None | Some(crate::MakefileVariant::GNUMake))
             && matches!(
                 text,
                 "ifdef"
@@ -88,12 +85,14 @@ impl<'a> Lexer<'a> {
                     | "include"
                     | "-include"
                     | "sinclude"
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
+        }
 
         // Check for NMake keywords (case-insensitive)
-        if matches!(self.variant, Some(crate::MakefileVariant::NMake)) {
+        // When variant is None, recognize NMake keywords too for lossless parsing
+        if matches!(self.variant, None | Some(crate::MakefileVariant::NMake)) {
             let lower = text.to_lowercase();
             if matches!(
                 lower.as_str(),
@@ -223,11 +222,7 @@ impl<'a> Lexer<'a> {
                         self.at_line_start = false;
                         Some((kind, text))
                     }
-                    '!' if matches!(
-                        self.variant,
-                        Some(crate::MakefileVariant::NMake)
-                    ) =>
-                    {
+                    '!' if matches!(self.variant, None | Some(crate::MakefileVariant::NMake)) => {
                         // Handle NMake directives like !IF, !IFDEF, !ERROR, etc.
                         self.input.next(); // consume '!'
                         if let Some(&next_char) = self.input.peek() {
@@ -703,15 +698,14 @@ override_dh_auto_clean:
             ]
         );
 
-        // Test that ! without NMake variant produces error
+        // Test that ! with None variant now recognizes NMake directives (for lossless parsing)
         assert_eq!(
             lex("!IF DEBUG\n", None)
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (ERROR, "!"),
-                (IDENTIFIER, "IF"),
+                (KEYWORD, "!IF"),  // Now recognized when variant is None
                 (WHITESPACE, " "),
                 (IDENTIFIER, "DEBUG"),
                 (NEWLINE, "\n"),
@@ -726,5 +720,96 @@ override_dh_auto_clean:
         // Check that the backslash before '1' is preserved
         let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(input, text, "Token text reconstruction differs from input");
+    }
+
+    #[test]
+    fn test_gnu_directives_with_no_variant() {
+        // Test that GNU Make directives are recognized when variant is None
+        assert_eq!(
+            lex("ifdef DEBUG\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "ifdef"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
+
+        assert_eq!(
+            lex("include config.mk\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "include"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "config.mk"),
+                (NEWLINE, "\n"),
+            ]
+        );
+
+        assert_eq!(
+            lex("export PATH\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "export"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "PATH"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_make_directives_recognized_with_no_variant() {
+        // Test that both GNU Make and NMake directives are recognized when variant is None
+        // This allows lossless parsing of any Makefile without knowing the variant
+        
+        // GNU Make directives still work
+        assert_eq!(
+            lex("ifdef DEBUG\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "ifdef"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
+        
+        // NMake directives are now also recognized when variant is None
+        assert_eq!(
+            lex("!IF DEBUG\n", None)
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "!IF"),  // Recognized as NMake keyword when at line start
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
+        
+        // And still work with explicit NMake variant
+        assert_eq!(
+            lex("!IFDEF DEBUG\n", Some(crate::MakefileVariant::NMake))
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (KEYWORD, "!IFDEF"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "DEBUG"),
+                (NEWLINE, "\n"),
+            ]
+        );
     }
 }

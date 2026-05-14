@@ -177,7 +177,8 @@ impl Include {
             for child in self.syntax().children_with_tokens() {
                 match child {
                     rowan::NodeOrToken::Token(tok)
-                        if (tok.kind() == KEYWORD || tok.kind() == IDENTIFIER) && tok.text() == current_text =>
+                        if (tok.kind() == KEYWORD || tok.kind() == IDENTIFIER)
+                            && tok.text() == current_text =>
                     {
                         // Replace the include keyword with the same token type
                         builder.token(tok.kind().into(), new_keyword);

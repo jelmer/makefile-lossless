@@ -2340,7 +2340,6 @@ pub(crate) fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxN
     }
 }
 
-
 impl FromStr for Rule {
     type Err = crate::Error;
 
@@ -2356,8 +2355,6 @@ impl FromStr for Makefile {
         Makefile::parse(s).to_result()
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -7639,6 +7636,51 @@ mod test_continuation {
         let makefile: Makefile = "CFLAGS = $(CC)\n".parse().unwrap();
         let refs: Vec<_> = makefile.variable_references().collect();
         assert_eq!(refs[0].argument_index_at_offset(11), None);
+    }
+
+    #[test]
+    fn test_all_make_variants_parsed_with_no_variant() {
+        // Test that both GNU Make and NMake syntax are correctly parsed when variant is None
+        // This enables lossless parsing of any Makefile without knowing the variant
+        
+        // GNU Make conditionals work
+        let gnu_text = r#"ifdef DEBUG
+CFLAGS = -g
+else
+CFLAGS = -O2
+endif
+
+include config.mk
+export PATH
+"#;
+        let gnu_makefile: Makefile = gnu_text.parse().unwrap();
+
+        // Should have one conditional
+        let conditionals: Vec<_> = gnu_makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(
+            conditionals[0].conditional_type(),
+            Some("ifdef".to_string())
+        );
+
+        // Should have one include
+        let includes: Vec<_> = gnu_makefile.includes().collect();
+        assert_eq!(includes.len(), 1);
+
+        // Should recognize variable definitions
+        let vars: Vec<_> = gnu_makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 3); // CFLAGS twice and PATH
+        
+        // NMake syntax should also be preserved losslessly
+        let nmake_text = r#"!IF "$(DEBUG)" == "1"
+CFLAGS = /Od /Zi
+!ELSE
+CFLAGS = /O2
+!ENDIF
+"#;
+        // At minimum, it should parse without errors and preserve text
+        let parsed = parse(nmake_text, None);
+        assert_eq!(parsed.root().to_string(), nmake_text);
     }
 
     #[test]
