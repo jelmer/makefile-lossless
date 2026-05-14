@@ -7642,7 +7642,7 @@ mod test_continuation {
     fn test_all_make_variants_parsed_with_no_variant() {
         // Test that both GNU Make and NMake syntax are correctly parsed when variant is None
         // This enables lossless parsing of any Makefile without knowing the variant
-        
+
         // GNU Make conditionals work
         let gnu_text = r#"ifdef DEBUG
 CFLAGS = -g
@@ -7670,7 +7670,7 @@ export PATH
         // Should recognize variable definitions
         let vars: Vec<_> = gnu_makefile.variable_definitions().collect();
         assert_eq!(vars.len(), 3); // CFLAGS twice and PATH
-        
+
         // NMake syntax should also be preserved losslessly
         let nmake_text = r#"!IF "$(DEBUG)" == "1"
 CFLAGS = /Od /Zi

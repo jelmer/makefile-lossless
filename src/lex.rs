@@ -69,40 +69,45 @@ impl<'a> Lexer<'a> {
         false
     }
 
-    fn is_keyword(&self, text: &str) -> bool {
-        // Check for GNU Make keywords
-        if matches!(self.variant, None | Some(crate::MakefileVariant::GNUMake))
-            && matches!(
-                text,
-                "ifdef"
-                    | "ifndef"
-                    | "ifeq"
-                    | "ifneq"
-                    | "else"
-                    | "endif"
-                    | "export"
-                    | "unexport"
-                    | "include"
-                    | "-include"
-                    | "sinclude"
-            )
-        {
-            return true;
-        }
+    fn is_gnu_make_keyword(&self, text: &str) -> bool {
+        matches!(
+            text,
+            "ifdef"
+                | "ifndef"
+                | "ifeq"
+                | "ifneq"
+                | "else"
+                | "endif"
+                | "export"
+                | "unexport"
+                | "include"
+                | "-include"
+                | "sinclude"
+        )
+    }
 
-        // Check for NMake keywords (case-insensitive)
-        // When variant is None, recognize NMake keywords too for lossless parsing
-        if matches!(self.variant, None | Some(crate::MakefileVariant::NMake)) {
-            let lower = text.to_lowercase();
-            if matches!(
-                lower.as_str(),
-                "!if" | "!ifdef" | "!ifndef" | "!else" | "!elseif" | "!endif"
-            ) {
-                return true;
+    fn is_nmake_keyword(&self, text: &str) -> bool {
+        let lower = text.to_lowercase();
+        matches!(
+            lower.as_str(),
+            "!if" | "!ifdef" | "!ifndef" | "!else" | "!elseif" | "!endif"
+        )
+    }
+
+    fn is_keyword(&self, text: &str) -> bool {
+        match self.variant {
+            Some(crate::MakefileVariant::GNUMake) => self.is_gnu_make_keyword(text),
+            Some(crate::MakefileVariant::NMake) => self.is_nmake_keyword(text),
+            Some(crate::MakefileVariant::BSDMake) | Some(crate::MakefileVariant::POSIXMake) => {
+                // BSD Make and POSIX Make don't have special keywords that we recognize differently
+                false
+            }
+            None => {
+                // When variant is unknown, recognize keywords from all variants
+                // This enables lossless parsing of any Makefile
+                self.is_gnu_make_keyword(text) || self.is_nmake_keyword(text)
             }
         }
-
-        false
     }
 
     fn read_quoted_string(&mut self) -> String {
@@ -705,7 +710,7 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (KEYWORD, "!IF"),  // Now recognized when variant is None
+                (KEYWORD, "!IF"), // Now recognized when variant is None
                 (WHITESPACE, " "),
                 (IDENTIFIER, "DEBUG"),
                 (NEWLINE, "\n"),
@@ -769,7 +774,7 @@ override_dh_auto_clean:
     fn test_all_make_directives_recognized_with_no_variant() {
         // Test that both GNU Make and NMake directives are recognized when variant is None
         // This allows lossless parsing of any Makefile without knowing the variant
-        
+
         // GNU Make directives still work
         assert_eq!(
             lex("ifdef DEBUG\n", None)
@@ -783,7 +788,7 @@ override_dh_auto_clean:
                 (NEWLINE, "\n"),
             ]
         );
-        
+
         // NMake directives are now also recognized when variant is None
         assert_eq!(
             lex("!IF DEBUG\n", None)
@@ -791,13 +796,13 @@ override_dh_auto_clean:
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (KEYWORD, "!IF"),  // Recognized as NMake keyword when at line start
+                (KEYWORD, "!IF"), // Recognized as NMake keyword when at line start
                 (WHITESPACE, " "),
                 (IDENTIFIER, "DEBUG"),
                 (NEWLINE, "\n"),
             ]
         );
-        
+
         // And still work with explicit NMake variant
         assert_eq!(
             lex("!IFDEF DEBUG\n", Some(crate::MakefileVariant::NMake))
