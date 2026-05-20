@@ -276,8 +276,9 @@ impl Rule {
                     IDENTIFIER => {
                         current_target.push_str(token.text());
                     }
-                    WHITESPACE => {
-                        // Only treat whitespace as a delimiter if we're not inside parentheses
+                    WHITESPACE | BACKSLASH | NEWLINE => {
+                        // Whitespace and line continuations (backslash-newline)
+                        // delimit targets, unless we're inside parentheses.
                         if in_parens == 0 && !current_target.is_empty() {
                             result.push(current_target.clone());
                             current_target.clear();

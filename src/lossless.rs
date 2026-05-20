@@ -444,10 +444,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(IDENTIFIER) => {
                         let token = &self.tokens.last().unwrap().1.clone();
                         // Check if this is a starting conditional directive
-                        if (token == "ifdef"
-                            || token == "ifndef"
-                            || token == "ifeq"
-                            || token == "ifneq")
+                        if Self::is_conditional_start(token)
                             && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
                         {
                             // If we're not inside a conditional (depth == 0) and there's a blank line,
@@ -573,6 +570,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     break;
                 }
 
+                // A backslash-newline is a line continuation: the target list
+                // continues on the next physical line. Consume both tokens and
+                // keep parsing targets.
+                if self.current() == Some(BACKSLASH) && self.is_line_continuation() {
+                    self.bump(); // backslash
+                    self.bump(); // newline
+                    continue;
+                }
+
                 // Try to parse another target
                 match self.current() {
                     Some(IDENTIFIER) | Some(DOLLAR) => {
@@ -585,6 +591,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             true
+        }
+
+        /// Returns true if the current token is a BACKSLASH immediately
+        /// followed by a NEWLINE (a line continuation).
+        fn is_line_continuation(&self) -> bool {
+            self.current() == Some(BACKSLASH)
+                && self.tokens.len() >= 2
+                && self.tokens[self.tokens.len() - 2].0 == NEWLINE
         }
 
         fn parse_comment(&mut self) {
@@ -835,7 +849,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             let token = self.tokens.last().unwrap().1.clone();
-            if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&token.as_str()) {
+            if !Self::is_conditional_start(&token) {
                 self.error(format!("unknown conditional directive: {}", token));
                 return None;
             }
@@ -884,14 +898,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        // Helper to check if a token starts a conditional block.
+        // Note this requires an exact match: a variable named e.g. `ifpkg`
+        // merely starts with "if" and is not a conditional directive.
+        fn is_conditional_start(token: &str) -> bool {
+            matches!(token, "ifdef" | "ifndef" | "ifeq" | "ifneq")
+        }
+
         // Helper to check if a token is a conditional directive
         fn is_conditional_directive(&self, token: &str) -> bool {
-            token == "ifdef"
-                || token == "ifndef"
-                || token == "ifeq"
-                || token == "ifneq"
-                || token == "else"
-                || token == "endif"
+            Self::is_conditional_start(token) || token == "else" || token == "endif"
         }
 
         // Helper method to handle conditional token
@@ -923,11 +939,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
                         if self.current() == Some(IDENTIFIER) {
                             let next_token = &self.tokens.last().unwrap().1;
-                            if next_token == "ifdef"
-                                || next_token == "ifndef"
-                                || next_token == "ifeq"
-                                || next_token == "ifneq"
-                            {
+                            if Self::is_conditional_start(next_token) {
                                 // This is "else ifdef", "else ifeq", etc.
                                 // Parse the conditional part
                                 match next_token.as_str() {
@@ -1164,6 +1176,57 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
+        /// Parse a `define`/`endef` multi-line variable definition.
+        ///
+        /// The body is consumed verbatim; only `define` and `endef` lines are
+        /// interpreted, so the parser tracks nesting depth to support nested
+        /// `define` blocks.
+        fn parse_define(&mut self) {
+            self.builder.start_node(VARIABLE.into());
+
+            // Consume the `define` keyword and the header line (variable name,
+            // optional assignment operator, up to and including the newline).
+            self.bump();
+            self.skip_until_newline();
+
+            // Consume body lines until the matching `endef`.
+            let mut depth = 1;
+            while depth > 0 {
+                if self.is_at_eof() {
+                    self.error("missing `endef` for `define`".to_string());
+                    break;
+                }
+                match self.first_token_on_line() {
+                    Some("endef") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Consume the `endef` line itself.
+                            self.skip_until_newline();
+                            break;
+                        }
+                    }
+                    Some("define") => depth += 1,
+                    _ => {}
+                }
+
+                // Consume the current line.
+                self.skip_until_newline();
+            }
+
+            self.builder.finish_node();
+        }
+
+        /// Return the text of the first non-whitespace token on the current
+        /// line, if it is an identifier. Used to detect `define`/`endef`.
+        fn first_token_on_line(&self) -> Option<&str> {
+            self.tokens
+                .iter()
+                .rev()
+                .find(|(kind, _)| !matches!(*kind, WHITESPACE | INDENT))
+                .filter(|(kind, _)| *kind == IDENTIFIER)
+                .map(|(_, text)| text.as_str())
+        }
+
         fn parse_identifier_token(&mut self) -> bool {
             let token = &self.tokens.last().unwrap().1;
 
@@ -1173,7 +1236,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            if token.starts_with("if")
+            if Self::is_conditional_start(token)
                 && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
             {
                 self.parse_conditional();
@@ -1182,6 +1245,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             if token == "include" || token == "-include" || token == "sinclude" {
                 self.parse_include();
+                return true;
+            }
+
+            if token == "define" {
+                self.parse_define();
                 return true;
             }
 
@@ -1338,6 +1406,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn expect_eol(&mut self) {
             // Skip any whitespace before looking for a newline
             self.skip_ws();
+
+            // GNU Make allows a comment at the end of a directive line.
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
 
             match self.current() {
                 Some(NEWLINE) => {
@@ -2408,6 +2481,53 @@ mod tests {
         let makefile = Makefile::read_relaxed(&mut buf)
             .expect("Failed to parse with recovery - missing condition");
         assert!(makefile.code().contains("DEBUG"));
+    }
+
+    #[test]
+    fn test_variable_named_like_conditional() {
+        // A variable whose name starts with "if" must not be mistaken for a
+        // conditional directive (regression: `ifpkg` parsed as `ifdef`).
+        let code = "ifpkg = $(if $(filter foo,bar),baz)\n";
+        let makefile: Makefile = code.parse().expect("ifpkg variable should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("ifpkg".to_string()), vars[0].name());
+    }
+
+    #[test]
+    fn test_conditional_with_trailing_comment() {
+        let code = "ifeq ($(X), linux) # extra features\nFOO = bar\nendif\n";
+        let makefile: Makefile = code.parse().expect("trailing comment should parse");
+        assert_eq!(code, makefile.to_string());
+    }
+
+    #[test]
+    fn test_rule_with_continuation_in_targets() {
+        let code = "a b \\\nc: dep\n\techo hi\n";
+        let makefile: Makefile = code.parse().expect("continuation in targets should parse");
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(1, rules.len());
+        assert_eq!(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            rules[0].targets().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_define_endef() {
+        let code = "define greeting\n\techo hello\n\techo world\nendef\n\nall:\n\t$(greeting)\n";
+        let makefile: Makefile = code.parse().expect("define/endef should parse");
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(1, makefile.rules().count());
+    }
+
+    #[test]
+    fn test_define_endef_nested() {
+        let code = "define outer\ndefine inner\nbody\nendef\nendef\n";
+        let makefile: Makefile = code.parse().expect("nested define/endef should parse");
+        assert_eq!(code, makefile.to_string());
     }
 
     #[test]
