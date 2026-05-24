@@ -305,6 +305,67 @@ impl Conditional {
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
 
+    /// Add a matching `endif` to close this conditional, if it doesn't already
+    /// have one.
+    ///
+    /// Returns `Ok(true)` if a CONDITIONAL_ENDIF was inserted, `Ok(false)` if
+    /// the conditional was already terminated. Returns an error if the
+    /// conditional has no recognized opener (e.g. a bare `else`/`endif` that
+    /// the parser wrapped in a CONDITIONAL node).
+    ///
+    /// If the existing body does not end with a newline, one is inserted
+    /// before the `endif` so it lands on its own line.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef DEBUG\nVAR = 1\n".parse().unwrap();
+    /// let mut cond = makefile.conditionals().next().unwrap();
+    /// assert!(cond.add_endif().unwrap());
+    /// assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+    /// ```
+    pub fn add_endif(&mut self) -> Result<bool, Error> {
+        if self.conditional_type().is_none() {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    message: "Cannot add endif to conditional with no opener".to_string(),
+                    line: 1,
+                    context: "conditional_add_endif".to_string(),
+                }],
+            }));
+        }
+        if self
+            .syntax()
+            .children_with_tokens()
+            .any(|c| c.kind() == CONDITIONAL_ENDIF)
+        {
+            return Ok(false);
+        }
+
+        // Need a newline before `endif` if the current tail doesn't already end
+        // with one.
+        let needs_newline = self
+            .syntax()
+            .last_token()
+            .is_none_or(|t| t.kind() != NEWLINE);
+
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(CONDITIONAL_ENDIF.into());
+        if needs_newline {
+            builder.token(NEWLINE.into(), "\n");
+        }
+        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(NEWLINE.into(), "\n");
+        builder.finish_node();
+
+        let endif = SyntaxNode::new_root_mut(builder.finish());
+        let count = self.syntax().children_with_tokens().count();
+        self.syntax()
+            .splice_children(count..count, vec![endif.into()]);
+
+        Ok(true)
+    }
+
     /// Add an else clause to the conditional if it doesn't already have one
     fn add_else_clause(&mut self) {
         if self.has_else() {
@@ -349,5 +410,60 @@ endif
         let parent = cond.parent();
         // Parent is ROOT node which doesn't cast to MakefileItem
         assert!(parent.is_none());
+    }
+
+    #[test]
+    fn test_add_endif_to_unterminated() {
+        let makefile: Makefile = "ifdef DEBUG\nVAR = 1\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.add_endif().unwrap());
+        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_endif_already_terminated_noop() {
+        let makefile: Makefile = "ifdef DEBUG\nVAR = 1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(!cond.add_endif().unwrap());
+        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_endif_no_trailing_newline() {
+        // Source with no final newline produces a parse error, but the tree
+        // is still usable for mutations.
+        let parsed = Makefile::parse("ifdef DEBUG\nVAR = 1");
+        let makefile = parsed.tree();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.add_endif().unwrap());
+        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_endif_with_else() {
+        let makefile: Makefile = "ifdef DEBUG\nA = 1\nelse\nA = 2\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.add_endif().unwrap());
+        assert_eq!(makefile.code(), "ifdef DEBUG\nA = 1\nelse\nA = 2\nendif\n");
+    }
+
+    #[test]
+    fn test_add_endif_rejects_bare_else() {
+        // A bare `else`/`endif` is wrapped in a Conditional node with no
+        // CONDITIONAL_IF, so conditional_type() is None. We refuse to add
+        // an `endif` to it — the parser already complains.
+        let parsed = Makefile::parse("else\nVAR = 1\n");
+        let makefile = parsed.tree();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.conditional_type().is_none());
+        assert!(cond.add_endif().is_err());
+    }
+
+    #[test]
+    fn test_add_endif_preserves_existing_body() {
+        let makefile: Makefile = "ifeq ($(X),y)\nA = 1\nB = 2\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.add_endif().unwrap());
+        assert_eq!(makefile.code(), "ifeq ($(X),y)\nA = 1\nB = 2\nendif\n");
     }
 }
