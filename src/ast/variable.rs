@@ -25,7 +25,7 @@ impl VariableDefinition {
     pub fn name(&self) -> Option<String> {
         self.syntax().children_with_tokens().find_map(|it| {
             it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER && it.text() != "export" {
+                if it.kind() == IDENTIFIER && it.text() != "export" && it.text() != "override" {
                     Some(it.text().to_string())
                 } else {
                     None
@@ -39,6 +39,26 @@ impl VariableDefinition {
         self.syntax()
             .children_with_tokens()
             .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+    }
+
+    /// Check if this variable definition uses the `override` directive
+    ///
+    /// `override FOO = bar` makes the assignment take precedence over any
+    /// value passed on the make command line.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "override CC = clang\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.is_override());
+    /// assert_eq!(var.name(), Some("CC".to_string()));
+    /// ```
+    pub fn is_override(&self) -> bool {
+        self.syntax().children_with_tokens().any(|it| {
+            it.as_token()
+                .is_some_and(|token| token.text() == "override")
+        })
     }
 
     /// Get the assignment operator/flavor used in this variable definition
@@ -370,6 +390,63 @@ mod tests {
         assert!(var.is_export());
         assert_eq!(var.name(), Some("VAR".to_string()));
         assert_eq!(makefile.code(), "export VAR ?= new_value\n");
+    }
+
+    #[test]
+    fn test_override_simple() {
+        let makefile: Makefile = "override CC = clang\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_override());
+        assert!(!var.is_export());
+        assert_eq!(var.name(), Some("CC".to_string()));
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("clang".to_string()));
+    }
+
+    #[test]
+    fn test_override_with_immediate_op() {
+        let makefile: Makefile = "override FOO := bar\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_override());
+        assert_eq!(var.name(), Some("FOO".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+    }
+
+    #[test]
+    fn test_override_export() {
+        let makefile: Makefile = "override export FOO = bar\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_override());
+        assert!(var.is_export());
+        assert_eq!(var.name(), Some("FOO".to_string()));
+    }
+
+    #[test]
+    fn test_export_override() {
+        // GNU Make accepts either order.
+        let makefile: Makefile = "export override FOO = bar\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_override());
+        assert!(var.is_export());
+        assert_eq!(var.name(), Some("FOO".to_string()));
+    }
+
+    #[test]
+    fn test_without_override() {
+        let makefile: Makefile = "FOO = bar\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.is_override());
+    }
+
+    #[test]
+    fn test_override_in_makefile_with_other_lines() {
+        let makefile: Makefile = "FOO = a\noverride BAR := b\n".parse().unwrap();
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].name(), Some("FOO".to_string()));
+        assert!(!vars[0].is_override());
+        assert_eq!(vars[1].name(), Some("BAR".to_string()));
+        assert!(vars[1].is_override());
     }
 
     #[test]

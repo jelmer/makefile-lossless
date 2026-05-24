@@ -624,11 +624,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Handle export prefix if present
+            // Handle `override` and `export` prefixes (in either order). Both
+            // are independent modifiers on a variable assignment.
             self.skip_ws();
-            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "export" {
-                self.bump();
-                self.skip_ws();
+            for _ in 0..2 {
+                if self.current() == Some(IDENTIFIER)
+                    && matches!(
+                        self.tokens.last().unwrap().1.as_str(),
+                        "export" | "override"
+                    )
+                {
+                    self.bump();
+                    self.skip_ws();
+                } else {
+                    break;
+                }
             }
 
             // Parse variable name
@@ -1367,27 +1377,27 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
             let mut pos = self.tokens.len().saturating_sub(1);
             let mut seen_identifier = false;
-            let mut seen_export = false;
+            let mut seen_directive = false; // export or override prefix
 
             while pos > 0 {
                 let (kind, text) = &self.tokens[pos];
 
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if text == "export" => seen_export = true,
+                    IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
                     IDENTIFIER if !seen_identifier => seen_identifier = true,
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
-                        return seen_identifier || seen_export
+                        return seen_identifier || seen_directive
                     }
                     OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
                     WHITESPACE => (),
-                    _ if seen_export => return true, // Everything after export is part of the assignment
+                    _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
                 pos = pos.saturating_sub(1);
             }
             // Bare "export VARNAME" (without assignment operator) is a valid GNU Make directive
-            seen_export
+            seen_directive
         }
 
         /// Advance one token, adding it to the current branch of the tree builder.
