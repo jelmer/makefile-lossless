@@ -166,6 +166,51 @@ impl VariableDefinition {
         }
     }
 
+    /// Remove a trailing whitespace token at the tail of the value, if any.
+    ///
+    /// In GNU Make, whitespace after the last non-comment content but before
+    /// the end of the line (or a `#` comment) is included in the variable's
+    /// value. This is almost always unintentional. This method strips that
+    /// trailing whitespace while preserving everything else (comments,
+    /// nested variable references, line continuations).
+    ///
+    /// Returns `true` if a trailing whitespace token was removed.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR = value  \n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.trim_trailing_value_whitespace());
+    /// assert_eq!(makefile.code(), "VAR = value\n");
+    /// ```
+    pub fn trim_trailing_value_whitespace(&mut self) -> bool {
+        let Some(expr) = self.syntax().children().find(|c| c.kind() == EXPR) else {
+            return false;
+        };
+
+        // Find the last non-comment child. Comments are part of the EXPR but
+        // the whitespace we care about precedes them (Make includes that
+        // whitespace in the value).
+        let last_non_comment = expr
+            .children_with_tokens()
+            .filter(|c| c.kind() != COMMENT)
+            .last();
+        let Some(elem) = last_non_comment else {
+            return false;
+        };
+        let Some(token) = elem.into_token() else {
+            return false;
+        };
+        if token.kind() != WHITESPACE {
+            return false;
+        }
+
+        let idx = token.index();
+        expr.splice_children(idx..idx + 1, vec![]);
+        true
+    }
+
     /// Update the value of this variable definition while preserving the rest
     /// (export prefix, operator, whitespace, etc.)
     ///
@@ -339,5 +384,82 @@ mod tests {
             makefile.code(),
             "DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)\n"
         );
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_single_space() {
+        let makefile: Makefile = "VAR = value \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_multiple_spaces() {
+        let makefile: Makefile = "VAR = value    \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_tab() {
+        let makefile: Makefile = "VAR = value\t\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_none() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_preserves_comment() {
+        // `VAR = value # comment` sets VAR to "value " — the trailing space
+        // before the `#` is part of the value. Trimming should strip just that.
+        let makefile: Makefile = "VAR = value # comment\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = value# comment\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_preserves_internal_whitespace() {
+        let makefile: Makefile = "VAR = foo bar   \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = foo bar\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_with_var_ref() {
+        let makefile: Makefile = "VAR = $(BAR)  \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = $(BAR)\n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_empty_value() {
+        // `VAR = ` has an empty EXPR; the whitespace is between OPERATOR and
+        // NEWLINE, not part of the value.
+        let makefile: Makefile = "VAR = \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = \n");
+    }
+
+    #[test]
+    fn test_trim_trailing_value_whitespace_line_continuation() {
+        // The last token in EXPR is BACKSLASH, not WHITESPACE — don't trim.
+        let makefile: Makefile = "VAR = foo \\\n\tbar\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.trim_trailing_value_whitespace());
+        assert_eq!(makefile.code(), "VAR = foo \\\n\tbar\n");
     }
 }
