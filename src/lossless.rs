@@ -1362,8 +1362,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 Some(kind) => {
+                    // `error()` already consumes the offending token; bumping
+                    // again here would pop past the end of the stack when
+                    // this is the last token.
                     self.error(format!("unexpected token {:?}", kind));
-                    self.bump();
                     true
                 }
             }
@@ -7815,6 +7817,24 @@ mod test_continuation {
         // before the close left the green tree unbalanced and rowan
         // panicked in GreenNodeBuilder::finish.
         let cases = ["ifeq((", "ifeq(((((", "ifneq((", "ifeq(($(X)", "X = $(("];
+        for src in cases {
+            let parse = crate::parse::Parse::<Makefile>::parse_makefile(src);
+            assert_eq!(
+                parse.tree().to_string(),
+                src,
+                "round-trip mismatch for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_unexpected_tokens_at_top_level_does_not_panic() {
+        // Found by cargo-fuzz: the top-level dispatcher's catch-all arm
+        // bumped a token after `error()` had already consumed one, which
+        // could pop past the end of the token stack. The parser must
+        // tolerate arbitrary garbage without panicking, and the lossless
+        // round-trip must still hold.
+        let cases = ["(", "(\0(", ")", "(())", "\0", ",", ":", "((((((((((("];
         for src in cases {
             let parse = crate::parse::Parse::<Makefile>::parse_makefile(src);
             assert_eq!(
