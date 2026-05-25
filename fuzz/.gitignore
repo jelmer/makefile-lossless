@@ -1,0 +1,10 @@
+target
+artifacts
+coverage
+
+# Ignore generated corpus contents but keep seed inputs that are checked in.
+corpus/*
+!corpus/parse
+!corpus/roundtrip
+corpus/*/*
+!corpus/*/example_*.mk

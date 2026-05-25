@@ -774,6 +774,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         // Internal helper to parse parenthesized expressions
         fn parse_parenthesized_expr_internal(&mut self, is_variable_ref: bool) {
             let mut paren_count = 1;
+            // Each nested LPAREN opens an EXPR node that the matching RPAREN
+            // closes. If EOF arrives before those RPARENs do, we must still
+            // close them or the green tree ends up unbalanced (rowan panics
+            // in GreenNodeBuilder::finish).
+            let mut open_nested = 0u32;
 
             while paren_count > 0 && self.current().is_some() {
                 match self.current() {
@@ -782,12 +787,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                         // Start a new expression node for nested parentheses
                         self.builder.start_node(EXPR.into());
+                        open_nested += 1;
                     }
                     Some(RPAREN) => {
                         paren_count -= 1;
                         self.bump();
                         if paren_count > 0 {
                             self.builder.finish_node();
+                            open_nested -= 1;
                         }
                     }
                     Some(QUOTE) => {
@@ -808,6 +815,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         break;
                     }
                 }
+            }
+
+            for _ in 0..open_nested {
+                self.builder.finish_node();
             }
 
             if !is_variable_ref {
@@ -1351,8 +1362,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 Some(kind) => {
+                    // `error()` already consumes the offending token; bumping
+                    // again here would pop past the end of the stack when
+                    // this is the last token.
                     self.error(format!("unexpected token {:?}", kind));
-                    self.bump();
                     true
                 }
             }
@@ -7794,6 +7807,41 @@ mod test_continuation {
                 panic!("failed to parse {src:?}: {e:?}");
             });
             assert_eq!(parsed.to_string(), src, "round-trip mismatch for {src:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_unclosed_conditional_paren_does_not_panic() {
+        // Found by cargo-fuzz: nested LPAREN inside ifeq()/ifneq() opened
+        // an EXPR node that was only closed by the matching RPAREN. EOF
+        // before the close left the green tree unbalanced and rowan
+        // panicked in GreenNodeBuilder::finish.
+        let cases = ["ifeq((", "ifeq(((((", "ifneq((", "ifeq(($(X)", "X = $(("];
+        for src in cases {
+            let parse = crate::parse::Parse::<Makefile>::parse_makefile(src);
+            assert_eq!(
+                parse.tree().to_string(),
+                src,
+                "round-trip mismatch for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_unexpected_tokens_at_top_level_does_not_panic() {
+        // Found by cargo-fuzz: the top-level dispatcher's catch-all arm
+        // bumped a token after `error()` had already consumed one, which
+        // could pop past the end of the token stack. The parser must
+        // tolerate arbitrary garbage without panicking, and the lossless
+        // round-trip must still hold.
+        let cases = ["(", "(\0(", ")", "(())", "\0", ",", ":", "((((((((((("];
+        for src in cases {
+            let parse = crate::parse::Parse::<Makefile>::parse_makefile(src);
+            assert_eq!(
+                parse.tree().to_string(),
+                src,
+                "round-trip mismatch for {src:?}"
+            );
         }
     }
 }
