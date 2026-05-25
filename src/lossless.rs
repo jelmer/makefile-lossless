@@ -661,9 +661,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                         self.skip_ws();
 
-                        // Parse value, creating nested EXPR nodes for variable references
+                        // Parse value, creating nested EXPR nodes for
+                        // variable references. A trailing `# comment` is
+                        // left as a sibling COMMENT token, not bundled
+                        // into the EXPR.
                         self.builder.start_node(EXPR.into());
-                        while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        while self.current().is_some()
+                            && self.current() != Some(NEWLINE)
+                            && self.current() != Some(COMMENT)
+                        {
                             if self.current() == Some(DOLLAR) {
                                 self.parse_variable_reference();
                             } else {
@@ -672,10 +678,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                         self.builder.finish_node();
 
+                        // Optional trailing comment.
+                        if self.current() == Some(COMMENT) {
+                            self.bump();
+                        }
+
                         // Expect newline
                         if self.current() == Some(NEWLINE) {
                             self.bump();
-                        } else {
+                        } else if !self.is_at_eof() {
                             self.error("expected newline after variable value".to_string());
                         }
                     } else {
