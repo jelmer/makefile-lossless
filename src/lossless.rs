@@ -1278,6 +1278,49 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
+        /// Parse a `vpath` directive in one of its three forms:
+        ///
+        /// - `vpath PATTERN DIRS` - add a search path for files matching PATTERN
+        /// - `vpath PATTERN`      - clear the search path for PATTERN
+        /// - `vpath`              - clear every `vpath` setting
+        ///
+        /// Produces a `VPATH` node containing the keyword token, optional
+        /// pattern (as an IDENTIFIER) and an optional EXPR holding the
+        /// directory list.
+        fn parse_vpath(&mut self) {
+            self.builder.start_node(VPATH.into());
+            // Consume the `vpath` keyword.
+            self.bump();
+            self.skip_ws();
+
+            // Optional pattern (rest of header until whitespace).
+            if self.current().is_some() && self.current() != Some(NEWLINE) {
+                // The pattern token sequence (until whitespace or newline).
+                while let Some(kind) = self.current() {
+                    match kind {
+                        WHITESPACE | NEWLINE => break,
+                        _ => self.bump(),
+                    }
+                }
+                self.skip_ws();
+
+                // Optional directory list (everything else on the line).
+                if self.current().is_some() && self.current() != Some(NEWLINE) {
+                    self.builder.start_node(EXPR.into());
+                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        self.bump();
+                    }
+                    self.builder.finish_node();
+                }
+            }
+
+            // Consume the trailing newline.
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node();
+        }
+
         /// Parse a `define`/`endef` multi-line variable definition.
         ///
         /// Produces a `VARIABLE` node structured like a regular assignment:
@@ -1379,6 +1422,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             if token == "define" {
                 self.parse_define();
+                return true;
+            }
+
+            if token == "vpath" {
+                self.parse_vpath();
                 return true;
             }
 
@@ -1794,6 +1842,7 @@ ast_node!(Recipe, RECIPE);
 ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
+ast_node!(Vpath, VPATH);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
