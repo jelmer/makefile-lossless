@@ -1215,39 +1215,66 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Parse a `define`/`endef` multi-line variable definition.
         ///
-        /// The body is consumed verbatim; only `define` and `endef` lines are
-        /// interpreted, so the parser tracks nesting depth to support nested
-        /// `define` blocks.
+        /// Produces a `VARIABLE` node structured like a regular assignment:
+        ///
+        /// - the `define` keyword itself (kept as an `IDENTIFIER` token);
+        /// - the variable's identifier;
+        /// - the assignment operator (defaults to `=` if absent);
+        /// - an `EXPR` node containing the verbatim body (without the
+        ///   surrounding newlines that bracket it);
+        /// - the closing `endef` token.
+        ///
+        /// Because the body is wrapped in an `EXPR` node, the existing
+        /// `VariableDefinition::name()` / `assignment_operator()` /
+        /// `raw_value()` accessors work transparently for `define` blocks.
         fn parse_define(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Consume the `define` keyword and the header line (variable name,
-            // optional assignment operator, up to and including the newline).
+            // Consume the `define` keyword itself.
             self.bump();
-            self.skip_until_newline();
+            // Optional whitespace then the variable name (an IDENTIFIER).
+            self.skip_ws();
+            if self.current() == Some(IDENTIFIER) {
+                self.bump();
+            }
+            self.skip_ws();
+            // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
+            if self.current() == Some(OPERATOR) {
+                self.bump();
+            }
+            // Skip any trailing whitespace on the header line.
+            self.skip_ws();
+            // Consume the header-terminating newline (kept as a child).
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
 
-            // Consume body lines until the matching `endef`.
-            let mut depth = 1;
-            while depth > 0 {
-                if self.is_at_eof() {
-                    self.error("missing `endef` for `define`".to_string());
-                    break;
-                }
+            // The body of the define lives in an EXPR node so that
+            // `raw_value()` returns it. We consume token-by-token until we
+            // see an `endef` line at depth 0, tracking nested `define`.
+            self.builder.start_node(EXPR.into());
+            let mut depth: usize = 1;
+            'body: while !self.is_at_eof() {
                 match self.first_token_on_line() {
                     Some("endef") => {
                         depth -= 1;
                         if depth == 0 {
-                            // Consume the `endef` line itself.
-                            self.skip_until_newline();
-                            break;
+                            break 'body;
                         }
                     }
                     Some("define") => depth += 1,
                     _ => {}
                 }
-
-                // Consume the current line.
+                // Consume one line into the EXPR body.
                 self.skip_until_newline();
+            }
+            self.builder.finish_node(); // EXPR
+
+            // Consume the closing `endef` line itself (if we found it).
+            if depth == 0 {
+                self.skip_until_newline();
+            } else {
+                self.error("missing `endef` for `define`".to_string());
             }
 
             self.builder.finish_node();
