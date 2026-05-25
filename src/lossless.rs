@@ -559,14 +559,79 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Parse dependencies if we found both target and colon
             if has_target && has_colon {
                 self.skip_ws();
-                self.parse_rule_dependencies();
-                self.expect_eol();
 
-                // Parse recipe lines
-                self.parse_rule_recipes();
+                // Detect a target-specific variable assignment:
+                //   target: VAR [op] value
+                // by peeking IDENTIFIER (WS)? OPERATOR. If matched, treat
+                // the line as a scoped assignment (no prerequisites, no
+                // recipe) and produce a child VARIABLE node so callers can
+                // use the existing VariableDefinition accessors.
+                if self.looks_like_target_specific_assignment() {
+                    self.parse_target_specific_assignment();
+                } else {
+                    self.parse_rule_dependencies();
+                    self.expect_eol();
+
+                    // Parse recipe lines
+                    self.parse_rule_recipes();
+                }
             }
 
             self.builder.finish_node();
+        }
+
+        /// Look ahead (without consuming) for the `IDENTIFIER (WS)? OPERATOR`
+        /// pattern that marks a target-specific variable assignment such as
+        /// `all: CFLAGS = -O2`.
+        fn looks_like_target_specific_assignment(&self) -> bool {
+            // tokens is reversed (last = current). We look from the end.
+            let n = self.tokens.len();
+            if n < 2 {
+                return false;
+            }
+            // Current token must be an IDENTIFIER (the variable name).
+            if self.tokens[n - 1].0 != IDENTIFIER {
+                return false;
+            }
+            let mut i = n - 2;
+            // Optional whitespace.
+            if self.tokens[i].0 == WHITESPACE {
+                if i == 0 {
+                    return false;
+                }
+                i -= 1;
+            }
+            // Next token must be an assignment OPERATOR.
+            self.tokens[i].0 == OPERATOR
+                && matches!(
+                    self.tokens[i].1.as_str(),
+                    "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
+                )
+        }
+
+        /// Parse `VAR [op] value` after the rule's `:` colon, wrapped in a
+        /// child `VARIABLE` node. Consumes through the end-of-line.
+        fn parse_target_specific_assignment(&mut self) {
+            self.builder.start_node(VARIABLE.into());
+            // Variable name (IDENTIFIER).
+            self.bump();
+            self.skip_ws();
+            // Assignment operator.
+            if self.current() == Some(OPERATOR) {
+                self.bump();
+            }
+            // Optional whitespace before the value.
+            self.skip_ws();
+            // Value lives in an EXPR node, like normal assignments.
+            self.builder.start_node(EXPR.into());
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node(); // EXPR
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node(); // VARIABLE
         }
 
         fn parse_rule_targets(&mut self) -> bool {

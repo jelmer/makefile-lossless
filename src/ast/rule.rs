@@ -477,6 +477,24 @@ impl Rule {
         self.recipe_nodes().map(|r| r.text())
     }
 
+    /// If this rule is actually a target-specific variable assignment
+    /// (`target: VAR [op] value`), return the embedded [`VariableDefinition`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "all: CFLAGS = -O2\n".parse().unwrap();
+    /// let var = rule.scoped_assignment().unwrap();
+    /// assert_eq!(var.name(), Some("CFLAGS".to_string()));
+    /// assert_eq!(var.assignment_operator(), Some("=".to_string()));
+    /// ```
+    pub fn scoped_assignment(&self) -> Option<crate::lossless::VariableDefinition> {
+        self.syntax()
+            .children()
+            .find(|c| c.kind() == VARIABLE)
+            .and_then(crate::lossless::VariableDefinition::cast)
+    }
+
     /// Get recipe nodes with line/column information
     ///
     /// Returns an iterator over `Recipe` AST nodes, which support the `line()`, `column()`,
