@@ -4,3 +4,4 @@ pub mod include;
 pub mod makefile;
 pub mod rule;
 pub mod variable;
+pub mod vpath;

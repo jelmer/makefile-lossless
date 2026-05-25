@@ -389,32 +389,48 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(WHITESPACE) => {
                         self.bump(); // Consume whitespace between prerequisites
                     }
-                    Some(IDENTIFIER) => {
-                        // Start a new prerequisite node
-                        self.builder.start_node(PREREQUISITE.into());
-
-                        if self.is_archive_member() {
-                            self.parse_archive_member();
-                        } else {
-                            self.bump(); // Simple identifier
-                        }
-
-                        self.builder.finish_node(); // End PREREQUISITE
-                    }
-                    Some(DOLLAR) => {
-                        // Variable reference - parse it within a PREREQUISITE node
-                        self.builder.start_node(PREREQUISITE.into());
-                        self.parse_variable_reference();
-                        self.builder.finish_node(); // End PREREQUISITE
-                    }
-                    _ => {
-                        // Other tokens (like comments) - just consume them
+                    Some(COMMENT) => {
+                        // Trailing comment ends the prerequisite list.
                         self.bump();
                     }
+                    Some(_) => {
+                        // Collect contiguous non-whitespace tokens into one
+                        // PREREQUISITE node, preserving structures like
+                        // `$$(@:.out=.src)` or `lib(member.o)` as a single
+                        // word.
+                        self.parse_prerequisite_word();
+                    }
+                    None => break,
                 }
             }
 
             self.builder.finish_node(); // End PREREQUISITES
+        }
+
+        /// Parse a single prerequisite word: consume tokens up to the next
+        /// whitespace/newline/comment, descending into variable references
+        /// (`$(...)`, `${...}`, `$X`, `$$`) and archive-member parentheses
+        /// without treating them as word boundaries.
+        fn parse_prerequisite_word(&mut self) {
+            self.builder.start_node(PREREQUISITE.into());
+
+            // Archive member syntax: `lib(member.o)` — keep as a unit.
+            if self.current() == Some(IDENTIFIER) && self.is_archive_member() {
+                self.parse_archive_member();
+                self.builder.finish_node();
+                return;
+            }
+
+            // Otherwise, consume tokens until a separator.
+            while let Some(kind) = self.current() {
+                match kind {
+                    WHITESPACE | NEWLINE | COMMENT => break,
+                    DOLLAR => self.parse_variable_reference(),
+                    _ => self.bump(),
+                }
+            }
+
+            self.builder.finish_node(); // End PREREQUISITE
         }
 
         fn parse_rule_recipes(&mut self) {
@@ -543,14 +559,79 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Parse dependencies if we found both target and colon
             if has_target && has_colon {
                 self.skip_ws();
-                self.parse_rule_dependencies();
-                self.expect_eol();
 
-                // Parse recipe lines
-                self.parse_rule_recipes();
+                // Detect a target-specific variable assignment:
+                //   target: VAR [op] value
+                // by peeking IDENTIFIER (WS)? OPERATOR. If matched, treat
+                // the line as a scoped assignment (no prerequisites, no
+                // recipe) and produce a child VARIABLE node so callers can
+                // use the existing VariableDefinition accessors.
+                if self.looks_like_target_specific_assignment() {
+                    self.parse_target_specific_assignment();
+                } else {
+                    self.parse_rule_dependencies();
+                    self.expect_eol();
+
+                    // Parse recipe lines
+                    self.parse_rule_recipes();
+                }
             }
 
             self.builder.finish_node();
+        }
+
+        /// Look ahead (without consuming) for the `IDENTIFIER (WS)? OPERATOR`
+        /// pattern that marks a target-specific variable assignment such as
+        /// `all: CFLAGS = -O2`.
+        fn looks_like_target_specific_assignment(&self) -> bool {
+            // tokens is reversed (last = current). We look from the end.
+            let n = self.tokens.len();
+            if n < 2 {
+                return false;
+            }
+            // Current token must be an IDENTIFIER (the variable name).
+            if self.tokens[n - 1].0 != IDENTIFIER {
+                return false;
+            }
+            let mut i = n - 2;
+            // Optional whitespace.
+            if self.tokens[i].0 == WHITESPACE {
+                if i == 0 {
+                    return false;
+                }
+                i -= 1;
+            }
+            // Next token must be an assignment OPERATOR.
+            self.tokens[i].0 == OPERATOR
+                && matches!(
+                    self.tokens[i].1.as_str(),
+                    "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
+                )
+        }
+
+        /// Parse `VAR [op] value` after the rule's `:` colon, wrapped in a
+        /// child `VARIABLE` node. Consumes through the end-of-line.
+        fn parse_target_specific_assignment(&mut self) {
+            self.builder.start_node(VARIABLE.into());
+            // Variable name (IDENTIFIER).
+            self.bump();
+            self.skip_ws();
+            // Assignment operator.
+            if self.current() == Some(OPERATOR) {
+                self.bump();
+            }
+            // Optional whitespace before the value.
+            self.skip_ws();
+            // Value lives in an EXPR node, like normal assignments.
+            self.builder.start_node(EXPR.into());
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node(); // EXPR
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node(); // VARIABLE
         }
 
         fn parse_rule_targets(&mut self) -> bool {
@@ -661,9 +742,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                         self.skip_ws();
 
-                        // Parse value, creating nested EXPR nodes for variable references
+                        // Parse value, creating nested EXPR nodes for
+                        // variable references. A trailing `# comment` is
+                        // left as a sibling COMMENT token, not bundled
+                        // into the EXPR.
                         self.builder.start_node(EXPR.into());
-                        while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        while self.current().is_some()
+                            && self.current() != Some(NEWLINE)
+                            && self.current() != Some(COMMENT)
+                        {
                             if self.current() == Some(DOLLAR) {
                                 self.parse_variable_reference();
                             } else {
@@ -672,10 +759,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                         self.builder.finish_node();
 
+                        // Optional trailing comment.
+                        if self.current() == Some(COMMENT) {
+                            self.bump();
+                        }
+
                         // Expect newline
                         if self.current() == Some(NEWLINE) {
                             self.bump();
-                        } else {
+                        } else if !self.is_at_eof() {
                             self.error("expected newline after variable value".to_string());
                         }
                     } else {
@@ -1197,41 +1289,111 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
+        /// Parse a `vpath` directive in one of its three forms:
+        ///
+        /// - `vpath PATTERN DIRS` - add a search path for files matching PATTERN
+        /// - `vpath PATTERN`      - clear the search path for PATTERN
+        /// - `vpath`              - clear every `vpath` setting
+        ///
+        /// Produces a `VPATH` node containing the keyword token, optional
+        /// pattern (as an IDENTIFIER) and an optional EXPR holding the
+        /// directory list.
+        fn parse_vpath(&mut self) {
+            self.builder.start_node(VPATH.into());
+            // Consume the `vpath` keyword.
+            self.bump();
+            self.skip_ws();
+
+            // Optional pattern (rest of header until whitespace).
+            if self.current().is_some() && self.current() != Some(NEWLINE) {
+                // The pattern token sequence (until whitespace or newline).
+                while let Some(kind) = self.current() {
+                    match kind {
+                        WHITESPACE | NEWLINE => break,
+                        _ => self.bump(),
+                    }
+                }
+                self.skip_ws();
+
+                // Optional directory list (everything else on the line).
+                if self.current().is_some() && self.current() != Some(NEWLINE) {
+                    self.builder.start_node(EXPR.into());
+                    while self.current().is_some() && self.current() != Some(NEWLINE) {
+                        self.bump();
+                    }
+                    self.builder.finish_node();
+                }
+            }
+
+            // Consume the trailing newline.
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node();
+        }
+
         /// Parse a `define`/`endef` multi-line variable definition.
         ///
-        /// The body is consumed verbatim; only `define` and `endef` lines are
-        /// interpreted, so the parser tracks nesting depth to support nested
-        /// `define` blocks.
+        /// Produces a `VARIABLE` node structured like a regular assignment:
+        ///
+        /// - the `define` keyword itself (kept as an `IDENTIFIER` token);
+        /// - the variable's identifier;
+        /// - the assignment operator (defaults to `=` if absent);
+        /// - an `EXPR` node containing the verbatim body (without the
+        ///   surrounding newlines that bracket it);
+        /// - the closing `endef` token.
+        ///
+        /// Because the body is wrapped in an `EXPR` node, the existing
+        /// `VariableDefinition::name()` / `assignment_operator()` /
+        /// `raw_value()` accessors work transparently for `define` blocks.
         fn parse_define(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Consume the `define` keyword and the header line (variable name,
-            // optional assignment operator, up to and including the newline).
+            // Consume the `define` keyword itself.
             self.bump();
-            self.skip_until_newline();
+            // Optional whitespace then the variable name (an IDENTIFIER).
+            self.skip_ws();
+            if self.current() == Some(IDENTIFIER) {
+                self.bump();
+            }
+            self.skip_ws();
+            // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
+            if self.current() == Some(OPERATOR) {
+                self.bump();
+            }
+            // Skip any trailing whitespace on the header line.
+            self.skip_ws();
+            // Consume the header-terminating newline (kept as a child).
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
 
-            // Consume body lines until the matching `endef`.
-            let mut depth = 1;
-            while depth > 0 {
-                if self.is_at_eof() {
-                    self.error("missing `endef` for `define`".to_string());
-                    break;
-                }
+            // The body of the define lives in an EXPR node so that
+            // `raw_value()` returns it. We consume token-by-token until we
+            // see an `endef` line at depth 0, tracking nested `define`.
+            self.builder.start_node(EXPR.into());
+            let mut depth: usize = 1;
+            'body: while !self.is_at_eof() {
                 match self.first_token_on_line() {
                     Some("endef") => {
                         depth -= 1;
                         if depth == 0 {
-                            // Consume the `endef` line itself.
-                            self.skip_until_newline();
-                            break;
+                            break 'body;
                         }
                     }
                     Some("define") => depth += 1,
                     _ => {}
                 }
-
-                // Consume the current line.
+                // Consume one line into the EXPR body.
                 self.skip_until_newline();
+            }
+            self.builder.finish_node(); // EXPR
+
+            // Consume the closing `endef` line itself (if we found it).
+            if depth == 0 {
+                self.skip_until_newline();
+            } else {
+                self.error("missing `endef` for `define`".to_string());
             }
 
             self.builder.finish_node();
@@ -1271,6 +1433,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             if token == "define" {
                 self.parse_define();
+                return true;
+            }
+
+            if token == "vpath" {
+                self.parse_vpath();
                 return true;
             }
 
@@ -1688,6 +1855,7 @@ ast_node!(Recipe, RECIPE);
 ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
+ast_node!(Vpath, VPATH);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);

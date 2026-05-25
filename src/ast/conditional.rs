@@ -4,6 +4,82 @@ use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
 
+/// Split `s` at the first top-level comma. A comma is "top-level" when it
+/// is not inside a `$(...)` / `${...}` group. Returns `None` if no such
+/// comma exists.
+fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut paren = 0usize;
+    let mut brace = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' if i + 1 < bytes.len() => {
+                let next = bytes[i + 1];
+                if next == b'(' {
+                    paren += 1;
+                    i += 2;
+                    continue;
+                }
+                if next == b'{' {
+                    brace += 1;
+                    i += 2;
+                    continue;
+                }
+                // $$ or $X — skip both.
+                i += 2;
+                continue;
+            }
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'{' => brace += 1,
+            b'}' => brace = brace.saturating_sub(1),
+            b',' if paren == 0 && brace == 0 => {
+                return Some((&s[..i], &s[i + 1..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract two quoted strings from `s`, in the form `"a" "b"` or `'a' 'b'`.
+/// Returns `None` if fewer than two quoted strings are present. Surrounding
+/// quote characters are stripped from each result.
+fn quoted_pair(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut iter = s.chars().peekable();
+    while iter.peek().is_some() {
+        // Skip leading whitespace between args.
+        while let Some(&c) = iter.peek() {
+            if c.is_ascii_whitespace() {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let opener = match iter.next() {
+            Some(c @ ('"' | '\'')) => c,
+            _ => break,
+        };
+        let mut buf = String::new();
+        for c in iter.by_ref() {
+            if c == opener {
+                out.push(buf);
+                buf = String::new();
+                break;
+            }
+            buf.push(c);
+        }
+    }
+    if out.len() >= 2 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 impl Conditional {
     /// Get the parent item of this conditional, if any
     ///
@@ -57,6 +133,48 @@ impl Conditional {
         let expr_node = if_node.children().find(|it| it.kind() == EXPR)?;
 
         Some(expr_node.text().to_string().trim().to_string())
+    }
+
+    /// For an `ifeq` / `ifneq` conditional, return the two argument
+    /// strings (unexpanded). Supports both the `(a,b)` and `"a" "b"`
+    /// (or `'a' 'b'`) syntaxes.
+    ///
+    /// Returns `None` for `ifdef` / `ifndef` (or if the args can't be
+    /// recovered).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mf: Makefile = "ifeq ($(A),$(B))\nX = 1\nendif\n".parse().unwrap();
+    /// let c = mf.conditionals().next().unwrap();
+    /// assert_eq!(c.ifeq_args(), Some(("$(A)".to_string(), "$(B)".to_string())));
+    /// ```
+    pub fn ifeq_args(&self) -> Option<(String, String)> {
+        let if_node = self
+            .syntax()
+            .children()
+            .find(|it| it.kind() == CONDITIONAL_IF)?;
+        // Inside CONDITIONAL_IF there is one EXPR node wrapping the args.
+        let wrapper = if_node.children().find(|it| it.kind() == EXPR)?;
+
+        let text = wrapper.text().to_string();
+        let stripped = text.trim();
+        // Form 1: parenthesised — `(a, b)`. Split at the top-level comma,
+        // ignoring commas inside nested `$(...)` / `${...}`.
+        if let Some(inner) = stripped
+            .strip_prefix('(')
+            .and_then(|s| s.trim_end().strip_suffix(')'))
+        {
+            if let Some((a, b)) = split_top_level_comma(inner) {
+                return Some((a.trim().to_string(), b.trim().to_string()));
+            }
+        }
+
+        // Form 2: quoted — `"a" "b"` or `'a' 'b'`.
+        let mut parts = quoted_pair(&text)?;
+        let b = parts.pop()?;
+        let a = parts.pop()?;
+        Some((a, b))
     }
 
     /// Check if this conditional has an else clause

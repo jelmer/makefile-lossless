@@ -35,7 +35,7 @@ pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
     Makefile, ParseError, PositionedParseError, Recipe, Rule, VariableDefinition,
-    VariableReference,
+    VariableReference, Vpath,
 };
 pub use parse::Parse;
 pub use rowan::TextRange;
@@ -93,6 +93,7 @@ pub enum SyntaxKind {
     CONDITIONAL_ELSE,  // An else or else-conditional clause
     CONDITIONAL_ENDIF, // The endif keyword
     INCLUDE,
+    VPATH, // A `vpath PATTERN DIRS` / `vpath PATTERN` / `vpath` directive
 
     // Archive members
     ARCHIVE_MEMBERS, // Container for just the members inside parentheses
