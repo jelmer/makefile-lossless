@@ -389,32 +389,48 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(WHITESPACE) => {
                         self.bump(); // Consume whitespace between prerequisites
                     }
-                    Some(IDENTIFIER) => {
-                        // Start a new prerequisite node
-                        self.builder.start_node(PREREQUISITE.into());
-
-                        if self.is_archive_member() {
-                            self.parse_archive_member();
-                        } else {
-                            self.bump(); // Simple identifier
-                        }
-
-                        self.builder.finish_node(); // End PREREQUISITE
-                    }
-                    Some(DOLLAR) => {
-                        // Variable reference - parse it within a PREREQUISITE node
-                        self.builder.start_node(PREREQUISITE.into());
-                        self.parse_variable_reference();
-                        self.builder.finish_node(); // End PREREQUISITE
-                    }
-                    _ => {
-                        // Other tokens (like comments) - just consume them
+                    Some(COMMENT) => {
+                        // Trailing comment ends the prerequisite list.
                         self.bump();
                     }
+                    Some(_) => {
+                        // Collect contiguous non-whitespace tokens into one
+                        // PREREQUISITE node, preserving structures like
+                        // `$$(@:.out=.src)` or `lib(member.o)` as a single
+                        // word.
+                        self.parse_prerequisite_word();
+                    }
+                    None => break,
                 }
             }
 
             self.builder.finish_node(); // End PREREQUISITES
+        }
+
+        /// Parse a single prerequisite word: consume tokens up to the next
+        /// whitespace/newline/comment, descending into variable references
+        /// (`$(...)`, `${...}`, `$X`, `$$`) and archive-member parentheses
+        /// without treating them as word boundaries.
+        fn parse_prerequisite_word(&mut self) {
+            self.builder.start_node(PREREQUISITE.into());
+
+            // Archive member syntax: `lib(member.o)` — keep as a unit.
+            if self.current() == Some(IDENTIFIER) && self.is_archive_member() {
+                self.parse_archive_member();
+                self.builder.finish_node();
+                return;
+            }
+
+            // Otherwise, consume tokens until a separator.
+            while let Some(kind) = self.current() {
+                match kind {
+                    WHITESPACE | NEWLINE | COMMENT => break,
+                    DOLLAR => self.parse_variable_reference(),
+                    _ => self.bump(),
+                }
+            }
+
+            self.builder.finish_node(); // End PREREQUISITE
         }
 
         fn parse_rule_recipes(&mut self) {
