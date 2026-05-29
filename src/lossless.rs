@@ -2260,6 +2260,11 @@ impl Recipe {
         self.syntax().parent().and_then(Rule::cast)
     }
 
+    /// Get the source range of this recipe node.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.syntax().text_range()
+    }
+
     /// Check if this recipe has the silent prefix (@)
     ///
     /// # Example
@@ -2461,6 +2466,112 @@ impl Recipe {
 
         // Remove this recipe node from its parent
         parent.splice_children(node_index..node_index + 1, vec![]);
+    }
+
+    /// Iterate `$(VAR)` and `${VAR}` variable references inside this recipe.
+    ///
+    /// Recipe bodies are stored as raw text, so [`Makefile::variable_references`]
+    /// does not descend into them. This method scans the recipe's text directly
+    /// and yields each reference with its absolute source range.
+    ///
+    /// Function calls (`$(shell ...)`, anything with whitespace or commas after
+    /// the name) and automatic variables (`$@`, `$<`, numeric `$1`) are skipped;
+    /// only plain variable references are returned.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\techo $(FOO) ${BAR}\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// let names: Vec<_> = recipe
+    ///     .variable_references()
+    ///     .iter()
+    ///     .map(|r| r.name().to_string())
+    ///     .collect();
+    /// assert_eq!(names, vec!["FOO", "BAR"]);
+    /// ```
+    pub fn variable_references(&self) -> Vec<RecipeVariableReference> {
+        let mut out = Vec::new();
+        for token in self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() == TEXT)
+        {
+            let base: u32 = token.text_range().start().into();
+            scan_recipe_variable_refs(token.text(), base, &mut out);
+        }
+        out
+    }
+}
+
+/// A `$(VAR)` or `${VAR}` reference found inside a recipe body.
+///
+/// Recipes are stored as raw text, so these references have no backing syntax
+/// node; this type carries just the variable name and its absolute source range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeVariableReference {
+    name: String,
+    range: rowan::TextRange,
+}
+
+impl RecipeVariableReference {
+    /// The referenced variable name (without the surrounding `$(...)`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The absolute source range covering just the variable name.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.range
+    }
+}
+
+/// Scan `text` for `$(VAR)` / `${VAR}` references, pushing each onto `out` with
+/// ranges offset by `base` (the absolute start of `text` in the source).
+fn scan_recipe_variable_refs(text: &str, base: u32, out: &mut Vec<RecipeVariableReference>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' || i + 1 >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let close = match bytes[i + 1] {
+            b'(' => b')',
+            b'{' => b'}',
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+        let name_start = i + 2;
+        let Some(rel_end) = bytes[name_start..].iter().position(|&b| b == close) else {
+            i += 2;
+            continue;
+        };
+        let name_end = name_start + rel_end;
+        let name = &text[name_start..name_end];
+        // Skip function calls like $(shell ...): a name with whitespace inside.
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            i = name_end + 1;
+            continue;
+        }
+        // Skip pure-numeric automatic variables ($1, $2, ...).
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            i = name_end + 1;
+            continue;
+        }
+        out.push(RecipeVariableReference {
+            name: name.to_owned(),
+            range: rowan::TextRange::new(
+                rowan::TextSize::from(base + name_start as u32),
+                rowan::TextSize::from(base + name_end as u32),
+            ),
+        });
+        i = name_end + 1;
     }
 }
 
@@ -7548,6 +7659,51 @@ test:
 
         // Valid parts should still be accessible
         assert_eq!(tree.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_recipe_variable_references() {
+        let makefile: Makefile = "all:\n\techo $(FOO) ${BAR}\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        let refs = recipe.variable_references();
+        let names: Vec<_> = refs.iter().map(|r| r.name()).collect();
+        assert_eq!(names, vec!["FOO", "BAR"]);
+
+        // Ranges point at the variable names in the original source.
+        let src = makefile.to_string();
+        for r in &refs {
+            let range = r.text_range();
+            assert_eq!(&src[range], r.name());
+        }
+    }
+
+    #[test]
+    fn test_recipe_variable_references_skips_functions_and_automatic() {
+        let makefile: Makefile = "all:\n\t$(shell ls) $@ $1 $(REAL)\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        let names: Vec<_> = recipe
+            .variable_references()
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["REAL"]);
+    }
+
+    #[test]
+    fn test_recipe_variable_references_across_continuation() {
+        let makefile: Makefile = "all:\n\techo $(FOO) \\\n\t  $(BAR)\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        let refs = recipe.variable_references();
+        let names: Vec<_> = refs.iter().map(|r| r.name()).collect();
+        assert_eq!(names, vec!["FOO", "BAR"]);
+
+        let src = makefile.to_string();
+        for r in &refs {
+            assert_eq!(&src[r.text_range()], r.name());
+        }
     }
 }
 
