@@ -12,6 +12,11 @@ pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line_type: Option<LineType>,
     continuation: bool,
+    /// Parity of the current backslash run: true once an odd number have been
+    /// emitted, so the next backslash is escaped (`\\`) and a following newline
+    /// is literal, not a continuation. Mirrors the parser's
+    /// `pending_backslash_escape`.
+    pending_backslash_escape: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -20,6 +25,7 @@ impl<'a> Lexer<'a> {
             input: input.chars().peekable(),
             continuation: false,
             line_type: None,
+            pending_backslash_escape: false,
         }
     }
 
@@ -106,6 +112,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Option<(SyntaxKind, String)> {
+        // A backslash continues the line only when it is not itself escaped by
+        // a preceding backslash. `escaped` is the run parity carried over from
+        // the previous token; clear the field here so any non-backslash token
+        // resets the run.
+        let escaped = self.pending_backslash_escape;
+        self.pending_backslash_escape = false;
         if let Some(&c) = self.input.peek() {
             match (c, self.line_type) {
                 ('\t', None) if !self.continuation => {
@@ -215,10 +227,12 @@ impl<'a> Lexer<'a> {
                     }
                     '\\' => {
                         self.input.next();
-                        // If the next character is a newline, this is a line continuation
-                        if self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
+                        // A backslash-newline is a continuation only if this
+                        // backslash is not escaped by a preceding one.
+                        if !escaped && self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
                             self.continuation = true;
                         }
+                        self.pending_backslash_escape = !escaped;
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
                     _ => {
