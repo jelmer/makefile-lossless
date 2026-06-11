@@ -753,6 +753,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         {
                             if self.current() == Some(DOLLAR) {
                                 self.parse_variable_reference();
+                            } else if self.is_line_continuation() {
+                                // A backslash-newline continues the value on the
+                                // next physical line. Consume the backslash, the
+                                // newline and the following indent so the loop
+                                // keeps reading the value rather than stopping
+                                // and leaving an orphan indented line behind.
+                                self.bump(); // backslash
+                                self.bump(); // newline
+                                if self.current() == Some(INDENT) {
+                                    self.bump();
+                                }
                             } else {
                                 self.bump();
                             }
@@ -2814,6 +2825,24 @@ mod tests {
         assert_eq!(
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
             rules[0].targets().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_assignment_with_tab_continuation() {
+        // A variable value continued onto a tab-indented line, as commonly
+        // seen in debian/rules. The continuation must not be mistaken for a
+        // recipe line (which previously produced a spurious "recipe line is
+        // not attached to any target" error).
+        let code = "NATIVE_ARCHS += alpha arc hppa \\\n\triscv64 sh4 sparc\n";
+        let makefile: Makefile = code.parse().expect("tab continuation should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("NATIVE_ARCHS".to_string()), vars[0].name());
+        assert_eq!(
+            Some("alpha arc hppa \\\n\triscv64 sh4 sparc".to_string()),
+            vars[0].raw_value()
         );
     }
 
