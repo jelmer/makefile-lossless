@@ -139,6 +139,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         original_text: String,
         /// The makefile variant
         variant: Option<MakefileVariant>,
+        /// Parity of the current run of bumped BACKSLASH tokens: true once an
+        /// odd number have been seen, meaning the next backslash is escaped
+        /// (`\\`) and a following newline is a literal backslash, not a line
+        /// continuation. Reset to false by any other token. Mirrors the lexer's
+        /// `prev_was_backslash`, which makes the same decision for tokenizing
+        /// the continued line's indent.
+        pending_backslash_escape: bool,
     }
 
     impl Parser {
@@ -385,6 +392,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(PREREQUISITES.into());
 
             while self.current().is_some() && self.current() != Some(NEWLINE) {
+                // The prerequisite list may continue on the next physical line.
+                if self.consume_line_continuation() {
+                    continue;
+                }
                 match self.current() {
                     Some(WHITESPACE) => {
                         self.bump(); // Consume whitespace between prerequisites
@@ -421,10 +432,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return;
             }
 
-            // Otherwise, consume tokens until a separator.
+            // Otherwise, consume tokens until a separator. A line continuation
+            // ends the word; the outer loop consumes it and resumes on the
+            // next physical line.
             while let Some(kind) = self.current() {
                 match kind {
                     WHITESPACE | NEWLINE | COMMENT => break,
+                    BACKSLASH if self.is_line_continuation() => break,
                     DOLLAR => self.parse_variable_reference(),
                     _ => self.bump(),
                 }
@@ -651,12 +665,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     break;
                 }
 
-                // A backslash-newline is a line continuation: the target list
-                // continues on the next physical line. Consume both tokens and
-                // keep parsing targets.
-                if self.current() == Some(BACKSLASH) && self.is_line_continuation() {
-                    self.bump(); // backslash
-                    self.bump(); // newline
+                // The target list may continue on the next physical line.
+                if self.consume_line_continuation() {
                     continue;
                 }
 
@@ -674,12 +684,30 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
-        /// Returns true if the current token is a BACKSLASH immediately
-        /// followed by a NEWLINE (a line continuation).
+        /// Returns true if the current token is an unescaped BACKSLASH
+        /// immediately followed by a NEWLINE (a line continuation). A backslash
+        /// preceded by an odd run of backslashes is itself escaped (`\\`) and
+        /// does not continue the line.
         fn is_line_continuation(&self) -> bool {
-            self.current() == Some(BACKSLASH)
+            !self.pending_backslash_escape
+                && self.current() == Some(BACKSLASH)
                 && self.tokens.len() >= 2
                 && self.tokens[self.tokens.len() - 2].0 == NEWLINE
+        }
+
+        /// Consume a backslash-newline line continuation and any indentation on
+        /// the continued line, so the caller keeps reading the logical line.
+        /// Returns false if the current position is not a line continuation.
+        fn consume_line_continuation(&mut self) -> bool {
+            if !self.is_line_continuation() {
+                return false;
+            }
+            self.bump(); // backslash
+            self.bump(); // newline
+            if self.current() == Some(INDENT) {
+                self.bump();
+            }
+            true
         }
 
         fn parse_comment(&mut self) {
@@ -751,6 +779,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             && self.current() != Some(NEWLINE)
                             && self.current() != Some(COMMENT)
                         {
+                            // The value may continue on the next physical line.
+                            if self.consume_line_continuation() {
+                                continue;
+                            }
                             if self.current() == Some(DOLLAR) {
                                 self.parse_variable_reference();
                             } else {
@@ -1583,6 +1615,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Advance one token, adding it to the current branch of the tree builder.
         fn bump(&mut self) {
             let (kind, text) = self.tokens.pop().unwrap();
+            // Track backslash-run parity: each backslash flips the flag, any
+            // other token clears it. See `pending_backslash_escape`.
+            self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
             if self.current_token_index > 0 {
                 self.current_token_index -= 1;
@@ -1721,6 +1756,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         current_token_index,
         original_text: text.to_string(),
         variant,
+        pending_backslash_escape: false,
     }
     .parse()
 }
@@ -2815,6 +2851,102 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
             rules[0].targets().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_rule_with_indented_continuation_in_targets() {
+        // The continued target line is tab-indented; the indent delimits
+        // targets rather than becoming part of the target name.
+        let code = "a b \\\n\tc: dep\n\techo hi\n";
+        let makefile: Makefile = code
+            .parse()
+            .expect("indented target continuation should parse");
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(1, rules.len());
+        assert_eq!(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            rules[0].targets().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rule_with_continuation_in_prerequisites() {
+        // A prerequisite list continued onto a tab-indented line. The
+        // continuation must not be folded into a prerequisite word, and the
+        // continued prerequisites must still be recognised.
+        let code = "all: a b \\\n\tc d\n\techo hi\n";
+        let makefile: Makefile = code
+            .parse()
+            .expect("prerequisite continuation should parse");
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(1, rules.len());
+        assert_eq!(
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            rules[0].prerequisites().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rule_prerequisite_escaped_backslash_not_continuation() {
+        // An escaped backslash (`\\`) ending a prerequisite line is a literal
+        // backslash, not a continuation, so the next line is a recipe.
+        let code = "all: a b\\\\\n\techo hi\n";
+        let makefile: Makefile = code.parse().expect("escaped backslash should parse");
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(1, rules.len());
+        assert_eq!(
+            vec!["a".to_string(), "b\\\\".to_string()],
+            rules[0].prerequisites().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["echo hi".to_string()],
+            rules[0].recipes().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_assignment_with_tab_continuation() {
+        // A variable value continued onto a tab-indented line, as commonly
+        // seen in debian/rules. The continuation must not be mistaken for a
+        // recipe line (which previously produced a spurious "recipe line is
+        // not attached to any target" error).
+        let code = "NATIVE_ARCHS += alpha arc hppa \\\n\triscv64 sh4 sparc\n";
+        let makefile: Makefile = code.parse().expect("tab continuation should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("NATIVE_ARCHS".to_string()), vars[0].name());
+        assert_eq!(
+            Some("alpha arc hppa \\\n\triscv64 sh4 sparc".to_string()),
+            vars[0].raw_value()
+        );
+    }
+
+    #[test]
+    fn test_assignment_escaped_backslash_not_continuation() {
+        // A value ending in an escaped backslash (`\\`) is a literal backslash,
+        // not a line continuation, so the following line is not folded into the
+        // value. An odd run of backslashes still continues the line.
+        let code = "VAR = foo \\\\\n\tbar\n";
+        let makefile: Makefile = code.parse().expect("escaped backslash should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("foo \\\\".to_string()), vars[0].raw_value());
+
+        let code = "VAR = foo \\\\\\\n\tbar\n";
+        let makefile: Makefile = code.parse().expect("odd backslash run should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(Some("foo \\\\\\\n\tbar".to_string()), vars[0].raw_value());
     }
 
     #[test]
