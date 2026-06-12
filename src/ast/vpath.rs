@@ -60,3 +60,60 @@ impl Vpath {
             .map(|n| n.text().to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::parse;
+
+    fn vpath_of(input: &str) -> Vpath {
+        let parsed = parse(input, None);
+        assert!(
+            parsed.errors.is_empty(),
+            "unexpected errors: {:?}",
+            parsed.errors
+        );
+        parsed
+            .root()
+            .syntax()
+            .descendants()
+            .find_map(Vpath::cast)
+            .expect("no VPATH node")
+    }
+
+    #[test]
+    fn test_pattern_keyword_only() {
+        assert_eq!(vpath_of("vpath\n").pattern(), None);
+    }
+
+    #[test]
+    fn test_pattern_with_pattern_only() {
+        assert_eq!(vpath_of("vpath %.c\n").pattern(), Some("%.c".to_string()));
+    }
+
+    #[test]
+    fn test_pattern_with_pattern_and_dirs() {
+        assert_eq!(
+            vpath_of("vpath %.c src:lib\n").pattern(),
+            Some("%.c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_directories_text_none_when_keyword_only() {
+        assert_eq!(vpath_of("vpath\n").directories_text(), None);
+    }
+
+    #[test]
+    fn test_directories_text_none_when_pattern_only() {
+        assert_eq!(vpath_of("vpath %.c\n").directories_text(), None);
+    }
+
+    #[test]
+    fn test_directories_text_present() {
+        assert_eq!(
+            vpath_of("vpath %.c src:lib\n").directories_text(),
+            Some("src:lib".to_string())
+        );
+    }
+}

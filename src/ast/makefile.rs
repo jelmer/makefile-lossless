@@ -1797,6 +1797,71 @@ mod tests {
     }
 
     #[test]
+    fn test_makefile_item_remove_comments_with_one_blank_line() {
+        // A single blank line between the comments and the item is consumed
+        // along with the comments (one blank-line newline removed).
+        let makefile: Makefile = "# c1\n# c2\n\nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().last().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(makefile.to_string(), "\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments_keeps_extra_blank_lines() {
+        // Only one blank-line newline is removed; a second blank line stays.
+        let makefile: Makefile = "# c1\n# c2\n\n\nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().last().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(makefile.to_string(), "\n\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments_stops_at_preceding_item() {
+        // Comments are collected only back to the previous item, and the blank
+        // line before the comment is preserved (it belongs to the item above).
+        let makefile: Makefile = "VAR0 = x\n\n# c1\nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().last().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(makefile.to_string(), "VAR0 = x\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_add_comment_exact_output() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let mut item = makefile.items().next().unwrap();
+        item.add_comment("note").unwrap();
+        assert_eq!(makefile.to_string(), "# note\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments_strips_trailing_whitespace() {
+        // Trailing whitespace on the removed comment line is removed too.
+        let makefile: Makefile = "# c1  \nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().last().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(makefile.to_string(), "VAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_remove_comments_stops_at_shebang() {
+        // A shebang line is not a removable comment; nothing is removed.
+        let makefile: Makefile = "#!/usr/bin/make -f\nVAR = value\n".parse().unwrap();
+        let mut item = makefile.items().last().unwrap();
+        let count = item.remove_comments().unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(makefile.to_string(), "#!/usr/bin/make -f\nVAR = value\n");
+    }
+
+    #[test]
     fn test_makefile_item_modify_comment() {
         let makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
         let mut item = makefile.items().next().unwrap();
@@ -2257,5 +2322,44 @@ override_dh_auto_configure:
         let blocks: Vec<_> = makefile.comment_blocks().collect();
         // Blank lines between comments should still form a block
         assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_insert_rule_at_front() {
+        let mut makefile: Makefile = "a:\n\tx\n\nb:\n\ty\n".parse().unwrap();
+        let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
+        makefile.insert_rule(0, new_rule).unwrap();
+        assert_eq!(makefile.to_string(), "new:\n\tz\n\na:\n\tx\n\nb:\n\ty\n");
+    }
+
+    #[test]
+    fn test_insert_rule_in_middle_no_blank_before_target() {
+        let mut makefile: Makefile = "a:\n\tx\nb:\n\ty\n".parse().unwrap();
+        let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
+        makefile.insert_rule(1, new_rule).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\tx\n\nnew:\n\tz\n\nb:\n\ty\n");
+    }
+
+    #[test]
+    fn test_insert_rule_in_middle_blank_before_target() {
+        let mut makefile: Makefile = "a:\n\tx\n\nb:\n\ty\n".parse().unwrap();
+        let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
+        makefile.insert_rule(1, new_rule).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\tx\n\n\nnew:\n\tz\n\nb:\n\ty\n");
+    }
+
+    #[test]
+    fn test_insert_rule_at_end() {
+        let mut makefile: Makefile = "a:\n\tx\n".parse().unwrap();
+        let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
+        makefile.insert_rule(1, new_rule).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\tx\n\nnew:\n\tz\n");
+    }
+
+    #[test]
+    fn test_insert_rule_out_of_bounds() {
+        let mut makefile: Makefile = "a:\n\tx\n".parse().unwrap();
+        let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
+        assert!(makefile.insert_rule(5, new_rule).is_err());
     }
 }

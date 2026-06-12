@@ -1192,7 +1192,7 @@ impl Default for Makefile {
 
 #[cfg(test)]
 mod tests {
-    use crate::Makefile;
+    use crate::{Makefile, Rule};
 
     #[test]
     fn test_rules_with_pipe_in_shell_continuation() {
@@ -1220,5 +1220,57 @@ mod tests {
 
         let output = makefile.to_string();
         assert_eq!(input, output, "Round-trip failed");
+    }
+
+    #[test]
+    fn test_targets_multiple() {
+        let rule: Rule = "a b c: dep\n\tcmd".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_targets_archive_member_keeps_parens() {
+        let rule: Rule = "lib.a(obj.o): dep\n\tcmd".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["lib.a(obj.o)"]);
+    }
+
+    #[test]
+    fn test_targets_archive_member_keeps_inner_whitespace() {
+        // Whitespace inside the parentheses must not split the target: the
+        // in_parens depth counter keeps the whole member together.
+        let rule: Rule = "lib.a(a.o b.o): dep\n\tcmd".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["lib.a(a.o b.o)"]);
+    }
+
+    #[test]
+    fn test_targets_variable_reference() {
+        let rule: Rule = "$(VAR): dep\n\tcmd".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(VAR)"]);
+    }
+
+    #[test]
+    fn test_is_double_colon_true() {
+        let rule: Rule = "all:: dep\n\tcmd".parse().unwrap();
+        assert!(rule.is_double_colon());
+    }
+
+    #[test]
+    fn test_is_double_colon_false() {
+        let rule: Rule = "all: dep\n\tcmd".parse().unwrap();
+        assert!(!rule.is_double_colon());
+    }
+
+    #[test]
+    fn test_set_targets_multiple_separated_by_single_space() {
+        let mut rule: Rule = "old: dep\n\tcmd\n".parse().unwrap();
+        rule.set_targets(vec!["a", "b", "c"]).unwrap();
+        assert_eq!(rule.to_string(), "a b c: dep\n\tcmd\n");
+    }
+
+    #[test]
+    fn test_rule_item_recipe_debug() {
+        let rule: Rule = "all:\n\techo hi\n".parse().unwrap();
+        let items: Vec<_> = rule.items().collect();
+        assert_eq!(format!("{:?}", items[0]), "Recipe(\"echo hi\")");
     }
 }

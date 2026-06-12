@@ -393,6 +393,29 @@ mod tests {
     }
 
     #[test]
+    fn test_is_define_true() {
+        let makefile: Makefile = "define greeting\necho hello\nendef\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_define());
+    }
+
+    #[test]
+    fn test_is_define_false_for_plain_assignment() {
+        let makefile: Makefile = "VAR = value\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.is_define());
+    }
+
+    #[test]
+    fn test_is_define_false_for_value_containing_define_word() {
+        // The identifier check must look for a `define` keyword token, not a
+        // value that merely contains the word.
+        let makefile: Makefile = "VAR = define\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.is_define());
+    }
+
+    #[test]
     fn test_set_assignment_operator_simple_to_conditional() {
         let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
