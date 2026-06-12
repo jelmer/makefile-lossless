@@ -55,7 +55,7 @@ impl Parse<Makefile> {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, Parse, TextEdit, TextRange};
+    /// use makefile_edit::{Makefile, Parse, TextEdit, TextRange};
     ///
     /// let old_text = "VAR1 = old\nVAR2 = value\n";
     /// let parse = Parse::<Makefile>::parse_makefile(old_text);

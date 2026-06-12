@@ -69,7 +69,7 @@ impl Vpath {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileItem, MakefileVariant};
     /// let makefile: Makefile = "vpath %.c a \\\n  b\n".parse().unwrap();
     /// let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else {
     ///     panic!("expected a vpath directive");

@@ -9,7 +9,7 @@
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::variable_at_offset;
+/// use makefile_edit::variable_at_offset;
 /// assert_eq!(variable_at_offset("$(FOO)", 2), Some("FOO"));
 /// assert_eq!(variable_at_offset("${BAR}", 3), Some("BAR"));
 /// assert_eq!(variable_at_offset("plain text", 3), None);
@@ -46,7 +46,7 @@ pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::word_at_offset;
+/// use makefile_edit::word_at_offset;
 /// assert_eq!(word_at_offset("hello world", 0), Some("hello"));
 /// assert_eq!(word_at_offset("hello world", 5), None); // space
 /// assert_eq!(word_at_offset("hello world", 6), Some("world"));
@@ -81,7 +81,7 @@ pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::is_in_prerequisites;
+/// use makefile_edit::is_in_prerequisites;
 /// let text = "all: build test\n\techo ok\n";
 /// assert!(!is_in_prerequisites(text, 0));  // 'a' in target
 /// assert!(is_in_prerequisites(text, 5));   // 'b' in prerequisites

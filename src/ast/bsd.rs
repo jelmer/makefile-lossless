@@ -60,7 +60,7 @@ impl ForLoop {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let makefile: Makefile = ".for src dst in a b\nX+= ${src}\n.endfor\n".parse().unwrap();
     /// let MakefileItem::ForLoop(f) = makefile.items().next().unwrap() else { panic!() };
     /// assert_eq!(f.variables(), vec!["src", "dst"]);
@@ -100,7 +100,7 @@ impl ForLoop {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{ConditionalItem, Makefile, MakefileItem, MakefileVariant};
+    /// use makefile_edit::{ConditionalItem, Makefile, MakefileItem, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant(
     ///     "all:\n.for f in a b\n\techo ${f}\n.endfor\n",
     ///     MakefileVariant::BSDMake,
@@ -137,7 +137,7 @@ impl Directive {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileItem, MakefileVariant};
     /// let makefile: Makefile = ".  error unsupported platform\n".parse().unwrap();
     /// let MakefileItem::Directive(d) = makefile.items().next().unwrap() else { panic!() };
     /// assert_eq!(d.keyword(), Some(".error".to_string()));

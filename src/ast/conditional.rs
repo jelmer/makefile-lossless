@@ -148,7 +148,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".if ${A}\n.elifndef B\n.else\n.endif\n".parse().unwrap();
     /// let cond = makefile.conditionals().next().unwrap();
     /// let types: Vec<_> = cond.branches().map(|b| b.conditional_type()).collect();
@@ -216,7 +216,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "ifdef A\nelse ifndef $(B)\nendif\n".parse().unwrap();
     /// let cond = makefile.conditionals().next().unwrap();
     /// let conditions: Vec<_> = cond.branches().map(|b| b.condition()).collect();
@@ -237,7 +237,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant(
     ///     ".if ${A:S/a/b/ \\\n\t:S/c/d/} == x\n.endif\n",
     ///     MakefileVariant::BSDMake,
@@ -268,7 +268,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "ifeq ($(A),a)\nelse ifneq \"$(A)\" 'b'\nendif\n"
     ///     .parse()
     ///     .unwrap();
@@ -291,7 +291,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = "ifeq ($(subst a \\\n  b,c,a  b),c)\nendif\n".parse().unwrap();
     /// let branch = makefile.conditionals().next().unwrap().branches().next().unwrap();
     /// assert_eq!(
@@ -336,7 +336,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{BsdCondition, Makefile};
+    /// use makefile_edit::{BsdCondition, Makefile};
     /// let makefile: Makefile = ".ifndef A || B\n.elif ${C}\n.else\n.endif\n".parse().unwrap();
     /// let cond = makefile.conditionals().next().unwrap();
     /// let branches: Vec<_> = cond
@@ -373,7 +373,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{ConditionalItem, Makefile, MakefileItem, RuleItem};
+    /// use makefile_edit::{ConditionalItem, Makefile, MakefileItem, RuleItem};
     /// let makefile: Makefile = "all:\nifdef V\n\techo verbose\nelse\n\t@echo quiet\nendif\n"
     ///     .parse()
     ///     .unwrap();
@@ -404,7 +404,7 @@ impl ConditionalBranch {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "ifdef A\nX = 1\nelse\nX = 2\nendif\n".parse().unwrap();
     /// let cond = makefile.conditionals().next().unwrap();
     /// let lines: Vec<_> = cond.branches().map(|b| b.line()).collect();
@@ -423,7 +423,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = r#"ifdef OUTER
     /// ifdef INNER
@@ -434,7 +434,7 @@ impl Conditional {
     ///
     /// let outer = makefile.conditionals().next().unwrap();
     /// let inner = outer.if_items().find_map(|item| {
-    ///     if let makefile_lossless::MakefileItem::Conditional(c) = item {
+    ///     if let makefile_edit::MakefileItem::Conditional(c) = item {
     ///         Some(c)
     ///     } else {
     ///         None
@@ -464,7 +464,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile =
     ///     Makefile::parse_with_variant("!ifdef DEBUG\nX=1\n!endif\n", MakefileVariant::NMake)
     ///         .tree();
@@ -512,7 +512,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mf: Makefile = "ifeq ($(A),$(B))\nX = 1\nendif\n".parse().unwrap();
     /// let c = mf.conditionals().next().unwrap();
     /// assert_eq!(c.ifeq_args(), Some(("$(A)".to_string(), "$(B)".to_string())));
@@ -543,7 +543,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = r#"ifeq ($(OS),Linux)
     /// A = linux
     /// else ifdef WINDIR
@@ -659,7 +659,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = r#"ifdef DEBUG
     /// VAR = debug
     /// endif
@@ -716,7 +716,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = r#"ifdef DEBUG
     /// VAR = debug
     /// rule:
@@ -743,7 +743,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = r#"ifdef DEBUG
     /// VAR = debug
     /// else
@@ -767,7 +767,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile: Makefile = "ifdef DEBUG\nendif\n".parse().unwrap();
     /// let mut cond = makefile.conditionals().next().unwrap();
     /// let temp: Makefile = "CFLAGS = -g\n".parse().unwrap();
@@ -798,7 +798,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile: Makefile = "ifdef DEBUG\nVAR=1\nendif\n".parse().unwrap();
     /// let mut cond = makefile.conditionals().next().unwrap();
     /// let temp: Makefile = "CFLAGS = -O2\n".parse().unwrap();
@@ -842,7 +842,7 @@ impl Conditional {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nVAR = 1\n");
     /// let mut cond = makefile.conditionals().next().unwrap();
     /// assert!(cond.add_endif().unwrap());
