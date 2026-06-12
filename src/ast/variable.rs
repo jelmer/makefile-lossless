@@ -198,6 +198,69 @@ impl VariableDefinition {
         }
     }
 
+    /// Rename the variable, preserving the operator, value and any
+    /// `export`/`override`/`define` prefix.
+    ///
+    /// The name is the first IDENTIFIER token that is not a directive
+    /// keyword (the same token [`Self::name`] returns). A no-op if the
+    /// definition has no such token.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "export FOO := bar\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// var.set_name("BAZ");
+    /// assert_eq!(var.name(), Some("BAZ".to_string()));
+    /// assert_eq!(makefile.code(), "export BAZ := bar\n");
+    /// ```
+    pub fn set_name(&mut self, new_name: &str) {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(VARIABLE.into());
+
+        let mut renamed = false;
+        for child in self.syntax().children_with_tokens() {
+            match child {
+                rowan::NodeOrToken::Token(token)
+                    if !renamed
+                        && token.kind() == IDENTIFIER
+                        && token.text() != "export"
+                        && token.text() != "override"
+                        && token.text() != "define" =>
+                {
+                    builder.token(IDENTIFIER.into(), new_name);
+                    renamed = true;
+                }
+                rowan::NodeOrToken::Token(token) => {
+                    builder.token(token.kind().into(), token.text());
+                }
+                rowan::NodeOrToken::Node(node) => {
+                    rebuild_node(&mut builder, &node);
+                }
+            }
+        }
+
+        builder.finish_node();
+        if !renamed {
+            return;
+        }
+        let new_variable = SyntaxNode::new_root_mut(builder.finish());
+
+        let index = self.syntax().index();
+        if let Some(parent) = self.syntax().parent() {
+            parent.splice_children(index..index + 1, vec![new_variable.clone().into()]);
+
+            *self = VariableDefinition::cast(
+                parent
+                    .children_with_tokens()
+                    .nth(index)
+                    .and_then(|it| it.into_node())
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
     /// Remove a trailing whitespace token at the tail of the value, if any.
     ///
     /// In GNU Make, whitespace after the last non-comment content but before
@@ -402,6 +465,44 @@ mod tests {
         assert!(var.is_export());
         assert_eq!(var.name(), Some("VAR".to_string()));
         assert_eq!(makefile.code(), "export VAR ?= new_value\n");
+    }
+
+    #[test]
+    fn test_set_name_simple() {
+        let makefile: Makefile = "VAR := value\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("RENAMED");
+        assert_eq!(var.name(), Some("RENAMED".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("value".to_string()));
+        assert_eq!(makefile.code(), "RENAMED := value\n");
+    }
+
+    #[test]
+    fn test_set_name_preserves_export() {
+        let makefile: Makefile = "export FOO = nocheck\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("BAR");
+        assert!(var.is_export());
+        assert_eq!(var.name(), Some("BAR".to_string()));
+        assert_eq!(makefile.code(), "export BAR = nocheck\n");
+    }
+
+    #[test]
+    fn test_set_name_preserves_override_and_whitespace() {
+        let makefile: Makefile = "override  FOO  :=  bar\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("BAZ");
+        assert!(var.is_override());
+        assert_eq!(makefile.code(), "override  BAZ  :=  bar\n");
+    }
+
+    #[test]
+    fn test_set_name_does_not_touch_value_reference() {
+        let makefile: Makefile = "FOO := $(FOO) extra\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("BAR");
+        assert_eq!(makefile.code(), "BAR := $(FOO) extra\n");
     }
 
     #[test]
