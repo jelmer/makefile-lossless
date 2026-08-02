@@ -21,21 +21,45 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 }
 
 impl VariableDefinition {
+    /// Internal: the token holding the variable's name, i.e. the first
+    /// IDENTIFIER that isn't a directive keyword (`export`/`override`/
+    /// `define`). Single source of truth for [`Self::name`],
+    /// [`Self::name_range`] and [`Self::set_name`].
+    fn name_token(&self) -> Option<crate::lossless::SyntaxToken> {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| {
+                t.kind() == IDENTIFIER
+                    && t.text() != "export"
+                    && t.text() != "override"
+                    && t.text() != "define"
+            })
+    }
+
     /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER
-                    && it.text() != "export"
-                    && it.text() != "override"
-                    && it.text() != "define"
-                {
-                    Some(it.text().to_string())
-                } else {
-                    None
-                }
-            })
-        })
+        self.name_token().map(|t| t.text().to_string())
+    }
+
+    /// The source range covering just the variable's name.
+    ///
+    /// Excludes any `export`/`override`/`define` prefix, the assignment
+    /// operator and the value. Lets callers compute a minimal rename edit
+    /// instead of re-rendering the whole definition (and with it the
+    /// surrounding whitespace).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "export FOO := bar\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// let range = var.name_range().unwrap();
+    /// assert_eq!(usize::from(range.start()), 7);
+    /// assert_eq!(usize::from(range.end()), 10);
+    /// ```
+    pub fn name_range(&self) -> Option<rowan::TextRange> {
+        self.name_token().map(|t| t.text_range())
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -215,21 +239,18 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "export BAZ := bar\n");
     /// ```
     pub fn set_name(&mut self, new_name: &str) {
+        let Some(name_token) = self.name_token() else {
+            return;
+        };
+        let name_index = name_token.index();
+
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
-        let mut renamed = false;
         for child in self.syntax().children_with_tokens() {
             match child {
-                rowan::NodeOrToken::Token(token)
-                    if !renamed
-                        && token.kind() == IDENTIFIER
-                        && token.text() != "export"
-                        && token.text() != "override"
-                        && token.text() != "define" =>
-                {
+                rowan::NodeOrToken::Token(token) if token.index() == name_index => {
                     builder.token(IDENTIFIER.into(), new_name);
-                    renamed = true;
                 }
                 rowan::NodeOrToken::Token(token) => {
                     builder.token(token.kind().into(), token.text());
@@ -241,9 +262,6 @@ impl VariableDefinition {
         }
 
         builder.finish_node();
-        if !renamed {
-            return;
-        }
         let new_variable = SyntaxNode::new_root_mut(builder.finish());
 
         let index = self.syntax().index();
@@ -526,6 +544,58 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("BAR");
         assert_eq!(makefile.code(), "BAR := $(FOO) extra\n");
+    }
+
+    #[test]
+    fn test_name_range_simple() {
+        let text = "FOO := bar\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(usize::from(range.start()), 0);
+        assert_eq!(usize::from(range.end()), 3);
+        assert_eq!(&text[range.start().into()..range.end().into()], "FOO");
+    }
+
+    #[test]
+    fn test_name_range_skips_export_prefix() {
+        let text = "export FOO := bar\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(&text[range.start().into()..range.end().into()], "FOO");
+    }
+
+    #[test]
+    fn test_name_range_skips_override_prefix() {
+        let text = "override  FOO  :=  bar\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(&text[range.start().into()..range.end().into()], "FOO");
+    }
+
+    #[test]
+    fn test_name_range_excludes_value_reference() {
+        let text = "FOO := $(FOO) extra\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(usize::from(range.start()), 0);
+        assert_eq!(usize::from(range.end()), 3);
+    }
+
+    #[test]
+    fn test_name_range_matches_name() {
+        let text = "export  BAR:=1\nFOO = 2\n";
+        let makefile: Makefile = text.parse().unwrap();
+        for var in makefile.variable_definitions() {
+            let range = var.name_range().unwrap();
+            assert_eq!(
+                &text[range.start().into()..range.end().into()],
+                var.name().unwrap().as_str()
+            );
+        }
     }
 
     #[test]

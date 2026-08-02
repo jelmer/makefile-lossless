@@ -1768,7 +1768,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 /// has identity semantics.
 pub(crate) type SyntaxNode = rowan::SyntaxNode<Lang>;
 #[allow(unused)]
-type SyntaxToken = rowan::SyntaxToken<Lang>;
+pub(crate) type SyntaxToken = rowan::SyntaxToken<Lang>;
 #[allow(unused)]
 pub(crate) type SyntaxElement = rowan::NodeOrToken<SyntaxNode, SyntaxToken>;
 
