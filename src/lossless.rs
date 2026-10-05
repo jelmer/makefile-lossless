@@ -1218,7 +1218,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// target-specific variable assignment such as `all: CFLAGS = -O2`.
         /// NAME is what [`Self::parse_variable_name`] accepts, e.g.
         /// `obj-$(X)`. Line continuations may appear wherever WS may.
+        /// Only GNU make has target-specific variables; elsewhere `X=1`
+        /// after the colon is a prerequisite or, in BSD make, a special
+        /// source as in `.SHELL: name=sh`.
         fn looks_like_target_specific_assignment(&self) -> bool {
+            if !matches!(self.variant, None | Some(MakefileVariant::GNUMake)) {
+                return false;
+            }
             // tokens is reversed (last = current), so iterate from the end.
             let mut tokens = self.tokens.iter().rev().peekable();
             Self::skip_ws_and_continuation_tokens(&mut tokens);
@@ -5639,6 +5645,41 @@ mod tests {
             assert_eq!(Some("X".to_string()), var.name(), "{code:?}");
             assert_eq!(Some("=".to_string()), var.assignment_operator());
             assert_eq!(Some("1".to_string()), var.raw_value());
+        }
+    }
+
+    #[test]
+    fn test_no_target_specific_assignment_outside_gnu_make() {
+        // Only GNU make has target-specific variables; elsewhere these are
+        // prerequisites, or special sources as in NetBSD's sh-errctl.mk.
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            for (code, prerequisites) in [
+                (
+                    ".SHELL: name=\"sh\" path=/bin/sh\n",
+                    vec!["name=\"sh\"", "path=/bin/sh"],
+                ),
+                (
+                    ".SHELL: \\\n\tname=\"sh\" \\\n\tpath=/bin/sh\n",
+                    vec!["name=\"sh\"", "path=/bin/sh"],
+                ),
+                ("all: \\\n  X=1\n", vec!["X=1"]),
+            ] {
+                let parsed = parse(code, Some(variant));
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rule = root.rules().next().unwrap();
+                assert!(rule.scoped_assignment().is_none(), "{variant:?} {code:?}");
+                assert_eq!(
+                    prerequisites,
+                    rule.prerequisites().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+            }
         }
     }
 
