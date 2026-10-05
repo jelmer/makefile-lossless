@@ -3894,6 +3894,32 @@ rule: dependency
     }
 
     #[test]
+    fn test_parse_shell_assign_in_value() {
+        let input = "X != echo a!=b\n";
+        let parsed = parse(input, None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let root = parsed.root();
+        assert_eq!(root.rules().count(), 0);
+        let variables = root.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(variables.len(), 1);
+        assert_eq!(variables[0].name(), Some("X".to_string()));
+        assert_eq!(variables[0].assignment_operator(), Some("!=".to_string()));
+        assert_eq!(variables[0].raw_value(), Some("echo a!=b".to_string()));
+        assert_eq!(root.to_string(), input);
+    }
+
+    #[test]
+    fn test_parse_target_specific_shell_assign() {
+        let parsed = parse("foo: X != echo hi\n", None);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let rule = parsed.root().rules().next().unwrap();
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some("!=".to_string()));
+        assert_eq!(var.raw_value(), Some("echo hi".to_string()));
+    }
+
+    #[test]
     fn test_parse_export_assign() {
         const EXPORT: &str = r#"export VARIABLE := value
 "#;
