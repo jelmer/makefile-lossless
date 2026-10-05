@@ -6707,6 +6707,30 @@ rule: dependency
     }
 
     #[test]
+    fn test_parse_double_colon_static_pattern_rule() {
+        let parsed = parse("a.o:: %.o: %.c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..15
+  RULE@0..15
+    TARGETS@0..3
+      IDENTIFIER@0..3 "a.o"
+    OPERATOR@3..5 "::"
+    WHITESPACE@5..6 " "
+    TARGET_PATTERN@6..9
+      IDENTIFIER@6..9 "%.o"
+    OPERATOR@9..10 ":"
+    WHITESPACE@10..11 " "
+    PREREQUISITES@11..14
+      PREREQUISITE@11..14
+        IDENTIFIER@11..14 "%.c"
+    NEWLINE@14..15 "\n"
+"#
+        );
+    }
+
+    #[test]
     fn test_parse_grouped_targets() {
         let parsed = parse("a b &: c\n", None);
         assert_eq!(parsed.errors, vec![]);

@@ -1645,6 +1645,17 @@ mod tests {
     }
 
     #[test]
+    fn test_double_colon_static_pattern_rule() {
+        let rule: Rule = "a.o b.o:: %.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a.o", "b.o"]);
+        assert!(rule.is_double_colon());
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["$(CC) -c $<"]);
+        assert_eq!(rule.to_string(), "a.o b.o:: %.o: %.c\n\t$(CC) -c $<\n");
+    }
+
+    #[test]
     fn test_static_pattern_rule_without_prerequisites() {
         let rule: Rule = "a.o: %.o:\n".parse().unwrap();
         assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
