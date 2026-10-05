@@ -1279,4 +1279,89 @@ mod tests {
         let items: Vec<_> = rule.items().collect();
         assert_eq!(format!("{:?}", items[0]), "Recipe(\"echo hi\")");
     }
+
+    #[test]
+    fn test_scoped_assignment_export() {
+        let rule: Rule = "c: export SHOUT = loud\n".parse().unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("SHOUT".to_string()));
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("loud".to_string()));
+        assert!(var.is_export());
+        assert!(!var.is_override());
+        assert!(!var.is_private());
+        assert_eq!(rule.to_string(), "c: export SHOUT = loud\n");
+    }
+
+    #[test]
+    fn test_scoped_assignment_override() {
+        let rule: Rule = "d: override X := 1\n".parse().unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(!var.is_export());
+        assert!(var.is_override());
+        assert!(!var.is_private());
+    }
+
+    #[test]
+    fn test_scoped_assignment_private() {
+        let rule: Rule = "e: private Y += 2\n".parse().unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("Y".to_string()));
+        assert_eq!(var.assignment_operator(), Some("+=".to_string()));
+        assert_eq!(var.raw_value(), Some("2".to_string()));
+        assert!(!var.is_export());
+        assert!(!var.is_override());
+        assert!(var.is_private());
+    }
+
+    #[test]
+    fn test_scoped_assignment_combined_modifiers() {
+        let rule: Rule = "f: private override export Z ?= 3\n".parse().unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("Z".to_string()));
+        assert_eq!(var.assignment_operator(), Some("?=".to_string()));
+        assert_eq!(var.raw_value(), Some("3".to_string()));
+        assert!(var.is_export());
+        assert!(var.is_override());
+        assert!(var.is_private());
+    }
+
+    #[test]
+    fn test_scoped_assignment_keyword_as_name() {
+        // Without a following name, the keyword is the variable name itself.
+        let rule: Rule = "g: private = 1\n".parse().unwrap();
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("private".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(!var.is_private());
+    }
+
+    #[test]
+    fn test_keyword_prerequisites_without_assignment() {
+        let rule: Rule = "h: export private\n".parse().unwrap();
+        assert!(rule.scoped_assignment().is_none());
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["export".to_string(), "private".to_string()]
+        );
+    }
 }

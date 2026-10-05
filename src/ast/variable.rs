@@ -22,8 +22,9 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 
 impl VariableDefinition {
     /// Internal: the leading directive keywords (`export`/`override`/
-    /// `define`/`undefine`). A keyword only counts as one when another word
-    /// follows it, so `undefine = 1` assigns to a variable named `undefine`.
+    /// `private`/`define`/`undefine`). A keyword only counts as one when
+    /// another word follows it, so `undefine = 1` assigns to a variable
+    /// named `undefine`.
     fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
         let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
         let mut in_word = false;
@@ -49,7 +50,10 @@ impl VariableDefinition {
             .map_while(|word| match word.as_slice() {
                 [rowan::NodeOrToken::Token(t)]
                     if t.kind() == IDENTIFIER
-                        && matches!(t.text(), "export" | "override" | "define" | "undefine") =>
+                        && matches!(
+                            t.text(),
+                            "export" | "override" | "private" | "define" | "undefine"
+                        ) =>
                 {
                     Some(t.clone())
                 }
@@ -168,6 +172,25 @@ impl VariableDefinition {
             it.as_token()
                 .is_some_and(|token| token.text() == "override")
         })
+    }
+
+    /// Check if this variable definition uses the `private` modifier
+    ///
+    /// A private target-specific variable is not inherited by the target's
+    /// prerequisites.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "all: private CFLAGS = -O2\n".parse().unwrap();
+    /// let var = rule.scoped_assignment().unwrap();
+    /// assert!(var.is_private());
+    /// assert_eq!(var.name(), Some("CFLAGS".to_string()));
+    /// ```
+    pub fn is_private(&self) -> bool {
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "private")
     }
 
     /// Get the assignment operator/flavor used in this variable definition
@@ -704,6 +727,14 @@ mod tests {
         assert!(var.is_override());
         assert!(var.is_export());
         assert_eq!(var.name(), Some("FOO".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_as_variable_name() {
+        let makefile: Makefile = "private = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("private".to_string()));
+        assert!(!var.is_private());
     }
 
     #[test]
