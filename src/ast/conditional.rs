@@ -847,7 +847,7 @@ mod tests {
     use crate::lossless::Makefile;
     use crate::{
         BsdComparisonOp, BsdCondition, BsdConditionError, BsdFunction, BsdOperand, MakefileItem,
-        MakefileVariant, RuleItem,
+        MakefileVariant, ParseErrorKind, RuleItem,
     };
 
     fn describe_item(item: ConditionalItem) -> String {
@@ -1032,6 +1032,78 @@ mod tests {
             cond.branches().map(describe).collect::<Vec<_>>(),
             vec![branch(Some("ifdef"), Some(""), 0, &["var X=1"])]
         );
+    }
+
+    fn error_summary(code: &str) -> Vec<(ParseErrorKind, usize, String)> {
+        let parsed = Makefile::parse(code);
+        assert_eq!(parsed.tree().code(), code);
+        parsed
+            .errors()
+            .iter()
+            .map(|e| (e.kind(), e.line, e.message.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_ifdef_extra_words() {
+        let msg = "invalid syntax in conditional: expected a single variable name".to_string();
+        assert_eq!(
+            error_summary("ifdef FOO bar\nX = 1\nendif\n"),
+            vec![(ParseErrorKind::InvalidConditional, 1, msg.clone())]
+        );
+        assert_eq!(
+            error_summary("ifndef FOO\tbar # c\nendif\n"),
+            vec![(ParseErrorKind::InvalidConditional, 1, msg.clone())]
+        );
+        // Reported on the physical line of the extra word.
+        assert_eq!(
+            error_summary("ifdef FOO \\\n  bar\nendif\n"),
+            vec![(ParseErrorKind::InvalidConditional, 2, msg.clone())]
+        );
+        // Even if A expands to nothing, make sees " b" and rejects it.
+        assert_eq!(
+            error_summary("ifdef $(A) b\nendif\n"),
+            vec![(ParseErrorKind::InvalidConditional, 1, msg.clone())]
+        );
+        assert_eq!(
+            error_summary("ifeq (a,b)\nelse ifdef FOO bar\nendif\n"),
+            vec![(ParseErrorKind::InvalidConditional, 2, msg)]
+        );
+    }
+
+    #[test]
+    fn test_ifdef_extra_words_condition() {
+        let makefile = Makefile::parse("ifdef FOO bar\nX = 1\nendif\n").tree();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifdef"), Some("FOO bar"), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_ifdef_single_word() {
+        // Whether these are valid depends on what the references expand
+        // to, which is for the evaluator to check.
+        for code in [
+            "ifdef FOO   \nendif\n",
+            "ifdef FOO # c\nendif\n",
+            "ifdef $(A)\nendif\n",
+            "ifdef $(A)b\nendif\n",
+            "ifdef FOO $(B)\nendif\n",
+            "ifdef $(A) ${B}\nendif\n",
+            "ifdef FOO \\\n\nendif\n",
+        ] {
+            assert_eq!(error_summary(code), vec![], "{code:?}");
+        }
+    }
+
+    #[test]
+    fn test_bsd_ifdef_expression() {
+        let code = ".ifdef A && B\nX = 1\n.endif\n";
+        let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+        assert_eq!(parsed.errors(), &[]);
+        assert_eq!(parsed.tree().code(), code);
     }
 
     #[test]
