@@ -21,10 +21,10 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 }
 
 impl VariableDefinition {
-    /// Internal: the leading directive keywords (`export`/`override`/
-    /// `private`/`define`/`undefine`). A keyword only counts as one when
-    /// another word follows it, so `undefine = 1` assigns to a variable
-    /// named `undefine`. The exception is a lone keyword without an
+    /// Internal: the leading directive keywords (`export`/`unexport`/
+    /// `override`/`private`/`define`/`undefine`). A keyword only counts as
+    /// one when another word follows it, so `undefine = 1` assigns to a
+    /// variable named `undefine`. The exception is a lone keyword without an
     /// assignment operator, such as a bare `export`.
     fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
         let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
@@ -54,7 +54,7 @@ impl VariableDefinition {
                 if t.kind() == IDENTIFIER
                     && matches!(
                         t.text(),
-                        "export" | "override" | "private" | "define" | "undefine"
+                        "export" | "unexport" | "override" | "private" | "define" | "undefine"
                     ) =>
             {
                 Some(t.clone())
@@ -79,14 +79,18 @@ impl VariableDefinition {
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
-        let keywords = self.directive_keywords();
-        self.syntax()
-            .children_with_tokens()
-            .skip_while(|it| {
-                it.kind() == WHITESPACE || it.as_token().is_some_and(|t| keywords.contains(t))
-            })
+        self.after_directive_keywords()
             .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR))
             .collect()
+    }
+
+    /// Internal: the children following the directive keywords and any
+    /// whitespace around them.
+    fn after_directive_keywords(&self) -> impl Iterator<Item = crate::lossless::SyntaxElement> {
+        let keywords = self.directive_keywords();
+        self.syntax().children_with_tokens().skip_while(move |it| {
+            it.kind() == WHITESPACE || it.as_token().is_some_and(|t| keywords.contains(t))
+        })
     }
 
     /// Internal: the EXPR node holding the value, which follows the
@@ -105,6 +109,43 @@ impl VariableDefinition {
             return None;
         }
         Some(elements.iter().map(|it| it.to_string()).collect())
+    }
+
+    /// All variable names on this line, including variable references
+    /// such as `$(VARS)` verbatim.
+    ///
+    /// Usually this is just [`Self::name`], but a bare `export` or
+    /// `unexport` directive can list several variables.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "export quiet Q KBUILD_VERBOSE\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert_eq!(
+    ///     var.names().collect::<Vec<_>>(),
+    ///     vec!["quiet", "Q", "KBUILD_VERBOSE"]
+    /// );
+    /// ```
+    pub fn names(&self) -> impl Iterator<Item = String> {
+        let mut names = Vec::new();
+        let mut current = String::new();
+        for it in self
+            .after_directive_keywords()
+            .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE))
+        {
+            if it.kind() == WHITESPACE {
+                if !current.is_empty() {
+                    names.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push_str(&it.to_string());
+            }
+        }
+        if !current.is_empty() {
+            names.push(current);
+        }
+        names.into_iter()
     }
 
     /// The source range covering just the variable's name.
@@ -163,6 +204,22 @@ impl VariableDefinition {
         self.directive_keywords()
             .iter()
             .any(|t| t.text() == "export")
+    }
+
+    /// Check if this variable definition uses the `unexport` directive
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "unexport CC\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.is_unexport());
+    /// assert!(!var.is_export());
+    /// ```
+    pub fn is_unexport(&self) -> bool {
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "unexport")
     }
 
     /// Check if this variable definition uses the `override` directive
@@ -791,8 +848,7 @@ mod tests {
         assert!(!var.is_export());
     }
 
-    /// Build a VARIABLE node directly, for directive forms the parser
-    /// does not produce yet.
+    /// Build a VARIABLE node directly, bypassing the parser.
     fn variable_from_tokens(tokens: &[(crate::SyntaxKind, &str)]) -> VariableDefinition {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
@@ -805,8 +861,8 @@ mod tests {
 
     #[test]
     fn test_bare_keyword_directive() {
-        // A bare `export` (export all variables) does not parse cleanly yet,
-        // so check the keyword logic on the tree it would produce.
+        // Check the keyword logic independently of the parser, including
+        // forms such as a bare `override` that it doesn't produce.
         let var = variable_from_tokens(&[(IDENTIFIER, "export"), (NEWLINE, "\n")]);
         assert!(var.is_export());
         assert!(!var.is_override());
