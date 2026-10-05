@@ -1,3 +1,4 @@
+use super::collapse_continuations;
 use super::makefile::MakefileItem;
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
@@ -334,7 +335,7 @@ impl Rule {
                 }
             } else if let Some(child_node) = child.as_node() {
                 // Handle nested nodes like ARCHIVE_MEMBERS
-                current_target.push_str(&node_text(child_node));
+                current_target.push_str(&collapse_continuations(child_node));
             }
         }
 
@@ -478,7 +479,7 @@ impl Rule {
                     seen_pipe = true;
                 }
                 rowan::NodeOrToken::Node(n) if n.kind() == PREREQUISITE => {
-                    let text = node_text(&n).trim().to_string();
+                    let text = collapse_continuations(&n).trim().to_string();
                     if seen_pipe {
                         order_only.push(text);
                     } else {
@@ -542,7 +543,7 @@ impl Rule {
         self.syntax()
             .children()
             .find(|n| n.kind() == TARGET_PATTERN)
-            .map(|n| node_text(&n).trim().to_string())
+            .map(|n| collapse_continuations(&n).trim().to_string())
     }
 
     /// Get the commands in the rule
@@ -1945,5 +1946,101 @@ mod tests {
             let rule = makefile.rules().next().unwrap();
             assert_eq!(rule.items().count(), 1, "{variant:?}");
         }
+    }
+
+    fn targets(rule: &Rule) -> Vec<String> {
+        rule.targets().collect()
+    }
+
+    #[test]
+    fn test_prerequisite_continuation_in_function_call() {
+        let input = "all: $(addprefix x, \\\n  a b) c\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["$(addprefix x, a b)".to_string(), "c".to_string()],
+                vec![]
+            )
+        );
+        assert_eq!(rule.to_string(), input);
+    }
+
+    #[test]
+    fn test_prerequisite_continuation_in_braced_reference() {
+        let input = "all: ${addprefix x, \\\n\ta b}\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["${addprefix x, a b}".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_continuation_in_braced_reference_bsd() {
+        let input = "all: ${FOO:S/a/b/ \\\n\t:S/c/d/}\n";
+        let makefile = Makefile::parse_with_variant(input, crate::MakefileVariant::BSDMake).tree();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["${FOO:S/a/b/ :S/c/d/}".to_string()], vec![])
+        );
+        assert_eq!(makefile.to_string(), input);
+    }
+
+    #[test]
+    fn test_prerequisite_continuation_crlf() {
+        let input = "all: $(addprefix x, \\\r\n  a b) \\\r\n  c\r\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["$(addprefix x, a b)".to_string(), "c".to_string()],
+                vec![]
+            )
+        );
+        assert_eq!(rule.to_string(), input);
+    }
+
+    #[test]
+    fn test_prerequisite_escaped_backslash_after_reference() {
+        let input = "all: $(X)\\\\\n\techo hi\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["$(X)\\\\".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn test_order_only_prerequisite_continuation_in_function_call() {
+        let input = "all: a | $(addprefix x, \\\n  a b)\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a".to_string()],
+                vec!["$(addprefix x, a b)".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_target_continuation_in_function_call() {
+        let input = "$(addprefix x, \\\n  a b) c: d\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(targets(&rule), vec!["$(addprefix x, a b)", "c"]);
+        assert_eq!(prereqs(&rule), (vec!["d".to_string()], vec![]));
+        assert_eq!(rule.to_string(), input);
+    }
+
+    #[test]
+    fn test_static_pattern_continuation_in_function_call() {
+        let input = "a.o: $(patsubst %,%, \\\n  %.o): %.c\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(targets(&rule), vec!["a.o"]);
+        assert_eq!(
+            rule.static_pattern(),
+            Some("$(patsubst %,%, %.o)".to_string())
+        );
+        assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
     }
 }
