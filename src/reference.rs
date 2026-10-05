@@ -461,17 +461,22 @@ impl ParsedReference {
     /// This is useful for expanding a value: find the next `$`, parse the
     /// reference there and continue after it. Note that `$$` is not a
     /// reference.
+    ///
+    /// For [`MakefileVariant::BSDMake`], `\#` stands for `#`, as make
+    /// replaces it before parsing any line other than a recipe line.
     pub fn parse_prefix(
         text: &str,
         variant: MakefileVariant,
     ) -> Result<(Self, usize), ReferenceError> {
-        let mut parser = Parser::new(text);
-        let parsed = if variant == MakefileVariant::BSDMake {
-            parser.parse_expr()?
-        } else {
-            parser.parse_simple_expr(variant)?
-        };
-        Ok((parsed, parser.pos))
+        if variant != MakefileVariant::BSDMake {
+            let mut parser = Parser::new(text);
+            let parsed = parser.parse_simple_expr(variant)?;
+            return Ok((parsed, parser.pos));
+        }
+        let unescaped = UnescapedHash::new(text);
+        let mut parser = Parser::new(&unescaped.text);
+        let parsed = parser.parse_expr().map_err(|e| unescaped.map_error(e))?;
+        Ok((parsed, unescaped.original_offset(parser.pos)))
     }
 
     /// Parse the text between the braces of a variable reference, such as
@@ -480,21 +485,29 @@ impl ParsedReference {
     /// The body extends to the end of `text`; there is no closing brace that
     /// ends it, so a `}` or `)` is treated like any other character where
     /// make would accept it.
+    ///
+    /// As in [`Self::parse_prefix`], `\#` stands for `#` for
+    /// [`MakefileVariant::BSDMake`].
     pub fn parse_body(body: &str, variant: MakefileVariant) -> Result<Self, ReferenceError> {
-        let mut parser = Parser::new(body);
-        if variant == MakefileVariant::BSDMake {
-            let delims = Delims {
-                startc: None,
-                endc: None,
-            };
-            let parsed = parser.parse_braced(delims)?;
-            if parser.pos != body.len() {
-                return Err(syntax_error(parser.pos, "unexpected text after reference"));
-            }
-            Ok(parsed)
-        } else {
-            parse_simple_body(body, 0, variant)
+        if variant != MakefileVariant::BSDMake {
+            return parse_simple_body(body, 0, variant);
         }
+        let unescaped = UnescapedHash::new(body);
+        let mut parser = Parser::new(&unescaped.text);
+        let delims = Delims {
+            startc: None,
+            endc: None,
+        };
+        let parsed = parser
+            .parse_braced(delims)
+            .map_err(|e| unescaped.map_error(e))?;
+        if parser.pos != unescaped.text.len() {
+            return Err(syntax_error(
+                unescaped.original_offset(parser.pos),
+                "unexpected text after reference",
+            ));
+        }
+        Ok(parsed)
     }
 }
 
@@ -506,7 +519,17 @@ impl ParsedReference {
 ///
 /// Returns `None` if the expression is malformed.
 pub(crate) fn bsd_expr_extent(text: &str) -> Option<(usize, Vec<Range<usize>>)> {
-    let mut parser = Parser::new(text);
+    bsd_expr_extent_at(&UnescapedHash::new(text), 0)
+}
+
+/// Like [`bsd_expr_extent`], for the expression at offset `start` of the
+/// original text of `line`. The offsets returned are relative to `start`.
+pub(crate) fn bsd_expr_extent_at(
+    line: &UnescapedHash,
+    start: usize,
+) -> Option<(usize, Vec<Range<usize>>)> {
+    let unescaped_start = line.unescaped_offset(start);
+    let mut parser = Parser::new(&line.text[unescaped_start..]);
     parser.parse_expr().ok()?;
     let mut spans = parser.spans;
     spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
@@ -518,7 +541,84 @@ pub(crate) fn bsd_expr_extent(text: &str) -> Option<(usize, Vec<Range<usize>>)> 
         }
         nested.push(span);
     }
-    Some((parser.pos, nested))
+    let original = |offset: usize| line.original_offset(unescaped_start + offset) - start;
+    let nested = nested
+        .into_iter()
+        .map(|span| original(span.start)..original(span.end))
+        .collect();
+    Some((original(parser.pos), nested))
+}
+
+/// Text with `\#` replaced by `#`, as BSD make does before parsing a line
+/// other than a recipe line. A backslash escaped by another backslash is
+/// kept along with it.
+#[derive(Default)]
+pub(crate) struct UnescapedHash {
+    text: String,
+    /// The offsets in `text` of each `#` whose backslash was removed.
+    removed: Vec<usize>,
+    /// The offsets in the original text of the removed backslashes.
+    escapes: Vec<usize>,
+}
+
+impl UnescapedHash {
+    pub(crate) fn new(original: &str) -> Self {
+        let mut text = String::with_capacity(original.len());
+        let mut removed = vec![];
+        let mut escapes = vec![];
+        let mut chars = original.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c != '\\' {
+                text.push(c);
+                continue;
+            }
+            match chars.next().map(|(_, next)| next) {
+                Some('#') => {
+                    removed.push(text.len());
+                    escapes.push(i);
+                    text.push('#');
+                }
+                Some(next) => {
+                    text.push('\\');
+                    text.push(next);
+                }
+                None => text.push('\\'),
+            }
+        }
+        UnescapedHash {
+            text,
+            removed,
+            escapes,
+        }
+    }
+
+    /// The offset in the unescaped text corresponding to `offset` in the
+    /// original text.
+    fn unescaped_offset(&self, offset: usize) -> usize {
+        offset - self.escapes.partition_point(|&e| e < offset)
+    }
+
+    /// The offset in the original text corresponding to `offset` in the
+    /// unescaped text. An offset at an unescaped `#` maps to its backslash.
+    fn original_offset(&self, offset: usize) -> usize {
+        offset + self.removed.partition_point(|&r| r < offset)
+    }
+
+    fn map_error(&self, error: ReferenceError) -> ReferenceError {
+        match error {
+            ReferenceError::Syntax { offset, message } => ReferenceError::Syntax {
+                offset: self.original_offset(offset),
+                message,
+            },
+            ReferenceError::UnknownModifier { offset, modifier } => {
+                ReferenceError::UnknownModifier {
+                    offset: self.original_offset(offset),
+                    modifier,
+                }
+            }
+            ReferenceError::FunctionCall { name } => ReferenceError::FunctionCall { name },
+        }
+    }
 }
 
 fn syntax_error(offset: usize, message: impl Into<String>) -> ReferenceError {
@@ -2400,6 +2500,42 @@ mod tests {
         assert_eq!(
             ParsedReference::parse_prefix("$(X:a=b) rest", GNUMake),
             Ok((reference("X", vec![sysv("a", "b")]), 8))
+        );
+    }
+
+    #[test]
+    fn test_escaped_hash() {
+        // make replaces `\#` with `#` before parsing a line.
+        assert_eq!(one("${X:[\\#]}"), Modifier::Words(WordSelector::Count));
+        assert_eq!(one("${X:M\\#*}"), Modifier::Match("#*".to_string()));
+        assert_eq!(one("${X:S/\\#/x/}"), subst("#", "x", Default::default()));
+        // An escaped backslash does not escape the `#`.
+        assert_eq!(one("${X:M\\\\#}"), Modifier::Match("\\\\#".to_string()));
+        assert_eq!(
+            ParsedReference::parse_prefix("${X:[\\#]} == 1", BSDMake),
+            Ok((
+                reference("X", vec![Modifier::Words(WordSelector::Count)]),
+                9
+            ))
+        );
+        assert_eq!(
+            ParsedReference::parse("${X:M\\#:Z}", BSDMake),
+            Err(ReferenceError::UnknownModifier {
+                offset: 8,
+                modifier: "Z".to_string()
+            })
+        );
+        assert_eq!(
+            ParsedReference::parse_body("X:M\\#*", BSDMake),
+            Ok(reference("X", vec![Modifier::Match("#*".to_string())]))
+        );
+        assert_eq!(
+            bsd_expr_extent("${A:S/\\#/${B}/:M$C} ${D}"),
+            Some((19, vec![9..13, 16..18]))
+        );
+        assert_eq!(
+            ParsedReference::parse("$(X:\\#=x)", GNUMake),
+            Ok(reference("X", vec![sysv("\\#", "x")]))
         );
     }
 
