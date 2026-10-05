@@ -1,7 +1,7 @@
 //! Accessors for lines that consist only of variable references or function
 //! calls, such as `$(eval ...)` or `$(info ...)`.
 
-use super::logical_text;
+use super::{logical_text, LineSyntax};
 use crate::lossless::{lf_line_endings, ExpressionStatement, VariableReference};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -52,7 +52,8 @@ impl ExpressionStatement {
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .filter(|t| range.contains_range(t.text_range()));
-        logical_text(self.syntax(), tokens, true)
+        // Expression statements are specific to GNU make.
+        logical_text(self.syntax(), tokens, LineSyntax::Gnu, true)
     }
 
     /// Returns the text after a `;` following the references, or `None` if

@@ -1,9 +1,10 @@
 use super::makefile::MakefileItem;
-use super::{is_continuation, logical_text};
+use super::{is_continuation, logical_text, LineSyntax};
 use crate::lossless::{
     is_sunsh_operator, node_text, remove_with_preceding_comments, VariableDefinition,
     ASSIGNMENT_OPERATORS,
 };
+use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -387,37 +388,53 @@ impl VariableDefinition {
         self.value_expr().map(|it| node_text(&it))
     }
 
-    /// Get the value of the variable as GNU make stores it, before
-    /// expansion; this is what `$(value VAR)` returns.
+    /// Get the value of the variable as `variant` stores it, before
+    /// expansion; for GNU make this is what `$(value VAR)` returns.
     ///
     /// Unlike [`Self::raw_value`], line continuations are collapsed into a
-    /// single space and CRLF line endings converted to LF. Outside `define`
-    /// blocks, `\#` is unescaped to `#` (except inside variable references)
-    /// and backslashes before it or before a trailing comment are halved.
-    /// Whitespace before a trailing comment is part of the value.
+    /// single space, escapes and comments are handled the way `variant`
+    /// handles them and CRLF line endings are converted to LF. The parse
+    /// tree does not record which variant a makefile was parsed as, so it
+    /// has to be passed in.
+    ///
+    /// - GNU make drops the whitespace before a line continuation. `\#` is
+    ///   unescaped to `#` except inside variable references, and the
+    ///   backslashes before it, before a line continuation or before a
+    ///   trailing comment are halved. Whitespace before a trailing comment
+    ///   is part of the value. In `define` blocks only the line
+    ///   continuations are collapsed.
+    /// - POSIX make is handled like GNU make with `.POSIX:`, which keeps the
+    ///   whitespace before a line continuation.
+    /// - BSD make keeps the whitespace before a line continuation, does not
+    ///   halve backslashes, unescapes `\#` and ends the value at `#` even
+    ///   inside variable references, and removes trailing whitespace.
+    /// - For nmake, `\#` is not an escape. Its `^` escapes are not
+    ///   supported yet.
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_lossless::{Makefile, MakefileVariant};
     /// let makefile: Makefile = "X := a\\#b \\\n    c # comment\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(var.raw_value(), Some("a\\#b \\\n    c ".to_string()));
-    /// assert_eq!(var.value(), Some("a#b c ".to_string()));
+    /// assert_eq!(var.value(MakefileVariant::GNUMake), Some("a#b c ".to_string()));
+    /// assert_eq!(var.value(MakefileVariant::BSDMake), Some("a#b  c".to_string()));
     /// ```
-    pub fn value(&self) -> Option<String> {
+    pub fn value(&self, variant: MakefileVariant) -> Option<String> {
         let expr = self.value_expr()?;
         let tokens = expr
             .descendants_with_tokens()
             .filter_map(|it| it.into_token());
+        let syntax = LineSyntax::from(variant);
         if self.is_define() {
-            let mut value = logical_text(&expr, tokens, false);
+            let mut value = logical_text(&expr, tokens, syntax, false);
             // The newline before `endef` is not part of the value.
             if value.ends_with('\n') {
                 value.pop();
             }
             Some(value)
         } else {
-            let value = logical_text(&expr, tokens, true);
+            let value = logical_text(&expr, tokens, syntax, true);
             Some(value.trim_start_matches([' ', '\t']).to_string())
         }
     }
@@ -1304,11 +1321,15 @@ mod tests {
         assert_eq!(vars[0].raw_value(), Some("a$\\\n\tb".to_string()));
     }
 
-    fn value_of(code: &str) -> Option<String> {
-        let makefile: Makefile = code.parse().unwrap();
+    fn value_in(variant: MakefileVariant, code: &str) -> Option<String> {
+        let makefile = Makefile::parse_with_variant(code, variant).tree();
         assert_eq!(makefile.to_string(), code);
         let var = makefile.variable_definitions().next().unwrap();
-        var.value()
+        var.value(variant)
+    }
+
+    fn value_of(code: &str) -> Option<String> {
+        value_in(MakefileVariant::GNUMake, code)
     }
 
     #[test]
@@ -1444,8 +1465,109 @@ mod tests {
     fn test_value_target_specific() {
         let rule: crate::Rule = "foo: X = a\\#b \\\n  c # d\n".parse().unwrap();
         assert_eq!(
-            rule.scoped_assignment().unwrap().value(),
+            rule.scoped_assignment()
+                .unwrap()
+                .value(MakefileVariant::GNUMake),
             Some("a#b c ".to_string())
+        );
+    }
+
+    fn bsd_value(code: &str) -> Option<String> {
+        value_in(MakefileVariant::BSDMake, code)
+    }
+
+    #[test]
+    fn test_value_bsd_strips_trailing_whitespace() {
+        assert_eq!(bsd_value("X = a  # c\n"), Some("a".to_string()));
+        assert_eq!(bsd_value("X = a  \n"), Some("a".to_string()));
+        assert_eq!(bsd_value("X = a \\\n\nY = b\n"), Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_value_bsd_escaped_space() {
+        assert_eq!(bsd_value("X = a\\ \n"), Some("a\\ ".to_string()));
+        assert_eq!(bsd_value("X = a\\  \n"), Some("a\\ ".to_string()));
+    }
+
+    #[test]
+    fn test_value_bsd_escaped_hash() {
+        assert_eq!(bsd_value("X = a\\#b # c\n"), Some("a#b".to_string()));
+        assert_eq!(
+            bsd_value("X = ${a\\#b} $(c\\#d)\n"),
+            Some("${a#b} $(c#d)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value_bsd_backslashes_not_halved() {
+        assert_eq!(bsd_value("X = a\\\\#b\n"), Some("a\\\\".to_string()));
+        assert_eq!(bsd_value("X = a\\\\\\#b\n"), Some("a\\\\#b".to_string()));
+        assert_eq!(bsd_value("X = a\\b\\\\c\n"), Some("a\\b\\\\c".to_string()));
+        assert_eq!(bsd_value("X = a \\\\\n"), Some("a \\\\".to_string()));
+    }
+
+    #[test]
+    fn test_value_bsd_comment_in_reference() {
+        let makefile = Makefile::parse_with_variant("X = ${A:M#*} b\n", MakefileVariant::BSDMake);
+        let var = makefile.tree().variable_definitions().next().unwrap();
+        assert_eq!(
+            var.value(MakefileVariant::BSDMake),
+            Some("${A:M".to_string())
+        );
+        assert_eq!(bsd_value("X = ${L:[#]}\n"), Some("${L:[#]}".to_string()));
+    }
+
+    #[test]
+    fn test_value_bsd_continuation() {
+        assert_eq!(bsd_value("X = a \\\n   b\n"), Some("a  b".to_string()));
+        assert_eq!(bsd_value("X = a\t\\\n\t b\n"), Some("a\t b".to_string()));
+        assert_eq!(bsd_value("X = a\\\n b\n"), Some("a b".to_string()));
+        assert_eq!(
+            bsd_value("X = a \\\n  \\\n  b\n"),
+            Some("a   b".to_string())
+        );
+        assert_eq!(
+            bsd_value("X = a \\\\\\\n b\n"),
+            Some("a \\\\ b".to_string())
+        );
+        assert_eq!(bsd_value("X = \\\n  a\n"), Some("a".to_string()));
+    }
+
+    fn posix_value(code: &str) -> Option<String> {
+        value_in(MakefileVariant::POSIXMake, code)
+    }
+
+    #[test]
+    fn test_value_posix_continuation() {
+        assert_eq!(posix_value("x = a \\\n   b\n"), Some("a  b".to_string()));
+        assert_eq!(posix_value("x = a\t\\\n\t b\n"), Some("a\t b".to_string()));
+        assert_eq!(posix_value("x = a\\\n b\n"), Some("a b".to_string()));
+        assert_eq!(
+            posix_value("x = a \\\n  \\\n  b\n"),
+            Some("a   b".to_string())
+        );
+        assert_eq!(
+            posix_value("x = a \\\\\\\n b\n"),
+            Some("a \\ b".to_string())
+        );
+        assert_eq!(posix_value("x = \\\n  a\n"), Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_value_posix_comments() {
+        assert_eq!(posix_value("x = a\\#b # c\n"), Some("a#b ".to_string()));
+        assert_eq!(posix_value("x = a\\\\#b\n"), Some("a\\".to_string()));
+        assert_eq!(posix_value("x = a\\\\\\#b\n"), Some("a\\#b".to_string()));
+        assert_eq!(posix_value("x = ${a\\#b}\n"), Some("${a\\#b}".to_string()));
+        assert_eq!(posix_value("x = a  \n"), Some("a  ".to_string()));
+    }
+
+    #[test]
+    fn test_value_nmake() {
+        // `\#` is not an escape in nmake, so the `#` starts a comment.
+        assert_eq!(
+            value_in(MakefileVariant::NMake, "X = a\\#b\n"),
+            Some("a\\".to_string())
         );
     }
 }
