@@ -1462,7 +1462,119 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// The rest of the logical line, as BSD make sees it when parsing an
+        /// expression: up to the end of the line or a comment, with each
+        /// line continuation and the indentation after it replaced by a
+        /// space.
+        fn bsd_logical_line(&self) -> String {
+            let mut text = String::new();
+            let mut escaped = self.pending_backslash_escape;
+            let mut tokens = self.tokens.iter().rev().peekable();
+            while let Some((kind, token)) = tokens.next() {
+                match kind {
+                    NEWLINE | COMMENT => break,
+                    BACKSLASH if !escaped && tokens.peek().is_some_and(|(k, _)| *k == NEWLINE) => {
+                        tokens.next();
+                        tokens.next_if(|(k, _)| *k == INDENT);
+                        text.push(' ');
+                        escaped = false;
+                        continue;
+                    }
+                    // A quoted string spanning lines. Its line continuation
+                    // is not replaced, so stop here.
+                    _ if token.contains(['\n', '\r']) => break,
+                    _ => {}
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+                text.push_str(token);
+            }
+            text
+        }
+
+        /// Consume the tokens making up the next `len` bytes of
+        /// [`Self::bsd_logical_line`], splitting the last token if needed.
+        fn bump_logical_bytes(&mut self, mut len: usize) {
+            while len > 0 {
+                if self.consume_line_continuation() {
+                    len -= 1;
+                    continue;
+                }
+                let token_len = self.tokens.last().expect("text comes from tokens").1.len();
+                if token_len > len {
+                    self.split_current_token(len);
+                }
+                len -= token_len.min(len);
+                self.bump();
+            }
+        }
+
+        /// Split the current token after `len` bytes. If the rest starts an
+        /// expression, it is lexed again so that the expression starts with
+        /// a `$` token.
+        fn split_current_token(&mut self, len: usize) {
+            let consumed = self.token_positions.len() - self.tokens.len();
+            let (kind, text) = self.tokens.pop().unwrap();
+            let (head, tail) = text.split_at(len);
+            let mut pieces = vec![(kind, head.to_string())];
+            if tail.starts_with('$') {
+                pieces.extend(lex_non_recipe_line(tail, self.variant).0);
+            } else {
+                pieces.push((kind, tail.to_string()));
+            }
+
+            // Keep token_positions in step with the new tokens.
+            let mut position = self.token_positions[consumed].0;
+            let positions: Vec<_> = pieces
+                .iter()
+                .map(|(_, piece)| {
+                    let start = position;
+                    position += rowan::TextSize::of(piece.as_str());
+                    (start, position)
+                })
+                .collect();
+            self.token_positions
+                .splice(consumed..consumed + 1, positions);
+            self.tokens.extend(pieces.into_iter().rev());
+        }
+
+        /// Parse a BSD make expression, finding its end the way make does,
+        /// which depends on its modifiers: the closing brace may appear
+        /// unbalanced in a modifier as in `${X:S,},x,}`, and a `$` need not
+        /// start a nested expression as in `${X:S/$/x/}`. Returns false
+        /// without consuming anything if the expression is malformed.
+        fn parse_bsd_variable_reference(&mut self) -> bool {
+            let text = self.bsd_logical_line();
+            let Some((end, nested)) = crate::reference::bsd_expr_extent(&text) else {
+                return false;
+            };
+            self.emit_bsd_expr(&text[..end], &nested);
+            true
+        }
+
+        /// Add an EXPR node for the expression `text`, which starts at the
+        /// current token, with nodes for the expressions at `nested`.
+        fn emit_bsd_expr(&mut self, text: &str, nested: &[std::ops::Range<usize>]) {
+            self.builder.start_node(EXPR.into());
+            let mut pos = 0;
+            for span in nested {
+                self.bump_logical_bytes(span.start - pos);
+                let inner = &text[span.clone()];
+                let inner_nested = match crate::reference::bsd_expr_extent(inner) {
+                    Some((end, inner_nested)) if end == inner.len() => inner_nested,
+                    _ => vec![],
+                };
+                self.emit_bsd_expr(inner, &inner_nested);
+                pos = span.end;
+            }
+            self.bump_logical_bytes(text.len() - pos);
+            self.builder.finish_node();
+        }
+
         fn parse_variable_reference(&mut self) {
+            if self.variant == Some(MakefileVariant::BSDMake) && self.parse_bsd_variable_reference()
+            {
+                return;
+            }
             self.builder.start_node(EXPR.into());
             self.bump(); // Consume $
 
@@ -4439,6 +4551,157 @@ mod tests {
         let var = parsed.root().variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("${:UVAR{value}}".to_string()));
         assert_eq!(var.raw_value(), Some("x".to_string()));
+    }
+
+    /// The text of the variable references in `text`, after checking that it
+    /// parses without errors and round-trips.
+    fn reference_texts(text: &str, variant: MakefileVariant) -> Vec<String> {
+        let parsed = Makefile::parse_with_variant(text, variant);
+        assert_eq!(parsed.errors(), []);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile
+            .variable_references()
+            .map(|r| r.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_bsd_reference_regex_anchor() {
+        let text = "X = ${X:C/e[lb]$//}\n";
+        assert_eq!(
+            reference_texts(text, MakefileVariant::BSDMake),
+            vec!["${X:C/e[lb]$//}"]
+        );
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let reference = makefile.variable_references().next().unwrap();
+        assert_eq!(
+            reference.parse(MakefileVariant::BSDMake),
+            Ok(crate::ParsedReference {
+                name: "X".to_string(),
+                modifiers: vec![crate::Modifier::RegexSubstitute {
+                    regex: crate::ModifierArg::literal("e[lb]$"),
+                    replacement: crate::ModifierArg::literal(""),
+                    flags: Default::default(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_substitute_anchor() {
+        assert_eq!(
+            reference_texts("X = ${X:S/$/x/}\n", MakefileVariant::BSDMake),
+            vec!["${X:S/$/x/}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_closing_brace_as_delimiter() {
+        let text = "Y = ${SRCS:S,},x,}\n";
+        assert_eq!(
+            reference_texts(text, MakefileVariant::BSDMake),
+            vec!["${SRCS:S,},x,}"]
+        );
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let reference = makefile.variable_references().next().unwrap();
+        assert_eq!(
+            reference.parse(MakefileVariant::BSDMake).map(|r| r.name),
+            Ok("SRCS".to_string())
+        );
+        assert_eq!(
+            reference_texts("Y = $(X:S/)/y/)\n", MakefileVariant::BSDMake),
+            vec!["$(X:S/)/y/)"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_escaped_brace_in_pattern() {
+        assert_eq!(
+            reference_texts("X = ${X:M*\\}*}\n", MakefileVariant::BSDMake),
+            vec!["${X:M*\\}*}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_loop_body() {
+        assert_eq!(
+            reference_texts("X = ${X:@v@${v}}@}\n", MakefileVariant::BSDMake),
+            vec!["${X:@v@${v}}@}", "${v}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_default_value_braces() {
+        // :U does not balance braces, so the second brace is not part of
+        // the reference.
+        assert_eq!(
+            reference_texts("X = ${X:U}}\n", MakefileVariant::BSDMake),
+            vec!["${X:U}"]
+        );
+        assert_eq!(
+            reference_texts("X = ${X:U{a}}\n", MakefileVariant::BSDMake),
+            vec!["${X:U{a}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_nested() {
+        assert_eq!(
+            reference_texts(
+                "X = ${X:S/a/$b/:S/${Y:S,},x,}/c/:M${Z}}\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![
+                "${X:S/a/$b/:S/${Y:S,},x,}/c/:M${Z}}",
+                "$b",
+                "${Y:S,},x,}",
+                "${Z}"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_continued() {
+        assert_eq!(
+            reference_texts("X = ${X:S,},x \\\n\ty,}\n", MakefileVariant::BSDMake),
+            vec!["${X:S,},x \\\n\ty,}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_single_character_reference() {
+        // `i/small` is lexed as a single token.
+        assert_eq!(
+            reference_texts(
+                "X = ${X:@i@${D}/$i/small@} $i/small $$x\n",
+                MakefileVariant::BSDMake
+            ),
+            vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i", "$$"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_in_quotes() {
+        assert_eq!(
+            reference_texts(
+                "X = ${\"${A:Uno}\"!=\"no\":?${B}:c}\n",
+                MakefileVariant::BSDMake
+            ),
+            vec!["${\"${A:Uno}\"!=\"no\":?${B}:c}", "${A:Uno}", "${B}"]
+        );
+    }
+
+    #[test]
+    fn test_gnu_reference_counts_opening_delimiter() {
+        assert_eq!(
+            reference_texts("Y = $(X:S/)/y/)\n", MakefileVariant::GNUMake),
+            vec!["$(X:S/)"]
+        );
+        assert_eq!(
+            reference_texts("Y = ${SRCS:S,},x,}\n", MakefileVariant::GNUMake),
+            vec!["${SRCS:S,}"]
+        );
     }
 
     #[test]
