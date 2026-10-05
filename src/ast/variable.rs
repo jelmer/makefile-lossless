@@ -269,10 +269,9 @@ impl VariableDefinition {
 
     /// Returns true if this assignment is a `define` ... `endef` block.
     pub fn is_define(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| {
-            it.as_token()
-                .is_some_and(|t| t.kind() == IDENTIFIER && t.text() == "define")
-        })
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "define")
     }
 
     /// Check if this is an `undefine` directive, e.g. `undefine FOO`
