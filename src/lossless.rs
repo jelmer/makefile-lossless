@@ -563,7 +563,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(PREREQUISITES.into());
             // Only the first `|` separates normal from order-only
             // prerequisites; GNU make takes any later one as a file name.
-            let mut seen_pipe = false;
+            // BSD make has no order-only prerequisites and takes any `|` as a
+            // file name.
+            let mut seen_pipe = self.is_bsd_make();
 
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 // The prerequisite list may continue on the next physical line.
@@ -957,6 +959,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `$(OBJS): %.o: %.c`. Colons inside variable references, after an
         /// inline recipe's `;` or in a comment don't count.
         fn has_static_pattern_colon(&self) -> bool {
+            // BSD make has no static pattern rules, and takes `%.o:` as a
+            // file name.
+            if self.is_bsd_make() {
+                return false;
+            }
             let mut escaped = self.pending_backslash_escape;
             let mut tokens = self.tokens.iter().rev().peekable();
             while let Some((kind, text)) = tokens.next() {

@@ -19,6 +19,8 @@ pub struct Lexer<'a> {
     pending_backslash_escape: bool,
     /// Whether BSD make syntax is accepted.
     bsd: bool,
+    /// Whether GNU make syntax is accepted.
+    gnu: bool,
     /// Whether the previous token was a `[`. BSD make does not treat `#` as
     /// a comment there, so that the `:[#]` modifier works.
     after_lbracket: bool,
@@ -40,6 +42,7 @@ impl<'a> Lexer<'a> {
             line_type: None,
             pending_backslash_escape: false,
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
+            gnu: variant != Some(MakefileVariant::BSDMake),
             after_lbracket: false,
             recipe_continuation: false,
             reference_depth: 0,
@@ -303,7 +306,9 @@ impl<'a> Lexer<'a> {
                         let text = self.input.by_ref().take(len).collect();
                         Some((SyntaxKind::OPERATOR, text))
                     }
-                    '&' => {
+                    // BSD make has no grouped targets, and takes the `&` in
+                    // `a b &: c` as a target.
+                    '&' if self.gnu => {
                         // `&:` and `&::` separate grouped targets from their
                         // prerequisites; any other `&` is just a character.
                         let mut probe = self.input.clone();

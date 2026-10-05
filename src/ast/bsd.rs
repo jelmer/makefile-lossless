@@ -762,4 +762,33 @@ mod tests {
         assert!(parsed.ok());
         assert_eq!(parsed.tree().variable_definitions().count(), 2);
     }
+
+    #[test]
+    fn test_no_order_only_prerequisites_in_bsd_make() {
+        // BSD make takes `|` as a file name: "don't know how to make |".
+        let makefile = parse_bsd("foo: bar | baz\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["bar", "|", "baz"]
+        );
+        assert_eq!(rule.order_only_prerequisites().count(), 0);
+    }
+
+    #[test]
+    fn test_no_gnu_rule_syntax_in_bsd_make() {
+        // BSD make takes `%.o:` as a source and `&` as a target.
+        let makefile = parse_bsd("a.o: %.o: %.c\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["%.o:", "%.c"]
+        );
+
+        let makefile = parse_bsd("a b &: c\n");
+        let rule = makefile.rules().next().unwrap();
+        assert!(!rule.is_grouped());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "&"]);
+    }
 }
