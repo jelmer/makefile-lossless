@@ -2832,6 +2832,38 @@ impl Recipe {
     ///
     /// For comment-only lines, this returns an empty string.
     pub fn text(&self) -> String {
+        self.logical_text(false)
+    }
+
+    /// Get the text of this recipe line as GNU make hands it to the shell,
+    /// before variable expansion.
+    ///
+    /// This is the line without its leading tab. Unlike [`Recipe::text`],
+    /// lines starting with `#` are included: make does not treat `#` in a
+    /// recipe as a comment, it passes it on to the shell. For lines split
+    /// with backslash-newline, the backslash and newline are kept and a single
+    /// leading tab is removed from each continuation line.
+    ///
+    /// Prefix characters (`@`, `-`, `+`) are not removed. make strips those
+    /// after variable expansion, since they may come from a variable; see
+    /// [`Recipe::is_silent`] and [`Recipe::is_ignore_errors`] for the literal
+    /// ones.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t# note\n\t@echo a \\\n\t\tb # c\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert_eq!(recipes[0].shell_text(), "# note");
+    /// assert_eq!(recipes[1].shell_text(), "@echo a \\\n\tb # c");
+    /// ```
+    pub fn shell_text(&self) -> String {
+        self.logical_text(true)
+    }
+
+    fn logical_text(&self, include_comments: bool) -> String {
         let tokens: Vec<_> = self
             .syntax()
             .children_with_tokens()
@@ -2856,14 +2888,16 @@ impl Recipe {
             tokens.len()
         };
 
-        // Include TEXT, NEWLINE (internal continuation), and INDENT (continuation indent) tokens,
-        // but skip COMMENT tokens (those are returned by comment()).
         // For INDENT tokens after a continuation newline, strip the leading tab character.
         let mut after_newline = false;
         tokens[start..end]
             .iter()
             .filter_map(|t| match t.kind() {
                 TEXT => {
+                    after_newline = false;
+                    Some(t.text().to_string())
+                }
+                COMMENT if include_comments => {
                     after_newline = false;
                     Some(t.text().to_string())
                 }
@@ -9240,6 +9274,88 @@ test:
         assert!(
             !recipes[6].is_ignore_errors(),
             "echo should not ignore errors"
+        );
+    }
+
+    fn shell_texts(text: &str) -> Vec<String> {
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().map(|r| r.shell_text()).collect()
+    }
+
+    #[test]
+    fn test_recipe_shell_text_plain() {
+        assert_eq!(shell_texts("all:\n\techo hello\n"), vec!["echo hello"]);
+    }
+
+    #[test]
+    fn test_recipe_shell_text_no_trailing_newline() {
+        assert_eq!(shell_texts("all:\n\techo hello"), vec!["echo hello"]);
+    }
+
+    #[test]
+    fn test_recipe_shell_text_extra_indent() {
+        assert_eq!(
+            shell_texts("all:\n\t\techo a\n\t  echo b\n"),
+            vec!["\techo a", "  echo b"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_inline_hash() {
+        assert_eq!(shell_texts("all:\n\techo a # b\n"), vec!["echo a # b"]);
+    }
+
+    #[test]
+    fn test_recipe_shell_text_comment_only() {
+        assert_eq!(
+            shell_texts("all:\n\t# just a comment\n\techo hello\n"),
+            vec!["# just a comment", "echo hello"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_quoted_hash() {
+        assert_eq!(shell_texts("all:\n\techo \"x#y\"\n"), vec!["echo \"x#y\""]);
+    }
+
+    #[test]
+    fn test_recipe_shell_text_continuation_with_tab() {
+        assert_eq!(
+            shell_texts("all:\n\techo a \\\n\tb \\\n\t\tc\n\techo d\n"),
+            vec!["echo a \\\nb \\\n\tc", "echo d"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_continuation_without_tab() {
+        assert_eq!(
+            shell_texts("all:\n\techo a \\\n  b\n"),
+            vec!["echo a \\\n  b"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_continuation_with_hash() {
+        assert_eq!(
+            shell_texts("all:\n\techo a # b \\\n\tc\n"),
+            vec!["echo a # b \\\nc"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_continuation_comment_line() {
+        assert_eq!(
+            shell_texts("all:\n\techo a \\\n\t# x\n"),
+            vec!["echo a \\\n# x"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_shell_text_keeps_prefixes() {
+        assert_eq!(
+            shell_texts("all:\n\t@echo a\n\t-echo b\n\t+echo c\n\t@-+echo d\n\t@# e\n"),
+            vec!["@echo a", "-echo b", "+echo c", "@-+echo d", "@# e"]
         );
     }
 
