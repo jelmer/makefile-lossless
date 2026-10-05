@@ -76,6 +76,13 @@ impl MakefileItem {
         }
     }
 
+    /// Get the range of this item in the source text.
+    ///
+    /// This is cheap, unlike computing the line number.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.syntax().text_range()
+    }
+
     /// Helper to get parent node or return an appropriate error
     fn get_parent_or_error(&self, action: &str, method: &str) -> Result<SyntaxNode, Error> {
         self.syntax().parent().ok_or_else(|| {

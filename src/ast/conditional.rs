@@ -105,6 +105,19 @@ impl ConditionalItem {
             None => MakefileItem::cast(node).map(Self::Item),
         }
     }
+
+    /// Get the underlying syntax node
+    pub fn syntax(&self) -> &SyntaxNode<Lang> {
+        match self {
+            Self::Item(item) => item.syntax(),
+            Self::Recipe(recipe) => recipe.syntax(),
+        }
+    }
+
+    /// Get the range of this item in the source text.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.syntax().text_range()
+    }
 }
 
 /// A single branch of a [`Conditional`]: the initial `if`, an `else if`
