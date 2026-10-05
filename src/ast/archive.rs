@@ -1,4 +1,4 @@
-use crate::lossless::{ArchiveMember, ArchiveMembers};
+use crate::lossless::{node_text, ArchiveMember, ArchiveMembers};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -33,7 +33,7 @@ impl ArchiveMembers {
 impl ArchiveMember {
     /// Get the text of this archive member
     pub fn text(&self) -> String {
-        self.syntax().text().to_string().trim().to_string()
+        node_text(self.syntax()).trim().to_string()
     }
 }
 

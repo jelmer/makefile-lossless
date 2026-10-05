@@ -2869,7 +2869,7 @@ impl Recipe {
                 }
                 NEWLINE => {
                     after_newline = true;
-                    Some(t.text().to_string())
+                    Some(lf_line_endings(t.text()))
                 }
                 INDENT if after_newline => {
                     after_newline = false;
@@ -3296,6 +3296,20 @@ fn scan_recipe_variable_refs(text: &str, base: u32, out: &mut Vec<RecipeVariable
         });
         i = name_end + 1;
     }
+}
+
+/// Convert CRLF line endings in `text` to LF.
+///
+/// The lexer keeps CRLF line endings as single NEWLINE tokens so that files
+/// round-trip losslessly; accessors use this so that the values they return
+/// do not depend on the line endings of the file.
+pub(crate) fn lf_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// The text of `node`, with CRLF line endings converted to LF.
+pub(crate) fn node_text(node: &SyntaxNode) -> String {
+    lf_line_endings(&node.text().to_string())
 }
 
 ///
@@ -10664,5 +10678,163 @@ mod test_continuation {
                 "round-trip mismatch for {src:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod test_crlf {
+    use super::*;
+    use crate::ast::makefile::MakefileItem;
+
+    fn parse_crlf(src: &str) -> Makefile {
+        let makefile: Makefile = src.parse().unwrap();
+        assert_eq!(makefile.to_string(), src);
+        makefile
+    }
+
+    fn variables(makefile: &Makefile) -> Vec<(String, String)> {
+        makefile
+            .variable_definitions()
+            .map(|v| (v.name().unwrap(), v.raw_value().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn test_assignments() {
+        let makefile = parse_crlf("X = 1\r\nY := 2 # c\r\nZ =\r\n");
+        assert_eq!(
+            variables(&makefile),
+            vec![
+                ("X".to_string(), "1".to_string()),
+                ("Y".to_string(), "2 ".to_string()),
+                ("Z".to_string(), "".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_value_continuation() {
+        let makefile = parse_crlf("Y = a \\\r\n  b\r\nZ = c\r\n");
+        assert_eq!(
+            variables(&makefile),
+            vec![
+                ("Y".to_string(), "a \\\n  b".to_string()),
+                ("Z".to_string(), "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rule_with_continuation_and_recipes() {
+        let makefile =
+            parse_crlf("all: a \\\r\n\tb\r\n\techo hi\r\n\techo a \\\r\n\t  b\r\n\t# note\r\n");
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["all"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec!["echo hi", "echo a \\\n  b", ""]
+        );
+        let comments: Vec<_> = rules[0].recipe_nodes().map(|r| r.comment()).collect();
+        assert_eq!(comments, vec![None, None, Some("# note".to_string())]);
+    }
+
+    #[test]
+    fn test_define() {
+        let makefile = parse_crlf("define FOO\r\nline1\r\nline2\r\nendef\r\nX = 1\r\n");
+        assert_eq!(
+            variables(&makefile),
+            vec![
+                ("FOO".to_string(), "line1\nline2\n".to_string()),
+                ("X".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_conditional() {
+        let makefile = parse_crlf("ifdef X\r\nA = 1\r\nelse\r\nA = 2\r\nendif\r\n");
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+        assert_eq!(conditional.condition(), Some("X".to_string()));
+        assert_eq!(conditional.if_body(), Some("A = 1\n".to_string()));
+        assert_eq!(conditional.else_body(), Some("\nA = 2\n".to_string()));
+    }
+
+    #[test]
+    fn test_ifeq() {
+        let makefile = parse_crlf("ifeq ($(X),y)\r\nA = 1\r\nendif\r\n");
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            conditional.ifeq_args(),
+            Some(("$(X)".to_string(), "y".to_string()))
+        );
+        assert_eq!(conditional.if_body(), Some("A = 1\n".to_string()));
+    }
+
+    #[test]
+    fn test_comments() {
+        let makefile = parse_crlf("# first\r\n# second\r\nX = 1\r\n");
+        let item = makefile.items().next().unwrap();
+        assert_eq!(
+            item.preceding_comments().collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn test_include() {
+        let makefile = parse_crlf("include foo.mk\r\n-include bar.mk\r\n");
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["foo.mk", "bar.mk"]
+        );
+    }
+
+    #[test]
+    fn test_condition_continuation() {
+        let makefile = parse_crlf("ifeq ($(X),\\\r\n  y)\r\nA = 1\r\nendif\r\n");
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.condition(), Some("($(X),\\\n  y)".to_string()));
+        assert_eq!(
+            conditional.ifeq_args(),
+            Some(("$(X)".to_string(), "\\\n  y".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_expression_statement() {
+        let makefile = parse_crlf("$(info a \\\r\n  b)\r\n");
+        let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
+            panic!("expected an expression statement");
+        };
+        assert_eq!(stmt.expression(), "$(info a \\\n  b)");
+    }
+
+    #[test]
+    fn test_vpath() {
+        let makefile = parse_crlf("vpath %.c src:lib\r\n");
+        let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else {
+            panic!("expected a vpath directive");
+        };
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("src:lib".to_string()));
+    }
+
+    #[test]
+    fn test_bsd_for_and_directive() {
+        let src = ".for i in a \\\r\n  b\r\nX+= ${i}\r\n.endfor\r\n.error bad \\\r\n  thing\r\n";
+        let makefile = Makefile::parse_with_variant(src, crate::MakefileVariant::BSDMake).tree();
+        assert_eq!(makefile.to_string(), src);
+        let items: Vec<_> = makefile.items().collect();
+        let MakefileItem::ForLoop(for_loop) = &items[0] else {
+            panic!("expected a for loop");
+        };
+        assert_eq!(for_loop.list(), Some("a \\\n  b".to_string()));
+        let MakefileItem::Directive(directive) = &items[1] else {
+            panic!("expected a directive");
+        };
+        assert_eq!(directive.argument(), Some("bad \\\n  thing".to_string()));
     }
 }

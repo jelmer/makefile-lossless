@@ -1,7 +1,7 @@
 //! Accessors for lines that consist only of variable references or function
 //! calls, such as `$(eval ...)` or `$(info ...)`.
 
-use crate::lossless::{ExpressionStatement, VariableReference};
+use crate::lossless::{lf_line_endings, ExpressionStatement, VariableReference};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -42,10 +42,13 @@ impl ExpressionStatement {
         let start = first.text_range().start();
         let end = exprs.last().unwrap_or(first).text_range().end();
         let offset = self.syntax().text_range().start();
-        self.syntax()
-            .text()
-            .slice((start - offset)..(end - offset))
-            .to_string()
+        lf_line_endings(
+            &self
+                .syntax()
+                .text()
+                .slice((start - offset)..(end - offset))
+                .to_string(),
+        )
     }
 }
 

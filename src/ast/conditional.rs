@@ -1,6 +1,9 @@
 use super::bsd::directive_keyword;
 use super::makefile::MakefileItem;
-use crate::lossless::{remove_with_preceding_comments, Conditional, Error, ErrorInfo, ParseError};
+use crate::lossless::{
+    lf_line_endings, node_text, remove_with_preceding_comments, Conditional, Error, ErrorInfo,
+    ParseError,
+};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -142,7 +145,7 @@ impl Conditional {
         // Find the EXPR node which contains the condition
         let expr_node = if_node.children().find(|it| it.kind() == EXPR)?;
 
-        Some(expr_node.text().to_string().trim().to_string())
+        Some(node_text(&expr_node).trim().to_string())
     }
 
     /// For an `ifeq` / `ifneq` conditional, return the two argument
@@ -167,7 +170,7 @@ impl Conditional {
         // Inside CONDITIONAL_IF there is one EXPR node wrapping the args.
         let wrapper = if_node.children().find(|it| it.kind() == EXPR)?;
 
-        let text = wrapper.text().to_string();
+        let text = node_text(&wrapper);
         let stripped = text.trim();
         // Form 1: parenthesised — `(a, b)`. Split at the top-level comma,
         // ignoring commas inside nested `$(...)` / `${...}`.
@@ -208,7 +211,7 @@ impl Conditional {
                 break;
             }
             if in_if_body {
-                body.push_str(child.to_string().as_str());
+                body.push_str(&lf_line_endings(&child.to_string()));
             }
         }
 
@@ -237,7 +240,7 @@ impl Conditional {
                 break;
             }
             if in_else_body {
-                body.push_str(child.to_string().as_str());
+                body.push_str(&lf_line_endings(&child.to_string()));
             }
         }
 
