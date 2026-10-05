@@ -25,6 +25,11 @@ pub struct Lexer<'a> {
     /// Whether the previous line was a recipe line ending in a backslash, so
     /// that this line continues the recipe.
     recipe_continuation: bool,
+    /// Number of parentheses and braces open inside `$(...)` and `${...}`
+    /// references on the current logical line, outside quoted strings.
+    reference_depth: usize,
+    /// Number of `$` tokens directly before the current one.
+    dollars: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -37,6 +42,8 @@ impl<'a> Lexer<'a> {
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
             after_lbracket: false,
             recipe_continuation: false,
+            reference_depth: 0,
+            dollars: 0,
         }
     }
 
@@ -80,6 +87,51 @@ impl<'a> Lexer<'a> {
             }
         }
         false
+    }
+
+    /// Whether the quote at the current position should start a quoted
+    /// string. Make doesn't treat quotes as syntactic; grouping only serves
+    /// to keep e.g. the `)` in `$(if a,')')` from closing the reference.
+    /// Inside a reference, don't group if that would hide the delimiter
+    /// closing it, as in `${:U'}=x'`.
+    fn should_group_quote(&self, quote: char) -> bool {
+        if !self.has_matching_close_quote(quote) {
+            return false;
+        }
+        if self.reference_depth == 0 {
+            return true;
+        }
+        let mut probe = self.input.clone();
+        probe.next();
+        let mut quoted = Vec::new();
+        while let Some(c) = probe.next() {
+            if c == quote {
+                break;
+            }
+            quoted.push(c);
+            if c == '\\' {
+                quoted.extend(probe.next());
+            }
+        }
+        let rest: Vec<char> = probe.take_while(|&c| !Self::is_newline(c)).collect();
+        // Whether the open references are closed on this line.
+        let closes = |chars: &mut dyn Iterator<Item = &char>| {
+            let mut depth = self.reference_depth;
+            for c in chars {
+                match c {
+                    '(' | '{' => depth += 1,
+                    ')' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        };
+        closes(&mut rest.iter()) || !closes(&mut quoted.iter().chain(rest.iter()))
     }
 
     fn read_quoted_string(&mut self) -> String {
@@ -203,7 +255,7 @@ impl<'a> Lexer<'a> {
                         self.read_while(Self::is_valid_identifier_char),
                     )),
                     '"' | '\'' => {
-                        if self.has_matching_close_quote(c) {
+                        if self.should_group_quote(c) {
                             Some((SyntaxKind::QUOTE, self.read_quoted_string()))
                         } else {
                             // Lone quote — emit as a single-character QUOTE
@@ -309,7 +361,25 @@ impl Iterator for Lexer<'_> {
     type Item = (crate::SyntaxKind, String);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_token()
+        let token = self.next_token()?;
+        match token.0 {
+            SyntaxKind::LPAREN | SyntaxKind::LBRACE
+                if self.reference_depth > 0 || self.dollars % 2 == 1 =>
+            {
+                self.reference_depth += 1
+            }
+            SyntaxKind::RPAREN | SyntaxKind::RBRACE => {
+                self.reference_depth = self.reference_depth.saturating_sub(1)
+            }
+            SyntaxKind::NEWLINE if !self.continuation => self.reference_depth = 0,
+            _ => {}
+        }
+        self.dollars = if token.0 == SyntaxKind::DOLLAR {
+            self.dollars + 1
+        } else {
+            0
+        };
+        Some(token)
     }
 }
 
@@ -467,6 +537,63 @@ rule: prerequisite
                 (OPERATOR, ":".to_string()),
                 (ERROR, "[".to_string()),
                 (COMMENT, "#]}".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_quote_hiding_reference_close() {
+        // Grouping `'}=a'` would hide the `}` that closes the reference.
+        assert_eq!(
+            lex_default("${:U'}=a'\n"),
+            vec![
+                (DOLLAR, "$".to_string()),
+                (LBRACE, "{".to_string()),
+                (OPERATOR, ":".to_string()),
+                (IDENTIFIER, "U".to_string()),
+                (QUOTE, "'".to_string()),
+                (RBRACE, "}".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (QUOTE, "'".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_quote_hiding_paren_in_reference() {
+        // The reference is still closed after the quoted `)`.
+        assert_eq!(
+            lex_default("$(if a,')')\n"),
+            vec![
+                (DOLLAR, "$".to_string()),
+                (LPAREN, "(".to_string()),
+                (IDENTIFIER, "if".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (COMMA, ",".to_string()),
+                (QUOTE, "')'".to_string()),
+                (RPAREN, ")".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_quote_outside_reference() {
+        // Braces outside references don't matter to make.
+        assert_eq!(
+            lex_default("X = '{' '}'\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (OPERATOR, "=".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (QUOTE, "'{'".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (QUOTE, "'}'".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
         );
