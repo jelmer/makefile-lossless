@@ -614,4 +614,37 @@ mod tests {
         assert_eq!(makefile.code(), "VAR !=\techo\n");
         assert_eq!(var.assignment_operator(), Some("!=".to_string()));
     }
+
+    #[test]
+    fn test_include_without_space() {
+        let makefile = parse_ok(".include<bsd.own.mk>\n.-include\"x.mk\"\n");
+        assert_eq!(
+            makefile
+                .includes()
+                .map(|i| (i.path().unwrap(), i.is_optional()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("bsd.own.mk".to_string(), false),
+                ("x.mk".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_keyword_as_target() {
+        // Like make, `include` needs whitespace after it to be a directive.
+        let makefile = parse_ok("include: foo\n\techo\n");
+        assert_eq!(makefile.includes().count(), 0);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["include"]);
+    }
+
+    #[test]
+    fn test_sysv_include_dependency_line() {
+        // BSD make reads a line with a dependency operator followed by
+        // whitespace as a dependency line, even if it starts with `include`.
+        let makefile = parse_bsd("include foo: bar\ninclude a:b\n");
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["a:b"]);
+    }
 }

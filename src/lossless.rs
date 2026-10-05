@@ -693,7 +693,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             // parse_conditional() handles the entire conditional including endif,
                             // so we need to decrement after it returns
                             conditional_depth -= 1;
-                        } else if token == "include" || token == "-include" || token == "sinclude" {
+                        } else if self.at_include_keyword() {
                             // Includes can appear in rules, with same blank line logic
                             if conditional_depth == 0 && newline_count >= 1 {
                                 break;
@@ -813,6 +813,43 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn at_assignment_operator(&self) -> bool {
             matches!(self.tokens.last(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str()))
+        }
+
+        /// Whether the current token is an `include`, `-include` or
+        /// `sinclude` directive. Like make, this requires whitespace after
+        /// the keyword, so `include: foo` is a rule. BSD make also treats a
+        /// line with a dependency operator followed by whitespace, as in
+        /// `include foo: bar`, as a rule.
+        fn at_include_keyword(&self) -> bool {
+            let mut tokens = self.tokens.iter().rev();
+            if !tokens.next().is_some_and(|(kind, text)| {
+                *kind == IDENTIFIER && matches!(text.as_str(), "include" | "-include" | "sinclude")
+            }) {
+                return false;
+            }
+            let mut tokens = tokens.peekable();
+            if !matches!(
+                tokens.peek(),
+                None | Some((WHITESPACE | NEWLINE | COMMENT, _))
+            ) {
+                return false;
+            }
+            if self.variant != Some(MakefileVariant::BSDMake) {
+                return true;
+            }
+            while let Some((kind, text)) = tokens.next() {
+                match (*kind, text.as_str()) {
+                    (NEWLINE, _) => break,
+                    (OPERATOR, ":" | "::")
+                        if matches!(tokens.peek(), None | Some((WHITESPACE | NEWLINE, _)))
+                            || text == "::" =>
+                    {
+                        return false
+                    }
+                    _ => {}
+                }
+            }
+            true
         }
 
         fn line_has_dependency_operator(&self) -> bool {
@@ -1882,12 +1919,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         || !self.line_has_dependency_operator()))
             {
                 self.parse_assignment();
-            } else if self.current() == Some(IDENTIFIER)
-                && matches!(
-                    self.tokens.last().unwrap().1.as_str(),
-                    "include" | "-include" | "sinclude"
-                )
-            {
+            } else if self.at_include_keyword() {
                 self.parse_include();
             } else if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "vpath"
             {
@@ -2098,9 +2130,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Like BSD make, require whitespace or the end of the line after
             // the name, so that `.info: foo` is a dependency line. The
             // conditional and loop directives are more lenient, as in `.if!0`.
+            // `.include` doesn't need whitespace either, as in
+            // `.include<bsd.prog.mk>`.
             let lenient = is_bsd_if(name)
                 || is_bsd_elif(name)
-                || matches!(name, "else" | "endif" | "for" | "endfor");
+                || matches!(
+                    name,
+                    "else"
+                        | "endif"
+                        | "for"
+                        | "endfor"
+                        | "include"
+                        | "-include"
+                        | "sinclude"
+                        | "dinclude"
+                );
             let next = self.tokens[..n - count].last();
             if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
                 return None;
