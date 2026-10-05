@@ -462,6 +462,19 @@ impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
                     self.stack.extend(cond.else_items());
                 }
                 MakefileItem::ForLoop(ref f) => self.stack.extend(f.items()),
+                MakefileItem::Rule(ref rule) => {
+                    // Conditionals and loops in a rule's recipe can also
+                    // contain non-recipe items, such as variables or other
+                    // rules. Prepend them to keep document order.
+                    let children: Vec<_> = rule
+                        .syntax()
+                        .children()
+                        .filter_map(MakefileItem::cast)
+                        .collect();
+                    for child in children.into_iter().rev() {
+                        self.stack.push_front(child);
+                    }
+                }
                 _ => {}
             }
             if let Some(extracted) = T::extract(item) {

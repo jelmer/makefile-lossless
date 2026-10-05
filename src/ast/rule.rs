@@ -527,6 +527,12 @@ impl Rule {
     /// This method iterates through the rule's body and yields both recipe lines
     /// and any conditionals that appear within the rule.
     ///
+    /// A conditional is part of the rule if a recipe line comes first in one of
+    /// its branches. Recipe lines inside it are not returned by [`Rule::recipes`],
+    /// and any other items in it (such as variable definitions) are not part of
+    /// the rule, though `Makefile::rules()` and `Makefile::variable_definitions()`
+    /// do include them.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Rule, RuleItem};
