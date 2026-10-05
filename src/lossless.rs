@@ -1348,16 +1348,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        // Helper to parse normal content (assignment, include, vpath, expression
-        // statement or rule).
-        // This is shared by the top level and conditional bodies.
+        // Helper to parse normal content (define block, assignment, include,
+        // vpath, expression statement or rule). This is shared by the top
+        // level and conditional bodies.
         fn parse_normal_content(&mut self) {
             // Skip any leading whitespace
             self.skip_ws();
 
-            // Like GNU Make, check for an assignment first so that e.g.
-            // "vpath = foo" defines a variable.
-            if self.is_assignment_line() {
+            // Like GNU Make, check for an assignment before include/vpath so
+            // that e.g. "vpath = foo" defines a variable.
+            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "define" {
+                self.parse_define();
+            } else if self.is_assignment_line() {
                 self.parse_assignment();
             } else if self.current() == Some(IDENTIFIER)
                 && matches!(
@@ -1891,12 +1893,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            if token == "define" {
-                self.parse_define();
-                return true;
-            }
-
-            // Handle normal content (assignment, include, vpath or rule)
+            // Handle normal content (define, assignment, include, vpath or
+            // rule)
             self.parse_normal_content();
             true
         }
@@ -3532,6 +3530,82 @@ mod tests {
         let code = "define outer\ndefine inner\nbody\nendef\nendef\n";
         let makefile: Makefile = code.parse().expect("nested define/endef should parse");
         assert_eq!(code, makefile.to_string());
+    }
+
+    fn assert_define(item: MakefileItem, name: &str, value: &str) {
+        let MakefileItem::Variable(var) = item else {
+            panic!("expected a variable, got {:?}", item.syntax());
+        };
+        assert!(var.is_define());
+        assert_eq!(Some(name.to_string()), var.name());
+        assert_eq!(Some(value.to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_define_in_conditional() {
+        let code = "ifdef X\ndefine FOO\nbody\nendef\nelse\ndefine BAR :=\nother\nendef\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(0, makefile.rules().count());
+        let cond = makefile.conditionals().next().unwrap();
+        let if_items: Vec<_> = cond.if_items().collect();
+        assert_eq!(1, if_items.len());
+        assert_define(if_items[0].clone(), "FOO", "body\n");
+        let else_items: Vec<_> = cond.else_items().collect();
+        assert_eq!(1, else_items.len());
+        assert_define(else_items[0].clone(), "BAR", "other\n");
+    }
+
+    #[test]
+    fn test_define_in_nested_conditional() {
+        let code = "ifdef X\nifeq ($(Y),1)\ndefine FOO\nbody\nendef\nendif\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let outer = makefile.conditionals().next().unwrap();
+        let outer_items: Vec<_> = outer.if_items().collect();
+        assert_eq!(1, outer_items.len());
+        let MakefileItem::Conditional(inner) = &outer_items[0] else {
+            panic!("expected a conditional, got {:?}", outer_items[0].syntax());
+        };
+        let inner_items: Vec<_> = inner.if_items().collect();
+        assert_eq!(1, inner_items.len());
+        assert_define(inner_items[0].clone(), "FOO", "body\n");
+    }
+
+    #[test]
+    fn test_define_in_conditional_with_directive_lines() {
+        // Conditional directives inside a define body are part of its value.
+        let code = "ifdef X\ndefine FOO\nifdef Y\na\nelse\nb\nendif\nendef\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let cond = makefile.conditionals().next().unwrap();
+        assert!(!cond.has_else());
+        let if_items: Vec<_> = cond.if_items().collect();
+        assert_eq!(1, if_items.len());
+        assert_define(if_items[0].clone(), "FOO", "ifdef Y\na\nelse\nb\nendif\n");
+    }
+
+    #[test]
+    fn test_define_in_conditional_in_rule() {
+        let code = "all:\n\techo hi\nifdef X\ndefine FOO\nbody\nendef\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(1, makefile.rules().count());
+        let defines: Vec<_> = makefile
+            .syntax()
+            .descendants()
+            .filter_map(VariableDefinition::cast)
+            .collect();
+        assert_eq!(1, defines.len());
+        assert_define(MakefileItem::Variable(defines[0].clone()), "FOO", "body\n");
     }
 
     #[test]
