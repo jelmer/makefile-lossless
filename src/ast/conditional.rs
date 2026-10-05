@@ -178,7 +178,8 @@ impl ConditionalBranch {
     /// The raw, unexpanded condition of this branch, or `None` for a plain
     /// `else`.
     ///
-    /// For `ifdef` / `ifndef` this is the variable name. For `ifeq` /
+    /// For `ifdef` / `ifndef` this is the variable name, which is empty
+    /// for a bare `ifdef` (GNU make treats that as undefined). For `ifeq` /
     /// `ifneq` it is the full argument text, e.g. `($(A),b)`; use
     /// [`Self::ifeq_args`] to get the two arguments.
     ///
@@ -980,21 +981,53 @@ mod tests {
     #[test]
     fn test_ifdef_only_comment() {
         let code = "ifdef # c\nX = 1\nendif\n";
-        let parsed = Makefile::parse(code);
-        assert_eq!(
-            parsed
-                .errors()
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>(),
-            vec!["expected condition after conditional directive"]
-        );
-        let makefile = parsed.tree();
+        let makefile: Makefile = code.parse().unwrap();
         assert_eq!(makefile.code(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
             vec![branch(Some("ifdef"), Some(""), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_empty_ifdef() {
+        let code = "ifdef\nX = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("".to_string()));
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifdef"), Some(""), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_empty_ifndef() {
+        let code = "ifndef \nX = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifndef"), Some(""), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_empty_else_ifdef() {
+        let code = "ifdef A\nX = 1\nelse ifdef\nX = 2\nelse ifndef # c\nX = 3\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifdef"), Some("A"), 0, &["var X=1"]),
+                branch(Some("ifdef"), Some(""), 2, &["var X=2"]),
+                branch(Some("ifndef"), Some(""), 4, &["var X=3"]),
+            ]
         );
     }
 
