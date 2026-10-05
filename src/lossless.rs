@@ -729,47 +729,100 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether `self.tokens[i]` is an `export`/`override`/`private`
-        /// modifier followed by whitespace and another identifier, as in
-        /// `all: export CFLAGS = -O2`.
+        /// modifier followed by whitespace and the start of a variable name,
+        /// as in `all: export CFLAGS = -O2`.
         fn is_assignment_modifier(&self, i: usize) -> bool {
             i >= 2
                 && self.tokens[i].0 == IDENTIFIER
                 && matches!(self.tokens[i].1.as_str(), "export" | "override" | "private")
                 && self.tokens[i - 1].0 == WHITESPACE
-                && self.tokens[i - 2].0 == IDENTIFIER
+                && matches!(self.tokens[i - 2].0, IDENTIFIER | DOLLAR | BACKSLASH)
         }
 
         /// Look ahead (without consuming) for the
-        /// `(MODIFIER WS)* IDENTIFIER (WS)? OPERATOR` pattern that marks a
+        /// `(MODIFIER WS)* NAME (WS)? OPERATOR` pattern that marks a
         /// target-specific variable assignment such as `all: CFLAGS = -O2`.
+        /// NAME is what [`Self::parse_variable_name`] accepts, e.g.
+        /// `obj-$(X)`.
         fn looks_like_target_specific_assignment(&self) -> bool {
-            // tokens is reversed (last = current). We look from the end.
-            let n = self.tokens.len();
-            if n < 2 {
+            let Some(mut i) = self.tokens.len().checked_sub(1) else {
                 return false;
-            }
-            let mut i = n - 1;
+            };
             while self.is_assignment_modifier(i) {
                 i -= 2;
             }
-            // The variable name.
-            if self.tokens[i].0 != IDENTIFIER || i == 0 {
+            // tokens is reversed (last = current), so iterate from the end.
+            let mut tokens = self.tokens[..=i].iter().rev().peekable();
+            if Self::skip_variable_name(&mut tokens) != Some(true) {
                 return false;
             }
-            i -= 1;
-            // Optional whitespace.
-            if self.tokens[i].0 == WHITESPACE {
-                if i == 0 {
-                    return false;
+            tokens.next_if(|(kind, _)| *kind == WHITESPACE);
+            tokens.next().is_some_and(|(kind, text)| {
+                *kind == OPERATOR
+                    && matches!(
+                        text.as_str(),
+                        "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
+                    )
+            })
+        }
+
+        /// Advance `tokens` past a variable name, as accepted by
+        /// [`Self::parse_variable_name`]. Returns whether there was a name,
+        /// or None if the line ends inside a variable reference.
+        fn skip_variable_name<'a, I>(tokens: &mut std::iter::Peekable<I>) -> Option<bool>
+        where
+            I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        {
+            let mut seen_name = false;
+            loop {
+                match tokens.peek().map(|(kind, _)| *kind) {
+                    Some(IDENTIFIER) => {}
+                    // A backslash is part of the name unless it continues
+                    // the line.
+                    Some(BACKSLASH) if !matches!(tokens.clone().nth(1), Some((NEWLINE, _))) => {}
+                    Some(DOLLAR) => {
+                        tokens.next();
+                        if !Self::skip_variable_reference(tokens) {
+                            return None;
+                        }
+                        seen_name = true;
+                        continue;
+                    }
+                    _ => return Some(seen_name),
                 }
-                i -= 1;
+                tokens.next();
+                seen_name = true;
             }
-            // Next token must be an assignment OPERATOR.
-            self.tokens[i].0 == OPERATOR
-                && matches!(
-                    self.tokens[i].1.as_str(),
-                    "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
-                )
+        }
+
+        /// Advance `tokens` past the rest of a variable reference whose `$`
+        /// has just been consumed: `(...)`, `{...}` or the single character
+        /// of `$X`. Returns false if the line ends before the reference does.
+        fn skip_variable_reference<'a>(
+            tokens: &mut impl Iterator<Item = &'a (SyntaxKind, String)>,
+        ) -> bool {
+            let close = match tokens.next() {
+                Some((LPAREN, _)) => RPAREN,
+                Some((LBRACE, _)) => RBRACE,
+                None | Some((NEWLINE, _)) => return false,
+                Some(_) => return true,
+            };
+            let open = if close == RPAREN { LPAREN } else { LBRACE };
+            let mut depth = 1;
+            for (kind, _) in tokens {
+                match *kind {
+                    NEWLINE => return false,
+                    k if k == open => depth += 1,
+                    k if k == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            true
         }
 
         /// Parse `VAR [op] value` after the rule's `:` colon, wrapped in a
@@ -780,8 +833,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.bump();
                 self.skip_ws();
             }
-            // Variable name (IDENTIFIER).
-            self.bump();
+            self.parse_variable_name();
             self.skip_ws();
             // Assignment operator.
             if self.current() == Some(OPERATOR) {
@@ -921,24 +973,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.skip_ws();
             }
 
-            // Parse variable name, which may be built from several parts
-            // such as `CFLAGS.${PROG}` or `a\b`.
-            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR | BACKSLASH))
-                || self.is_line_continuation()
-            {
+            if !self.parse_variable_name() {
                 self.error("expected variable name".to_string());
                 self.builder.finish_node();
                 return;
-            }
-            loop {
-                match self.current() {
-                    Some(IDENTIFIER) => self.bump(),
-                    // A backslash is part of the name unless it continues
-                    // the line.
-                    Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
-                    Some(DOLLAR) => self.parse_variable_reference(),
-                    _ => break,
-                }
             }
 
             if is_undefine {
@@ -974,6 +1012,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Parse a variable name, which may be built from several parts such
+        /// as `CFLAGS.${PROG}` or `a\b`. Returns false if there is no name.
+        fn parse_variable_name(&mut self) -> bool {
+            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR | BACKSLASH))
+                || self.is_line_continuation()
+            {
+                return false;
+            }
+            loop {
+                match self.current() {
+                    Some(IDENTIFIER) => self.bump(),
+                    // A backslash is part of the name unless it continues
+                    // the line.
+                    Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    _ => return true,
+                }
+            }
         }
 
         /// Parse an assignment's value through the end of the logical line,
@@ -2154,56 +2212,32 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-            let mut tokens = self.tokens.iter().rev();
+            let is_directive =
+                |text: &str| matches!(text, "export" | "override" | "private" | "undefine");
+            let mut tokens = self.tokens.iter().rev().peekable();
             let mut seen_name = false;
             // Whitespace after the name: anything but an operator now means
             // this is not an assignment.
             let mut name_done = false;
             let mut seen_directive = false; // export or override prefix
 
-            while let Some((kind, text)) = tokens.next() {
+            loop {
+                if !name_done
+                    && !tokens
+                        .peek()
+                        .is_some_and(|(kind, text)| *kind == IDENTIFIER && is_directive(text))
+                {
+                    match Self::skip_variable_name(&mut tokens) {
+                        None => return false,
+                        Some(found) => seen_name |= found,
+                    }
+                }
+                let Some((kind, text)) = tokens.next() else {
+                    break;
+                };
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER
-                        if matches!(
-                            text.as_str(),
-                            "export" | "override" | "private" | "undefine"
-                        ) =>
-                    {
-                        seen_directive = true
-                    }
-                    IDENTIFIER if !name_done => seen_name = true,
-                    // A backslash is part of the name unless it continues the line
-                    BACKSLASH
-                        if !name_done && !matches!(tokens.clone().next(), Some((NEWLINE, _))) =>
-                    {
-                        seen_name = true
-                    }
-                    DOLLAR if !name_done => {
-                        // Skip over a variable reference that is part of
-                        // the name, e.g. `CFLAGS.${PROG}`.
-                        seen_name = true;
-                        let close = match tokens.next() {
-                            Some((LPAREN, _)) => RPAREN,
-                            Some((LBRACE, _)) => RBRACE,
-                            _ => continue,
-                        };
-                        let open = if close == RPAREN { LPAREN } else { LBRACE };
-                        let mut depth = 1;
-                        for (kind, _) in tokens.by_ref() {
-                            match *kind {
-                                NEWLINE => return false,
-                                k if k == open => depth += 1,
-                                k if k == close => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    IDENTIFIER if is_directive(text) => seen_directive = true,
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
                         return seen_name || seen_directive
                     }
@@ -9535,6 +9569,181 @@ test:
         assert_eq!(
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nVARIABLE\n  EXPR\n"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_specific_computed_variable_name() {
+        let code = "foo: obj-$(X) = 1\nfoo: $(V)_FLAGS += -g\n%.o: CFLAGS_$(ARCH) := -O2\nbar: ${Y}z?=$(Z)\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        let scoped = root
+            .rules()
+            .map(|r| {
+                let v = r.scoped_assignment().unwrap();
+                (
+                    r.targets().collect::<Vec<_>>(),
+                    v.name(),
+                    v.assignment_operator(),
+                    v.raw_value(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scoped,
+            vec![
+                (
+                    vec!["foo".to_string()],
+                    Some("obj-$(X)".to_string()),
+                    Some("=".to_string()),
+                    Some("1".to_string())
+                ),
+                (
+                    vec!["foo".to_string()],
+                    Some("$(V)_FLAGS".to_string()),
+                    Some("+=".to_string()),
+                    Some("-g".to_string())
+                ),
+                (
+                    vec!["%.o".to_string()],
+                    Some("CFLAGS_$(ARCH)".to_string()),
+                    Some(":=".to_string()),
+                    Some("-O2".to_string())
+                ),
+                (
+                    vec!["bar".to_string()],
+                    Some("${Y}z".to_string()),
+                    Some("?=".to_string()),
+                    Some("$(Z)".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_target_specific_modifiers_with_computed_name() {
+        let code = "foo: export obj-$(X) = 1\nbar: override $(V)_FLAGS += -g\nbaz: private export ${Y} := 2\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        let scoped = root
+            .rules()
+            .map(|r| {
+                let v = r.scoped_assignment().unwrap();
+                (
+                    v.name(),
+                    v.raw_value(),
+                    v.is_export(),
+                    v.is_override(),
+                    v.is_private(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scoped,
+            vec![
+                (
+                    Some("obj-$(X)".to_string()),
+                    Some("1".to_string()),
+                    true,
+                    false,
+                    false
+                ),
+                (
+                    Some("$(V)_FLAGS".to_string()),
+                    Some("-g".to_string()),
+                    false,
+                    true,
+                    false
+                ),
+                (
+                    Some("${Y}".to_string()),
+                    Some("2".to_string()),
+                    true,
+                    false,
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_target_specific_variable_name_with_backslash() {
+        let code = "foo: a\\b = 1\nbar: export x\\\\y ?= 2\nbaz: obj-$(X)\\c := 3\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        let scoped = root
+            .rules()
+            .map(|r| {
+                let v = r.scoped_assignment().unwrap();
+                (
+                    v.name(),
+                    v.assignment_operator(),
+                    v.raw_value(),
+                    v.is_export(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scoped,
+            vec![
+                (
+                    Some("a\\b".to_string()),
+                    Some("=".to_string()),
+                    Some("1".to_string()),
+                    false
+                ),
+                (
+                    Some("x\\\\y".to_string()),
+                    Some("?=".to_string()),
+                    Some("2".to_string()),
+                    true
+                ),
+                (
+                    Some("obj-$(X)\\c".to_string()),
+                    Some(":=".to_string()),
+                    Some("3".to_string()),
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_rules_with_references_in_prerequisites() {
+        let parsed = parse(
+            "foo: $(DEPS)\nfoo: a b\n$(OBJS): %.o: %.c\nfoo: a | $(DIR)\nfoo: $(SRCS:.c=.o)\n",
+            None,
+        );
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 0);
+        let rules = root
+            .rules()
+            .map(|r| {
+                (
+                    r.scoped_assignment().is_some(),
+                    r.prerequisites().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            vec![
+                (false, vec!["$(DEPS)".to_string()]),
+                (false, vec!["a".to_string(), "b".to_string()]),
+                (false, vec!["%.o:".to_string(), "%.c".to_string()]),
+                (
+                    false,
+                    vec!["a".to_string(), "|".to_string(), "$(DIR)".to_string()]
+                ),
+                (false, vec!["$(SRCS:.c=.o)".to_string()]),
+            ]
         );
     }
 }
