@@ -664,8 +664,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                     }
                     Some(COMMENT) => {
-                        // Comments after blank lines should not be part of the rule
-                        if conditional_depth == 0 && newline_count >= 1 {
+                        // Comments after blank lines should not be part of the
+                        // rule, unless the recipe continues after them
+                        if conditional_depth == 0 && newline_count >= 1 && !self.recipe_follows() {
                             break;
                         }
                         newline_count = 0;
@@ -676,9 +677,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // any other directive ends the rule.
                         if let Some((name, count)) = self.bsd_directive() {
                             let is_block = is_bsd_if(name) || name == "for";
+                            // Blank lines don't end a rule's recipe, so this
+                            // belongs to the rule if it has recipe lines.
                             if !is_block
-                                || (conditional_depth == 0
-                                    && (newline_count >= 1 || !self.conditional_continues_recipe()))
+                                || (conditional_depth == 0 && !self.conditional_continues_recipe())
                             {
                                 break;
                             }
@@ -691,12 +693,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         if Self::is_conditional_start(token)
                             && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
                         {
-                            // If we're not inside a conditional (depth == 0) and there's a blank line,
-                            // or it doesn't continue the recipe, this is a top-level conditional,
-                            // not part of the rule
-                            if conditional_depth == 0
-                                && (newline_count >= 1 || !self.conditional_continues_recipe())
-                            {
+                            // If we're not inside a conditional (depth == 0) and it doesn't
+                            // continue the recipe, this is a top-level conditional, not part
+                            // of the rule. Blank lines don't end a rule's recipe.
+                            if conditional_depth == 0 && !self.conditional_continues_recipe() {
                                 break;
                             }
                             newline_count = 0;
@@ -872,6 +872,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .rev()
                 .take_while(|(kind, _)| *kind != NEWLINE)
                 .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text))
+        }
+
+        /// Whether a recipe line follows the current comments and blank
+        /// lines. Make doesn't end a rule's recipe at either.
+        fn recipe_follows(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .find(|(kind, _)| !matches!(kind, COMMENT | NEWLINE | WHITESPACE))
+                .is_some_and(|(kind, _)| *kind == INDENT)
         }
 
         fn find_and_consume_colon(&mut self) -> bool {
@@ -2796,6 +2806,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_name = true;
                     }
                     RPAREN | RBRACE => level -= 1,
+                    // A line continuation counts as whitespace.
+                    BACKSLASH if matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        while tokens
+                            .next_if(|(kind, _)| matches!(kind, INDENT | WHITESPACE))
+                            .is_some()
+                        {}
+                        seen_space = seen_name;
+                    }
                     _ if level != 0 => {}
                     WHITESPACE => seen_space = seen_name,
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
@@ -2875,6 +2894,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // It's a rule if we see a colon first
                     OPERATOR if matches!(text.as_str(), ":" | "::" | "&:" | "&::") => return false,
                     WHITESPACE => name_done = seen_name,
+                    // A line continuation counts as whitespace.
+                    BACKSLASH if matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        while tokens
+                            .next_if(|(kind, _)| matches!(kind, INDENT | WHITESPACE))
+                            .is_some()
+                        {}
+                        name_done = seen_name;
+                    }
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
@@ -9755,7 +9783,8 @@ endif
             "Conditional should be part of rule, not top-level"
         );
 
-        // Conditional after blank line - top-level
+        // Conditional with recipe lines after a blank line - still part of
+        // the rule, as make doesn't end a recipe at a blank line
         let text2 = r#"rule:
 	command
 
@@ -9770,9 +9799,21 @@ endif
         assert_eq!(rules.len(), 1);
         assert_eq!(
             conditionals.len(),
-            1,
-            "Conditional after blank line should be top-level"
+            0,
+            "Conditional with recipe lines should be part of the rule"
         );
+
+        // Conditional without recipe lines after a blank line - top-level
+        let text3 = r#"rule:
+	command
+
+ifeq (,$(X))
+X = 1
+endif
+"#;
+        let makefile: Makefile = text3.parse().unwrap();
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
         assert_eq!(conditionals[0].line(), 3);
     }
 

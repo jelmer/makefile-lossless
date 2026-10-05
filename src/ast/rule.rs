@@ -1911,4 +1911,39 @@ mod tests {
         assert_eq!(recipes(&rule), vec!["echo a\\\\", "echo b"]);
         assert_eq!(rule.to_string(), input);
     }
+
+    #[test]
+    fn test_recipe_continues_after_blank_line_and_comment() {
+        // Make runs both commands for `rule`.
+        let makefile: Makefile = "rule:\n\tcommand\n\n# a comment\n\tmore\n".parse().unwrap();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec!["command", "more"]
+        );
+    }
+
+    #[test]
+    fn test_conditional_recipe_after_blank_line() {
+        // As in Linux's arch/m68k/Makefile; both makes run the recipe lines
+        // in the conditional for `vmlinux.gz`.
+        for (text, variant) in [
+            (
+                "vmlinux.gz: vmlinux\n\nifndef X\n\tcp a b\nendif\n",
+                crate::MakefileVariant::GNUMake,
+            ),
+            (
+                "vmlinux.gz: vmlinux\n\n.if !defined(X)\n\tcp a b\n.endif\n",
+                crate::MakefileVariant::BSDMake,
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert!(parsed.ok());
+            let makefile = parsed.tree();
+            assert_eq!(makefile.conditionals().count(), 0, "{variant:?}");
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.items().count(), 1, "{variant:?}");
+        }
+    }
 }
