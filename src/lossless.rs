@@ -1104,16 +1104,34 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.bump(); // Consume ( or {
 
                 if is_brace {
-                    // For ${...}, consume until matching }
-                    while self.current().is_some() && self.current() != Some(RBRACE) {
-                        if self.current() == Some(DOLLAR) {
-                            self.parse_variable_reference();
-                        } else {
-                            self.bump();
+                    // For ${...}, consume until the matching }, allowing
+                    // balanced braces inside as in `${:UVAR{value}}`.
+                    let mut depth = 0;
+                    loop {
+                        if self.consume_line_continuation() {
+                            continue;
                         }
-                    }
-                    if self.current() == Some(RBRACE) {
-                        self.bump(); // Consume }
+                        match self.current() {
+                            Some(DOLLAR) => self.parse_variable_reference(),
+                            Some(RBRACE) if depth == 0 => {
+                                self.bump();
+                                break;
+                            }
+                            Some(LBRACE) => {
+                                depth += 1;
+                                self.bump();
+                            }
+                            Some(RBRACE) => {
+                                depth -= 1;
+                                self.bump();
+                            }
+                            // Like `$(...)`, a reference can't span lines.
+                            Some(NEWLINE) | None => {
+                                self.record_error("unclosed variable reference".to_string());
+                                break;
+                            }
+                            Some(_) => self.bump(),
+                        }
                     }
                 } else {
                     // Start by checking if this is a function like $(shell ...)
@@ -1141,12 +1159,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_parenthesized_expr_internal(true);
                     }
                 }
-            } else if self.current().is_some() && self.current() != Some(NEWLINE) {
-                // Single character variable like $X or $$
+            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE)) {
+                // Single character variable like $X or $$. A `)` or `}` is
+                // left alone: make finds the end of an enclosing reference
+                // before looking at what it contains.
                 self.bump();
-            } else {
-                self.error("expected variable name after $".to_string());
             }
+            // A `$` at the end of a line is accepted by both GNU and BSD
+            // make; it expands to nothing.
 
             self.builder.finish_node();
         }
@@ -2361,7 +2381,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn consume_balanced_parens(&mut self, start_paren_count: usize) -> usize {
             let mut paren_count = start_paren_count;
 
-            while paren_count > 0 && self.current().is_some() {
+            while paren_count > 0 {
+                if self.consume_line_continuation() {
+                    continue;
+                }
                 match self.current() {
                     Some(LPAREN) => {
                         paren_count += 1;
@@ -2370,19 +2393,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(RPAREN) => {
                         paren_count -= 1;
                         self.bump();
-                        if paren_count == 0 {
-                            break;
-                        }
                     }
                     Some(DOLLAR) => {
                         // Handle nested variable references
                         self.parse_variable_reference();
                     }
-                    Some(_) => self.bump(),
-                    None => {
-                        self.error("unclosed parenthesis".to_string());
+                    Some(NEWLINE) | None => {
+                        self.record_error("unclosed variable reference".to_string());
                         break;
                     }
+                    Some(_) => self.bump(),
                 }
             }
 
@@ -3473,6 +3493,57 @@ mod tests {
     use super::*;
     use crate::ast::makefile::MakefileItem;
     use crate::pattern::matches_pattern;
+
+    #[test]
+    fn test_unclosed_reference_stops_at_newline() {
+        let parsed = parse("A = ${B\nC = 1\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "unclosed variable reference")]
+        );
+        let makefile = parsed.root();
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| v.name().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "C"]
+        );
+    }
+
+    #[test]
+    fn test_reference_continued_on_next_line() {
+        let parsed = parse("A = $(subst a,\\\n  b,c)\nC = 1\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().variable_definitions().count(), 2);
+    }
+
+    #[test]
+    fn test_dollar_before_closing_brace() {
+        let parsed = parse("A = ${:U\\$:M\\$}\nB = ${$}\nC = $\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            parsed
+                .root()
+                .variable_definitions()
+                .map(|v| v.raw_value().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["${:U\\$:M\\$}", "${$}", "$"]
+        );
+    }
+
+    #[test]
+    fn test_nested_braces_in_reference() {
+        let parsed = parse("${:UVAR{value}}=\tx\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let var = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("${:UVAR{value}}".to_string()));
+        assert_eq!(var.raw_value(), Some("x".to_string()));
+    }
 
     #[test]
     fn test_quote_in_variable_name() {
