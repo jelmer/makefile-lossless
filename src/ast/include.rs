@@ -133,7 +133,8 @@ impl Include {
     /// other variants. Variable references and backslashes before
     /// whitespace are kept, since make only handles them after expanding
     /// the path. For BSD make and nmake, the `<...>` or `"..."` delimiters
-    /// around the path are removed.
+    /// around the path are removed. An `include` without any file names,
+    /// which GNU make accepts, has an empty path.
     ///
     /// # Example
     /// ```
@@ -282,8 +283,9 @@ impl Include {
     /// Set the path of this include directive
     ///
     /// `#` is escaped as needed, so that [`Self::path`] returns `new_path`.
-    /// Returns an error if the directive has no path or `new_path` can not
-    /// be written in it, such as a path containing a newline.
+    /// Returns an error if the directive has no path, `new_path` is empty or
+    /// `new_path` can not be written in it, such as a path containing a
+    /// newline.
     ///
     /// # Example
     /// ```
@@ -305,6 +307,11 @@ impl Include {
                 }],
             })
         };
+        // GNU make accepts an include without file names, but that is not
+        // a path.
+        if new_path.is_empty() {
+            return Err(error("Cannot set an empty include path".to_string()));
+        }
         let expr = self
             .path_expr()
             .ok_or_else(|| error("Cannot set path: include has no path".to_string()))?;
@@ -875,6 +882,7 @@ mod tests {
         for (code, path) in [
             ("include old.mk\n", "a\nb"),
             ("include old.mk\n", "a\\"),
+            ("include old.mk\n", ""),
             (".include <old.mk>\n", "a>b"),
             (".include <old.mk>\n", "a\\#b"),
         ] {
