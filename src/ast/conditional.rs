@@ -140,19 +140,43 @@ impl ConditionalBranch {
     /// an `else ifeq` etc. branch. For BSD make it is the `.if` form of
     /// the directive including the leading dot, so `.elif` gives `.if` and
     /// `.elifdef` gives `.ifdef`, matching [`Conditional::conditional_type`].
+    /// For nmake it is likewise the `!IF` form in upper case, so `!elseif`
+    /// and `!ELSE IF` give `!IF` and `!ELSEIFDEF` gives `!IFDEF`.
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_lossless::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".if ${A}\n.elifndef B\n.else\n.endif\n".parse().unwrap();
     /// let cond = makefile.conditionals().next().unwrap();
     /// let types: Vec<_> = cond.branches().map(|b| b.conditional_type()).collect();
     /// assert_eq!(types, vec![Some(".if".to_string()), Some(".ifndef".to_string()), None]);
+    ///
+    /// let makefile = Makefile::parse_with_variant(
+    ///     "!if 1\n!ELSE IFDEF A\n!ELSE\n!ENDIF\n",
+    ///     MakefileVariant::NMake,
+    /// )
+    /// .tree();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let types: Vec<_> = cond.branches().map(|b| b.conditional_type()).collect();
+    /// assert_eq!(types, vec![Some("!IF".to_string()), Some("!IFDEF".to_string()), None]);
     /// ```
     pub fn conditional_type(&self) -> Option<String> {
-        let (_, keyword) = keyword_token(&self.header)?;
+        let (token, keyword) = keyword_token(&self.header)?;
         if let Some(rest) = keyword.strip_prefix(".elif") {
             return Some(format!(".if{}", rest));
+        }
+        if let Some(rest) = keyword.strip_prefix("!ELSE") {
+            if !rest.is_empty() {
+                return Some(format!("!{}", rest));
+            }
+            // In `!ELSE IF ...` the directive is the next identifier.
+            let directive = token
+                .siblings_with_tokens(Direction::Next)
+                .skip(1)
+                .filter_map(|it| it.into_token())
+                .find(|t| t.kind() != WHITESPACE)
+                .filter(|t| t.kind() == IDENTIFIER)?;
+            return Some(format!("!{}", directive.text().to_ascii_uppercase()));
         }
         match keyword.as_str() {
             "else" => {
@@ -274,6 +298,8 @@ impl ConditionalBranch {
     ///     ]
     /// );
     /// ```
+    // TODO: Parse the expressions of nmake's `!IF` and `!ELSEIF` in the same
+    // way, which have C-like operators, `DEFINED(macro)` and `EXIST(path)`.
     pub fn bsd_condition(&self) -> Option<Result<BsdCondition, BsdConditionError>> {
         if !self.conditional_type()?.starts_with('.') {
             return None;
@@ -372,14 +398,35 @@ impl Conditional {
     ///
     /// For BSD make conditionals this includes the leading dot, e.g. `.if`
     /// or `.ifdef`, regardless of any whitespace between the dot and the
-    /// keyword.
+    /// keyword. For nmake it is `!IF`, `!IFDEF` or `!IFNDEF`, in upper case
+    /// regardless of how the directive is written.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile =
+    ///     Makefile::parse_with_variant("!ifdef DEBUG\nX=1\n!endif\n", MakefileVariant::NMake)
+    ///         .tree();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// assert_eq!(cond.conditional_type(), Some("!IFDEF".to_string()));
+    /// assert_eq!(cond.condition(), Some("DEBUG".to_string()));
+    /// ```
     pub fn conditional_type(&self) -> Option<String> {
         self.if_branch()?.conditional_type()
     }
 
-    /// Whether this is a BSD make conditional (`.if` ... `.endif`).
-    fn is_bsd(&self) -> bool {
-        self.conditional_type().is_some_and(|t| t.starts_with('.'))
+    /// Add the tokens of the `else` or `endif` directive `name` to
+    /// `builder`, in the style of this conditional: `.else` for BSD make,
+    /// `!ELSE` for nmake.
+    fn build_keyword(&self, builder: &mut GreenNodeBuilder, name: &str) {
+        match self.conditional_type().and_then(|t| t.chars().next()) {
+            Some('.') => builder.token(IDENTIFIER.into(), &format!(".{}", name)),
+            Some('!') => {
+                builder.token(OPERATOR.into(), "!");
+                builder.token(IDENTIFIER.into(), &name.to_ascii_uppercase());
+            }
+            _ => builder.token(IDENTIFIER.into(), name),
+        }
     }
 
     /// Get the condition expression
@@ -754,10 +801,7 @@ impl Conditional {
         if needs_newline {
             builder.token(NEWLINE.into(), &eol);
         }
-        builder.token(
-            IDENTIFIER.into(),
-            if self.is_bsd() { ".endif" } else { "endif" },
-        );
+        self.build_keyword(&mut builder, "endif");
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
@@ -778,10 +822,7 @@ impl Conditional {
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ELSE.into());
-        builder.token(
-            IDENTIFIER.into(),
-            if self.is_bsd() { ".else" } else { "else" },
-        );
+        self.build_keyword(&mut builder, "else");
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 

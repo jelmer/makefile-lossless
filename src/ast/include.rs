@@ -4,11 +4,13 @@ use super::{collapse_continuations, logical_text, LineSyntax};
 use crate::lossless::{
     parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
-use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE};
+use crate::MakefileVariant;
+use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE, OPERATOR};
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode, SyntaxToken};
 
-/// Strip the `<...>` or `"..."` delimiters from a BSD make include path.
+/// Strip the `<...>` or `"..."` delimiters from a BSD make or nmake include
+/// path.
 ///
 /// Like BSD make, this ignores anything after the closing delimiter.
 fn strip_delimiters(path: &str) -> Option<&str> {
@@ -82,9 +84,24 @@ impl Include {
         Some((token, name))
     }
 
+    /// The character before the name of a BSD make `.include` (`.`) or
+    /// nmake `!INCLUDE` (`!`) directive, or `None` for GNU make.
+    fn prefix(&self) -> Option<char> {
+        directive_keyword(self.syntax())?
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '.' | '!'))
+    }
+
     /// Whether this is a BSD make `.include` directive.
     fn is_bsd(&self) -> bool {
-        directive_keyword(self.syntax()).is_some_and(|k| k.starts_with('.'))
+        self.prefix() == Some('.')
+    }
+
+    /// Whether this is a BSD make `.include` or nmake `!INCLUDE` directive,
+    /// whose path may be delimited by `<...>` or `"..."`.
+    fn has_delimited_path(&self) -> bool {
+        self.prefix().is_some()
     }
 
     /// The EXPR node holding the path.
@@ -99,29 +116,34 @@ impl Include {
     /// BSD make does for `.include` and GNU make otherwise; see
     /// [`crate::VariableDefinition::value`]. Variable references and
     /// backslashes before whitespace are kept, since make only handles them
-    /// after expanding the path. For BSD make, the `<...>` or `"..."`
-    /// delimiters around the path are removed.
+    /// after expanding the path. For BSD make and nmake, the `<...>` or
+    /// `"..."` delimiters around the path are removed.
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_lossless::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".include <bsd.prog.mk>\ninclude a\\#b.mk\n".parse().unwrap();
     /// let paths: Vec<_> = makefile.includes().map(|i| i.path().unwrap()).collect();
     /// assert_eq!(paths, vec!["bsd.prog.mk", "a#b.mk"]);
+    ///
+    /// let makefile =
+    ///     Makefile::parse_with_variant("!INCLUDE <win32.mak>\n", MakefileVariant::NMake).tree();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(inc.path(), Some("win32.mak".to_string()));
     /// ```
     pub fn path(&self) -> Option<String> {
         let expr = self.path_expr()?;
-        let syntax = if self.is_bsd() {
-            LineSyntax::Bsd
-        } else {
-            LineSyntax::Gnu
+        let syntax = match self.prefix() {
+            Some('.') => LineSyntax::Bsd,
+            Some('!') => LineSyntax::NMake,
+            _ => LineSyntax::Gnu,
         };
         let tokens = expr
             .descendants_with_tokens()
             .filter_map(|it| it.into_token());
         let text = logical_text(&expr, tokens, syntax, true);
         let path = text.trim();
-        if self.is_bsd() {
+        if self.has_delimited_path() {
             if let Some(inner) = strip_delimiters(path) {
                 return Some(inner.to_string());
             }
@@ -240,27 +262,36 @@ impl Include {
         let before_comment = expr
             .next_sibling_or_token()
             .is_some_and(|it| it.kind() == COMMENT);
-        let mut text = escape_hashes(new_path, self.is_bsd(), before_comment);
-        // Keep the delimiters of a BSD include.
-        if let Some(raw) = self.raw_path().filter(|_| self.is_bsd()) {
+        let nmake = self.prefix() == Some('!');
+        // TODO: Escape `#` for nmake, as `^#`. Until then, a path with `#`
+        // is rejected below since it reads back differently.
+        let mut text = if nmake {
+            new_path.to_string()
+        } else {
+            escape_hashes(new_path, self.is_bsd(), before_comment)
+        };
+        // Keep the delimiters of a BSD make or nmake include.
+        if let Some(raw) = self.raw_path().filter(|_| self.has_delimited_path()) {
             if strip_delimiters(&raw).is_some() {
                 let close = if raw.starts_with('<') { '>' } else { '"' };
                 text = format!("{}{}{}", &raw[..1], text, close);
             }
         }
 
-        // Parse the directive with the new path, from its keyword on, to
-        // check that make reads it back as `new_path`.
+        // Parse the directive with the new path, from its keyword (or the
+        // `!` of an nmake directive) on, to check that make reads it back as
+        // `new_path`.
+        let start = if nmake { OPERATOR } else { IDENTIFIER };
         let directive: String = self
             .syntax()
             .children_with_tokens()
-            .skip_while(|it| it.kind() != IDENTIFIER)
+            .skip_while(|it| it.kind() != start)
             .map(|it| match it.as_node() {
                 Some(node) if node == &expr => text.clone(),
                 _ => it.to_string(),
             })
             .collect();
-        let parsed = parse(&directive, None);
+        let parsed = parse(&directive, nmake.then_some(MakefileVariant::NMake));
         let mut items = parsed.root().syntax().children();
         let new_expr = items
             .next()
@@ -284,19 +315,32 @@ impl Include {
     /// If the include is already optional, this has no effect. For BSD make
     /// this switches between `.include` and `.-include`.
     ///
+    /// Returns an error when making an nmake `!INCLUDE` optional, as nmake
+    /// has no optional include directive.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
     /// let mut makefile: Makefile = "include config.mk\n".parse().unwrap();
     /// let mut inc = makefile.includes().next().unwrap();
-    /// inc.set_optional(true);
+    /// inc.set_optional(true).unwrap();
     /// assert!(inc.is_optional());
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
-    pub fn set_optional(&mut self, optional: bool) {
+    pub fn set_optional(&mut self, optional: bool) -> Result<(), Error> {
         let Some((token, name)) = self.keyword() else {
-            return;
+            return Ok(());
         };
+        if optional && name.starts_with('!') {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
+                    message: "nmake has no optional include directive".to_string(),
+                    line: 1,
+                    context: "include_set_optional".to_string(),
+                }],
+            }));
+        }
         // In the `.include` form the dot is part of the keyword token.
         let dot = if token.text().starts_with('.') {
             "."
@@ -306,7 +350,7 @@ impl Include {
         let new_name = match (optional, name.as_str()) {
             (true, "include") => "-include",
             (false, "-include" | "sinclude") => "include",
-            _ => return,
+            _ => return Ok(()),
         };
 
         let mut builder = GreenNodeBuilder::new();
@@ -319,6 +363,7 @@ impl Include {
         let index = token.index();
         self.syntax()
             .splice_children(index..index + 1, vec![new_token.into()]);
+        Ok(())
     }
 }
 
@@ -492,7 +537,7 @@ mod tests {
     fn test_include_set_optional_true() {
         let makefile: Makefile = "include config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(true);
+        inc.set_optional(true).unwrap();
 
         assert!(inc.is_optional());
         assert_eq!(makefile.to_string(), "-include config.mk\n");
@@ -502,7 +547,7 @@ mod tests {
     fn test_include_set_optional_false() {
         let makefile: Makefile = "-include config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(false);
+        inc.set_optional(false).unwrap();
 
         assert!(!inc.is_optional());
         assert_eq!(makefile.to_string(), "include config.mk\n");
@@ -512,7 +557,7 @@ mod tests {
     fn test_include_set_optional_from_sinclude() {
         let makefile: Makefile = "sinclude config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(false);
+        inc.set_optional(false).unwrap();
 
         assert!(!inc.is_optional());
         assert_eq!(makefile.to_string(), "include config.mk\n");
@@ -522,7 +567,7 @@ mod tests {
     fn test_include_set_optional_already_optional() {
         let makefile: Makefile = "-include config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(true);
+        inc.set_optional(true).unwrap();
 
         // Should remain unchanged
         assert!(inc.is_optional());
@@ -533,7 +578,7 @@ mod tests {
     fn test_include_set_optional_already_non_optional() {
         let makefile: Makefile = "include config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(false);
+        inc.set_optional(false).unwrap();
 
         // Should remain unchanged
         assert!(!inc.is_optional());
@@ -547,7 +592,7 @@ mod tests {
 
         // Change path and make optional
         inc.set_path("new.mk").unwrap();
-        inc.set_optional(true);
+        inc.set_optional(true).unwrap();
 
         assert_eq!(inc.path(), Some("new.mk".to_string()));
         assert!(inc.is_optional());
@@ -602,9 +647,9 @@ mod tests {
     fn test_set_optional_keeps_variable_references() {
         let makefile: Makefile = "include $(TOP)/config.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_optional(true);
+        inc.set_optional(true).unwrap();
         assert_eq!(makefile.to_string(), "-include $(TOP)/config.mk\n");
-        inc.set_optional(false);
+        inc.set_optional(false).unwrap();
         assert_eq!(makefile.to_string(), "include $(TOP)/config.mk\n");
     }
 
@@ -614,7 +659,7 @@ mod tests {
             .parse()
             .unwrap();
         for mut inc in makefile.includes() {
-            inc.set_optional(true);
+            inc.set_optional(true).unwrap();
             assert!(inc.is_optional());
         }
         assert_eq!(
@@ -622,7 +667,7 @@ mod tests {
             ".-include <bsd.prog.mk>\n.  -include \"x.mk\"\n"
         );
         for mut inc in makefile.includes() {
-            inc.set_optional(false);
+            inc.set_optional(false).unwrap();
             assert!(!inc.is_optional());
         }
         assert_eq!(
