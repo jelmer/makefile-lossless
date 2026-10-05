@@ -647,4 +647,27 @@ mod tests {
         assert_eq!(makefile.rules().count(), 1);
         assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["a:b"]);
     }
+
+    #[test]
+    fn test_add_bsd_conditional() {
+        let mut makefile = Makefile::new();
+        let cond = makefile
+            .add_conditional(
+                ".if",
+                "defined(DEBUG)",
+                "CFLAGS+= -g\n",
+                Some("CFLAGS+= -O2\n"),
+            )
+            .unwrap();
+        assert_eq!(cond.conditional_type(), Some(".if".to_string()));
+        let text = makefile.to_string();
+        assert_eq!(
+            text,
+            ".if defined(DEBUG)\nCFLAGS+= -g\n.else\nCFLAGS+= -O2\n.endif\n"
+        );
+        let reparsed = parse_bsd(&text);
+        let cond = reparsed.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("defined(DEBUG)".to_string()));
+        assert!(cond.has_else());
+    }
 }
