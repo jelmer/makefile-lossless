@@ -809,24 +809,35 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Whether the current token is an `export`/`override`/`private`
+        /// modifier. A keyword directly followed by an operator is the
+        /// variable name itself, as in `override := 1`.
+        fn at_assignment_prefix_keyword(&self) -> bool {
+            let n = self.tokens.len();
+            if n == 0
+                || self.tokens[n - 1].0 != IDENTIFIER
+                || !matches!(
+                    self.tokens[n - 1].1.as_str(),
+                    "export" | "override" | "private"
+                )
+            {
+                return false;
+            }
+            let next = self.tokens[..n - 1]
+                .iter()
+                .rev()
+                .find(|(kind, _)| *kind != WHITESPACE);
+            next.is_none_or(|(kind, _)| *kind != OPERATOR)
+        }
+
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Handle `override` and `export` prefixes (in either order). Both
-            // are independent modifiers on a variable assignment.
+            // Handle `export`/`override`/`private` modifiers, in any order.
             self.skip_ws();
-            for _ in 0..2 {
-                if self.current() == Some(IDENTIFIER)
-                    && matches!(
-                        self.tokens.last().unwrap().1.as_str(),
-                        "export" | "override"
-                    )
-                {
-                    self.bump();
-                    self.skip_ws();
-                } else {
-                    break;
-                }
+            while self.at_assignment_prefix_keyword() {
+                self.bump();
+                self.skip_ws();
             }
 
             // Parse variable name, which may be built from several parts
@@ -1938,7 +1949,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
+                    IDENTIFIER if matches!(text.as_str(), "export" | "override" | "private") => {
+                        seen_directive = true
+                    }
                     IDENTIFIER if !name_done => seen_name = true,
                     DOLLAR if !name_done => {
                         // Skip over a variable reference that is part of

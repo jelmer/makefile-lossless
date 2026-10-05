@@ -103,9 +103,10 @@ impl VariableDefinition {
 
     /// Check if this variable definition is exported
     pub fn is_export(&self) -> bool {
-        self.syntax()
-            .children_with_tokens()
-            .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+        self.syntax().children_with_tokens().any(|it| {
+            it.as_token()
+                .is_some_and(|t| t.text() == "export" && is_prefix_keyword(t))
+        })
     }
 
     /// Check if this variable definition uses the `override` directive
@@ -124,7 +125,7 @@ impl VariableDefinition {
     pub fn is_override(&self) -> bool {
         self.syntax().children_with_tokens().any(|it| {
             it.as_token()
-                .is_some_and(|token| token.text() == "override")
+                .is_some_and(|t| t.text() == "override" && is_prefix_keyword(t))
         })
     }
 
@@ -690,6 +691,61 @@ mod tests {
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("private".to_string()));
         assert!(!var.is_private());
+    }
+
+    #[test]
+    fn test_private() {
+        let makefile: Makefile = "private X = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(var.is_private());
+        assert!(!var.is_export());
+        assert!(!var.is_override());
+    }
+
+    #[test]
+    fn test_private_export() {
+        let makefile: Makefile = "private export X := 2\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("2".to_string()));
+        assert!(var.is_private());
+        assert!(var.is_export());
+        assert!(!var.is_override());
+        assert_eq!(makefile.to_string(), "private export X := 2\n");
+    }
+
+    #[test]
+    fn test_override_as_variable_name() {
+        let makefile: Makefile = "override := 2\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("override".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("2".to_string()));
+        assert!(!var.is_override());
+    }
+
+    #[test]
+    fn test_export_as_variable_name() {
+        let makefile: Makefile = "export = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("export".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(!var.is_export());
+    }
+
+    #[test]
+    fn test_override_keyword_named_variable() {
+        // GNU make treats this as an override of a variable named `export`.
+        let makefile: Makefile = "override export = 5\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("export".to_string()));
+        assert_eq!(var.raw_value(), Some("5".to_string()));
+        assert!(var.is_override());
+        assert!(!var.is_export());
     }
 
     #[test]
