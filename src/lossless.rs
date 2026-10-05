@@ -813,8 +813,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             // Parse variable name, which may be built from several parts
-            // such as `CFLAGS.${PROG}`.
-            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
+            // such as `CFLAGS.${PROG}`. A bare "export"/"unexport" with no
+            // names applies to all variables.
+            let export_all =
+                is_export_directive && matches!(self.current(), Some(NEWLINE | COMMENT) | None);
+            if !export_all && !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
                 self.error("expected variable name".to_string());
                 self.builder.finish_node();
                 return;
@@ -889,6 +892,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // Bare "export VARNAME" without assignment operator is valid GNU Make
                 Some(NEWLINE) => {
                     self.bump();
+                }
+                Some(COMMENT) if is_export_directive => {
+                    self.bump();
+                    if self.current() == Some(NEWLINE) {
+                        self.bump();
+                    }
                 }
                 None => {
                     // EOF after export VARNAME is fine
@@ -4082,6 +4091,63 @@ all: $(OBJS)
         let makefile = parsed.root();
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(var.names().collect::<Vec<_>>(), vec!["FOO"]);
+    }
+
+    #[test]
+    fn test_export_all() {
+        for text in ["export\n", "export", "unexport\n", "unexport"] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.errors, vec![], "{:?}", text);
+            let makefile = parsed.root();
+            let vars = makefile.variable_definitions().collect::<Vec<_>>();
+            assert_eq!(vars.len(), 1, "{:?}", text);
+            assert_eq!(vars[0].name(), None);
+            assert_eq!(vars[0].names().collect::<Vec<_>>(), Vec::<String>::new());
+            assert_eq!(vars[0].is_export(), text.starts_with("export"));
+            assert_eq!(vars[0].is_unexport(), text.starts_with("unexport"));
+            assert_eq!(makefile.rules().count(), 0);
+            assert_eq!(makefile.code(), text);
+        }
+    }
+
+    #[test]
+    fn test_export_all_followed_by_rule() {
+        let parsed = parse("export\nall:\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["all"]);
+    }
+
+    #[test]
+    fn test_export_names_with_comment() {
+        let parsed = parse("export A B # comment\nexport # all\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let node = parsed.syntax();
+        assert_eq!(
+            format!("{:#?}", node),
+            r##"ROOT@0..34
+  VARIABLE@0..21
+    IDENTIFIER@0..6 "export"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..8 "A"
+    WHITESPACE@8..9 " "
+    IDENTIFIER@9..10 "B"
+    WHITESPACE@10..11 " "
+    COMMENT@11..20 "# comment"
+    NEWLINE@20..21 "\n"
+  VARIABLE@21..34
+    IDENTIFIER@21..27 "export"
+    WHITESPACE@27..28 " "
+    COMMENT@28..33 "# all"
+    NEWLINE@33..34 "\n"
+"##
+        );
+        let vars = parsed.root().variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["A", "B"]);
+        assert_eq!(vars[1].names().collect::<Vec<_>>(), Vec::<String>::new());
     }
 
     #[test]
