@@ -1,5 +1,8 @@
 use super::makefile::MakefileItem;
-use crate::lossless::{node_text, remove_with_preceding_comments, VariableDefinition};
+use crate::lossless::{
+    is_sunsh_operator, node_text, remove_with_preceding_comments, VariableDefinition,
+    ASSIGNMENT_OPERATORS,
+};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -18,6 +21,11 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
         }
     }
     builder.finish_node();
+}
+
+/// Whether `text` is an assignment operator token.
+fn is_assignment_operator(text: &str) -> bool {
+    ASSIGNMENT_OPERATORS.contains(&text) || is_sunsh_operator(text)
 }
 
 impl VariableDefinition {
@@ -79,8 +87,30 @@ impl VariableDefinition {
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
+        // BSD make names may contain almost any character, as in `EXP.[A-]`
+        // or `a:b`, including whitespace inside parentheses and braces.
         self.after_directive_keywords()
-            .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR))
+            .scan(0usize, |level, it| {
+                let in_name = match &it {
+                    rowan::NodeOrToken::Token(t) => match t.kind() {
+                        LPAREN | LBRACE => {
+                            *level += 1;
+                            true
+                        }
+                        RPAREN | RBRACE => {
+                            *level = level.saturating_sub(1);
+                            true
+                        }
+                        NEWLINE | COMMENT => false,
+                        _ if *level > 0 => true,
+                        WHITESPACE => false,
+                        OPERATOR => !is_assignment_operator(t.text()),
+                        _ => true,
+                    },
+                    rowan::NodeOrToken::Node(n) => n.kind() == EXPR,
+                };
+                in_name.then_some(it)
+            })
             .collect()
     }
 
@@ -93,10 +123,17 @@ impl VariableDefinition {
         })
     }
 
-    /// Internal: the EXPR node holding the value, which follows the
-    /// assignment operator (or, for `define`, the name).
+    /// Internal: the EXPR node holding the value, which follows the name
+    /// (or, for BSD make's empty variable name, the assignment operator).
     fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
-        let name_end = self.name_elements().last()?.index();
+        let name_end = match self.name_elements().last() {
+            Some(element) => element.index(),
+            None => self
+                .syntax()
+                .children_with_tokens()
+                .find(|it| it.kind() == OPERATOR)?
+                .index(),
+        };
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR && it.index() > name_end)
@@ -262,7 +299,9 @@ impl VariableDefinition {
 
     /// Get the assignment operator/flavor used in this variable definition
     ///
-    /// Returns the operator as a string: "=", ":=", "::=", ":::=", "+=", "?=", or "!="
+    /// Returns the operator as a string: "=", ":=", "::=", ":::=", "+=", "?=", or "!=",
+    /// or ":sh=" for BSD make's alternative shell assignment operator, which
+    /// may also be written with whitespace as in `VAR :sh = cmd`.
     ///
     /// # Example
     /// ```
@@ -272,15 +311,17 @@ impl VariableDefinition {
     /// assert_eq!(var.assignment_operator(), Some(":=".to_string()));
     /// ```
     pub fn assignment_operator(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|token| {
-                if token.kind() == OPERATOR {
-                    Some(token.text().to_string())
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
+            .map(|t| {
+                if is_sunsh_operator(t.text()) {
+                    ":sh=".to_string()
                 } else {
-                    None
+                    t.text().to_string()
                 }
             })
-        })
     }
 
     /// Get the raw value of the variable definition
@@ -344,13 +385,21 @@ impl VariableDefinition {
     /// assert!(makefile.code().contains("VAR ?= value"));
     /// ```
     pub fn set_assignment_operator(&mut self, op: &str) {
+        // The name may contain operator tokens too, as in BSD make's `a:b=c`.
+        let op_index = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
+            .map(|t| t.index());
+
         // Build a new VARIABLE node, copying all children but replacing the OPERATOR token
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
         for child in self.syntax().children_with_tokens() {
             match child {
-                rowan::NodeOrToken::Token(token) if token.kind() == OPERATOR => {
+                rowan::NodeOrToken::Token(token) if Some(token.index()) == op_index => {
                     builder.token(OPERATOR.into(), op);
                 }
                 rowan::NodeOrToken::Token(token) => {
@@ -1054,5 +1103,16 @@ mod tests {
         let makefile: Makefile = "FOO = a\\#b # comment\n".parse().unwrap();
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(var.raw_value(), Some("a\\#b ".to_string()));
+    }
+
+    #[test]
+    fn test_set_assignment_operator_with_operator_in_name() {
+        let parsed =
+            crate::Makefile::parse_with_variant("a:b=c\n", crate::MakefileVariant::BSDMake);
+        let makefile = parsed.tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("+=");
+        assert_eq!(var.name(), Some("a:b".to_string()));
+        assert_eq!(makefile.code(), "a:b+=c\n");
     }
 }

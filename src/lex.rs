@@ -158,6 +158,24 @@ impl<'a> Lexer<'a> {
         result
     }
 
+    /// Read a comment up to the end of the line. Outside recipes, a comment
+    /// ending in an unescaped backslash continues on the next line.
+    fn read_comment(&mut self) -> String {
+        let mut comment = self.read_while(|c| !Self::is_newline(c));
+        while self.line_type == Some(LineType::Other)
+            && comment.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+            && self.input.peek().is_some_and(|&c| Self::is_newline(c))
+        {
+            let newline = self.input.next().unwrap();
+            comment.push(newline);
+            if newline == '\r' && self.input.peek() == Some(&'\n') {
+                comment.push(self.input.next().unwrap());
+            }
+            comment.push_str(&self.read_while(|c| !Self::is_newline(c)));
+        }
+        comment
+    }
+
     fn read_while<F>(&mut self, predicate: F) -> String
     where
         F: Fn(char) -> bool,
@@ -237,10 +255,7 @@ impl<'a> Lexer<'a> {
                     return Some((SyntaxKind::NEWLINE, text));
                 }
                 '#' if !(self.bsd && after_lbracket && self.line_type == Some(LineType::Other)) => {
-                    return Some((
-                        SyntaxKind::COMMENT,
-                        self.read_while(|c| !Self::is_newline(c)),
-                    ));
+                    return Some((SyntaxKind::COMMENT, self.read_comment()));
                 }
                 _ => {}
             }
@@ -627,6 +642,23 @@ rule: prerequisite
                 (QUOTE, "'{'".to_string()),
                 (WHITESPACE, " ".to_string()),
                 (QUOTE, "'}'".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_continuation() {
+        assert_eq!(
+            lex_default("# a \\\nb\n# c \\\\\nX=1\n"),
+            vec![
+                (COMMENT, "# a \\\nb".to_string()),
+                (NEWLINE, "\n".to_string()),
+                (COMMENT, "# c \\\\".to_string()),
+                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "1".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
         );

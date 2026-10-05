@@ -219,6 +219,30 @@ mod tests {
     }
 
     #[test]
+    fn test_for_loop_continued_header() {
+        let makefile = parse_ok(".for \\\n    var \\\n    in \\\n    a b\n.endfor\n");
+        let Some(MakefileItem::ForLoop(f)) = makefile.items().next() else {
+            panic!("expected for loop");
+        };
+        assert_eq!(f.variables(), vec!["var"]);
+        assert_eq!(f.list(), Some("a b".to_string()));
+    }
+
+    #[test]
+    fn test_continuation_after_dot() {
+        let makefile =
+            parse_ok(".for outer in o\n.\\\n   for inner in i\n.\\\n   endfor\n.endfor\n");
+        let Some(MakefileItem::ForLoop(outer)) = makefile.items().next() else {
+            panic!("expected for loop");
+        };
+        let Some(MakefileItem::ForLoop(inner)) = outer.items().next() else {
+            panic!("expected nested for loop");
+        };
+        assert_eq!(inner.variables(), vec!["inner"]);
+        assert_eq!(inner.list(), Some("i".to_string()));
+    }
+
+    #[test]
     fn test_for_loop_indented_keyword() {
         let makefile = parse_ok(".  for f in a b\n.  endfor\n");
         let Some(MakefileItem::ForLoop(f)) = makefile.items().next() else {
@@ -263,11 +287,41 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_target_list() {
+        let makefile = parse_ok(": empty-source\n\t: command\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().count(), 0);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["empty-source"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec![": command"]);
+
+        let parsed = Makefile::parse_with_variant(": empty-source\n", MakefileVariant::GNUMake);
+        assert!(!parsed.ok());
+    }
+
+    #[test]
     fn test_conditional_in_recipe() {
         let makefile = parse_ok("all:\n.if defined(X)\n\techo x\n.endif\n\techo y\n");
         let rule = makefile.rules().next().unwrap();
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo y"]);
         assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_after_rule_without_recipe() {
+        // The conditional does not continue the recipe, so it is not part
+        // of the rule.
+        let makefile = parse_ok("all: foo\n.if defined(X)\nCFLAGS+= -g\n.endif\n");
+        assert_eq!(makefile.items().count(), 2);
+        assert_eq!(makefile.conditionals().count(), 1);
+    }
+
+    #[test]
+    fn test_for_loop_in_recipe() {
+        let makefile = parse_ok("all:\n.  for d in a b\n\techo ${d}\n.  endfor\n");
+        assert_eq!(makefile.items().count(), 1);
     }
 
     #[test]
@@ -283,6 +337,70 @@ mod tests {
         assert_eq!(var.name(), Some("SRCS".to_string()));
         assert_eq!(var.assignment_operator(), Some("!=".to_string()));
         assert_eq!(var.raw_value(), Some("echo *.c".to_string()));
+    }
+
+    #[test]
+    fn test_empty_variable_name() {
+        let makefile = parse_ok("!=\techo 'command during parsing' 1>&2; echo\n");
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), None);
+        assert_eq!(var.assignment_operator(), Some("!=".to_string()));
+        assert_eq!(
+            var.raw_value(),
+            Some("echo 'command during parsing' 1>&2; echo".to_string())
+        );
+
+        let parsed = Makefile::parse_with_variant("!= echo\n", MakefileVariant::GNUMake);
+        assert!(!parsed.ok());
+    }
+
+    #[test]
+    fn test_unusual_variable_names() {
+        let text = "EXP.[A-]=\tA B ]\nC++=\tvalue\nVAR(spaces in parens)=\t()\n@D=\tx\n*=\tasterisk\n%=\tpercent\n";
+        let makefile = parse_ok(text);
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| (
+                    v.name().unwrap(),
+                    v.assignment_operator().unwrap(),
+                    v.raw_value().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("EXP.[A-]".to_string(), "=".to_string(), "A B ]".to_string()),
+                ("C+".to_string(), "+=".to_string(), "value".to_string()),
+                (
+                    "VAR(spaces in parens)".to_string(),
+                    "=".to_string(),
+                    "()".to_string()
+                ),
+                ("@D".to_string(), "=".to_string(), "x".to_string()),
+                ("*".to_string(), "=".to_string(), "asterisk".to_string()),
+                ("%".to_string(), "=".to_string(), "percent".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_colon_in_variable_name() {
+        // BSD make treats this as an assignment to `a:b`; GNU make, and the
+        // default mode, as a target-specific variable.
+        let parsed = Makefile::parse_with_variant("a:b=c\n", MakefileVariant::BSDMake);
+        assert!(parsed.ok());
+        let var = parsed.tree().variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("a:b".to_string()));
+        assert_eq!(var.raw_value(), Some("c".to_string()));
+
+        let makefile = parse_ok("a:b=c\n");
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_name_with_space_is_not_assignment() {
+        let parsed = Makefile::parse("VARIABLE NAME=\tvalue\n");
+        assert!(!parsed.ok());
+        assert_eq!(parsed.tree().variable_definitions().count(), 0);
     }
 
     #[test]
@@ -324,6 +442,25 @@ mod tests {
     }
 
     #[test]
+    fn test_unclosed_if_in_for() {
+        let parsed = Makefile::parse(".for var in value\n.  if 0\n.endfor\nA=1\n");
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "unterminated .if (missing .endif)")]
+        );
+        let makefile = parsed.tree();
+        assert!(matches!(
+            makefile.items().next(),
+            Some(MakefileItem::ForLoop(_))
+        ));
+        assert_eq!(makefile.items().count(), 2);
+    }
+
+    #[test]
     fn test_for_without_in() {
         let parsed = Makefile::parse(".for x\n.endfor\n");
         assert_eq!(
@@ -342,6 +479,17 @@ mod tests {
         let makefile = parse_ok(".info: message\n");
         let rule = makefile.rules().next().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec![".info"]);
+    }
+
+    #[test]
+    fn test_directive_followed_by_operator() {
+        // With whitespace after the name, this is still a directive.
+        let makefile = parse_ok(".info = x\n.if == \"\"\n.endif\n");
+        let Some(MakefileItem::Directive(d)) = makefile.items().next() else {
+            panic!("expected directive");
+        };
+        assert_eq!(d.argument(), Some("= x".to_string()));
+        assert_eq!(makefile.conditionals().count(), 1);
     }
 
     #[test]
@@ -374,5 +522,96 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "expected condition after .ifdef")]
         );
+    }
+
+    fn parse_bsd(text: &str) -> Makefile {
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile
+    }
+
+    #[test]
+    fn test_sunsh_assignment() {
+        let makefile = parse_bsd(concat!(
+            "VAR:sh=\techo colon-sh\n",
+            "VAR :sh =\techo spaced\n",
+            "VAR :sh :sh=\techo multiple\n",
+            "VAR:sh =\techo space-before-op\n",
+        ));
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| (
+                    v.name().unwrap(),
+                    v.assignment_operator().unwrap(),
+                    v.raw_value().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo colon-sh".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo spaced".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo multiple".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo space-before-op".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sunsh_not_an_operator() {
+        // As in BSD make: `:shell` is part of the name, `:sh` before another
+        // operator is ignored if separated from the name, and part of the
+        // name otherwise. A group of parentheses after `:sh` is ignored too.
+        let makefile = parse_bsd(concat!(
+            "VAR:shell=\techo colon-shell\n",
+            "VAR :sh +=\techo two\n",
+            "VAR:sh !=\techo space-after\n",
+            "VAR :sh(a comment)=\tvalue\n",
+        ));
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| (v.name().unwrap(), v.assignment_operator().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("VAR:shell".to_string(), "=".to_string()),
+                ("VAR".to_string(), "+=".to_string()),
+                ("VAR:sh".to_string(), "!=".to_string()),
+                ("VAR".to_string(), "=".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sunsh_in_default_mode_is_rule() {
+        // GNU make reads this as a rule with a target-specific variable.
+        let makefile = parse_ok("VAR:sh= echo\n");
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_set_assignment_operator_on_sunsh() {
+        let makefile = parse_bsd("VAR :sh =\techo\n");
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("!=");
+        assert_eq!(makefile.code(), "VAR !=\techo\n");
+        assert_eq!(var.assignment_operator(), Some("!=".to_string()));
     }
 }
