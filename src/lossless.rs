@@ -1861,9 +1861,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             for _ in 0..len - trailing_ws {
                 let (_, text) = self.tokens.pop().unwrap();
                 name.push_str(&text);
-                if self.current_token_index > 0 {
-                    self.current_token_index -= 1;
-                }
             }
             if name.is_empty() {
                 self.error("empty variable name in `define`".to_string());
@@ -8862,6 +8859,19 @@ test:
                 3,
                 "foo bar".to_string(),
                 rowan::TextRange::new(19.into(), 20.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_after_multi_token_define_name() {
+        assert_eq!(
+            error_locations("define \\n\n\n\nendef\nfoo bar\n"),
+            vec![(
+                "expected ':'".to_string(),
+                5,
+                "foo bar".to_string(),
+                rowan::TextRange::new(25.into(), 26.into())
             )]
         );
     }
