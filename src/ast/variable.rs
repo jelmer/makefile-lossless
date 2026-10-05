@@ -1423,6 +1423,26 @@ mod tests {
     }
 
     #[test]
+    fn test_value_hash_in_reference() {
+        let code = "X = ${A:M#*} $(a #b) c # d\n";
+        assert_eq!(value_of(code), Some("${A:M#*} $(a #b) c ".to_string()));
+        assert_eq!(posix_value(code), Some("${A:M#*} $(a #b) c ".to_string()));
+        assert_eq!(bsd_value(code), Some("${A:M".to_string()));
+    }
+
+    #[test]
+    fn test_value_bsd_hash_in_reference_parsed_as_default() {
+        let makefile: Makefile = "X = ${A:M#*} b\nY = ${L:[#]}\n".parse().unwrap();
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| v.value(MakefileVariant::BSDMake))
+                .collect::<Vec<_>>(),
+            vec![Some("${A:M".to_string()), Some("${L:[#]}".to_string())]
+        );
+    }
+
+    #[test]
     fn test_value_continuation_in_reference() {
         assert_eq!(
             value_of("X = $(info a \\\n   b)\n"),

@@ -141,6 +141,15 @@ pub(crate) fn logical_text(
     for token in tokens {
         match token.kind() {
             COMMENT if comments && syntax == LineSyntax::Bsd => break,
+            // The tree may come from a variant in which `#` inside a
+            // reference is literal, but BSD make only exempts `[#`.
+            TEXT if comments
+                && syntax == LineSyntax::Bsd
+                && token.text() == "#"
+                && !token.prev_token().is_some_and(|t| t.text().ends_with('[')) =>
+            {
+                break
+            }
             BACKSLASH if is_continuation_backslash(&token) => {
                 let kept = halve(backslashes);
                 backslashes = 0;

@@ -21,6 +21,9 @@ pub struct Lexer<'a> {
     bsd: bool,
     /// Whether GNU make syntax is accepted.
     gnu: bool,
+    /// Whether `#` inside a variable reference or function call is literal,
+    /// as in GNU make, rather than the start of a comment.
+    hash_in_references: bool,
     /// Whether the previous token was a `[`. BSD make does not treat `#` as
     /// a comment there, so that the `:[#]` modifier works.
     after_lbracket: bool,
@@ -49,6 +52,10 @@ impl<'a> Lexer<'a> {
             pending_backslash_escape: false,
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
             gnu: variant != Some(MakefileVariant::BSDMake),
+            hash_in_references: !matches!(
+                variant,
+                Some(MakefileVariant::BSDMake | MakefileVariant::NMake)
+            ),
             after_lbracket: false,
             recipe_continuation: false,
             reference_depth: 0,
@@ -331,7 +338,10 @@ impl<'a> Lexer<'a> {
                     text.extend(self.input.next());
                     return Some((SyntaxKind::NEWLINE, text));
                 }
-                '#' if !(self.bsd && after_lbracket && self.line_type == Some(LineType::Other)) => {
+                '#' if self.line_type == Some(LineType::Other)
+                    && ((self.bsd && after_lbracket)
+                        || (self.hash_in_references && self.reference_depth > 0)) => {}
+                '#' => {
                     return Some((SyntaxKind::COMMENT, self.read_comment()));
                 }
                 _ => {}
@@ -724,8 +734,9 @@ rule: prerequisite
         ];
         assert_eq!(lex("X=${L:[#]}\n", Some(MakefileVariant::BSDMake)), bsd);
         assert_eq!(lex("X=${L:[#]}\n", None), bsd);
+        assert_eq!(lex("X=${L:[#]}\n", Some(MakefileVariant::GNUMake)), bsd);
         assert_eq!(
-            lex("X=${L:[#]}\n", Some(MakefileVariant::GNUMake)),
+            lex("X=${L:[#]}\n", Some(MakefileVariant::NMake)),
             vec![
                 (IDENTIFIER, "X".to_string()),
                 (OPERATOR, "=".to_string()),
@@ -735,6 +746,73 @@ rule: prerequisite
                 (OPERATOR, ":".to_string()),
                 (TEXT, "[".to_string()),
                 (COMMENT, "#]}".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hash_in_reference() {
+        let literal = vec![
+            (IDENTIFIER, "X".to_string()),
+            (OPERATOR, "=".to_string()),
+            (DOLLAR, "$".to_string()),
+            (LPAREN, "(".to_string()),
+            (IDENTIFIER, "a".to_string()),
+            (WHITESPACE, " ".to_string()),
+            (TEXT, "#".to_string()),
+            (IDENTIFIER, "b".to_string()),
+            (RPAREN, ")".to_string()),
+            (WHITESPACE, " ".to_string()),
+            (COMMENT, "#c".to_string()),
+            (NEWLINE, "\n".to_string()),
+        ];
+        let comment = vec![
+            (IDENTIFIER, "X".to_string()),
+            (OPERATOR, "=".to_string()),
+            (DOLLAR, "$".to_string()),
+            (LPAREN, "(".to_string()),
+            (IDENTIFIER, "a".to_string()),
+            (WHITESPACE, " ".to_string()),
+            (COMMENT, "#b) #c".to_string()),
+            (NEWLINE, "\n".to_string()),
+        ];
+        let input = "X=$(a #b) #c\n";
+        assert_eq!(lex(input, None), literal);
+        assert_eq!(lex(input, Some(MakefileVariant::GNUMake)), literal);
+        assert_eq!(lex(input, Some(MakefileVariant::POSIXMake)), literal);
+        assert_eq!(lex(input, Some(MakefileVariant::BSDMake)), comment);
+        assert_eq!(lex(input, Some(MakefileVariant::NMake)), comment);
+    }
+
+    #[test]
+    fn test_hash_after_escaped_dollar() {
+        assert_eq!(
+            lex("X=$$(a #b)\n", Some(MakefileVariant::GNUMake)),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (DOLLAR, "$".to_string()),
+                (DOLLAR, "$".to_string()),
+                (LPAREN, "(".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (COMMENT, "#b)".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hash_in_recipe_reference() {
+        assert_eq!(
+            lex("a:\n\techo $(x #y)\n", Some(MakefileVariant::GNUMake)),
+            vec![
+                (IDENTIFIER, "a".to_string()),
+                (OPERATOR, ":".to_string()),
+                (NEWLINE, "\n".to_string()),
+                (INDENT, "\t".to_string()),
+                (TEXT, "echo $(x #y)".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
         );
