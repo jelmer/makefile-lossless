@@ -2005,8 +2005,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(EXPR.into());
             let mut found_path = false;
 
-            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
+            loop {
                 match self.current() {
+                    None | Some(NEWLINE | COMMENT) => break,
+                    // Leave whitespace before a trailing comment out of the
+                    // path.
+                    Some(WHITESPACE)
+                        if matches!(self.peek_past_ws(), None | Some(NEWLINE | COMMENT)) =>
+                    {
+                        break
+                    }
                     Some(WHITESPACE) => self.skip_ws(),
                     Some(BACKSLASH) if self.is_line_continuation() => {
                         self.consume_line_continuation();
@@ -2020,7 +2028,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         found_path = true;
                         self.bump();
                     }
-                    None => break,
                 }
             }
 
@@ -2029,6 +2036,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+
+            // A trailing comment is not part of the path.
+            self.skip_ws();
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
 
             // Expect newline
             if self.current() == Some(NEWLINE) {
