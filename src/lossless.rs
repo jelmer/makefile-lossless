@@ -151,7 +151,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     impl Parser {
         fn error(&mut self, msg: String) {
             self.builder.start_node(ERROR.into());
+            self.record_error(msg);
+            if self.current().is_some() {
+                self.bump();
+            }
+            self.builder.finish_node();
+        }
 
+        /// Record an error without consuming the current token.
+        fn record_error(&mut self, msg: String) {
             let (line, context) = if self.current() == Some(INDENT) {
                 // For indented lines, report the error on the next line
                 let lines: Vec<&str> = self.original_text.lines().collect();
@@ -191,11 +199,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             });
 
             self.add_positioned_error(message, None);
-
-            if self.current().is_some() {
-                self.bump();
-            }
-            self.builder.finish_node();
         }
 
         /// Add a positioned error at the current token position
@@ -904,7 +907,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // in GreenNodeBuilder::finish).
             let mut open_nested = 0u32;
 
-            while paren_count > 0 && self.current().is_some() {
+            while paren_count > 0 {
+                if self.consume_line_continuation() {
+                    continue;
+                }
                 match self.current() {
                     Some(LPAREN) => {
                         paren_count += 1;
@@ -929,15 +935,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Handle variable references
                         self.parse_variable_reference();
                     }
-                    Some(_) => self.bump(),
-                    None => {
-                        self.error(if is_variable_ref {
+                    // Leave the newline for the caller, like GNU make,
+                    // which does not let the reference span lines.
+                    Some(NEWLINE) | None => {
+                        self.record_error(if is_variable_ref {
                             "unclosed variable reference".to_string()
                         } else {
                             "unclosed parenthesis".to_string()
                         });
                         break;
                     }
+                    Some(_) => self.bump(),
                 }
             }
 
@@ -1225,10 +1233,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
 
                 match self.current() {
-                    None => {
-                        self.error("unterminated conditional (missing endif)".to_string());
-                        break;
-                    }
                     Some(IDENTIFIER) => {
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
@@ -1249,7 +1253,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Be more tolerant of unexpected tokens in conditionals
                         self.bump();
                     }
+                    None => unreachable!("loop condition excludes EOF"),
                 }
+            }
+
+            if depth > 0 && self.is_at_eof() {
+                self.record_error("unterminated conditional (missing endif)".to_string());
             }
 
             self.builder.finish_node();
@@ -8281,6 +8290,74 @@ mod test_continuation {
                 "round-trip mismatch for {src:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_missing_endif_is_error() {
+        let (makefile, errors) = Makefile::from_str_relaxed("ifdef X\nY = 1\n");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unterminated conditional (missing endif)"]
+        );
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\n");
+        assert!("ifdef X\nY = 1\n".parse::<Makefile>().is_err());
+    }
+
+    #[test]
+    fn test_parse_nested_missing_endif_is_error() {
+        let (_, errors) = Makefile::from_str_relaxed("ifdef X\nifdef Y\nZ = 1\nendif\n");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unterminated conditional (missing endif)"]
+        );
+    }
+
+    #[test]
+    fn test_parse_unclosed_conditional_paren_stops_at_eol() {
+        let src = "ifeq ($(X),y\nA = 1\nendif\nB = 2\n";
+        let (makefile, errors) = Makefile::from_str_relaxed(src);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unclosed parenthesis"]
+        );
+        assert_eq!(makefile.to_string(), src);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("($(X),y".to_string()));
+        assert_eq!(cond.to_string(), "ifeq ($(X),y\nA = 1\nendif\n");
+        assert_eq!(makefile.items().count(), 2);
+    }
+
+    #[test]
+    fn test_parse_unclosed_variable_ref_in_conditional_stops_at_eol() {
+        let src = "ifeq (a,$(X\nA = 1\nendif\n";
+        let (makefile, errors) = Makefile::from_str_relaxed(src);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unclosed variable reference", "unclosed parenthesis"]
+        );
+        assert_eq!(makefile.to_string(), src);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("(a,$(X".to_string()));
+    }
+
+    #[test]
+    fn test_parse_conditional_paren_with_continuation() {
+        let src = "ifeq ($(X),\\\n  y)\nA = 1\nendif\n";
+        let makefile: Makefile = src.parse().unwrap();
+        assert_eq!(makefile.to_string(), src);
+        assert_eq!(makefile.conditionals().count(), 1);
     }
 
     #[test]
