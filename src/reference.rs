@@ -107,6 +107,7 @@ pub struct SubstituteFlags {
 
 /// The order requested by the `:O` modifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SortOrder {
     /// `:O`: sort words lexicographically.
     Ascending,
@@ -351,6 +352,7 @@ pub struct ParsedReference {
 
 /// An error parsing a variable reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReferenceError {
     /// The reference is malformed.
     Syntax {

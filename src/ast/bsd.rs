@@ -106,7 +106,7 @@ impl ForLoop {
     ///     .body_items()
     ///     .map(|item| match item {
     ///         ConditionalItem::Recipe(r) => r.text(),
-    ///         ConditionalItem::Item(_) => panic!("expected recipe"),
+    ///         _ => panic!("expected recipe"),
     ///     })
     ///     .collect();
     /// assert_eq!(recipes, vec!["echo ${f}"]);

@@ -59,6 +59,7 @@ pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// The variant of makefile being parsed
+#[non_exhaustive]
 pub enum MakefileVariant {
     /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
     GNUMake,
@@ -75,6 +76,7 @@ pub enum MakefileVariant {
 #[allow(non_camel_case_types)]
 #[repr(u16)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum SyntaxKind {
     IDENTIFIER = 0,
     INDENT,
