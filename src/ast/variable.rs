@@ -1,5 +1,7 @@
 use super::makefile::MakefileItem;
-use crate::lossless::{node_text, remove_with_preceding_comments, VariableDefinition};
+use crate::lossless::{
+    node_text, remove_with_preceding_comments, VariableDefinition, ASSIGNMENT_OPERATORS,
+};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -79,8 +81,30 @@ impl VariableDefinition {
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
+        // BSD make names may contain almost any character, as in `EXP.[A-]`
+        // or `a:b`, including whitespace inside parentheses and braces.
         self.after_directive_keywords()
-            .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR))
+            .scan(0usize, |level, it| {
+                let in_name = match &it {
+                    rowan::NodeOrToken::Token(t) => match t.kind() {
+                        LPAREN | LBRACE => {
+                            *level += 1;
+                            true
+                        }
+                        RPAREN | RBRACE => {
+                            *level = level.saturating_sub(1);
+                            true
+                        }
+                        NEWLINE | COMMENT => false,
+                        _ if *level > 0 => true,
+                        WHITESPACE => false,
+                        OPERATOR => !ASSIGNMENT_OPERATORS.contains(&t.text()),
+                        _ => true,
+                    },
+                    rowan::NodeOrToken::Node(n) => n.kind() == EXPR,
+                };
+                in_name.then_some(it)
+            })
             .collect()
     }
 
@@ -93,10 +117,17 @@ impl VariableDefinition {
         })
     }
 
-    /// Internal: the EXPR node holding the value, which follows the
-    /// assignment operator (or, for `define`, the name).
+    /// Internal: the EXPR node holding the value, which follows the name
+    /// (or, for BSD make's empty variable name, the assignment operator).
     fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
-        let name_end = self.name_elements().last()?.index();
+        let name_end = match self.name_elements().last() {
+            Some(element) => element.index(),
+            None => self
+                .syntax()
+                .children_with_tokens()
+                .find(|it| it.kind() == OPERATOR)?
+                .index(),
+        };
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR && it.index() > name_end)
@@ -272,15 +303,11 @@ impl VariableDefinition {
     /// assert_eq!(var.assignment_operator(), Some(":=".to_string()));
     /// ```
     pub fn assignment_operator(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|token| {
-                if token.kind() == OPERATOR {
-                    Some(token.text().to_string())
-                } else {
-                    None
-                }
-            })
-        })
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == OPERATOR && ASSIGNMENT_OPERATORS.contains(&t.text()))
+            .map(|t| t.text().to_string())
     }
 
     /// Get the raw value of the variable definition

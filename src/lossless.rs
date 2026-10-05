@@ -119,6 +119,8 @@ pub(crate) struct Parse {
     pub(crate) positioned_errors: Vec<PositionedParseError>,
 }
 
+pub(crate) const ASSIGNMENT_OPERATORS: &[&str] = &["=", ":=", "::=", ":::=", "+=", "?=", "!="];
+
 /// BSD make directives, without the leading dot.
 const BSD_DIRECTIVES: &[&str] = &[
     "include",
@@ -142,6 +144,7 @@ const BSD_DIRECTIVES: &[&str] = &[
     "break",
     "undef",
     "export",
+    "export-all",
     "export-env",
     "export-literal",
     "unexport",
@@ -215,6 +218,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         original_text: String,
         /// The makefile variant
         variant: Option<MakefileVariant>,
+        /// Number of enclosing BSD `.for` loops.
+        for_depth: usize,
         /// Parity of the current run of bumped BACKSLASH tokens: true once an
         /// odd number have been seen, meaning the next backslash is escaped
         /// (`\\`) and a following newline is a literal backslash, not a line
@@ -541,7 +546,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // any other directive ends the rule.
                         if let Some((name, count)) = self.bsd_directive() {
                             let is_block = is_bsd_if(name) || name == "for";
-                            if !is_block || (conditional_depth == 0 && newline_count >= 1) {
+                            if !is_block
+                                || (conditional_depth == 0
+                                    && (newline_count >= 1 || !self.conditional_continues_recipe()))
+                            {
                                 break;
                             }
                             newline_count = 0;
@@ -611,6 +619,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// directive, so if no recipe line follows the conditional doesn't
         /// belong to the preceding rule.
         fn conditional_continues_recipe(&self) -> bool {
+            let bsd = self.bsd_directives_enabled();
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
             let mut tokens = self
@@ -620,9 +629,38 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .filter(|(kind, _)| *kind != WHITESPACE)
                 .peekable();
             while let Some((kind, text)) = tokens.peek() {
+                // The name of a BSD directive such as `.if` or `.  if`
+                let bsd_name = match (*kind, text.as_str()) {
+                    (IDENTIFIER, ".") if bsd => tokens
+                        .clone()
+                        .nth(1)
+                        .filter(|(kind, _)| *kind == IDENTIFIER)
+                        .map(|(_, name)| name.as_str()),
+                    (IDENTIFIER, t) if bsd => t.strip_prefix('.'),
+                    _ => None,
+                };
                 match (*kind, text.as_str()) {
                     (NEWLINE | COMMENT, _) => {}
                     (INDENT, _) if in_rule => return true,
+                    // `.for` is tracked like a conditional with no else
+                    // branch, as its body may run zero times.
+                    _ if bsd_name.is_some_and(|n| is_bsd_if(n) || n == "for") => {
+                        stack.push(ConditionalRuleContext::new(in_rule))
+                    }
+                    _ if bsd_name.is_some_and(|n| is_bsd_elif(n) || n == "else") => {
+                        match stack.last_mut() {
+                            Some(context) => {
+                                in_rule = context.next_branch(in_rule, bsd_name == Some("else"))
+                            }
+                            None => return false,
+                        }
+                    }
+                    _ if bsd_name.is_some_and(|n| n == "endif" || n == "endfor") => {
+                        match stack.pop() {
+                            Some(context) => in_rule = context.end(in_rule),
+                            None => return false,
+                        }
+                    }
                     (IDENTIFIER, t) if Self::is_conditional_start(t) => {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
@@ -652,6 +690,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
             false
+        }
+
+        fn at_assignment_operator(&self) -> bool {
+            matches!(self.tokens.last(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str()))
         }
 
         fn line_has_dependency_operator(&self) -> bool {
@@ -698,7 +740,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Parse targets in a TARGETS node
             self.skip_ws();
             self.builder.start_node(TARGETS.into());
-            let has_target = self.parse_rule_targets();
+            // BSD make allows an empty list of targets, as in `: source`.
+            let has_target = (self.bsd_directives_enabled() && self.at_dependency_operator())
+                || self.parse_rule_targets();
             self.builder.finish_node();
 
             // Find and consume the colon
@@ -763,11 +807,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             tokens.next_if(|(kind, _)| *kind == WHITESPACE);
             tokens.next().is_some_and(|(kind, text)| {
-                *kind == OPERATOR
-                    && matches!(
-                        text.as_str(),
-                        "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
-                    )
+                *kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text.as_str())
             })
         }
 
@@ -1020,7 +1060,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             match self.current() {
                 Some(OPERATOR) => {
                     let op = &self.tokens.last().unwrap().1;
-                    if ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&op.as_str()) {
+                    if ASSIGNMENT_OPERATORS.contains(&op.as_str()) {
                         self.bump();
                         self.skip_ws();
                         self.parse_assignment_value();
@@ -1048,6 +1088,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Parse a variable name, which may be built from several parts such
         /// as `CFLAGS.${PROG}` or `a\b`. Returns false if there is no name.
         fn parse_variable_name(&mut self) -> bool {
+            if self.bsd_directives_enabled() {
+                return self.parse_bsd_variable_name();
+            }
             if !matches!(self.current(), Some(IDENTIFIER | DOLLAR | BACKSLASH))
                 || self.is_line_continuation()
             {
@@ -1061,6 +1104,38 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
                     Some(DOLLAR) => self.parse_variable_reference(),
                     _ => return true,
+                }
+            }
+        }
+
+        /// Parse a variable name as BSD make does: it may contain almost any
+        /// character, as in `EXP.[A-]`, and be empty, as in `!= command` to
+        /// run a command while parsing. Returns false if there is no name and
+        /// no assignment operator.
+        fn parse_bsd_variable_name(&mut self) -> bool {
+            if matches!(self.current(), None | Some(NEWLINE | COMMENT | WHITESPACE))
+                || self.is_line_continuation()
+            {
+                return false;
+            }
+            let mut level = 0usize;
+            loop {
+                match self.current() {
+                    None | Some(NEWLINE | COMMENT) => return true,
+                    // A backslash is part of the name unless it continues
+                    // the line.
+                    Some(BACKSLASH) if self.is_line_continuation() => return true,
+                    Some(WHITESPACE) if level == 0 => return true,
+                    Some(OPERATOR) if level == 0 && self.at_assignment_operator() => return true,
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(kind) => {
+                        match kind {
+                            LPAREN | LBRACE => level += 1,
+                            RPAREN | RBRACE => level = level.saturating_sub(1),
+                            _ => {}
+                        }
+                        self.bump();
+                    }
                 }
             }
         }
@@ -1592,7 +1667,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // that e.g. "vpath = foo" defines a variable.
             if self.is_define_line() {
                 self.parse_define();
-            } else if self.is_assignment_line() {
+            } else if self.is_assignment_line()
+                || (self.bsd_directives_enabled()
+                    && self.is_bsd_assignment_line()
+                    && (self.variant == Some(MakefileVariant::BSDMake)
+                        || !self.line_has_dependency_operator()))
+            {
                 self.parse_assignment();
             } else if self.current() == Some(IDENTIFIER)
                 && matches!(
@@ -1770,7 +1850,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// name without the leading dot (e.g. `if`, `-include`) and the
         /// number of tokens making up the keyword: `.if` is a single token,
         /// while `.  if` (whitespace after the dot, used for indenting
-        /// nested directives) is three.
+        /// nested directives) is three. Line continuations may also appear
+        /// between the dot and the name.
         fn bsd_directive(&self) -> Option<(&'static str, usize)> {
             if !self.bsd_directives_enabled() {
                 return None;
@@ -1781,22 +1862,33 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return None;
             }
             let (name, count) = if text == "." {
-                if n < 3 || self.tokens[n - 2].0 != WHITESPACE || self.tokens[n - 3].0 != IDENTIFIER
-                {
+                // Skip whitespace and line continuations between the dot
+                // and the name.
+                let mut i = n - 1;
+                loop {
+                    i = i.checked_sub(1)?;
+                    match self.tokens[i].0 {
+                        WHITESPACE | INDENT => {}
+                        BACKSLASH if i > 0 && self.tokens[i - 1].0 == NEWLINE => i -= 1,
+                        _ => break,
+                    }
+                }
+                if i == n - 2 || self.tokens[i].0 != IDENTIFIER {
                     return None;
                 }
-                (self.tokens[n - 3].1.as_str(), 3)
+                (self.tokens[i].1.as_str(), n - i)
             } else {
                 (text.strip_prefix('.')?, 1)
             };
             let name = *BSD_DIRECTIVES.iter().find(|d| **d == name)?;
-            // Something like `.export: foo` or `.info = x` is a rule or an
-            // assignment rather than a directive.
-            let next = self.tokens[..n - count]
-                .iter()
-                .rev()
-                .find(|(kind, _)| *kind != WHITESPACE);
-            if matches!(next, Some((OPERATOR, op)) if op != "!") {
+            // Like BSD make, require whitespace or the end of the line after
+            // the name, so that `.info: foo` is a dependency line. The
+            // conditional and loop directives are more lenient, as in `.if!0`.
+            let lenient = is_bsd_if(name)
+                || is_bsd_elif(name)
+                || matches!(name, "else" | "endif" | "for" | "endfor");
+            let next = self.tokens[..n - count].last();
+            if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
                 return None;
             }
             Some((name, count))
@@ -1834,7 +1926,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// an optional comment and the newline. If `required` names the
         /// directive, an empty argument is reported as an error.
         fn parse_directive_argument(&mut self, required: Option<&str>) {
-            self.skip_ws();
+            self.skip_ws_and_continuations();
             self.builder.start_node(EXPR.into());
             let mut found = false;
             while let Some(kind) = self.current() {
@@ -1942,6 +2034,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.builder.finish_node();
                         break;
                     }
+                    // A `.for` body is plain text to make, so `.endfor` ends
+                    // the loop even if a conditional inside it is still open.
+                    "endfor" if self.for_depth > 0 => {
+                        self.record_error("unterminated .if (missing .endif)".to_string());
+                        self.in_rule = rule_context.end(self.in_rule);
+                        break;
+                    }
                     _ => self.parse_block_item(),
                 }
             }
@@ -1954,12 +2053,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(FOR_LOOP.into());
             self.builder.start_node(FOR_HEADER.into());
             self.bump_n(count);
-            self.skip_ws();
+            self.skip_ws_and_continuations();
             let mut found_variable = false;
             while self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 != "in" {
                 found_variable = true;
                 self.bump();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
             if !found_variable {
                 self.record_error("expected variable name after .for".to_string());
@@ -1976,6 +2075,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // after the loop if it holds both before and after the body.
             let outer_in_rule = self.in_rule;
 
+            self.for_depth += 1;
             loop {
                 if self.is_at_eof() {
                     self.record_error("unterminated .for (missing .endfor)".to_string());
@@ -1993,6 +2093,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ => self.parse_block_item(),
                 }
             }
+            self.for_depth -= 1;
 
             self.builder.finish_node();
         }
@@ -2198,7 +2299,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_assignment();
                     true
                 }
-                Some(ERROR) if self.line_has_dependency_operator() => {
+                Some(OPERATOR)
+                    if self.bsd_directives_enabled() && self.at_assignment_operator() =>
+                {
+                    self.parse_assignment();
+                    true
+                }
+                Some(OPERATOR)
+                    if self.bsd_directives_enabled() && self.at_dependency_operator() =>
+                {
+                    self.parse_rule();
+                    true
+                }
+                Some(ERROR)
+                    if self.line_has_dependency_operator()
+                        || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) =>
+                {
                     self.parse_normal_content();
                     true
                 }
@@ -2263,19 +2379,43 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// BSD make's rule for recognizing an assignment (`Parse_IsVar`):
+        /// outside parentheses and braces, the line contains an assignment
+        /// operator before any whitespace-separated second word. The name
+        /// may contain almost any character, as in `EXP.[A-]=` or `a:b=c`.
+        fn is_bsd_assignment_line(&self) -> bool {
+            let mut level = 0i32;
+            let mut seen_name = false;
+            let mut seen_space = false;
+            for (kind, text) in self.tokens.iter().rev() {
+                match kind {
+                    NEWLINE | COMMENT => return false,
+                    LPAREN | LBRACE => {
+                        level += 1;
+                        seen_name = true;
+                    }
+                    RPAREN | RBRACE => level -= 1,
+                    _ if level != 0 => {}
+                    WHITESPACE => seen_space = seen_name,
+                    OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
+                    _ if seen_space => return false,
+                    _ => seen_name = true,
+                }
+            }
+            false
+        }
+
         fn has_assignment_operator_on_line(&self) -> bool {
             self.tokens
                 .iter()
                 .rev()
                 .take_while(|(kind, _)| *kind != NEWLINE)
                 .any(|(kind, text)| {
-                    *kind == OPERATOR
-                        && ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&text.as_str())
+                    *kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text.as_str())
                 })
         }
 
         fn is_assignment_line(&mut self) -> bool {
-            let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
             let is_directive = |text: &str| {
                 matches!(
                     text,
@@ -2306,7 +2446,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match kind {
                     NEWLINE => break,
                     IDENTIFIER if is_directive(text) => seen_directive = true,
-                    OPERATOR if assignment_ops.contains(&text.as_str()) => {
+                    OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => {
                         return seen_name || seen_directive
                     }
                     OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
@@ -2377,6 +2517,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        fn skip_ws_and_continuations(&mut self) {
+            loop {
+                self.skip_ws();
+                if !self.consume_line_continuation() {
+                    break;
+                }
+            }
+        }
+
         fn skip_until_newline(&mut self) {
             while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 self.bump();
@@ -2440,6 +2589,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         token_positions,
         original_text: text.to_string(),
         variant,
+        for_depth: 0,
         pending_backslash_escape: false,
         in_rule: false,
     }
