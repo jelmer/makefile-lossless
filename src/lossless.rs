@@ -750,15 +750,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
-            // Parse variable name
-            match self.current() {
-                Some(IDENTIFIER) => self.bump(),
-                Some(DOLLAR) => self.parse_variable_reference(),
-                _ => {
-                    self.error("expected variable name".to_string());
-                    self.builder.finish_node();
-                    return;
-                }
+            if !self.parse_variable_name() {
+                self.error("expected variable name".to_string());
+                self.builder.finish_node();
+                return;
             }
 
             // Skip whitespace and parse operator
@@ -817,6 +812,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Parse a variable name, which may be built up from several adjacent
+        /// parts, e.g. `obj-$(X)`. Returns false if there is no name.
+        fn parse_variable_name(&mut self) -> bool {
+            let mut has_name = false;
+            loop {
+                match self.current() {
+                    Some(IDENTIFIER) => self.bump(),
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    _ => return has_name,
+                }
+                has_name = true;
+            }
         }
 
         fn parse_variable_reference(&mut self) {
@@ -1383,11 +1392,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Consume the `define` keyword itself.
             self.bump();
-            // Optional whitespace then the variable name (an IDENTIFIER).
+            // Optional whitespace then the variable name.
             self.skip_ws();
-            if self.current() == Some(IDENTIFIER) {
-                self.bump();
-            }
+            self.parse_variable_name();
             self.skip_ws();
             // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
             if self.current() == Some(OPERATOR) {
@@ -1588,21 +1595,44 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
             let mut pos = self.tokens.len().saturating_sub(1);
-            let mut seen_identifier = false;
             let mut seen_directive = false; // export or override prefix
+            let mut seen_name = false;
+            // Set once whitespace follows the name; further name parts mean
+            // this is not an assignment.
+            let mut name_done = false;
+            // Nesting depth inside a `$(...)` or `${...}` in the name
+            let mut depth = 0usize;
 
             while pos > 0 {
                 let (kind, text) = &self.tokens[pos];
 
+                if depth > 0 {
+                    match kind {
+                        NEWLINE => break,
+                        LPAREN | LBRACE => depth += 1,
+                        RPAREN | RBRACE => depth -= 1,
+                        _ => (),
+                    }
+                    pos -= 1;
+                    continue;
+                }
+
                 match kind {
                     NEWLINE => break,
                     IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
-                    IDENTIFIER if !seen_identifier => seen_identifier = true,
+                    IDENTIFIER if !name_done => seen_name = true,
+                    DOLLAR if !name_done => {
+                        seen_name = true;
+                        if matches!(self.tokens[pos - 1].0, LPAREN | LBRACE) {
+                            depth = 1;
+                            pos -= 1;
+                        }
+                    }
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
-                        return seen_identifier || seen_directive
+                        return seen_name || seen_directive
                     }
                     OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
-                    WHITESPACE => (),
+                    WHITESPACE => name_done = seen_name,
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
@@ -2965,6 +2995,16 @@ mod tests {
     }
 
     #[test]
+    fn test_define_computed_name() {
+        let code = "define cmd_$(X)\nfoo\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("cmd_$(X)".to_string()));
+        assert_eq!(var.raw_value(), Some("foo\n".to_string()));
+    }
+
+    #[test]
     fn test_parse_simple() {
         const SIMPLE: &str = r#"VARIABLE = value
 
@@ -3049,6 +3089,73 @@ rule: dependency
         let variable = variables.pop().unwrap();
         assert_eq!(variable.name(), Some("VARIABLE".to_string()));
         assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_computed_variable_name() {
+        let parsed = parse(
+            "obj-$(X) += a.o\nmmu-$(X)\t:= a.o\n$(prefix)_FLAGS = -O2\nexport ${Y}z ?= 1\n",
+            None,
+        );
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.rules().count(), 0);
+        let vars = root
+            .variable_definitions()
+            .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vars,
+            vec![
+                (
+                    Some("obj-$(X)".to_string()),
+                    Some("+=".to_string()),
+                    Some("a.o".to_string())
+                ),
+                (
+                    Some("mmu-$(X)".to_string()),
+                    Some(":=".to_string()),
+                    Some("a.o".to_string())
+                ),
+                (
+                    Some("$(prefix)_FLAGS".to_string()),
+                    Some("=".to_string()),
+                    Some("-O2".to_string())
+                ),
+                (
+                    Some("${Y}z".to_string()),
+                    Some("?=".to_string()),
+                    Some("1".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_rules_with_references_in_targets() {
+        let parsed = parse(
+            "$(OBJS): foo.h\n$(OUT)/%.o: %.c\n\tcc\n$(SRCS:.c=.o): bar.h\nfoo: X = 1\n",
+            None,
+        );
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 0);
+        let rules = root
+            .rules()
+            .map(|r| (r.targets().collect(), r.prerequisites().collect()))
+            .collect::<Vec<(Vec<String>, Vec<String>)>>();
+        assert_eq!(
+            rules,
+            vec![
+                (vec!["$(OBJS)".to_string()], vec!["foo.h".to_string()]),
+                (vec!["$(OUT)/%.o".to_string()], vec!["%.c".to_string()]),
+                (vec!["$(SRCS:.c=.o)".to_string()], vec!["bar.h".to_string()]),
+                (vec!["foo".to_string()], vec![]),
+            ]
+        );
+        let scoped = root.rules().nth(3).unwrap().scoped_assignment().unwrap();
+        assert_eq!(scoped.name(), Some("X".to_string()));
+        assert_eq!(scoped.raw_value(), Some("1".to_string()));
     }
 
     #[test]

@@ -21,25 +21,43 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 }
 
 impl VariableDefinition {
-    /// Internal: the token holding the variable's name, i.e. the first
-    /// IDENTIFIER that isn't a directive keyword (`export`/`override`/
-    /// `define`). Single source of truth for [`Self::name`],
-    /// [`Self::name_range`] and [`Self::set_name`].
-    fn name_token(&self) -> Option<crate::lossless::SyntaxToken> {
+    /// Internal: the elements making up the variable's name, i.e. the
+    /// adjacent IDENTIFIER tokens and variable reference EXPR nodes following
+    /// any directive keywords (`export`/`override`/`define`). Usually a single
+    /// IDENTIFIER, but computed names like `obj-$(X)` have several parts.
+    /// Single source of truth for [`Self::name`], [`Self::name_range`] and
+    /// [`Self::set_name`].
+    fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
         self.syntax()
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| {
-                t.kind() == IDENTIFIER
-                    && t.text() != "export"
-                    && t.text() != "override"
-                    && t.text() != "define"
+            .skip_while(|it| {
+                it.kind() == WHITESPACE
+                    || it.as_token().is_some_and(|t| {
+                        t.kind() == IDENTIFIER
+                            && matches!(t.text(), "export" | "override" | "define")
+                    })
             })
+            .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
+            .collect()
+    }
+
+    /// Internal: the EXPR node holding the value, i.e. the first EXPR after
+    /// the operator, or after the header line of a `define` without one.
+    fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
+        self.syntax()
+            .children_with_tokens()
+            .skip_while(|it| !matches!(it.kind(), OPERATOR | NEWLINE))
+            .filter_map(|it| it.into_node())
+            .find(|it| it.kind() == EXPR)
     }
 
     /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
-        self.name_token().map(|t| t.text().to_string())
+        let elements = self.name_elements();
+        if elements.is_empty() {
+            return None;
+        }
+        Some(elements.iter().map(|it| it.to_string()).collect())
     }
 
     /// The source range covering just the variable's name.
@@ -59,7 +77,10 @@ impl VariableDefinition {
     /// assert_eq!(usize::from(range.end()), 10);
     /// ```
     pub fn name_range(&self) -> Option<rowan::TextRange> {
-        self.name_token().map(|t| t.text_range())
+        let elements = self.name_elements();
+        let start = elements.first()?.text_range().start();
+        let end = elements.last()?.text_range().end();
+        Some(rowan::TextRange::new(start, end))
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -122,10 +143,7 @@ impl VariableDefinition {
 
     /// Get the raw value of the variable definition
     pub fn raw_value(&self) -> Option<String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.text().into())
+        self.value_expr().map(|it| it.text().into())
     }
 
     /// Get the parent item of this variable definition, if any
@@ -239,19 +257,23 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "export BAZ := bar\n");
     /// ```
     pub fn set_name(&mut self, new_name: &str) {
-        let Some(name_token) = self.name_token() else {
+        let elements = self.name_elements();
+        let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
             return;
         };
-        let name_index = name_token.index();
+        let name_indices = first.index()..=last.index();
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
         for child in self.syntax().children_with_tokens() {
-            match child {
-                rowan::NodeOrToken::Token(token) if token.index() == name_index => {
+            if name_indices.contains(&child.index()) {
+                if child.index() == *name_indices.start() {
                     builder.token(IDENTIFIER.into(), new_name);
                 }
+                continue;
+            }
+            match child {
                 rowan::NodeOrToken::Token(token) => {
                     builder.token(token.kind().into(), token.text());
                 }
@@ -298,7 +320,7 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = value\n");
     /// ```
     pub fn trim_trailing_value_whitespace(&mut self) -> bool {
-        let Some(expr) = self.syntax().children().find(|c| c.kind() == EXPR) else {
+        let Some(expr) = self.value_expr() else {
             return false;
         };
 
@@ -338,11 +360,7 @@ impl VariableDefinition {
     /// ```
     pub fn set_value(&mut self, new_value: &str) {
         // Find the EXPR node containing the value
-        let expr_index = self
-            .syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.index());
+        let expr_index = self.value_expr().map(|it| it.index());
 
         if let Some(expr_idx) = expr_index {
             // Build a new EXPR node with the new value
@@ -596,6 +614,38 @@ mod tests {
                 var.name().unwrap().as_str()
             );
         }
+    }
+
+    #[test]
+    fn test_name_range_computed_name() {
+        let text = "export obj-$(X)_y := $(Z)\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(
+            &text[range.start().into()..range.end().into()],
+            "obj-$(X)_y"
+        );
+    }
+
+    #[test]
+    fn test_set_name_computed_name() {
+        let makefile: Makefile = "export obj-$(X)_y := $(Z)\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("FOO");
+        assert_eq!(var.name(), Some("FOO".to_string()));
+        assert_eq!(var.raw_value(), Some("$(Z)".to_string()));
+        assert_eq!(makefile.code(), "export FOO := $(Z)\n");
+    }
+
+    #[test]
+    fn test_set_value_computed_name() {
+        let makefile: Makefile = "$(X) = a \n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.trim_trailing_value_whitespace());
+        assert_eq!(var.raw_value(), Some("a".to_string()));
+        var.set_value("b");
+        assert_eq!(makefile.code(), "$(X) = b\n");
     }
 
     #[test]
