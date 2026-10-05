@@ -123,6 +123,7 @@ impl Include {
         let Some(parent) = self.syntax().parent() else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot remove include: no parent node".to_string(),
                     line: 1,
                     context: "include_remove".to_string(),

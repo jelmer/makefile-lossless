@@ -40,8 +40,8 @@ pub use bsd_condition::{
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
-    ForLoop, Identifier, Include, Lang, Makefile, ParseError, PositionedParseError, Recipe,
-    RecipeVariableReference, Rule, VariableDefinition, VariableReference, Vpath,
+    ForLoop, Identifier, Include, Lang, Makefile, ParseError, ParseErrorKind, PositionedParseError,
+    Recipe, RecipeVariableReference, Rule, VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
 pub use reference::{

@@ -975,6 +975,7 @@ impl Rule {
             .ok_or_else(|| {
                 Error::Parse(ParseError {
                     errors: vec![ErrorInfo {
+                        kind: crate::ParseErrorKind::Other,
                         message: "No operator found in rule".to_string(),
                         line: 1,
                         context: "set_prerequisites".to_string(),
@@ -1034,6 +1035,7 @@ impl Rule {
         let targets_index = targets_index.ok_or_else(|| {
             Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "No TARGETS node found in rule".to_string(),
                     line: 1,
                     context: "rename_target".to_string(),
@@ -1084,6 +1086,7 @@ impl Rule {
         if targets.is_empty() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot set empty targets list for a rule".to_string(),
                     line: 1,
                     context: "set_targets".to_string(),
@@ -1105,6 +1108,7 @@ impl Rule {
         let targets_index = targets_index.ok_or_else(|| {
             Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "No TARGETS node found in rule".to_string(),
                     line: 1,
                     context: "set_targets".to_string(),
@@ -1170,6 +1174,7 @@ impl Rule {
         if new_targets.is_empty() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot remove all targets from a rule".to_string(),
                     line: 1,
                     context: "remove_target".to_string(),
@@ -1191,6 +1196,7 @@ impl Rule {
         let targets_index = targets_index.ok_or_else(|| {
             Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "No TARGETS node found in rule".to_string(),
                     line: 1,
                     context: "remove_target".to_string(),
@@ -1228,6 +1234,7 @@ impl Rule {
         let parent = self.syntax().parent().ok_or_else(|| {
             Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Rule has no parent".to_string(),
                     line: 1,
                     context: "remove".to_string(),
