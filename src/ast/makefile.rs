@@ -1605,35 +1605,27 @@ impl Makefile {
     /// # Arguments
     /// * `path` - The file path to include (e.g., "config.mk")
     ///
+    /// `#` is escaped as needed, so that [`Include::path`] returns `path`.
+    /// Returns an error if `path` can not be written in an include
+    /// directive, such as a path containing a newline.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
     /// let mut makefile = Makefile::new();
-    /// makefile.add_include("config.mk");
+    /// makefile.add_include("config.mk").unwrap();
     /// assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["config.mk"]);
     /// ```
-    pub fn add_include(&mut self, path: &str) -> Include {
-        let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(INCLUDE.into());
-        builder.token(IDENTIFIER.into(), "include");
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap path in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), path);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+    pub fn add_include(&mut self, path: &str) -> Result<Include, Error> {
+        let syntax = Include::new(path, &line_ending(self.syntax()))?
+            .syntax()
+            .clone();
 
         // Insert at the beginning (position 0)
         self.syntax().splice_children(0..0, vec![syntax.into()]);
 
         // Return the newly added include (first child)
-        Include::cast(self.syntax().children().next().unwrap()).unwrap()
+        Ok(Include::cast(self.syntax().children().next().unwrap()).unwrap())
     }
 
     /// Insert an include directive at a specific position
@@ -1643,6 +1635,10 @@ impl Makefile {
     /// # Arguments
     /// * `index` - The position to insert at (0 = beginning, items().count() = end)
     /// * `path` - The file path to include (e.g., "config.mk")
+    ///
+    /// `#` is escaped as needed, so that [`Include::path`] returns `path`.
+    /// Returns an error if `path` can not be written in an include
+    /// directive, such as a path containing a newline.
     ///
     /// # Example
     /// ```
@@ -1666,21 +1662,9 @@ impl Makefile {
             }));
         }
 
-        let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(INCLUDE.into());
-        builder.token(IDENTIFIER.into(), "include");
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap path in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), path);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = Include::new(path, &line_ending(self.syntax()))?
+            .syntax()
+            .clone();
 
         let target_index = if index == items.len() {
             // Insert at the end
@@ -1707,6 +1691,10 @@ impl Makefile {
     /// * `after` - The MakefileItem to insert after
     /// * `path` - The file path to include (e.g., "config.mk")
     ///
+    /// `#` is escaped as needed, so that [`Include::path`] returns `path`.
+    /// Returns an error if `path` can not be written in an include
+    /// directive, such as a path containing a newline.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1721,21 +1709,9 @@ impl Makefile {
         after: &MakefileItem,
         path: &str,
     ) -> Result<Include, Error> {
-        let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(INCLUDE.into());
-        builder.token(IDENTIFIER.into(), "include");
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap path in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), path);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = Include::new(path, &line_ending(self.syntax()))?
+            .syntax()
+            .clone();
 
         // Find the position of the item to insert after
         let after_syntax = after.syntax();
