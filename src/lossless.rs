@@ -749,9 +749,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(PREREQUISITES.into());
             // Only the first `|` separates normal from order-only
             // prerequisites; GNU make takes any later one as a file name.
-            // BSD make has no order-only prerequisites and takes any `|` as a
-            // file name.
-            let mut seen_pipe = self.is_bsd_make();
+            // Other makes have no order-only prerequisites and take any `|`
+            // as a file name.
+            let mut seen_pipe = !self.gnu_directives_enabled();
 
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 // The prerequisite list may continue on the next physical line.
@@ -1064,9 +1064,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `sinclude` directive. Like make, this requires whitespace after
         /// the keyword, so `include: foo` is a rule. BSD make also treats a
         /// line with a dependency operator followed by whitespace, as in
-        /// `include foo: bar`, as a rule.
+        /// `include foo: bar`, as a rule. POSIX make has no `sinclude`, and
+        /// nmake only has `!INCLUDE`.
         fn at_include_keyword(&self) -> bool {
-            if !self.at_keyword(&["include", "-include", "sinclude"]) {
+            let keywords: &[&str] = match self.variant {
+                Some(MakefileVariant::NMake) => &[],
+                Some(MakefileVariant::POSIXMake) => &["include", "-include"],
+                _ => &["include", "-include", "sinclude"],
+            };
+            if !self.at_keyword(keywords) {
                 return false;
             }
             let mut tokens = self.tokens.iter().rev().skip(1).peekable();
@@ -1250,9 +1256,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `$(OBJS): %.o: %.c`. Colons inside variable references, after an
         /// inline recipe's `;` or in a comment don't count.
         fn has_static_pattern_colon(&self) -> bool {
-            // BSD make has no static pattern rules, and takes `%.o:` as a
-            // file name.
-            if self.is_bsd_make() {
+            // Only GNU make has static pattern rules; other makes take
+            // `%.o:` as a file name.
+            if !self.gnu_directives_enabled() {
                 return false;
             }
             let mut escaped = self.pending_backslash_escape;
@@ -7160,6 +7166,38 @@ rule: dependency
     }
 
     #[test]
+    fn test_no_gnu_rule_syntax_in_posix_make_or_nmake() {
+        // Order-only prerequisites, static pattern rules and grouped targets
+        // are GNU make extensions, so `|`, `%.o:` and `&` are file names.
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
+            for (code, targets, prerequisites) in [
+                ("foo: bar | baz\n", vec!["foo"], vec!["bar", "|", "baz"]),
+                ("a.o: %.o: %.c\n", vec!["a.o"], vec!["%.o:", "%.c"]),
+                ("a b &: c\n", vec!["a", "b", "&"], vec!["c"]),
+            ] {
+                let parsed = parse(code, Some(variant));
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rule = root.rules().next().unwrap();
+                assert_eq!(
+                    targets,
+                    rule.targets().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(
+                    prerequisites,
+                    rule.prerequisites().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(rule.order_only_prerequisites().count(), 0);
+                assert_eq!(rule.static_pattern(), None);
+                assert!(!rule.is_grouped());
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_inline_recipe() {
         let parsed = parse("all: dep ; echo hi # x\n\tcmd\n", None);
         assert_eq!(parsed.errors, vec![]);
@@ -8959,14 +8997,14 @@ execute_after_dh_auto_install:
     fn test_include_ends_rule() {
         // GNU make ends rule context at an include line, so a following
         // recipe line is "recipe commences before first target".
-        for directive in ["include", "-include", "sinclude"] {
+        // POSIX make has no `sinclude`, and nmake has no bare include.
+        for (directive, posix) in [("include", true), ("-include", true), ("sinclude", false)] {
             let text = format!("all:\n\techo a\n{directive} foo.mk\n");
-            for variant in [
-                None,
-                Some(MakefileVariant::GNUMake),
-                Some(MakefileVariant::POSIXMake),
-                Some(MakefileVariant::NMake),
-            ] {
+            let mut variants = vec![None, Some(MakefileVariant::GNUMake)];
+            if posix {
+                variants.push(Some(MakefileVariant::POSIXMake));
+            }
+            for variant in variants {
                 let parsed = parse(&text, variant);
                 assert_eq!(parsed.errors, vec![]);
                 let root = parsed.root();
@@ -8993,6 +9031,44 @@ execute_after_dh_auto_install:
         let rule = root.rules().next().unwrap();
         let kinds: Vec<_> = rule.syntax().children().map(|c| c.kind()).collect();
         assert_eq!(kinds, vec![TARGETS, PREREQUISITES, RECIPE, INCLUDE]);
+    }
+
+    #[test]
+    fn test_include_keywords_per_variant() {
+        // POSIX make has `include` and `-include` but not `sinclude`; nmake
+        // only has `!INCLUDE`.
+        for (variant, text, kinds, errors) in [
+            (
+                MakefileVariant::POSIXMake,
+                "include a.mk\n-include b.mk\n",
+                vec![INCLUDE, INCLUDE],
+                0,
+            ),
+            (MakefileVariant::POSIXMake, "sinclude c.mk\n", vec![RULE], 1),
+            (
+                MakefileVariant::NMake,
+                "include a.mk\n-include b.mk\nsinclude c.mk\n",
+                vec![RULE, RULE, RULE],
+                3,
+            ),
+        ] {
+            let parsed = parse(text, Some(variant));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"; errors],
+                "{variant:?} {text:?}"
+            );
+            assert_eq!(
+                top_level_kinds(parsed.root().syntax()),
+                kinds,
+                "{variant:?} {text:?}"
+            );
+            assert_eq!(parsed.root().code(), text);
+        }
     }
 
     #[test]
