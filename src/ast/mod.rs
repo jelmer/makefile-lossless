@@ -3,6 +3,7 @@ pub mod bsd;
 pub mod conditional;
 pub mod expression_statement;
 pub mod include;
+pub mod load;
 pub mod makefile;
 pub mod rule;
 pub mod variable;
