@@ -555,6 +555,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_missing_condition_bsd_variant() {
+        let parsed = Makefile::parse_with_variant(".ifdef\n.endif\n", MakefileVariant::BSDMake);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "expected condition after .ifdef")]
+        );
+    }
+
     fn parse_bsd(text: &str) -> Makefile {
         let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
         assert_eq!(parsed.errors(), &[]);

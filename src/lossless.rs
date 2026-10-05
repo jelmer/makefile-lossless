@@ -2099,9 +2099,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Skip any leading whitespace
             self.skip_ws();
 
-            // Collect variable names
-            let mut found_var = false;
-
+            // GNU make accepts an empty condition and treats the variable as
+            // undefined, so no name is required.
             loop {
                 match self.current() {
                     None | Some(NEWLINE | COMMENT) => break,
@@ -2116,25 +2115,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(BACKSLASH) if self.is_line_continuation() => {
                         self.consume_line_continuation();
                     }
-                    Some(DOLLAR) => {
-                        found_var = true;
-                        self.parse_variable_reference();
-                    }
-                    Some(_) => {
-                        // Accept any token as part of condition
-                        found_var = true;
-                        self.bump();
-                    }
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(_) => self.bump(),
                 }
-            }
-
-            if !found_var {
-                // TODO: GNU make accepts an empty condition and treats it
-                // as undefined.
-                self.record_error(
-                    ParseErrorKind::InvalidConditional,
-                    "expected condition after conditional directive".to_string(),
-                );
             }
 
             self.builder.finish_node();
