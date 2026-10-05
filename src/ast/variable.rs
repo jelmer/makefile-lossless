@@ -1,5 +1,5 @@
-use super::is_continuation;
 use super::makefile::MakefileItem;
+use super::{is_continuation, logical_text};
 use crate::lossless::{
     is_sunsh_operator, node_text, remove_with_preceding_comments, VariableDefinition,
     ASSIGNMENT_OPERATORS,
@@ -378,9 +378,48 @@ impl VariableDefinition {
             })
     }
 
-    /// Get the raw value of the variable definition
+    /// Get the raw value of the variable definition, as written
+    ///
+    /// Line continuations, escapes such as `\#` and whitespace before a
+    /// trailing comment are kept; CRLF line endings are converted to LF.
+    /// See [`Self::value`] for the value as GNU make stores it.
     pub fn raw_value(&self) -> Option<String> {
         self.value_expr().map(|it| node_text(&it))
+    }
+
+    /// Get the value of the variable as GNU make stores it, before
+    /// expansion; this is what `$(value VAR)` returns.
+    ///
+    /// Unlike [`Self::raw_value`], line continuations are collapsed into a
+    /// single space and CRLF line endings converted to LF. Outside `define`
+    /// blocks, `\#` is unescaped to `#` (except inside variable references)
+    /// and backslashes before it or before a trailing comment are halved.
+    /// Whitespace before a trailing comment is part of the value.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X := a\\#b \\\n    c # comment\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert_eq!(var.raw_value(), Some("a\\#b \\\n    c ".to_string()));
+    /// assert_eq!(var.value(), Some("a#b c ".to_string()));
+    /// ```
+    pub fn value(&self) -> Option<String> {
+        let expr = self.value_expr()?;
+        let tokens = expr
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token());
+        if self.is_define() {
+            let mut value = logical_text(&expr, tokens, false);
+            // The newline before `endef` is not part of the value.
+            if value.ends_with('\n') {
+                value.pop();
+            }
+            Some(value)
+        } else {
+            let value = logical_text(&expr, tokens, true);
+            Some(value.trim_start_matches([' ', '\t']).to_string())
+        }
     }
 
     /// Get the parent item of this variable definition, if any
@@ -1263,5 +1302,150 @@ mod tests {
         let vars: Vec<_> = makefile.variable_definitions().collect();
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0].raw_value(), Some("a$\\\n\tb".to_string()));
+    }
+
+    fn value_of(code: &str) -> Option<String> {
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        let var = makefile.variable_definitions().next().unwrap();
+        var.value()
+    }
+
+    #[test]
+    fn test_value_plain() {
+        assert_eq!(value_of("X = a b\n"), Some("a b".to_string()));
+    }
+
+    #[test]
+    fn test_value_escaped_hash() {
+        assert_eq!(value_of("X := a\\#b\n"), Some("a#b".to_string()));
+        assert_eq!(value_of("X := a\\#b # c\n"), Some("a#b ".to_string()));
+    }
+
+    #[test]
+    fn test_value_backslashes_before_hash() {
+        // GNU make halves a run of backslashes before `#`; an odd run
+        // escapes the `#`, an even run leaves it starting a comment.
+        assert_eq!(value_of("X := a\\\\#b\n"), Some("a\\".to_string()));
+        assert_eq!(value_of("X := a\\\\\\#b\n"), Some("a\\#b".to_string()));
+        assert_eq!(value_of("X := a\\\\\\\\#b\n"), Some("a\\\\".to_string()));
+    }
+
+    #[test]
+    fn test_value_other_backslashes_kept() {
+        assert_eq!(value_of("X = a\\b\\\\c\n"), Some("a\\b\\\\c".to_string()));
+    }
+
+    #[test]
+    fn test_value_keeps_whitespace_before_comment() {
+        assert_eq!(value_of("X = a  # c\n"), Some("a  ".to_string()));
+        assert_eq!(value_of("X = a  \n"), Some("a  ".to_string()));
+    }
+
+    #[test]
+    fn test_value_continuation() {
+        assert_eq!(value_of("X = a \\\n   b\n"), Some("a b".to_string()));
+        assert_eq!(value_of("X = a\\\n b\n"), Some("a b".to_string()));
+        assert_eq!(value_of("X = a\t\\\n\t b\n"), Some("a b".to_string()));
+        assert_eq!(value_of("X = a \\\n  \\\n  b\n"), Some("a b".to_string()));
+        assert_eq!(value_of("X = a \\\n  \n"), Some("a ".to_string()));
+        assert_eq!(value_of("X = \\\n  a\n"), Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_value_continuation_after_backslashes() {
+        // The backslashes before a continuation are halved; an even run
+        // does not continue the line and is kept as is.
+        assert_eq!(value_of("X = a \\\\\\\n b\n"), Some("a \\ b".to_string()));
+        assert_eq!(
+            value_of("X = a \\\\\\\\\\\n b\n"),
+            Some("a \\\\ b".to_string())
+        );
+        assert_eq!(value_of("X = a \\\\\n"), Some("a \\\\".to_string()));
+    }
+
+    #[test]
+    fn test_value_continued_comment() {
+        assert_eq!(value_of("X = a\\#b # c \\\n b\n"), Some("a#b ".to_string()));
+    }
+
+    #[test]
+    fn test_value_crlf() {
+        assert_eq!(
+            value_of("X = a \\\r\n b\r\nY = c\r\n"),
+            Some("a b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value_escaped_hash_in_reference() {
+        // GNU make does not treat `#` inside a variable reference as a
+        // comment, and leaves a `\#` there alone.
+        assert_eq!(
+            value_of("X = $(info a\\#b) c\\#d #e\n"),
+            Some("$(info a\\#b) c#d ".to_string())
+        );
+        assert_eq!(
+            value_of("X = ${a\\#b} $a\\#b\n"),
+            Some("${a\\#b} $a#b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value_continuation_in_reference() {
+        assert_eq!(
+            value_of("X = $(info a \\\n   b)\n"),
+            Some("$(info a b)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value_define() {
+        // Continuations are collapsed in define bodies, but comments and
+        // `\#` are kept.
+        assert_eq!(
+            value_of("define X\na \\\n  b\\#c # d\nendef\n"),
+            Some("a b\\#c # d".to_string())
+        );
+        assert_eq!(
+            value_of("define X\n\na\n\nendef\n"),
+            Some("\na\n".to_string())
+        );
+        assert_eq!(
+            value_of("define X\na \\\\\n  b\nendef\n"),
+            Some("a \\\\\n  b".to_string())
+        );
+        assert_eq!(
+            value_of("define X\na \\\\\\\n  b\nendef\n"),
+            Some("a \\ b".to_string())
+        );
+        assert_eq!(value_of("define X\nendef\n"), Some("".to_string()));
+    }
+
+    #[test]
+    fn test_value_define_crlf() {
+        assert_eq!(
+            value_of("define X\r\na \\\r\n  b\r\nc\r\nendef\r\n"),
+            Some("a b\nc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value_dollar_before_continuation() {
+        assert_eq!(value_of("X = a$\\\n\tb\n"), Some("a$ b".to_string()));
+    }
+
+    #[test]
+    fn test_value_undefine() {
+        assert_eq!(value_of("undefine X\n"), None);
+    }
+
+    #[test]
+    fn test_value_target_specific() {
+        let rule: crate::Rule = "foo: X = a\\#b \\\n  c # d\n".parse().unwrap();
+        assert_eq!(
+            rule.scoped_assignment().unwrap().value(),
+            Some("a#b c ".to_string())
+        );
     }
 }

@@ -192,6 +192,13 @@ mod tests {
     }
 
     #[test]
+    fn test_continuation_after_backslashes() {
+        // GNU make halves the backslashes before a continuation.
+        let vpath = vpath_of("vpath %.c a\\\\\\\n  b\n");
+        assert_eq!(vpath.directories_text(), Some("a\\ b".to_string()));
+    }
+
+    #[test]
     fn test_pattern_followed_by_comment() {
         let code = "vpath %.c # comment\n";
         let vpath = vpath_of(code);
