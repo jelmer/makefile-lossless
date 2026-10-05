@@ -166,7 +166,7 @@ impl Directive {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Makefile, MakefileItem, MakefileVariant};
+    use crate::{Makefile, MakefileItem, MakefileVariant, Rule};
 
     fn parse_ok(text: &str) -> Makefile {
         let parsed = Makefile::parse(text);
@@ -864,5 +864,180 @@ mod tests {
         assert_eq!(var.assignment_operator(), Some("=".to_string()));
         assert_eq!(var.raw_value(), Some("three".to_string()));
         assert_ne!(errors_with(MakefileVariant::GNUMake, "one two:=three\n"), 0);
+    }
+
+    fn local_assignment(rule: &Rule) -> (Option<String>, String, String) {
+        let var = rule.scoped_assignment().unwrap();
+        (
+            var.name(),
+            var.assignment_operator().unwrap(),
+            var.raw_value().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_target_local_assignment() {
+        // From NetBSD make's var-scope-local.mk.
+        for (text, name, op, value) in [
+            ("t.o: VAR= local\n", "VAR", "=", "local"),
+            ("t.o: VAR+= local\n", "VAR", "+=", "local"),
+            ("t.o: VAR += to ${.TARGET}\n", "VAR", "+=", "to ${.TARGET}"),
+            ("t.o: VAR= ${VAR}+local\n", "VAR", "=", "${VAR}+local"),
+            ("t.o: VAR ?= first\n", "VAR", "?=", "first"),
+            ("t.o: VAR := $${VAR}+local\n", "VAR", ":=", "$${VAR}+local"),
+            ("t.o: VAR != echo output\n", "VAR", "!=", "echo output"),
+            // Only one assignment per line: the rest of it is the value.
+            ("all: X=1 Y=2\n", "X", "=", "1 Y=2"),
+            ("all: \\\n  X=1\n", "X", "=", "1"),
+            (".PHONY: X=1\n", "X", "=", "1"),
+        ] {
+            let makefile = parse_bsd(text);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.prerequisites().count(), 0, "{text:?}");
+            assert_eq!(
+                local_assignment(&rule),
+                (Some(name.to_string()), op.to_string(), value.to_string()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_target_local_assignment_after_sources() {
+        // BSD make tries each source in turn as the start of an assignment.
+        let makefile = parse_bsd("a_use: .USE VAR=use\n\t@echo ${VAR}\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec![".USE"]);
+        assert_eq!(
+            local_assignment(&rule),
+            (Some("VAR".to_string()), "=".to_string(), "use".to_string())
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["@echo ${VAR}"]);
+
+        // `a b = c` is not an assignment, but `b = c` is.
+        let makefile = parse_bsd("all: a b = c\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(
+            local_assignment(&rule),
+            (Some("b".to_string()), "=".to_string(), "c".to_string())
+        );
+
+        // GNU make takes these as prerequisites.
+        let parsed = Makefile::parse_with_variant("all: a b = c\n", MakefileVariant::GNUMake);
+        let rule = parsed.tree().rules().next().unwrap();
+        assert!(rule.scoped_assignment().is_none());
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["a", "b", "=", "c"]
+        );
+    }
+
+    #[test]
+    fn test_target_local_assignment_with_inline_command() {
+        // BSD make splits off the command at the first `;` before looking
+        // for an assignment.
+        let makefile = parse_bsd("all: X=1; echo $X\n\techo two\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            local_assignment(&rule),
+            (Some("X".to_string()), "=".to_string(), "1".to_string())
+        );
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo $X", "echo two"]
+        );
+
+        let makefile = parse_bsd("all: X; Y=1\n");
+        let rule = makefile.rules().next().unwrap();
+        assert!(rule.scoped_assignment().is_none());
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["X"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["Y=1"]);
+    }
+
+    #[test]
+    fn test_target_local_assignment_followed_by_commands() {
+        let makefile = parse_bsd("one two:=three\n\techo $@\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            local_assignment(&rule),
+            (None, "=".to_string(), "three".to_string())
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo $@"]);
+    }
+
+    #[test]
+    fn test_no_target_local_assignment_for_special_sources() {
+        // These special targets don't take their sources as assignments.
+        for (text, sources) in [
+            (
+                ".SHELL: name=\"sh\" path=/bin/sh\n",
+                vec!["name=\"sh\"", "path=/bin/sh"],
+            ),
+            (
+                ".SHELL: \\\n\tname=\"sh\" \\\n\tpath=/bin/sh\n",
+                vec!["name=\"sh\"", "path=/bin/sh"],
+            ),
+            (".PATH: a=b\n", vec!["a=b"]),
+            (".PATH.c: a=b\n", vec!["a=b"]),
+            (".SUFFIXES: .a=b\n", vec![".a=b"]),
+            (".MAKEFLAGS: X=1\n", vec!["X=1"]),
+            (".NOTPARALLEL: X=1\n", vec!["X=1"]),
+        ] {
+            let makefile = parse_bsd(text);
+            let rule = makefile.rules().next().unwrap();
+            assert!(rule.scoped_assignment().is_none(), "{text:?}");
+            assert_eq!(
+                rule.prerequisites().collect::<Vec<_>>(),
+                sources,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unbalanced_brackets_make_dependency_line() {
+        // BSD make's Parse_IsVar counts brackets and rejects these as
+        // assignments, so they are dependency lines whose sources form a
+        // target-local assignment to an empty variable name.
+        for (text, target, double_colon, op, value) in [
+            ("a}b := 1\n", "a}b", false, "=", "1"),
+            (")x := 1\n", ")x", false, "=", "1"),
+            ("a}b ::= 1\n", "a}b", true, "=", "1"),
+            ("a}b :::= 1\n", "a}b", true, ":=", "1"),
+            ("a}b != 1\n", "a}b", false, "=", "1"),
+        ] {
+            let makefile = parse_bsd(text);
+            assert_eq!(makefile.items().count(), 1, "{text:?}");
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec![target], "{text:?}");
+            assert_eq!(rule.is_double_colon(), double_colon, "{text:?}");
+            assert_eq!(rule.prerequisites().count(), 0, "{text:?}");
+            let var = rule.scoped_assignment().unwrap();
+            assert_eq!(var.name(), None, "{text:?}");
+            assert_eq!(var.assignment_operator(), Some(op.to_string()), "{text:?}");
+            assert_eq!(var.raw_value(), Some(value.to_string()), "{text:?}");
+        }
+        // GNU make assigns to a variable named `a}b`.
+        let parsed = Makefile::parse_with_variant("a}b := 1\n", MakefileVariant::GNUMake);
+        assert!(parsed.ok());
+        assert_eq!(
+            parsed.tree().variable_definitions().next().unwrap().name(),
+            Some("a}b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_targets_with_shell_assignment_operator() {
+        // `a b != c` is not an assignment as its left-hand side is not a
+        // single word, so BSD make reads the dependency operator `!`.
+        let makefile = parse_bsd("a b != c\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b"]);
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), None);
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("c".to_string()));
+        assert_ne!(errors_with(MakefileVariant::GNUMake, "a b != c\n"), 0);
     }
 }

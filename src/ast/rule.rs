@@ -652,6 +652,12 @@ impl Rule {
     /// If this rule is actually a target-specific variable assignment
     /// (`target: VAR [op] value`), return the embedded [`VariableDefinition`].
     ///
+    /// In BSD make, such a target-local assignment may follow other sources,
+    /// as in `prog: .USE VAR=value`, and the rule may have commands. BSD make
+    /// only assigns the variable if `.MAKE.TARGET_LOCAL_VARIABLES` is true,
+    /// as it is by default; otherwise the words are sources. That setting is
+    /// not tracked by the parser.
+    ///
     /// # Example
     /// ```
     /// use makefile_edit::Rule;
