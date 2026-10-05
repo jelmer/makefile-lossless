@@ -3247,16 +3247,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(OPERATOR) {
                 self.bump();
             }
-            // Skip any trailing whitespace on the header line.
-            self.skip_ws();
-            // A comment on the header line is not part of the value.
-            if self.current() == Some(COMMENT) {
-                self.bump();
-            }
-            // Consume the header-terminating newline (kept as a child).
-            if self.current() == Some(NEWLINE) {
-                self.bump();
-            }
+            self.parse_define_line_end("define", false);
 
             // The body of the define lives in an EXPR node so that
             // `raw_value()` returns it. We consume token-by-token until we
@@ -3270,6 +3261,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         if depth == 0 {
                             break 'body;
                         }
+                        self.bump_endef_keyword();
+                        self.parse_define_line_end("endef", true);
+                        continue;
                     }
                     Some("define") => depth += 1,
                     _ => {}
@@ -3281,7 +3275,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Consume the closing `endef` line itself (if we found it).
             if depth == 0 {
-                self.skip_until_newline();
+                self.bump_endef_keyword();
+                self.parse_define_line_end("endef", false);
             } else {
                 self.error(
                     ParseErrorKind::MissingEndef,
@@ -3303,7 +3298,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut depth = 0;
             let mut multiword = false;
             if !self.bump_define_name_part(&mut depth, &mut multiword) {
-                self.error(
+                self.record_error(
                     ParseErrorKind::ExpectedVariableName,
                     "empty variable name in `define`".to_string(),
                 );
@@ -3376,6 +3371,45 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
+        /// Consume an `endef` keyword and any indentation before it.
+        fn bump_endef_keyword(&mut self) {
+            while matches!(self.current(), Some(WHITESPACE | INDENT)) {
+                self.bump();
+            }
+            self.bump();
+        }
+
+        /// Consume the rest of a `define` header after the operator, or of an
+        /// `endef` line, which may only contain a comment. Other text is
+        /// reported as extraneous; it is wrapped in an ERROR node unless it is
+        /// part of the value of an enclosing define.
+        fn parse_define_line_end(&mut self, directive: &str, in_value: bool) {
+            self.skip_ws_and_continuations();
+            if !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
+                if !in_value {
+                    self.builder.start_node(ERROR.into());
+                }
+                self.record_error(
+                    ParseErrorKind::ExtraneousText,
+                    format!("extraneous text after `{directive}` directive"),
+                );
+                while !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
+                    if !self.consume_line_continuation() {
+                        self.bump();
+                    }
+                }
+                if !in_value {
+                    self.builder.finish_node();
+                }
+            }
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+        }
+
         fn is_define_modifier(token: &str) -> bool {
             matches!(token, "override" | "export" | "private")
         }
@@ -3398,14 +3432,27 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Return the text of the first non-whitespace token on the current
-        /// line, if it is an identifier. Used to detect `define`/`endef`.
+        /// line, if it is an identifier followed by whitespace, a line
+        /// continuation or the end of the line. Used to detect
+        /// `define`/`endef` in a define body, where make does not strip
+        /// comments first, so `endef#c` is not `endef`.
         fn first_token_on_line(&self) -> Option<&str> {
-            self.tokens
+            let mut tokens = self
+                .tokens
                 .iter()
                 .rev()
-                .find(|(kind, _)| !matches!(*kind, WHITESPACE | INDENT))
-                .filter(|(kind, _)| *kind == IDENTIFIER)
-                .map(|(_, text)| text.as_str())
+                .skip_while(|(kind, _)| matches!(*kind, WHITESPACE | INDENT));
+            let (kind, text) = tokens.next()?;
+            if *kind != IDENTIFIER {
+                return None;
+            }
+            match tokens.next().map(|(kind, _)| *kind) {
+                None | Some(WHITESPACE | NEWLINE) => Some(text.as_str()),
+                Some(BACKSLASH) if matches!(tokens.next(), Some((NEWLINE, _))) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            }
         }
 
         fn parse_identifier_token(&mut self) -> bool {
@@ -6475,6 +6522,217 @@ mod tests {
         assert_eq!(Some("foo".to_string()), vars[0].name());
         assert_eq!(Some(":=".to_string()), vars[0].assignment_operator());
         assert_eq!(Some("b2\n".to_string()), vars[0].raw_value());
+    }
+
+    /// Parse a makefile with a single define named "A", returning the
+    /// errors as (kind, line) pairs and the operator and raw value of A.
+    fn parse_single_define(
+        code: &str,
+        variant: Option<MakefileVariant>,
+    ) -> (Vec<(ParseErrorKind, usize)>, Option<String>, Option<String>) {
+        let parsed = parse(code, variant);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len(), "{code:?}");
+        assert_eq!(Some("A".to_string()), vars[0].name(), "{code:?}");
+        (
+            parsed.errors.iter().map(|e| (e.kind(), e.line)).collect(),
+            vars[0].assignment_operator(),
+            vars[0].raw_value(),
+        )
+    }
+
+    #[test]
+    fn test_define_extraneous_text_after_operator() {
+        // GNU make: "extraneous text after 'define' directive". The text is
+        // not part of the value.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, op, line) in [
+                ("define A =x\nfoo\nendef\n", "=", 1),
+                ("define A = x\nfoo\nendef\n", "=", 1),
+                ("define A=x\nfoo\nendef\n", "=", 1),
+                ("define A ::= $(B) # c\nfoo\nendef\n", "::=", 1),
+                ("override define A +=x\nfoo\nendef\n", "+=", 1),
+                ("define A = \\\nbar\nfoo\nendef\n", "=", 2),
+                ("define A = x \\\nbar\nfoo\nendef\n", "=", 1),
+            ] {
+                assert_eq!(
+                    parse_single_define(code, variant),
+                    (
+                        vec![(ParseErrorKind::ExtraneousText, line)],
+                        Some(op.to_string()),
+                        Some("foo\n".to_string())
+                    ),
+                    "{code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_define_no_extraneous_text_after_operator() {
+        for code in [
+            "define A := # c\nfoo\nendef\n",
+            "define A =  \nfoo\nendef\n",
+            "define A = \\\n# c\nfoo\nendef\n",
+            "define A = \\\n\nfoo\nendef\n",
+            "define A = \\\n  \nfoo\nendef\n",
+        ] {
+            let (errors, _, value) = parse_single_define(code, None);
+            assert_eq!(
+                (errors, value),
+                (vec![], Some("foo\n".to_string())),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_endef_extraneous_text() {
+        // GNU make: "extraneous text after 'endef' directive". The line still
+        // ends the define.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, line) in [
+                ("define A\nfoo\nendef junk\n", 3),
+                ("define A\nfoo\nendef $(X)\n", 3),
+                ("define A\nfoo\nendef junk # c\n", 3),
+                ("define A\nfoo\nendef \\\nbar\n", 4),
+            ] {
+                assert_eq!(
+                    parse_single_define(code, variant),
+                    (
+                        vec![(ParseErrorKind::ExtraneousText, line)],
+                        None,
+                        Some("foo\n".to_string())
+                    ),
+                    "{code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_endef_no_extraneous_text() {
+        for code in [
+            "define A\nfoo\nendef # c\n",
+            "define A\nfoo\nendef\t# c\n",
+            "define A\nfoo\nendef  \n",
+            "define A\nfoo\nendef \\\n\n",
+            "define A\nfoo\nendef \\\n# c\n",
+            "define A\nfoo\nendef",
+        ] {
+            assert_eq!(
+                parse_single_define(code, None),
+                (vec![], None, Some("foo\n".to_string())),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_endef_extraneous_text() {
+        // make also checks the `endef` of a define nested in the body, which
+        // stays part of the value.
+        let code = "define A\ndefine B\nfoo\nendef junk\nendef\n";
+        assert_eq!(
+            parse_single_define(code, None),
+            (
+                vec![(ParseErrorKind::ExtraneousText, 4)],
+                None,
+                Some("define B\nfoo\nendef junk\n".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_define_body_keyword_needs_separator() {
+        // In a define body make only recognises `define` and `endef` when
+        // followed by whitespace or the end of the line.
+        for (code, value) in [
+            ("define A\nfoo\nendef#c\nendef\n", "foo\nendef#c\n"),
+            ("define A\nfoo\nendef=x\nendef\n", "foo\nendef=x\n"),
+            ("define A\nfoo\nendef$(X)\nendef\n", "foo\nendef$(X)\n"),
+            ("define A\nfoo\n endef#c\nendef\n", "foo\n endef#c\n"),
+            ("define A\ndefine#c\nfoo\nendef\n", "define#c\nfoo\n"),
+            ("define A\ndefine=x\nfoo\nendef\n", "define=x\nfoo\n"),
+            ("define A\nfoo\nendef\t# c\n", "foo\n"),
+        ] {
+            assert_eq!(
+                parse_single_define(code, None),
+                (vec![], None, Some(value.to_string())),
+                "{code:?}"
+            );
+        }
+        let parsed = parse("define A\nfoo\nendef#c\n", None);
+        assert_eq!(
+            parsed.errors.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            vec![ParseErrorKind::MissingEndef]
+        );
+        // A line continuation separates the keyword from what follows.
+        assert_eq!(
+            parse_single_define("define A\nfoo\nendef\\\nbar\n", None),
+            (
+                vec![(ParseErrorKind::ExtraneousText, 4)],
+                None,
+                Some("foo\n".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_directive_followed_by_comment() {
+        // Outside a define body make strips comments first, so `endif#c` is
+        // still `endif`.
+        for code in [
+            "ifdef X\nA = 1\nendif#c\n",
+            "ifdef X\nA = 1\nelse#c\nA = 2\nendif\n",
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            assert_eq!(code, parsed.root().to_string());
+        }
+        assert_eq!(
+            error_kinds("define#c\nendef\n", None),
+            vec![ParseErrorKind::ExpectedVariableName]
+        );
+        assert_eq!(
+            error_kinds("endif#c\n", None),
+            vec![ParseErrorKind::ExtraneousEndif]
+        );
+        assert_eq!(
+            error_kinds("else#c\n", None),
+            vec![ParseErrorKind::ElseWithoutIf]
+        );
+    }
+
+    #[test]
+    fn test_define_extraneous_text_tree() {
+        let code = "define A = x\nfoo\nendef y\n";
+        let parsed = parse(code, None);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..25
+  VARIABLE@0..25
+    IDENTIFIER@0..6 "define"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..8 "A"
+    WHITESPACE@8..9 " "
+    OPERATOR@9..10 "="
+    WHITESPACE@10..11 " "
+    ERROR@11..12
+      IDENTIFIER@11..12 "x"
+    NEWLINE@12..13 "\n"
+    EXPR@13..17
+      IDENTIFIER@13..16 "foo"
+      NEWLINE@16..17 "\n"
+    IDENTIFIER@17..22 "endef"
+    WHITESPACE@22..23 " "
+    ERROR@23..24
+      IDENTIFIER@23..24 "y"
+    NEWLINE@24..25 "\n"
+"##
+        );
     }
 
     #[test]
