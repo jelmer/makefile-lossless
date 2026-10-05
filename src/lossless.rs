@@ -620,11 +620,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_variable_reference();
                     true
                 }
-                // Characters such as `*` in `*.o: *.c`
-                Some(TEXT) => {
-                    self.bump();
-                    true
-                }
                 // A backslash is part of the target name. Both GNU and BSD
                 // make keep it, and it stops a following whitespace or `:`
                 // from ending the name.
@@ -637,12 +632,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     true
                 }
-                _ => {
+                Some(WHITESPACE | INDENT | NEWLINE | COMMENT | OPERATOR | BACKSLASH) | None => {
                     self.error(
                         ParseErrorKind::MissingTarget,
                         "expected rule target".to_string(),
                     );
                     false
+                }
+                // Anything else is literal text in the target name, such as
+                // `*` in `*.o: *.c` or the stray `}` in `${X}}`.
+                Some(_) => {
+                    self.bump();
+                    true
                 }
             }
         }
@@ -3601,10 +3602,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_rule();
                     true
                 }
-                Some(TEXT | BACKSLASH)
-                    if self.line_has_dependency_operator()
+                // Lines may also start with characters such as `*` in
+                // `*.o: *.c` or `}` in `}: dep`. BSD make takes a leading
+                // `(` as an archive member list without an archive name.
+                Some(
+                    kind @ (TEXT | BACKSLASH | LPAREN | RPAREN | LBRACE | RBRACE | COMMA | QUOTE),
+                ) if (kind != LPAREN || !self.is_bsd_make())
+                    && (self.line_has_dependency_operator()
                         || self.is_assignment_line()
-                        || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) =>
+                        || (self.bsd_directives_enabled() && self.is_bsd_assignment_line())) =>
                 {
                     self.parse_normal_content();
                     true
@@ -14387,6 +14393,92 @@ test:
                 (false, vec!["$(SRCS:.c=.o)".to_string()]),
             ]
         );
+    }
+    #[test]
+    fn test_rule_target_starting_with_bracket() {
+        let cases: &[(&str, &[&str])] = &[
+            ("}: dep\n", &["}"]),
+            ("): dep\n", &[")"]),
+            ("{: dep\n", &["{"]),
+            (",: dep\n", &[","]),
+            ("\": dep\n", &["\""]),
+            ("'a: dep\n", &["'a"]),
+            ("}x: dep\n", &["}x"]),
+            ("}x y: dep\n", &["}x", "y"]),
+        ];
+        let variants = [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ];
+        for (code, expected) in cases {
+            for variant in variants {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{code:?} {variant:?}");
+                let root = parsed.root();
+                assert_eq!(root.to_string(), *code);
+                let targets: Vec<Vec<String>> =
+                    root.rules().map(|r| r.targets().collect()).collect();
+                assert_eq!(targets, vec![expected.to_vec()], "{code:?} {variant:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rule_target_starting_with_lparen() {
+        // GNU make takes a leading `(` literally, while BSD make reads it as
+        // an archive member list without an archive name.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            let parsed = parse("(: dep\n(x: dep\n", variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let root = parsed.root();
+            assert_eq!(root.to_string(), "(: dep\n(x: dep\n");
+            let targets: Vec<Vec<String>> = root.rules().map(|r| r.targets().collect()).collect();
+            assert_eq!(targets, vec![vec!["("], vec!["(x"]], "{variant:?}");
+        }
+        let parsed = parse("(: dep\n", Some(MakefileVariant::BSDMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.kind, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(ParseErrorKind::UnexpectedToken, "unexpected token LPAREN")]
+        );
+        assert_eq!(parsed.root().to_string(), "(: dep\n");
+    }
+
+    #[test]
+    fn test_variable_name_starting_with_bracket() {
+        let cases = [
+            ("}x = 1\n", "}x"),
+            (")x := 1\n", ")x"),
+            (",x += 1\n", ",x"),
+            ("\"x ?= 1\n", "\"x"),
+        ];
+        for (code, name) in cases {
+            for variant in [
+                None,
+                Some(MakefileVariant::GNUMake),
+                Some(MakefileVariant::POSIXMake),
+                Some(MakefileVariant::NMake),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{code:?} {variant:?}");
+                let root = parsed.root();
+                assert_eq!(root.to_string(), code);
+                let names: Vec<Option<String>> =
+                    root.variable_definitions().map(|v| v.name()).collect();
+                assert_eq!(names, vec![Some(name.to_string())], "{code:?} {variant:?}");
+            }
+        }
     }
 }
 
