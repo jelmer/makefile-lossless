@@ -21,21 +21,54 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 }
 
 impl VariableDefinition {
+    /// Internal: the leading directive keywords (`export`/`override`/
+    /// `define`/`undefine`). A keyword only counts as one when another word
+    /// follows it, so `undefine = 1` assigns to a variable named `undefine`.
+    fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
+        let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
+        let mut in_word = false;
+        for it in self
+            .syntax()
+            .children_with_tokens()
+            .take_while(|it| !matches!(it.kind(), OPERATOR | NEWLINE | COMMENT))
+        {
+            if it.kind() == WHITESPACE {
+                in_word = false;
+                continue;
+            }
+            if !in_word {
+                words.push(Vec::new());
+                in_word = true;
+            }
+            words.last_mut().unwrap().push(it);
+        }
+        let count = words.len().saturating_sub(1);
+        words
+            .into_iter()
+            .take(count)
+            .map_while(|word| match word.as_slice() {
+                [rowan::NodeOrToken::Token(t)]
+                    if t.kind() == IDENTIFIER
+                        && matches!(t.text(), "export" | "override" | "define" | "undefine") =>
+                {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Internal: the elements making up the variable's name, i.e. the
     /// IDENTIFIER tokens and variable references that follow any directive
-    /// keywords (`export`/`override`/`define`). A name usually is a single
-    /// IDENTIFIER, but may contain references as in `CFLAGS.${PROG}`.
-    /// Single source of truth for [`Self::name`], [`Self::name_range`] and
-    /// [`Self::set_name`].
+    /// keywords. A name usually is a single IDENTIFIER, but may contain
+    /// references as in `CFLAGS.${PROG}`. Single source of truth for
+    /// [`Self::name`], [`Self::name_range`] and [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
+        let keywords = self.directive_keywords();
         self.syntax()
             .children_with_tokens()
             .skip_while(|it| {
-                it.kind() == WHITESPACE
-                    || it.as_token().is_some_and(|t| {
-                        t.kind() == IDENTIFIER
-                            && matches!(t.text(), "export" | "override" | "define")
-                    })
+                it.kind() == WHITESPACE || it.as_token().is_some_and(|t| keywords.contains(t))
             })
             .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
             .collect()
@@ -88,6 +121,26 @@ impl VariableDefinition {
             it.as_token()
                 .is_some_and(|t| t.kind() == IDENTIFIER && t.text() == "define")
         })
+    }
+
+    /// Check if this is an `undefine` directive, e.g. `undefine FOO`
+    ///
+    /// Such a node has a name but no assignment operator or value.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "override undefine CC\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.is_undefine());
+    /// assert!(var.is_override());
+    /// assert_eq!(var.name(), Some("CC".to_string()));
+    /// assert_eq!(var.assignment_operator(), None);
+    /// ```
+    pub fn is_undefine(&self) -> bool {
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "undefine")
     }
 
     /// Check if this variable definition is exported
