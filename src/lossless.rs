@@ -3455,6 +3455,22 @@ mod tests {
     use crate::pattern::matches_pattern;
 
     #[test]
+    fn test_quote_in_variable_name() {
+        let parsed = parse("${:U'}=\tsingle-quote-var-value'\nB = 1\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let vars: Vec<_> = parsed.root().variable_definitions().collect();
+        assert_eq!(
+            vars.iter()
+                .map(|v| (v.name().unwrap(), v.raw_value().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("${:U'}".to_string(), "single-quote-var-value'".to_string()),
+                ("B".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_conditionals() {
         // We'll use relaxed parsing for conditionals
 
