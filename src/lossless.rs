@@ -696,15 +696,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             // Optional whitespace before the value.
             self.skip_ws();
-            // Value lives in an EXPR node, like normal assignments.
-            self.builder.start_node(EXPR.into());
-            while self.current().is_some() && self.current() != Some(NEWLINE) {
-                self.bump();
-            }
-            self.builder.finish_node(); // EXPR
-            if self.current() == Some(NEWLINE) {
-                self.bump();
-            }
+            self.parse_assignment_value();
             self.builder.finish_node(); // VARIABLE
         }
 
@@ -833,39 +825,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     if ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&op.as_str()) {
                         self.bump();
                         self.skip_ws();
-
-                        // Parse value, creating nested EXPR nodes for
-                        // variable references. A trailing `# comment` is
-                        // left as a sibling COMMENT token, not bundled
-                        // into the EXPR.
-                        self.builder.start_node(EXPR.into());
-                        while self.current().is_some()
-                            && self.current() != Some(NEWLINE)
-                            && self.current() != Some(COMMENT)
-                        {
-                            // The value may continue on the next physical line.
-                            if self.consume_line_continuation() {
-                                continue;
-                            }
-                            if self.current() == Some(DOLLAR) {
-                                self.parse_variable_reference();
-                            } else {
-                                self.bump();
-                            }
-                        }
-                        self.builder.finish_node();
-
-                        // Optional trailing comment.
-                        if self.current() == Some(COMMENT) {
-                            self.bump();
-                        }
-
-                        // Expect newline
-                        if self.current() == Some(NEWLINE) {
-                            self.bump();
-                        } else if !self.is_at_eof() {
-                            self.error("expected newline after variable value".to_string());
-                        }
+                        self.parse_assignment_value();
                     } else {
                         self.error(format!("invalid assignment operator: {}", op));
                     }
@@ -881,6 +841,41 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Parse an assignment's value through the end of the logical line,
+        /// creating nested EXPR nodes for variable references. A trailing
+        /// `# comment` is left as a sibling COMMENT token, not bundled into
+        /// the EXPR.
+        fn parse_assignment_value(&mut self) {
+            self.builder.start_node(EXPR.into());
+            while self.current().is_some()
+                && self.current() != Some(NEWLINE)
+                && self.current() != Some(COMMENT)
+            {
+                // The value may continue on the next physical line.
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                if self.current() == Some(DOLLAR) {
+                    self.parse_variable_reference();
+                } else {
+                    self.bump();
+                }
+            }
+            self.builder.finish_node();
+
+            // Optional trailing comment.
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
+
+            // Expect newline
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            } else if !self.is_at_eof() {
+                self.error("expected newline after variable value".to_string());
+            }
         }
 
         fn parse_variable_reference(&mut self) {
@@ -3296,6 +3291,46 @@ mod tests {
         assert_eq!(code, makefile.to_string());
         let vars: Vec<_> = makefile.variable_definitions().collect();
         assert_eq!(Some("foo \\\\\\\n\tbar".to_string()), vars[0].raw_value());
+    }
+
+    #[test]
+    fn test_target_specific_assignment_trailing_comment() {
+        // As with top-level assignments, a trailing comment is not part of
+        // the value.
+        let code = "foo: X = $(Y) 1 # comment\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let rule = makefile.rules().next().unwrap();
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(Some("$(Y) 1 ".to_string()), var.raw_value());
+        let top: Makefile = "X = $(Y) 1 # comment\n".parse().unwrap();
+        let top_var = top.variable_definitions().next().unwrap();
+        let shape = |node: &SyntaxNode| {
+            node.descendants_with_tokens()
+                .map(|e| (e.kind(), e.as_token().map(|t| t.text().to_string())))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(top_var.syntax()), shape(var.syntax()));
+    }
+
+    #[test]
+    fn test_target_specific_assignment_with_continuation() {
+        let code = "git.o: EXTRA_CPPFLAGS = \\\n\t-DA \\\n\t-DB\n\nall:\n\techo hi\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(2, rules.len());
+        let var = rules[0].scoped_assignment().unwrap();
+        assert_eq!(Some("EXTRA_CPPFLAGS".to_string()), var.name());
+        assert_eq!(Some("\\\n\t-DA \\\n\t-DB".to_string()), var.raw_value());
+        assert_eq!(
+            "git.o: EXTRA_CPPFLAGS = \\\n\t-DA \\\n\t-DB\n",
+            rules[0].syntax().text().to_string()
+        );
+        assert_eq!(
+            vec!["echo hi".to_string()],
+            rules[1].recipes().collect::<Vec<_>>()
+        );
     }
 
     #[test]
