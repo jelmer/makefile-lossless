@@ -1,5 +1,7 @@
 use super::makefile::MakefileItem;
-use crate::lossless::{remove_with_preceding_comments, VariableDefinition, ASSIGNMENT_OPERATORS};
+use crate::lossless::{
+    is_sunsh_operator, remove_with_preceding_comments, VariableDefinition, ASSIGNMENT_OPERATORS,
+};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -18,6 +20,11 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
         }
     }
     builder.finish_node();
+}
+
+/// Whether `text` is an assignment operator token.
+fn is_assignment_operator(text: &str) -> bool {
+    ASSIGNMENT_OPERATORS.contains(&text) || is_sunsh_operator(text)
 }
 
 impl VariableDefinition {
@@ -96,7 +103,7 @@ impl VariableDefinition {
                         NEWLINE | COMMENT => false,
                         _ if *level > 0 => true,
                         WHITESPACE => false,
-                        OPERATOR => !ASSIGNMENT_OPERATORS.contains(&t.text()),
+                        OPERATOR => !is_assignment_operator(t.text()),
                         _ => true,
                     },
                     rowan::NodeOrToken::Node(n) => n.kind() == EXPR,
@@ -291,7 +298,9 @@ impl VariableDefinition {
 
     /// Get the assignment operator/flavor used in this variable definition
     ///
-    /// Returns the operator as a string: "=", ":=", "::=", ":::=", "+=", "?=", or "!="
+    /// Returns the operator as a string: "=", ":=", "::=", ":::=", "+=", "?=", or "!=",
+    /// or ":sh=" for BSD make's alternative shell assignment operator, which
+    /// may also be written with whitespace as in `VAR :sh = cmd`.
     ///
     /// # Example
     /// ```
@@ -304,8 +313,14 @@ impl VariableDefinition {
         self.syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == OPERATOR && ASSIGNMENT_OPERATORS.contains(&t.text()))
-            .map(|t| t.text().to_string())
+            .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
+            .map(|t| {
+                if is_sunsh_operator(t.text()) {
+                    ":sh=".to_string()
+                } else {
+                    t.text().to_string()
+                }
+            })
     }
 
     /// Get the raw value of the variable definition
@@ -374,7 +389,7 @@ impl VariableDefinition {
             .syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == OPERATOR && ASSIGNMENT_OPERATORS.contains(&t.text()))
+            .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
             .map(|t| t.index());
 
         // Build a new VARIABLE node, copying all children but replacing the OPERATOR token

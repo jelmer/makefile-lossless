@@ -523,4 +523,95 @@ mod tests {
             vec![(1, "expected condition after .ifdef")]
         );
     }
+
+    fn parse_bsd(text: &str) -> Makefile {
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile
+    }
+
+    #[test]
+    fn test_sunsh_assignment() {
+        let makefile = parse_bsd(concat!(
+            "VAR:sh=\techo colon-sh\n",
+            "VAR :sh =\techo spaced\n",
+            "VAR :sh :sh=\techo multiple\n",
+            "VAR:sh =\techo space-before-op\n",
+        ));
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| (
+                    v.name().unwrap(),
+                    v.assignment_operator().unwrap(),
+                    v.raw_value().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo colon-sh".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo spaced".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo multiple".to_string()
+                ),
+                (
+                    "VAR".to_string(),
+                    ":sh=".to_string(),
+                    "echo space-before-op".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sunsh_not_an_operator() {
+        // As in BSD make: `:shell` is part of the name, `:sh` before another
+        // operator is ignored if separated from the name, and part of the
+        // name otherwise. A group of parentheses after `:sh` is ignored too.
+        let makefile = parse_bsd(concat!(
+            "VAR:shell=\techo colon-shell\n",
+            "VAR :sh +=\techo two\n",
+            "VAR:sh !=\techo space-after\n",
+            "VAR :sh(a comment)=\tvalue\n",
+        ));
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| (v.name().unwrap(), v.assignment_operator().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("VAR:shell".to_string(), "=".to_string()),
+                ("VAR".to_string(), "+=".to_string()),
+                ("VAR:sh".to_string(), "!=".to_string()),
+                ("VAR".to_string(), "=".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sunsh_in_default_mode_is_rule() {
+        // GNU make reads this as a rule with a target-specific variable.
+        let makefile = parse_ok("VAR:sh= echo\n");
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_set_assignment_operator_on_sunsh() {
+        let makefile = parse_bsd("VAR :sh =\techo\n");
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("!=");
+        assert_eq!(makefile.code(), "VAR !=\techo\n");
+        assert_eq!(var.assignment_operator(), Some("!=".to_string()));
+    }
 }

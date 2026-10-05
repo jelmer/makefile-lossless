@@ -121,6 +121,15 @@ pub(crate) struct Parse {
 
 pub(crate) const ASSIGNMENT_OPERATORS: &[&str] = &["=", ":=", "::=", ":::=", "+=", "?=", "!="];
 
+/// Whether `text` is BSD make's `:sh=` shell assignment operator, which may
+/// contain whitespace and repeat the modifier, as in `:sh :sh =`.
+pub(crate) fn is_sunsh_operator(text: &str) -> bool {
+    let compact: String = text.split_whitespace().collect();
+    compact
+        .strip_suffix('=')
+        .is_some_and(|modifiers| !modifiers.is_empty() && modifiers.split(":sh").all(str::is_empty))
+}
+
 /// BSD make directives, without the leading dot.
 const BSD_DIRECTIVES: &[&str] = &[
     "include",
@@ -1040,6 +1049,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return;
             }
 
+            // BSD make's `:sh` modifier, as in `VAR :sh= cmd`. Together with
+            // a following `=` it forms the shell assignment operator `:sh=`;
+            // before any other operator it is ignored.
+            self.skip_ws();
+            if let Some((count, shell)) = self.sunsh_modifier() {
+                if shell {
+                    self.bump_merged(OPERATOR, count);
+                    self.skip_ws();
+                    self.parse_assignment_value();
+                    self.builder.finish_node();
+                    return;
+                }
+                self.bump_n(count - 1);
+            }
+
             // Skip whitespace and parse operator
             self.skip_ws();
 
@@ -1127,6 +1151,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(BACKSLASH) if self.is_line_continuation() => return true,
                     Some(WHITESPACE) if level == 0 => return true,
                     Some(OPERATOR) if level == 0 && self.at_assignment_operator() => return true,
+                    Some(OPERATOR)
+                        if level == 0 && self.sunsh_modifier().is_some_and(|(_, shell)| shell) =>
+                    {
+                        return true
+                    }
                     Some(DOLLAR) => self.parse_variable_reference(),
                     Some(kind) => {
                         match kind {
@@ -1900,6 +1929,57 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Consume `count` tokens as a single token of the given kind.
+        fn bump_merged(&mut self, kind: SyntaxKind, count: usize) {
+            let mut text = String::new();
+            for _ in 0..count {
+                text.push_str(&self.tokens.pop().unwrap().1);
+            }
+            self.pending_backslash_escape = false;
+            self.builder.token(kind.into(), &text);
+        }
+
+        /// If the current token starts BSD make's `:sh` assignment modifier,
+        /// as in `VAR :sh= cmd`, return the number of tokens up to and
+        /// including the assignment operator that follows it, and whether
+        /// they form the shell assignment operator `:sh=`. The modifier may
+        /// be repeated, as in `VAR :sh :sh=`. As in BSD make, it may also be
+        /// followed by a group of parentheses and braces, as in
+        /// `VAR :sh(comment)=`, after which the operator is a plain `=`.
+        fn sunsh_modifier(&self) -> Option<(usize, bool)> {
+            if !self.bsd_directives_enabled() {
+                return None;
+            }
+            let mut tokens = self.tokens.iter().rev().enumerate();
+            let mut seen = false;
+            let mut shell = false;
+            let mut level = 0usize;
+            loop {
+                let (i, (kind, text)) = tokens.next()?;
+                match (*kind, text.as_str()) {
+                    (NEWLINE, _) => return None,
+                    (LPAREN | LBRACE, _) if seen => {
+                        level += 1;
+                        shell = false;
+                    }
+                    (RPAREN | RBRACE, _) if level > 0 => level -= 1,
+                    _ if level > 0 => {}
+                    (OPERATOR, ":") => match tokens.next()? {
+                        (_, (IDENTIFIER, name)) if name == "sh" => {
+                            seen = true;
+                            shell = true;
+                        }
+                        _ => return None,
+                    },
+                    (WHITESPACE, _) if seen => {}
+                    (OPERATOR, op) if seen && ASSIGNMENT_OPERATORS.contains(&op) => {
+                        return Some((i + 1, shell && op == "="));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
         /// Dispatch a BSD make directive found by `bsd_directive`.
         fn parse_bsd_directive(&mut self, name: &str, count: usize) {
             match name {
@@ -2387,9 +2467,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut level = 0i32;
             let mut seen_name = false;
             let mut seen_space = false;
-            for (kind, text) in self.tokens.iter().rev() {
+            let mut tokens = self.tokens.iter().rev().peekable();
+            while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE | COMMENT => return false,
+                    // The `:sh` assignment modifier, as in `VAR :sh= cmd`
+                    OPERATOR
+                        if level == 0
+                            && text == ":"
+                            && tokens
+                                .peek()
+                                .is_some_and(|(k, t)| *k == IDENTIFIER && t == "sh") =>
+                    {
+                        tokens.next();
+                    }
                     LPAREN | LBRACE => {
                         level += 1;
                         seen_name = true;
