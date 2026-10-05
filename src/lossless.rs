@@ -1783,34 +1783,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Record an error at the current position without consuming any
-        /// tokens.
-        fn report_error(&mut self, message: String) {
-            let consumed = self.token_positions.len() - self.tokens.len();
-            let (start, end) = self
-                .token_positions
-                .get(consumed)
-                .copied()
-                .unwrap_or_else(|| {
-                    let end = rowan::TextSize::of(self.original_text.as_str());
-                    (end, end)
-                });
-            let line = self.original_text[..usize::from(start)]
-                .matches('\n')
-                .count()
-                + 1;
-            self.errors.push(ErrorInfo {
-                message: message.clone(),
-                line,
-                context: self.get_context_for_line(line),
-            });
-            self.positioned_errors.push(PositionedParseError {
-                message,
-                range: rowan::TextRange::new(start, end),
-                code: None,
-            });
-        }
-
         /// Dispatch a BSD make directive found by `bsd_directive`.
         fn parse_bsd_directive(&mut self, name: &str, count: usize) {
             match name {
@@ -1819,7 +1791,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "include" | "-include" | "sinclude" | "dinclude" => self.parse_include(),
                 _ if is_bsd_elif(name) || matches!(name, "else" | "endif" | "endfor") => {
                     let opener = if name == "endfor" { "for" } else { "if" };
-                    self.report_error(format!(".{} without matching .{}", name, opener));
+                    self.record_error(format!(".{} without matching .{}", name, opener));
                     self.builder.start_node(ERROR.into());
                     self.skip_until_newline();
                     self.builder.finish_node();
@@ -1858,7 +1830,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             self.builder.finish_node();
             if let (Some(name), false) = (required, found) {
-                self.report_error(format!("expected condition after .{}", name));
+                self.record_error(format!("expected condition after .{}", name));
             }
             if self.current() == Some(COMMENT) {
                 self.bump();
@@ -1879,7 +1851,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {}
                 Some(NEWLINE) => self.bump(),
                 Some(_) => {
-                    self.report_error(format!("unexpected text after .{}", name));
+                    self.record_error(format!("unexpected text after .{}", name));
                     self.skip_until_newline();
                 }
             }
@@ -1913,7 +1885,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             loop {
                 if self.is_at_eof() {
-                    self.report_error("unterminated .if (missing .endif)".to_string());
+                    self.record_error("unterminated .if (missing .endif)".to_string());
                     break;
                 }
                 let Some((name, count)) = self.bsd_directive() else {
@@ -1965,12 +1937,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.skip_ws();
             }
             if !found_variable {
-                self.report_error("expected variable name after .for".to_string());
+                self.record_error("expected variable name after .for".to_string());
             }
             if self.current() == Some(IDENTIFIER) {
                 self.bump();
             } else {
-                self.report_error("expected 'in' in .for".to_string());
+                self.record_error("expected 'in' in .for".to_string());
             }
             self.parse_directive_argument(None);
             self.builder.finish_node();
@@ -1981,7 +1953,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             loop {
                 if self.is_at_eof() {
-                    self.report_error("unterminated .for (missing .endfor)".to_string());
+                    self.record_error("unterminated .for (missing .endfor)".to_string());
                     break;
                 }
                 match self.bsd_directive() {
