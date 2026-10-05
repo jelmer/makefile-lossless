@@ -570,14 +570,12 @@ impl Parser {
             return Ok(BsdCondition::Value(lhs));
         };
         self.skip_whitespace();
-        let rhs_start = self.pos;
-        let rhs = self.parse_leaf(false)?;
-        if rhs == BsdOperand::Word(String::new()) {
-            return Err(self.error_at(
-                rhs_start,
-                format!("missing right-hand side of operator \"{}\"", op),
-            ));
+        // Only the end of the condition is an error; an empty leaf before
+        // `)` or another operator compares against the empty string.
+        if self.peek().is_none() {
+            return Err(self.error(format!("missing right-hand side of operator \"{}\"", op)));
         }
+        let rhs = self.parse_leaf(false)?;
         Ok(BsdCondition::Compare { lhs, op, rhs })
     }
 
@@ -823,6 +821,20 @@ mod tests {
             compare(var("${A:U12345}"), Greater, number("12345"))
         );
         assert_eq!(parse("(${A}==1)"), compare(var("${A}"), Equal, number("1")));
+    }
+
+    #[test]
+    fn test_comparison_empty_rhs() {
+        // As in make, a right-hand side that ends before the end of the
+        // condition is the empty string.
+        assert_eq!(parse("(${A} ==)"), compare(var("${A}"), Equal, word("")));
+        assert_eq!(
+            parse("(${A} != ) || 1"),
+            Or(vec![
+                compare(var("${A}"), NotEqual, word("")),
+                Value(number("1"))
+            ])
+        );
     }
 
     #[test]
@@ -1116,10 +1128,6 @@ mod tests {
         );
         assert_eq!(
             error("${A} == "),
-            ("missing right-hand side of operator \"==\"".to_string(), 8)
-        );
-        assert_eq!(
-            error("(${A} ==)"),
             ("missing right-hand side of operator \"==\"".to_string(), 8)
         );
         assert_eq!(
