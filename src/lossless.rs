@@ -284,46 +284,75 @@ fn nmake_directive_name(first: &str, second: Option<&str>) -> Option<(&'static s
     Some((name, false))
 }
 
-/// Tracks rule context (whether a tab-indented line is a recipe line) across
-/// the branches of a conditional. Only one branch is taken, so each branch
-/// starts in the context from before the conditional, and rule context only
-/// continues after it if it does on every path.
+/// Whether a tab-indented line is a recipe line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleContext {
+    Outside,
+    Inside,
+    /// Inside on some paths through the preceding conditionals but not on
+    /// others, so it depends on which branches make takes.
+    Varies,
+}
+
+impl RuleContext {
+    fn join(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Varies
+        }
+    }
+}
+
+/// Tracks rule context across the branches of a conditional. Only one
+/// branch is taken, so each branch starts in the context from before the
+/// conditional, and the context after it is the join of those at the end
+/// of every path.
 #[derive(Clone, Copy)]
 struct ConditionalRuleContext {
-    outer: bool,
-    all_paths: bool,
+    outer: RuleContext,
+    branches: Option<RuleContext>,
     has_else: bool,
 }
 
 impl ConditionalRuleContext {
-    fn new(outer: bool) -> Self {
+    fn new(outer: RuleContext) -> Self {
         Self {
             outer,
-            all_paths: true,
+            branches: None,
             has_else: false,
         }
     }
 
+    fn add_branch(&mut self, in_rule: RuleContext) {
+        self.branches = Some(self.branches.map_or(in_rule, |b| b.join(in_rule)));
+    }
+
     /// Start the next branch, given the rule context at the end of the
     /// previous one. Returns the rule context for the new branch.
-    fn next_branch(&mut self, in_rule: bool, is_final_else: bool) -> bool {
-        self.all_paths &= in_rule;
+    fn next_branch(&mut self, in_rule: RuleContext, is_final_else: bool) -> RuleContext {
+        self.add_branch(in_rule);
         self.has_else |= is_final_else;
         self.outer
     }
 
     /// Returns the rule context after the conditional, given the one at the
     /// end of its last branch.
-    fn end(self, in_rule: bool) -> bool {
-        in_rule && self.all_paths && (self.has_else || self.outer)
+    fn end(mut self, in_rule: RuleContext) -> RuleContext {
+        self.add_branch(in_rule);
+        if !self.has_else {
+            // No branch may be taken at all.
+            self.add_branch(self.outer);
+        }
+        self.branches.expect("a branch was added")
     }
 
     /// A context for a BSD make `.for` loop, after which the rule context is
     /// the one at the end of its body.
     fn for_loop() -> Self {
         Self {
-            outer: true,
-            all_paths: true,
+            outer: RuleContext::Outside,
+            branches: None,
             has_else: true,
         }
     }
@@ -359,7 +388,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Whether we are in rule context, i.e. a tab-indented line is a
         /// recipe line. Set by a rule line and cleared by any other line
         /// except comments, blank lines and conditional directives.
-        in_rule: bool,
+        in_rule: RuleContext,
         /// The logical line last used to find a BSD make expression.
         bsd_line: Option<BsdLine>,
         /// Number of times tokens were lexed again, which may change where
@@ -848,7 +877,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     continue;
                 }
                 match self.current() {
-                    Some(INDENT) if self.in_rule => {
+                    Some(INDENT) if self.in_rule == RuleContext::Inside => {
                         newline_count = 0;
                         self.parse_recipe_line();
                     }
@@ -983,7 +1012,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 };
                 match (*kind, text.as_str()) {
                     (NEWLINE | COMMENT, _) => {}
-                    (INDENT, _) if in_rule => return true,
+                    (INDENT, _) if in_rule == RuleContext::Inside => return true,
                     _ if bsd_name.is_some_and(is_bsd_if) => {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
@@ -1019,9 +1048,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         Some(context) => in_rule = context.end(in_rule),
                         None => return false,
                     },
-                    _ => in_rule = false,
+                    _ => in_rule = RuleContext::Outside,
                 }
-                if stack.is_empty() && !in_rule {
+                if stack.is_empty() && in_rule != RuleContext::Inside {
                     return false;
                 }
                 // Skip to the start of the next line, following continuations
@@ -1179,7 +1208,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_rule(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(RULE.into());
             let tab_indented = self.at_tab_indented_line_start();
 
@@ -1243,7 +1272,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
 
                     // Parse recipe lines
-                    self.in_rule = true;
+                    self.in_rule = RuleContext::Inside;
                     self.parse_rule_recipes();
                 }
             }
@@ -1592,7 +1621,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_assignment(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(VARIABLE.into());
 
             // Handle `export`/`unexport`/`override`/`private` modifiers, in
@@ -2520,8 +2549,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             self.parse_normal_content();
                         }
                     }
-                    Some(INDENT) if self.in_rule => self.parse_recipe_line(),
-                    Some(INDENT) => self.parse_indented_line_outside_rule(),
+                    Some(INDENT) => self.parse_indented_line(),
                     Some(WHITESPACE) => self.bump(),
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
@@ -2651,7 +2679,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_expression_statement(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(EXPRESSION_STATEMENT.into());
             while self.current() == Some(DOLLAR) {
                 self.parse_variable_reference();
@@ -2670,7 +2698,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_include(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
@@ -2743,7 +2771,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Parse a GNU make `load` or `-load` directive into a LOAD node.
         fn parse_load(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(LOAD.into());
             self.bump();
             self.skip_ws_and_continuations();
@@ -2822,7 +2850,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// pattern (as an IDENTIFIER) and an optional EXPR holding the
         /// directory list.
         fn parse_vpath(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(VPATH.into());
             // Consume the `vpath` keyword.
             self.bump();
@@ -3164,8 +3192,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Parse one line inside a BSD `.if` or `.for` body.
         fn parse_block_item(&mut self) {
             match self.current() {
-                Some(INDENT) if self.in_rule => self.parse_recipe_line(),
-                Some(INDENT) => self.parse_indented_line_outside_rule(),
+                Some(INDENT) => self.parse_indented_line(),
                 Some(NEWLINE) => self.bump(),
                 _ => {
                     self.parse_token();
@@ -3316,7 +3343,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `VariableDefinition::name()` / `assignment_operator()` /
         /// `raw_value()` accessors work transparently for `define` blocks.
         fn parse_define(&mut self) {
-            self.in_rule = false;
+            self.in_rule = RuleContext::Outside;
             self.builder.start_node(VARIABLE.into());
 
             // Consume any `override`/`export`/`private` modifiers and the
@@ -3632,15 +3659,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 Some(INDENT) => {
-                    if self.in_rule {
-                        // A recipe line after a conditional whose branches
-                        // all end in rule context. It belongs to the rule
-                        // ending the branch that is taken, so it can't be
-                        // part of any one rule node.
-                        self.parse_recipe_line();
-                    } else {
-                        self.parse_indented_line_outside_rule();
-                    }
+                    // In rule context here, this is a recipe line after a
+                    // conditional whose branches all end in rule context. It
+                    // belongs to the rule ending the branch that is taken,
+                    // so it can't be part of any one rule node.
+                    self.parse_indented_line();
                     true
                 }
                 // Variable names may start with a backslash, e.g. `\n := ...`
@@ -3693,19 +3716,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// command without a target.
         fn parse_indented_line_outside_rule(&mut self) {
             if self.is_bsd_make() {
-                // BSD make skips lines with only a comment.
-                let comment_only = self
-                    .tokens
-                    .iter()
-                    .rev()
-                    .skip(1)
-                    .find(|(kind, _)| *kind != WHITESPACE)
-                    .is_none_or(|(kind, text)| match kind {
-                        COMMENT | NEWLINE => true,
-                        TEXT => text.trim_start().starts_with('#'),
-                        _ => false,
-                    });
-                if comment_only {
+                if self.at_bsd_comment_line() {
                     self.parse_bsd_comment_line();
                     return;
                 }
@@ -3717,6 +3728,75 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             } else {
                 self.relex_as_non_recipe_line(true);
             }
+        }
+
+        /// Parse a tab-indented line, which is a recipe line in rule context.
+        fn parse_indented_line(&mut self) {
+            let in_rule = self.in_rule;
+            match in_rule {
+                RuleContext::Inside => self.parse_recipe_line(),
+                RuleContext::Outside => self.parse_indented_line_outside_rule(),
+                // Whether the line belongs to a rule depends on the branches
+                // make takes. BSD make reads it as a shell command either
+                // way, while GNU make reads it as an ordinary line outside
+                // of rule context, so it has to be a recipe line if it isn't
+                // valid as one.
+                RuleContext::Varies if self.is_bsd_make() && self.at_bsd_comment_line() => {
+                    self.parse_bsd_comment_line()
+                }
+                RuleContext::Varies if !self.is_bsd_make() && self.indented_line_is_statement() => {
+                    self.relex_as_non_recipe_line(true)
+                }
+                RuleContext::Varies => self.parse_recipe_line(),
+            }
+        }
+
+        /// Whether the tab-indented line at the current position has only a
+        /// comment, or nothing at all, which BSD make skips.
+        fn at_bsd_comment_line(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|(kind, _)| *kind != WHITESPACE)
+                .is_none_or(|(kind, text)| match kind {
+                    COMMENT | NEWLINE => true,
+                    TEXT => text.trim_start().starts_with('#'),
+                    _ => false,
+                })
+        }
+
+        /// Whether the tab-indented line at the current position, read as an
+        /// ordinary line, is valid outside of rule context: anything but a
+        /// line that can only be a rule and has no dependency operator.
+        fn indented_line_is_statement(&mut self) -> bool {
+            let (mut line, _) = self.lex_as_non_recipe_line(true);
+            line.reverse();
+            while matches!(line.last(), Some((WHITESPACE | INDENT, _))) {
+                line.pop();
+            }
+            let tokens = std::mem::replace(&mut self.tokens, line);
+            let is_statement = match self.tokens.last() {
+                None | Some((NEWLINE | COMMENT, _)) => true,
+                Some((IDENTIFIER, text)) if text == "vpath" && !self.is_bsd_make() => true,
+                Some((IDENTIFIER, text))
+                    if self.is_conditional_directive(text) && self.gnu_directives_enabled() =>
+                {
+                    true
+                }
+                _ => {
+                    self.directive().is_some()
+                        || self.is_define_line()
+                        || self.is_assignment_line()
+                        || (self.bsd_directives_enabled() && self.is_bsd_assignment_line())
+                        || self.at_include_keyword()
+                        || self.at_load_keyword()
+                        || self.is_expression_statement_line()
+                        || self.line_has_dependency_operator()
+                }
+            };
+            self.tokens = tokens;
+            is_statement
         }
 
         /// Parse a tab-indented line with only a comment, or nothing at all,
@@ -3747,24 +3827,36 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Lex the rest of the current logical line as an ordinary makefile
+        /// line, with quoted strings grouped if `group_quotes` is set.
+        /// Returns the new tokens in forward order and the number of current
+        /// tokens they replace.
+        fn lex_as_non_recipe_line(&self, group_quotes: bool) -> (Vec<(SyntaxKind, String)>, usize) {
+            let mut text = String::new();
+            let mut count = 0;
+            let mut current = self.tokens.iter().rev();
+            loop {
+                for (kind, token) in current.by_ref() {
+                    text.push_str(token);
+                    count += 1;
+                    if *kind == NEWLINE {
+                        break;
+                    }
+                }
+                let (tokens, continued) = lex_non_recipe_line(&text, self.variant, group_quotes);
+                if !continued || count == self.tokens.len() {
+                    return (tokens, count);
+                }
+            }
+        }
+
         /// Lex the rest of the current logical line again as an ordinary
         /// makefile line, with quoted strings grouped if `group_quotes` is
         /// set.
         fn relex_as_non_recipe_line(&mut self, group_quotes: bool) {
             let consumed = self.token_positions.len() - self.tokens.len();
-            let mut text = String::new();
-            let tokens = loop {
-                while let Some((kind, token)) = self.tokens.pop() {
-                    text.push_str(&token);
-                    if kind == NEWLINE {
-                        break;
-                    }
-                }
-                let (tokens, continued) = lex_non_recipe_line(&text, self.variant, group_quotes);
-                if !continued || self.tokens.is_empty() {
-                    break tokens;
-                }
-            };
+            let (tokens, count) = self.lex_as_non_recipe_line(group_quotes);
+            self.tokens.truncate(self.tokens.len() - count);
 
             // Keep token_positions in step with the new tokens.
             let rest = self.token_positions.split_off(consumed);
@@ -4096,7 +4188,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         variant,
         for_depth: 0,
         pending_backslash_escape: false,
-        in_rule: false,
+        in_rule: RuleContext::Outside,
         bsd_line: None,
         token_edits: 0,
     }
@@ -14337,6 +14429,174 @@ test:
                 .collect::<Vec<_>>(),
             vec!["# c", "# d \\\n\tmore"]
         );
+    }
+
+    #[test]
+    fn test_recipe_after_conditional_ending_rule_on_some_paths() {
+        use crate::ast::makefile::MakefileItem;
+        // If X is undefined, the rule context of `all` survives the
+        // conditional and make runs `echo b`. If X is defined, the
+        // assignment ends it and make reports "recipe commences before
+        // first target".
+        let input = "all:\n\t@echo a\n\nifdef X\nY=1\nendif\n\t@echo b\n";
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(input, variant);
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
+            );
+            let makefile = parsed.root();
+            assert_eq!(makefile.code(), input);
+            let items: Vec<_> = makefile.items().collect();
+            assert_eq!(items.len(), 3);
+            let MakefileItem::Rule(rule) = &items[0] else {
+                panic!("expected rule");
+            };
+            assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["@echo a"]);
+            let MakefileItem::Recipe(recipe) = &items[2] else {
+                panic!("expected recipe");
+            };
+            assert_eq!(recipe.text(), "@echo b");
+        }
+    }
+
+    #[test]
+    fn test_recipe_after_conditional_ending_rule_in_one_branch() {
+        let input = "all:\n\t@echo a\nifdef X\nY=1\nelse\n\t@echo c\nendif\n\t@echo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    VARIABLE\n      EXPR\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\nRECIPE\n"
+        );
+        assert_eq!(parsed.root().code(), input);
+    }
+
+    #[test]
+    fn test_recipe_after_nested_conditional_ending_rule_on_some_paths() {
+        let input = "all:\n\t@echo a\nifdef X\nifdef W\nY=1\nendif\nendif\n\t@echo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    VARIABLE\n      EXPR\n    CONDITIONAL_ENDIF\n  CONDITIONAL_ENDIF\nRECIPE\n"
+        );
+        assert_eq!(parsed.root().code(), input);
+    }
+
+    #[test]
+    fn test_recipe_after_conditional_with_rule_in_one_branch() {
+        let input = "ifdef A\nt:\nendif\n\t@echo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n"
+        );
+        assert_eq!(parsed.root().code(), input);
+    }
+
+    #[test]
+    fn test_recipe_after_conditional_ending_rule_on_all_paths() {
+        // Make always reports "recipe commences before first target" here.
+        let input = "all:\n\t@echo a\nifdef X\nY=1\nelse\nZ=1\nendif\n\t@echo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(8, "unexpected token TEXT"), (8, "expected ':'")]
+        );
+        assert_eq!(parsed.root().code(), input);
+    }
+
+    #[test]
+    fn test_assignment_after_conditional_ending_rule_on_some_paths() {
+        // A tab-indented line that make also accepts outside of rule context
+        // is still read as such.
+        let input = "all:\n\t@echo a\nifdef X\nY=1\nendif\n\tZ = 1\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nVARIABLE\n  EXPR\n"
+        );
+        assert_eq!(parsed.root().code(), input);
+    }
+
+    #[test]
+    fn test_statements_after_conditional_ending_rule_on_some_paths() {
+        let prefix = "all:\n\t@echo a\nifdef X\nY=1\nendif\n";
+        for (line, kinds) in [
+            ("\t$(info x)\n", "EXPRESSION_STATEMENT\n  EXPR\n"),
+            (
+                "\tfoo: bar\n",
+                "RULE\n  TARGETS\n  PREREQUISITES\n    PREREQUISITE\n",
+            ),
+            ("\tinclude foo.mk\n", "INCLUDE\n  EXPR\n"),
+            ("\t# comment\n", ""),
+        ] {
+            let input = format!("{}{}", prefix, line);
+            let parsed = parse(&input, None);
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                format!(
+                    "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\n{}",
+                    kinds
+                )
+            );
+            assert_eq!(parsed.root().code(), input);
+        }
+    }
+
+    #[test]
+    fn test_bsd_recipe_after_conditional_ending_rule_on_some_paths() {
+        // BSD make reads every tab-indented line as a shell command, which
+        // belongs to `all` if X is undefined.
+        for (input, last) in [
+            (
+                "all:\n\t@echo a\n.if defined(X)\nY=1\n.endif\n\t@echo b\n",
+                "@echo b",
+            ),
+            (
+                "all:\n\t@echo a\n.if defined(X)\nY=1\n.endif\n\tZ = 1\n",
+                "Z = 1",
+            ),
+        ] {
+            let parsed = parse(input, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
+            );
+            let makefile = parsed.root();
+            assert_eq!(makefile.code(), input);
+            let crate::ast::makefile::MakefileItem::Recipe(recipe) =
+                makefile.items().last().unwrap()
+            else {
+                panic!("expected recipe");
+            };
+            assert_eq!(recipe.text(), last);
+        }
+    }
+
+    #[test]
+    fn test_bsd_recipe_after_conditional_ending_rule_on_all_paths() {
+        let input = "all:\n\t@echo a\n.if defined(X)\nY=1\n.else\nZ=1\n.endif\n\t@echo b\n";
+        let parsed = parse(input, Some(MakefileVariant::BSDMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(8, "indented line not part of a rule")]
+        );
+        assert_eq!(parsed.root().code(), input);
     }
 
     #[test]
