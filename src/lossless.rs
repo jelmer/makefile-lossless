@@ -3098,6 +3098,12 @@ impl VariableReference {
     ///
     /// For simple references like `$(FOO)`, returns `"FOO"`.
     /// For function calls like `$(wildcard *.c)`, returns `"wildcard"`.
+    /// Modifiers are not part of the name, so `${SRCS:M*.c}` returns
+    /// `"SRCS"`, while nested references are, as in `${VAR.${M}}`. For
+    /// single-character references such as `$@`, returns that character.
+    ///
+    /// Returns `None` for `$$` and for expressions without a variable name,
+    /// such as BSD make's `${:Uvalue}`.
     ///
     /// Note: Variable references inside recipes are not parsed into the syntax tree
     /// (recipes are stored as raw text). This only finds references in variable values,
@@ -3111,12 +3117,28 @@ impl VariableReference {
     /// assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
     /// ```
     pub fn name(&self) -> Option<String> {
-        // After $ and (, the first IDENTIFIER token is the variable/function name
-        self.0
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == IDENTIFIER)
-            .map(|t| t.text().to_string())
+        let mut children = self.0.children_with_tokens().skip(1);
+        let open = children.next()?;
+        if !matches!(open.kind(), LPAREN | LBRACE) {
+            // A single-character reference such as `$@` or `$X`
+            let token = open.into_token()?;
+            if token.kind() == DOLLAR {
+                return None;
+            }
+            return token.text().chars().next().map(String::from);
+        }
+        let mut name = String::new();
+        for child in children {
+            match child.kind() {
+                RPAREN | RBRACE | WHITESPACE | COMMA | OPERATOR | NEWLINE => break,
+                _ => name.push_str(&child.to_string()),
+            }
+        }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     /// Check if this is a function call rather than a simple variable reference.
@@ -3818,7 +3840,9 @@ impl Recipe {
     ///
     /// Function calls (`$(shell ...)`, anything with whitespace or commas after
     /// the name) and automatic variables (`$@`, `$<`, numeric `$1`) are skipped;
-    /// only plain variable references are returned.
+    /// only plain variable references are returned, including those inside
+    /// function calls. Modifiers are not part of the name, so the name of
+    /// `${SRCS:M*.c}` is `SRCS`.
     ///
     /// # Example
     /// ```
@@ -3873,6 +3897,11 @@ impl RecipeVariableReference {
 
 /// Scan `text` for `$(VAR)` / `${VAR}` references, pushing each onto `out` with
 /// ranges offset by `base` (the absolute start of `text` in the source).
+///
+/// As in [`VariableReference::name`], the name ends before any modifiers, as
+/// in `${SRCS:M*.c}`, and may contain nested references, as in `${VAR.${M}}`.
+/// References inside other references, such as in modifiers or function
+/// arguments, are reported too.
 fn scan_recipe_variable_refs(text: &str, base: u32, out: &mut Vec<RecipeVariableReference>) {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -3890,31 +3919,66 @@ fn scan_recipe_variable_refs(text: &str, base: u32, out: &mut Vec<RecipeVariable
             }
         };
         let name_start = i + 2;
-        let Some(rel_end) = bytes[name_start..].iter().position(|&b| b == close) else {
+        let Some((name_end, terminator)) = find_name_end(bytes, name_start, close) else {
             i += 2;
             continue;
         };
-        let name_end = name_start + rel_end;
         let name = &text[name_start..name_end];
-        // Skip function calls like $(shell ...): a name with whitespace inside.
-        if name.is_empty() || name.contains(char::is_whitespace) {
-            i = name_end + 1;
-            continue;
+        // Function calls like $(shell ...) have whitespace after the name;
+        // pure-numeric names are automatic variables ($1, $2, ...).
+        let is_variable = !name.is_empty()
+            && !matches!(terminator, b' ' | b'\t' | b',')
+            && !name.chars().all(|c| c.is_ascii_digit());
+        if is_variable {
+            out.push(RecipeVariableReference {
+                name: name.to_owned(),
+                range: rowan::TextRange::new(
+                    rowan::TextSize::from(base + name_start as u32),
+                    rowan::TextSize::from(base + name_end as u32),
+                ),
+            });
         }
-        // Skip pure-numeric automatic variables ($1, $2, ...).
-        if name.chars().all(|c| c.is_ascii_digit()) {
-            i = name_end + 1;
-            continue;
-        }
-        out.push(RecipeVariableReference {
-            name: name.to_owned(),
-            range: rowan::TextRange::new(
-                rowan::TextSize::from(base + name_start as u32),
-                rowan::TextSize::from(base + name_end as u32),
-            ),
-        });
-        i = name_end + 1;
+        // Continue inside the reference to find nested ones.
+        i = name_start;
     }
+}
+
+/// Find the end of the variable name starting at `start` in a reference
+/// closed by `close`, skipping nested references. Returns the end and the
+/// byte that ended the name, or `None` if the reference is not closed.
+fn find_name_end(bytes: &[u8], start: usize, close: u8) -> Option<(usize, u8)> {
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'{')) => {
+                let nested_close = if bytes[i + 1] == b'(' { b')' } else { b'}' };
+                i = find_reference_end(bytes, i + 2, nested_close)? + 1;
+            }
+            c if c == close || matches!(c, b':' | b' ' | b'\t' | b',') => return Some((i, c)),
+            b'\n' => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Find the delimiter closing a reference whose contents start at `start`.
+fn find_reference_end(bytes: &[u8], start: usize, close: u8) -> Option<usize> {
+    let open = if close == b')' { b'(' } else { b'{' };
+    let mut depth = 0usize;
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                return Some(i);
+            }
+            depth -= 1;
+        } else if c == b'\n' {
+            return None;
+        }
+    }
+    None
 }
 
 /// Convert CRLF line endings in `text` to LF.
@@ -4113,6 +4177,53 @@ mod tests {
     use super::*;
     use crate::ast::makefile::MakefileItem;
     use crate::pattern::matches_pattern;
+
+    #[test]
+    fn test_variable_reference_names() {
+        let makefile: Makefile =
+            "A = ${SRCS:M*.c} $(OBJS:.o=.c) ${VAR.${M}} ${:Ufoo} $@ $(wildcard *.c) $$\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            makefile
+                .variable_references()
+                .map(|r| r.name())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("SRCS".to_string()),
+                Some("OBJS".to_string()),
+                Some("VAR.${M}".to_string()),
+                Some("M".to_string()),
+                None,
+                Some("@".to_string()),
+                Some("wildcard".to_string()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recipe_variable_reference_names() {
+        let text = "all:\n\t${.ALLSRC:M*.o} ${VAR.${M}} $(shell echo $(X)) ${X:S/a/${Y}/} $1\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        assert_eq!(
+            recipe
+                .variable_references()
+                .iter()
+                .map(|r| (r.name(), &text[std::ops::Range::from(r.text_range())]))
+                .collect::<Vec<_>>(),
+            vec![
+                (".ALLSRC", ".ALLSRC"),
+                ("VAR.${M}", "VAR.${M}"),
+                ("M", "M"),
+                ("X", "X"),
+                ("X", "X"),
+                ("Y", "Y"),
+            ]
+        );
+    }
 
     #[test]
     fn test_unclosed_reference_stops_at_newline() {
