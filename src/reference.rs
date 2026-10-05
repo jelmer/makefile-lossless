@@ -333,7 +333,7 @@ pub enum Modifier {
 ///
 /// # Example
 /// ```
-/// use makefile_edit::{MakefileVariant, Modifier, ParsedReference};
+/// use makefile_lossless::{MakefileVariant, Modifier, ParsedReference};
 /// let parsed = ParsedReference::parse("${SRCS:M*.c:Q}", MakefileVariant::BSDMake).unwrap();
 /// assert_eq!(parsed.name, "SRCS");
 /// assert_eq!(

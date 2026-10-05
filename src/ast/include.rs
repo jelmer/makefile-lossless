@@ -138,7 +138,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::{Makefile, MakefileVariant};
+    /// use makefile_lossless::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".include <bsd.prog.mk>\ninclude a\\#b.mk\n".parse().unwrap();
     /// let paths: Vec<_> = makefile.includes().map(|i| i.path().unwrap()).collect();
     /// assert_eq!(paths, vec!["bsd.prog.mk", "a#b.mk"]);
@@ -167,7 +167,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::{Makefile, MakefileVariant};
+    /// use makefile_lossless::{Makefile, MakefileVariant};
     /// let makefile: Makefile = "include $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
     /// let inc = makefile.includes().next().unwrap();
     /// assert_eq!(
@@ -212,7 +212,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::Makefile;
+    /// use makefile_lossless::Makefile;
     /// let makefile: Makefile = "include config.mk\n".parse().unwrap();
     /// let inc = makefile.includes().next().unwrap();
     /// let range = inc.path_range().unwrap();
@@ -237,7 +237,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::Makefile;
+    /// use makefile_lossless::Makefile;
     ///
     /// let makefile: Makefile = r#"ifdef DEBUG
     /// include debug.mk
@@ -246,7 +246,7 @@ impl Include {
     /// let cond = makefile.conditionals().next().unwrap();
     /// let inc = cond.if_items().next().unwrap();
     /// // Include's parent is the conditional
-    /// assert!(matches!(inc, makefile_edit::MakefileItem::Include(_)));
+    /// assert!(matches!(inc, makefile_lossless::MakefileItem::Include(_)));
     /// ```
     pub fn parent(&self) -> Option<MakefileItem> {
         self.syntax().parent().and_then(MakefileItem::cast)
@@ -258,7 +258,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::Makefile;
+    /// use makefile_lossless::Makefile;
     /// let mut makefile: Makefile = "include config.mk\nVAR = value\n".parse().unwrap();
     /// let mut inc = makefile.includes().next().unwrap();
     /// inc.remove().unwrap();
@@ -289,7 +289,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::Makefile;
+    /// use makefile_lossless::Makefile;
     /// let mut makefile: Makefile = "include old.mk\n".parse().unwrap();
     /// let mut inc = makefile.includes().next().unwrap();
     /// inc.set_path("new#1.mk").unwrap();
@@ -376,7 +376,7 @@ impl Include {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::Makefile;
+    /// use makefile_lossless::Makefile;
     /// let mut makefile: Makefile = "include config.mk\n".parse().unwrap();
     /// let mut inc = makefile.includes().next().unwrap();
     /// inc.set_optional(true).unwrap();
