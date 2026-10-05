@@ -940,14 +940,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Whether the current token is an `export`/`override`/`private`
-        /// modifier. A keyword directly followed by an operator is the
+        /// Whether the current token is an `export`/`unexport`/`override`/
+        /// `private` modifier. A keyword directly followed by an operator is the
         /// variable name itself, as in `override := 1`.
         fn at_assignment_prefix_keyword(&self) -> bool {
             self.current() == Some(IDENTIFIER)
                 && matches!(
                     self.tokens.last().unwrap().1.as_str(),
-                    "export" | "override" | "private"
+                    "export" | "unexport" | "override" | "private"
                 )
                 && self.peek_past_ws() != Some(OPERATOR)
         }
@@ -956,9 +956,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.in_rule = false;
             self.builder.start_node(VARIABLE.into());
 
-            // Handle `export`/`override`/`private` modifiers, in any order.
+            // Handle `export`/`unexport`/`override`/`private` modifiers, in
+            // any order.
             self.skip_ws();
+            let mut is_export_directive = false;
             while self.at_assignment_prefix_keyword() {
+                is_export_directive |= matches!(
+                    self.tokens.last().unwrap().1.as_str(),
+                    "export" | "unexport"
+                );
                 self.bump();
                 self.skip_ws();
             }
@@ -987,6 +993,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Skip whitespace and parse operator
             self.skip_ws();
+
+            // A bare "export"/"unexport" directive may list several variables.
+            // With an assignment, GNU make treats "A B" as a single name, which
+            // isn't supported; leave that to the operator check below to report.
+            if is_export_directive && !self.has_assignment_operator_on_line() {
+                loop {
+                    match self.current() {
+                        Some(IDENTIFIER) => self.bump(),
+                        Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
+                        Some(DOLLAR) => self.parse_variable_reference(),
+                        _ => break,
+                    }
+                    self.skip_ws();
+                }
+            }
             match self.current() {
                 Some(OPERATOR) => {
                     let op = &self.tokens.last().unwrap().1;
@@ -2214,10 +2235,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        fn has_assignment_operator_on_line(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .take_while(|(kind, _)| *kind != NEWLINE)
+                .any(|(kind, text)| {
+                    *kind == OPERATOR
+                        && ["=", ":=", "::=", ":::=", "+=", "?=", "!="].contains(&text.as_str())
+                })
+        }
+
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-            let is_directive =
-                |text: &str| matches!(text, "export" | "override" | "private" | "undefine");
+            let is_directive = |text: &str| {
+                matches!(
+                    text,
+                    "export" | "unexport" | "override" | "private" | "undefine"
+                )
+            };
             let mut tokens = self.tokens.iter().rev().peekable();
             let mut seen_name = false;
             // Whitespace after the name: anything but an operator now means
@@ -4748,6 +4784,105 @@ all: $(OBJS)
             );
             assert_eq!(parsed.root().code(), text);
         }
+    }
+
+    #[test]
+    fn test_export_multiple_names() {
+        let parsed = parse("export quiet Q KBUILD_VERBOSE\nall:\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert!(vars[0].is_export());
+        assert_eq!(vars[0].name(), Some("quiet".to_string()));
+        assert_eq!(
+            vars[0].names().collect::<Vec<_>>(),
+            vec!["quiet", "Q", "KBUILD_VERBOSE"]
+        );
+        assert_eq!(vars[0].assignment_operator(), None);
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(makefile.code(), "export quiet Q KBUILD_VERBOSE\nall:\n");
+    }
+
+    #[test]
+    fn test_unexport() {
+        let parsed = parse("unexport A\nunexport B C\nall:\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        assert!(vars[0].is_unexport());
+        assert!(!vars[0].is_export());
+        assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["A"]);
+        assert!(vars[1].is_unexport());
+        assert_eq!(vars[1].names().collect::<Vec<_>>(), vec!["B", "C"]);
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_unexport_assignment() {
+        let parsed = parse("unexport A = 1\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_unexport());
+        assert_eq!(var.name(), Some("A".to_string()));
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_export_names_with_variable_reference() {
+        let parsed = parse("export A $(B) C\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.names().collect::<Vec<_>>(), vec!["A", "$(B)", "C"]);
+    }
+
+    #[test]
+    fn test_export_names_with_computed_name() {
+        let parsed = parse("export CFLAGS.${PROG} B $(C)-x\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("CFLAGS.${PROG}".to_string()));
+        assert_eq!(
+            var.names().collect::<Vec<_>>(),
+            vec!["CFLAGS.${PROG}", "B", "$(C)-x"]
+        );
+    }
+
+    #[test]
+    fn test_export_multiple_words_with_assignment() {
+        // GNU make treats this as a single variable named "A B"
+        let parsed = parse("export A B = x\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expected assignment operator"]
+        );
+    }
+
+    #[test]
+    fn test_define_names() {
+        let parsed = parse("define FOO\nbar baz\nendef\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.names().collect::<Vec<_>>(), vec!["FOO"]);
+    }
+
+    #[test]
+    fn test_undefine_names() {
+        let parsed = parse("undefine FOO\noverride undefine BAR\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let vars = parsed.root().variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["FOO"]);
+        assert_eq!(vars[1].names().collect::<Vec<_>>(), vec!["BAR"]);
     }
 
     #[test]
