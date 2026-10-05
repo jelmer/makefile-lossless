@@ -2,6 +2,7 @@
 
 use super::{is_continuation, logical_text, LineSyntax};
 use crate::lossless::Vpath;
+use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -59,12 +60,40 @@ impl Vpath {
     /// continuations collapsed and `\#` unescaped, or `None` if the
     /// directive has no directories.
     pub fn directories_text(&self) -> Option<String> {
+        self.directories_text_with(LineSyntax::Gnu)
+    }
+
+    /// Like [`Self::directories_text`], but as `variant` reads it. Unlike GNU make by default, GNU make
+    /// after `.POSIX:` keeps the whitespace before a line continuation;
+    /// use [`MakefileVariant::POSIXMake`] for that.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant};
+    /// let makefile: Makefile = "vpath %.c a \\\n  b\n".parse().unwrap();
+    /// let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else {
+    ///     panic!("expected a vpath directive");
+    /// };
+    /// assert_eq!(
+    ///     vpath.directories_text_for(MakefileVariant::GNUMake),
+    ///     Some("a b".to_string())
+    /// );
+    /// assert_eq!(
+    ///     vpath.directories_text_for(MakefileVariant::POSIXMake),
+    ///     Some("a  b".to_string())
+    /// );
+    /// ```
+    pub fn directories_text_for(&self, variant: MakefileVariant) -> Option<String> {
+        self.directories_text_with(variant.into())
+    }
+
+    fn directories_text_with(&self, syntax: LineSyntax) -> Option<String> {
         self.syntax()
             .children()
             .find(|c| c.kind() == EXPR)
             .map(|n| {
                 let tokens = n.descendants_with_tokens().filter_map(|it| it.into_token());
-                logical_text(&n, tokens, LineSyntax::Gnu, true)
+                logical_text(&n, tokens, syntax, true)
                     .trim_end()
                     .to_string()
             })
@@ -229,5 +258,23 @@ mod tests {
         assert_eq!(vpath.syntax().to_string(), code);
         assert_eq!(vpath.pattern(), None);
         assert_eq!(vpath.directories_text(), None);
+    }
+
+    #[test]
+    fn test_directories_text_for_variant() {
+        use crate::MakefileVariant;
+        let vpath = vpath_of("vpath %.c $(subst a \\\n  b,c,a  b) \\\n  src\n");
+        assert_eq!(
+            vpath.directories_text(),
+            Some("$(subst a b,c,a  b) src".to_string())
+        );
+        assert_eq!(
+            vpath.directories_text_for(MakefileVariant::GNUMake),
+            Some("$(subst a b,c,a  b) src".to_string())
+        );
+        assert_eq!(
+            vpath.directories_text_for(MakefileVariant::POSIXMake),
+            Some("$(subst a  b,c,a  b)  src".to_string())
+        );
     }
 }
