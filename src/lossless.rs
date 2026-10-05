@@ -12201,6 +12201,44 @@ test:
     }
 
     #[test]
+    fn test_tab_indented_comment_continuation_at_top_level() {
+        // A backslash-newline continues a comment, so `more` and `\tmore`
+        // are part of it rather than rules.
+        for variant in [None, Some(MakefileVariant::POSIXMake)] {
+            let code = "X = 1\n\t# d \\\n\tmore\n\t# e \\\nmore\nall:\n";
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n"
+            );
+            assert_eq!(
+                parsed
+                    .syntax()
+                    .children_with_tokens()
+                    .filter_map(|it| it.into_token())
+                    .filter(|t| t.kind() == COMMENT)
+                    .map(|t| t.text().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["# d \\\n\tmore", "# e \\\nmore"]
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_tab_indented_comment_ending_in_escaped_backslash() {
+        let code = "X = 1\n\t# d \\\\\nY = 2\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "VARIABLE\n  EXPR\nVARIABLE\n  EXPR\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
     fn test_space_indented_line_after_rule_is_not_recipe() {
         let code = "t:\n\techo 1\n  X = 1\n";
         let parsed = parse(code, None);
