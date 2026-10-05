@@ -589,6 +589,12 @@ impl Makefile {
     ///
     /// Both GNU make and BSD make syntax are accepted. Use
     /// [`Self::parse_with_variant`] to restrict parsing to a single variant.
+    ///
+    /// Variable references end where they do in GNU make, at the matching
+    /// closing parenthesis or brace. BSD make instead ends them where their
+    /// modifiers end, so that `${X:S,},x,}` is a single reference and the
+    /// `$` in `${X:S/$/x/}` does not start a nested reference; parse with
+    /// [`MakefileVariant::BSDMake`] to get those boundaries.
     pub fn parse(text: &str) -> crate::Parse<Makefile> {
         crate::Parse::<Makefile>::parse_makefile(text)
     }

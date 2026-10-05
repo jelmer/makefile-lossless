@@ -6,6 +6,7 @@
 //! `$(SRCS:.c=.o)`.
 
 use crate::MakefileVariant;
+use std::ops::Range;
 
 /// A piece of a [`ModifierArg`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,7 +463,7 @@ impl ParsedReference {
         text: &str,
         variant: MakefileVariant,
     ) -> Result<(Self, usize), ReferenceError> {
-        let mut parser = Parser { text, pos: 0 };
+        let mut parser = Parser::new(text);
         let parsed = if variant == MakefileVariant::BSDMake {
             parser.parse_expr()?
         } else {
@@ -478,7 +479,7 @@ impl ParsedReference {
     /// ends it, so a `}` or `)` is treated like any other character where
     /// make would accept it.
     pub fn parse_body(body: &str, variant: MakefileVariant) -> Result<Self, ReferenceError> {
-        let mut parser = Parser { text: body, pos: 0 };
+        let mut parser = Parser::new(body);
         if variant == MakefileVariant::BSDMake {
             let delims = Delims {
                 startc: None,
@@ -493,6 +494,29 @@ impl ParsedReference {
             parse_simple_body(body, 0, variant)
         }
     }
+}
+
+/// Find the extent of the BSD make expression at the start of `text`, as
+/// [`ParsedReference::parse_prefix`] does, along with the byte ranges of the
+/// expressions nested directly in it. `$$` counts as a nested expression,
+/// but a `$` that make takes literally, such as the anchor in `:S/$/x/`,
+/// does not.
+///
+/// Returns `None` if the expression is malformed.
+pub(crate) fn bsd_expr_extent(text: &str) -> Option<(usize, Vec<Range<usize>>)> {
+    let mut parser = Parser::new(text);
+    parser.parse_expr().ok()?;
+    let mut spans = parser.spans;
+    spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+    let mut nested: Vec<Range<usize>> = vec![];
+    for span in spans {
+        // Skip the expression itself and the expressions nested further.
+        if span.start == 0 || nested.last().is_some_and(|last| span.start < last.end) {
+            continue;
+        }
+        nested.push(span);
+    }
+    Some((parser.pos, nested))
 }
 
 fn syntax_error(offset: usize, message: impl Into<String>) -> ReferenceError {
@@ -523,9 +547,19 @@ impl Delims {
 struct Parser<'a> {
     text: &'a str,
     pos: usize,
+    /// The byte ranges of the expressions found so far, including `$$`.
+    spans: Vec<Range<usize>>,
 }
 
 impl<'a> Parser<'a> {
+    fn new(text: &'a str) -> Self {
+        Parser {
+            text,
+            pos: 0,
+            spans: vec![],
+        }
+    }
+
     fn rest(&self) -> &'a str {
         &self.text[self.pos..]
     }
@@ -570,6 +604,7 @@ impl<'a> Parser<'a> {
             }
             Some(c) => {
                 self.bump();
+                self.spans.push(start..self.pos);
                 return Ok(ParsedReference {
                     name: c.to_string(),
                     modifiers: vec![],
@@ -577,10 +612,12 @@ impl<'a> Parser<'a> {
             }
         };
         let startc = self.bump();
-        self.parse_braced(Delims {
+        let parsed = self.parse_braced(Delims {
             startc,
             endc: Some(endc),
-        })
+        })?;
+        self.spans.push(start..self.pos);
+        Ok(parsed)
     }
 
     /// Parse the name and modifiers of an expression, after the opening
@@ -639,7 +676,11 @@ impl<'a> Parser<'a> {
                 Some(':' | ')' | '}') => {
                     self.bump();
                 }
-                Some(_) => self.bump_n(2),
+                Some(_) => {
+                    let start = self.pos;
+                    self.bump_n(2);
+                    self.spans.push(start..self.pos);
+                }
             }
         }
         Ok(self.text[start..self.pos].to_string())
@@ -699,6 +740,7 @@ impl<'a> Parser<'a> {
 
     fn parse_modifier(&mut self, delims: Delims) -> Result<Modifier, ReferenceError> {
         let start = self.pos;
+        let spans = self.spans.len();
         let first = self.peek().expect("caller checked for end of text");
         let simple = |parser: &mut Self, modifier: Modifier| {
             if delims.is_delimiter(parser.peek_nth(1)) {
@@ -766,7 +808,9 @@ impl<'a> Parser<'a> {
             }
             'M' | 'N' => {
                 self.bump();
+                let pattern_start = self.pos;
                 let pattern = self.parse_match_pattern(delims);
+                self.record_raw_spans(pattern_start..self.pos);
                 Some(if first == 'M' {
                     Modifier::Match(pattern)
                 } else {
@@ -798,6 +842,7 @@ impl<'a> Parser<'a> {
             return Ok(modifier);
         }
         self.pos = start;
+        self.spans.truncate(spans);
         if let Some(modifier) = self.parse_sysv(delims)? {
             return Ok(modifier);
         }
@@ -865,7 +910,9 @@ impl<'a> Parser<'a> {
                     "in the :@ modifier, the variable name must not contain a dollar",
                 )
             })?;
+        let body_start = self.pos;
         let body = self.parse_balanced_part('@')?;
+        self.record_raw_spans(body_start..self.pos - 1);
         Ok(Modifier::Loop { var, body })
     }
 
@@ -1236,6 +1283,7 @@ impl<'a> Parser<'a> {
             }
             Some('$') => {
                 self.bump_n(2);
+                self.spans.push(start..self.pos);
                 arg.push_char('$');
             }
             None | Some(':' | ')' | '}') => {
@@ -1243,10 +1291,41 @@ impl<'a> Parser<'a> {
             }
             Some(_) => {
                 self.bump_n(2);
+                self.spans.push(start..self.pos);
                 arg.push_expr(&self.text[start..self.pos]);
             }
         }
         Ok(())
+    }
+
+    /// Record the expressions in the raw text at `raw`, which make expands
+    /// only after parsing the modifier.
+    fn record_raw_spans(&mut self, raw: Range<usize>) {
+        let mut parser = Parser::new(&self.text[..raw.end]);
+        parser.pos = raw.start;
+        while let Some(offset) = parser.rest().find('$') {
+            parser.pos += offset;
+            let dollar = parser.pos;
+            match parser.peek_nth(1) {
+                None => break,
+                Some('(' | '{') => {
+                    let mut nested = Parser::new(parser.text);
+                    nested.pos = dollar;
+                    if nested.parse_expr().is_ok() {
+                        parser.spans.extend(nested.spans);
+                        parser.pos = nested.pos;
+                    } else {
+                        // Make reports the error when expanding the text.
+                        parser.bump();
+                    }
+                }
+                Some(_) => {
+                    parser.bump_n(2);
+                    parser.spans.push(dollar..parser.pos);
+                }
+            }
+        }
+        self.spans.extend(parser.spans);
     }
 
     /// Parse a part of a modifier up to and including `delim`, where `None`
@@ -1624,6 +1703,19 @@ mod tests {
             Err(ReferenceError::Syntax { offset, message }) => (offset, message),
             other => panic!("expected syntax error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_bsd_expr_extent() {
+        assert_eq!(bsd_expr_extent("${X:S/$/x/} y"), Some((11, vec![])));
+        assert_eq!(bsd_expr_extent("${X:S,},x,}}"), Some((11, vec![])));
+        assert_eq!(
+            bsd_expr_extent("${A.$B:S/${C}/$$/:M$D*:@v@${v}@}"),
+            Some((32, vec![4..6, 9..13, 14..16, 19..21, 26..30]))
+        );
+        assert_eq!(bsd_expr_extent("$X:"), Some((2, vec![])));
+        assert_eq!(bsd_expr_extent("${X:S/a/b"), None);
+        assert_eq!(bsd_expr_extent("$$"), None);
     }
 
     #[test]
