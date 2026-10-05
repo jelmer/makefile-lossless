@@ -118,10 +118,31 @@ impl VariableDefinition {
             }
             return elements;
         }
+        // The parser ends the name at the operator before the value. Look
+        // for it from the value, since a BSD make name may itself contain
+        // operators, as in `a:b`, and a GNU make name unbalanced brackets,
+        // as in `x{`.
+        let operator = self
+            .syntax()
+            .children()
+            .filter(|it| it.kind() == EXPR)
+            .last()
+            .and_then(|value| {
+                std::iter::successors(value.prev_sibling_or_token(), |it| {
+                    it.prev_sibling_or_token()
+                })
+                .find(|it| it.kind() != WHITESPACE)
+            })
+            .filter(|it| {
+                it.as_token()
+                    .is_some_and(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
+            });
         // BSD make names may contain almost any character, as in `EXP.[A-]`
         // or `a:b`, including whitespace inside parentheses and braces.
-        self.after_directive_keywords()
-            .scan(0usize, |level, it| {
+        let mut elements: Vec<_> = self
+            .after_directive_keywords()
+            .take_while(|it| Some(it) != operator.as_ref())
+            .scan(0isize, |level, it| {
                 if is_continuation(&it) {
                     return None;
                 }
@@ -132,11 +153,11 @@ impl VariableDefinition {
                             true
                         }
                         RPAREN | RBRACE => {
-                            *level = level.saturating_sub(1);
+                            *level -= 1;
                             true
                         }
                         NEWLINE | COMMENT => false,
-                        _ if *level > 0 => true,
+                        _ if *level != 0 => true,
                         WHITESPACE => false,
                         OPERATOR => !is_assignment_operator(t.text()),
                         _ => true,
@@ -145,7 +166,11 @@ impl VariableDefinition {
                 };
                 in_name.then_some(it)
             })
-            .collect()
+            .collect();
+        while elements.last().is_some_and(|it| it.kind() == WHITESPACE) {
+            elements.pop();
+        }
+        elements
     }
 
     /// Internal: the children following the directive keywords and any
@@ -1598,5 +1623,76 @@ mod tests {
             value_in(MakefileVariant::NMake, "X = a\\#b\n"),
             Some("a\\".to_string())
         );
+    }
+
+    #[test]
+    fn test_name_with_unbalanced_brackets() {
+        // GNU make does not pair up brackets in a name: `x{ = 1` assigns to
+        // `x{`. BSD make doesn't accept these as assignments at all.
+        let cases = [
+            ("x{ = 1\n", "x{"),
+            ("x( = 1\n", "x("),
+            ("a{b = 1\n", "a{b"),
+            ("a(b := 1\n", "a(b"),
+            ("a}b = 1\n", "a}b"),
+            ("a)b += 1\n", "a)b"),
+            ("{x = 1\n", "{x"),
+            ("(x = 1\n", "(x"),
+            ("}x = 1\n", "}x"),
+            (")x := 1\n", ")x"),
+            ("{ = 1\n", "{"),
+            ("override x{ = 1\n", "x{"),
+        ];
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            for (code, name) in cases {
+                let gnu = matches!(variant, None | Some(MakefileVariant::GNUMake));
+                if !gnu && code.starts_with("override") {
+                    continue;
+                }
+                let parsed = match variant {
+                    None => Makefile::parse(code),
+                    Some(v) => Makefile::parse_with_variant(code, v),
+                };
+                assert!(parsed.ok(), "{variant:?} {code:?}: {:?}", parsed.errors());
+                let makefile = parsed.tree();
+                assert_eq!(makefile.code(), code);
+                let vars: Vec<_> = makefile.variable_definitions().collect();
+                assert_eq!(vars.len(), 1, "{variant:?} {code:?}");
+                assert_eq!(
+                    vars[0].name(),
+                    Some(name.to_string()),
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(vars[0].raw_value(), Some("1".to_string()), "{variant:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_name_with_brackets_bsd() {
+        // BSD make pairs up brackets in a name, and lets the nesting level
+        // go negative.
+        for (code, name) in [("a{b c} = 1\n", "a{b c}"), ("a}b{ = 1\n", "a}b{")] {
+            let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+            assert!(parsed.ok(), "{code:?}: {:?}", parsed.errors());
+            let makefile = parsed.tree();
+            assert_eq!(makefile.code(), code);
+            let var = makefile.variable_definitions().next().unwrap();
+            assert_eq!(var.name(), Some(name.to_string()));
+            assert_eq!(var.raw_value(), Some("1".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_set_name_with_unbalanced_bracket() {
+        let makefile: Makefile = "x{ = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("y");
+        assert_eq!(makefile.code(), "y = 1\n");
     }
 }
