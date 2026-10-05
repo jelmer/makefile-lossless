@@ -666,20 +666,35 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        /// Look ahead (without consuming) for the `IDENTIFIER (WS)? OPERATOR`
-        /// pattern that marks a target-specific variable assignment such as
-        /// `all: CFLAGS = -O2`.
+        /// Whether `self.tokens[i]` is an `export`/`override`/`private`
+        /// modifier followed by whitespace and another identifier, as in
+        /// `all: export CFLAGS = -O2`.
+        fn is_assignment_modifier(&self, i: usize) -> bool {
+            i >= 2
+                && self.tokens[i].0 == IDENTIFIER
+                && matches!(self.tokens[i].1.as_str(), "export" | "override" | "private")
+                && self.tokens[i - 1].0 == WHITESPACE
+                && self.tokens[i - 2].0 == IDENTIFIER
+        }
+
+        /// Look ahead (without consuming) for the
+        /// `(MODIFIER WS)* IDENTIFIER (WS)? OPERATOR` pattern that marks a
+        /// target-specific variable assignment such as `all: CFLAGS = -O2`.
         fn looks_like_target_specific_assignment(&self) -> bool {
             // tokens is reversed (last = current). We look from the end.
             let n = self.tokens.len();
             if n < 2 {
                 return false;
             }
-            // Current token must be an IDENTIFIER (the variable name).
-            if self.tokens[n - 1].0 != IDENTIFIER {
+            let mut i = n - 1;
+            while self.is_assignment_modifier(i) {
+                i -= 2;
+            }
+            // The variable name.
+            if self.tokens[i].0 != IDENTIFIER || i == 0 {
                 return false;
             }
-            let mut i = n - 2;
+            i -= 1;
             // Optional whitespace.
             if self.tokens[i].0 == WHITESPACE {
                 if i == 0 {
@@ -699,6 +714,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// child `VARIABLE` node. Consumes through the end-of-line.
         fn parse_target_specific_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
+            while self.is_assignment_modifier(self.tokens.len() - 1) {
+                self.bump();
+                self.skip_ws();
+            }
             // Variable name (IDENTIFIER).
             self.bump();
             self.skip_ws();
@@ -794,24 +813,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Whether the current token is an `export`/`override`/`private`
+        /// modifier. A keyword directly followed by an operator is the
+        /// variable name itself, as in `override := 1`.
+        fn at_assignment_prefix_keyword(&self) -> bool {
+            self.current() == Some(IDENTIFIER)
+                && matches!(
+                    self.tokens.last().unwrap().1.as_str(),
+                    "export" | "override" | "private"
+                )
+                && self.peek_past_ws() != Some(OPERATOR)
+        }
+
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Handle `override` and `export` prefixes (in either order). Both
-            // are independent modifiers on a variable assignment.
+            // Handle `export`/`override`/`private` modifiers, in any order.
             self.skip_ws();
-            for _ in 0..2 {
-                if self.current() == Some(IDENTIFIER)
-                    && matches!(
-                        self.tokens.last().unwrap().1.as_str(),
-                        "export" | "override"
-                    )
-                {
-                    self.bump();
-                    self.skip_ws();
-                } else {
-                    break;
-                }
+            while self.at_assignment_prefix_keyword() {
+                self.bump();
+                self.skip_ws();
             }
 
             // `undefine NAME`, unless followed by an operator as in
@@ -2034,7 +2055,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if matches!(text.as_str(), "export" | "override" | "undefine") => {
+                    IDENTIFIER
+                        if matches!(
+                            text.as_str(),
+                            "export" | "override" | "private" | "undefine"
+                        ) =>
+                    {
                         seen_directive = true
                     }
                     IDENTIFIER if !name_done => seen_name = true,
