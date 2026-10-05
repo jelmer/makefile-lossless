@@ -1,6 +1,6 @@
 use crate::lossless::{
     parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
-    Makefile, ParseError, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
+    Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
 use crate::MakefileVariant;
@@ -40,6 +40,12 @@ pub enum MakefileItem {
     ExpressionStatement(ExpressionStatement),
     /// A GNU make `load` directive (e.g., `load foo.so`)
     Load(Load),
+    /// A recipe line after a conditional whose branches all end in rule
+    /// context, as in `ifdef X\na:\nelse\nb:\nendif\n\techo hi\n`. It
+    /// belongs to the rule that ends the branch make takes. Inside a
+    /// conditional branch, such lines are returned as
+    /// [`ConditionalItem::Recipe`](crate::ConditionalItem::Recipe) instead.
+    Recipe(Recipe),
 }
 
 impl MakefileItem {
@@ -61,6 +67,8 @@ impl MakefileItem {
             Some(MakefileItem::ExpressionStatement(stmt))
         } else if let Some(load) = Load::cast(node.clone()) {
             Some(MakefileItem::Load(load))
+        } else if let Some(recipe) = Recipe::cast(node.clone()) {
+            Some(MakefileItem::Recipe(recipe))
         } else {
             Conditional::cast(node).map(MakefileItem::Conditional)
         }
@@ -78,6 +86,7 @@ impl MakefileItem {
             MakefileItem::Directive(d) => d.syntax(),
             MakefileItem::ExpressionStatement(e) => e.syntax(),
             MakefileItem::Load(l) => l.syntax(),
+            MakefileItem::Recipe(r) => r.syntax(),
         }
     }
 

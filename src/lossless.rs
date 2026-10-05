@@ -764,7 +764,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // A space-indented comment or blank line doesn't end the rule
                         let next = self.tokens.iter().rev().nth(1).map(|(kind, _)| *kind);
                         match next {
-                            Some(COMMENT) if conditional_depth > 0 || newline_count == 0 => {
+                            Some(COMMENT)
+                                if conditional_depth > 0
+                                    || newline_count == 0
+                                    || self.recipe_continues() =>
+                            {
                                 self.bump();
                             }
                             Some(NEWLINE) | None => self.bump(),
@@ -778,7 +782,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(COMMENT) => {
                         // Comments after blank lines should not be part of the
                         // rule, unless the recipe continues after them
-                        if conditional_depth == 0 && newline_count >= 1 && !self.recipe_follows() {
+                        if conditional_depth == 0 && newline_count >= 1 && !self.recipe_continues()
+                        {
                             break;
                         }
                         newline_count = 0;
@@ -791,9 +796,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             let is_block = is_bsd_if(name) || name == "for";
                             // Blank lines don't end a rule's recipe, so this
                             // belongs to the rule if it has recipe lines.
-                            if !is_block
-                                || (conditional_depth == 0 && !self.conditional_continues_recipe())
-                            {
+                            if !is_block || (conditional_depth == 0 && !self.recipe_continues()) {
                                 break;
                             }
                             newline_count = 0;
@@ -808,7 +811,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             // If we're not inside a conditional (depth == 0) and it doesn't
                             // continue the recipe, this is a top-level conditional, not part
                             // of the rule. Blank lines don't end a rule's recipe.
-                            if conditional_depth == 0 && !self.conditional_continues_recipe() {
+                            if conditional_depth == 0 && !self.recipe_continues() {
                                 break;
                             }
                             newline_count = 0;
@@ -854,14 +857,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             matches!(self.tokens.last(), Some((OPERATOR, op)) if self.is_dependency_operator(op))
         }
 
-        /// Look ahead (without consuming) at the conditional starting at the
-        /// current token, and check whether a recipe line of the current rule
-        /// is reached before rule context ends, following rule context the
-        /// same way the parser does. GNU make ends a rule's recipe at the
-        /// first line that is not a recipe line, comment or conditional
-        /// directive, so if no recipe line follows the conditional doesn't
-        /// belong to the preceding rule.
-        fn conditional_continues_recipe(&self) -> bool {
+        /// Look ahead (without consuming) from the current token, which
+        /// starts a comment or conditional, and check whether a recipe line
+        /// of the current rule is reached before rule context ends,
+        /// following rule context the same way the parser does. GNU make
+        /// ends a rule's recipe at the first line that is not a recipe line,
+        /// comment, blank line or conditional directive, so if no recipe
+        /// line follows, the comment or conditional doesn't belong to the
+        /// preceding rule.
+        fn recipe_continues(&self) -> bool {
             let bsd = self.bsd_directives_enabled();
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
@@ -995,16 +999,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .rev()
                 .take_while(|(kind, _)| *kind != NEWLINE)
                 .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text))
-        }
-
-        /// Whether a recipe line follows the current comments and blank
-        /// lines. Make doesn't end a rule's recipe at either.
-        fn recipe_follows(&self) -> bool {
-            self.tokens
-                .iter()
-                .rev()
-                .find(|(kind, _)| !matches!(kind, COMMENT | NEWLINE | WHITESPACE))
-                .is_some_and(|(kind, _)| *kind == INDENT)
         }
 
         /// Whether the current token is at the start of a line that begins
@@ -2476,6 +2470,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_expression_statement(&mut self) {
+            self.in_rule = false;
             self.builder.start_node(EXPRESSION_STATEMENT.into());
             while self.current() == Some(DOLLAR) {
                 self.parse_variable_reference();
@@ -3221,8 +3216,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 Some(INDENT) => {
                     if self.in_rule {
-                        // A recipe line separated from its rule by a comment
-                        // after a blank line
+                        // A recipe line after a conditional whose branches
+                        // all end in rule context. It belongs to the rule
+                        // ending the branch that is taken, so it can't be
+                        // part of any one rule node.
                         self.parse_recipe_line();
                     } else {
                         self.parse_indented_line_outside_rule();
@@ -3286,15 +3283,45 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         TEXT => text.trim_start().starts_with('#'),
                         _ => false,
                     });
-                if !comment_only {
-                    self.record_error(
-                        ParseErrorKind::RecipeBeforeFirstTarget,
-                        "indented line not part of a rule".to_string(),
-                    );
+                if comment_only {
+                    self.parse_bsd_comment_line();
+                    return;
                 }
+                self.record_error(
+                    ParseErrorKind::RecipeBeforeFirstTarget,
+                    "indented line not part of a rule".to_string(),
+                );
                 self.parse_recipe_line();
             } else {
                 self.relex_as_non_recipe_line();
+            }
+        }
+
+        /// Parse a tab-indented line with only a comment, or nothing at all,
+        /// which BSD make skips. The comment, including any continuation
+        /// lines, becomes a single COMMENT token.
+        fn parse_bsd_comment_line(&mut self) {
+            self.bump_as(WHITESPACE);
+            while self.current() == Some(WHITESPACE) {
+                self.bump();
+            }
+            let mut comment = String::new();
+            while let Some((kind, text)) = self.tokens.last() {
+                if *kind == NEWLINE {
+                    let backslashes = comment.chars().rev().take_while(|c| *c == '\\').count();
+                    if backslashes % 2 == 0 || self.tokens.len() == 1 {
+                        break;
+                    }
+                }
+                comment.push_str(text);
+                self.tokens.pop();
+            }
+            if !comment.is_empty() {
+                self.pending_backslash_escape = false;
+                self.builder.token(COMMENT.into(), &comment);
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
             }
         }
 
@@ -12565,6 +12592,102 @@ test:
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nVARIABLE\n  EXPR\n"
         );
+    }
+
+    #[test]
+    fn test_comment_after_blank_line_ends_rule() {
+        let input = "all:\n\techo a\n\n# c\nx = 1\n";
+        let makefile = parse(input, None).root();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.syntax().to_string(), "all:\n\techo a\n\n");
+    }
+
+    #[test]
+    fn test_conditional_after_blank_line_and_comment() {
+        let input = "all:\n\techo a\n\n# c\nifdef X\n\techo x\nendif\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().code(), input);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ENDIF\n"
+        );
+    }
+
+    #[test]
+    fn test_recipe_after_blank_line_and_indented_comment() {
+        let input = "all:\n\techo a\n\n  # c\n\techo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(makefile.code(), input);
+        assert_eq!(makefile.items().count(), 1);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a", "echo b"]);
+        assert_eq!(rule.syntax().to_string(), input);
+    }
+
+    #[test]
+    fn test_recipe_after_conditional_ending_in_rule_context() {
+        use crate::ast::makefile::MakefileItem;
+        let input = "ifdef X\na:\nelse\nb:\nendif\n\techo hi\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        // The recipe line belongs to `a` or `b` depending on the branch
+        // taken, so it stays outside both rules.
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n"
+        );
+        let makefile = parsed.root();
+        assert_eq!(makefile.code(), input);
+        let items: Vec<_> = makefile.items().collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], MakefileItem::Conditional(_)));
+        let MakefileItem::Recipe(recipe) = &items[1] else {
+            panic!("expected recipe");
+        };
+        assert_eq!(recipe.text(), "echo hi");
+    }
+
+    #[test]
+    fn test_bsd_indented_comment_outside_rule() {
+        // BSD make skips lines with only whitespace and a comment, so they
+        // aren't recipe lines.
+        let input = "X = 1\n\t# c\n\t# d \\\n\tmore\n\t\n";
+        let parsed = parse(input, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().code(), input);
+        assert_eq!(node_kinds(&parsed.syntax()), "VARIABLE\n  EXPR\n");
+        assert_eq!(
+            parsed
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|it| it.into_token())
+                .filter(|t| t.kind() == COMMENT)
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>(),
+            vec!["# c", "# d \\\n\tmore"]
+        );
+    }
+
+    #[test]
+    fn test_expression_statement_ends_rule() {
+        let input = "all:\n\techo a\n$(info i)\n\techo b\n";
+        let parsed = parse(input, None);
+        assert_eq!(
+            parsed.errors,
+            vec![ErrorInfo {
+                message: "expected ':'".to_string(),
+                line: 4,
+                context: "\techo b".to_string(),
+                kind: ParseErrorKind::RecipeBeforeFirstTarget,
+            }]
+        );
+        let makefile = parsed.root();
+        assert_eq!(makefile.code(), input);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a"]);
     }
 
     #[test]
