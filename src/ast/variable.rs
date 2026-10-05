@@ -109,10 +109,10 @@ impl VariableDefinition {
 
     /// The source range covering just the variable's name.
     ///
-    /// Excludes any `export`/`override`/`define` prefix, the assignment
-    /// operator and the value. Lets callers compute a minimal rename edit
-    /// instead of re-rendering the whole definition (and with it the
-    /// surrounding whitespace).
+    /// Excludes any `export`/`override`/`private`/`define` prefix, the
+    /// assignment operator and the value. Lets callers compute a minimal
+    /// rename edit instead of re-rendering the whole definition (and with it
+    /// the surrounding whitespace).
     ///
     /// # Example
     /// ```
