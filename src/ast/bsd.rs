@@ -791,4 +791,18 @@ mod tests {
         assert!(!rule.is_grouped());
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "&"]);
     }
+
+    #[test]
+    fn test_target_local_assignment_with_empty_name() {
+        // BSD make: "one: ignoring ' = three' as the variable name '' expands
+        // to empty". GNU make reports "empty variable name".
+        let makefile = parse_bsd("one two:=three\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["one", "two"]);
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), None);
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("three".to_string()));
+        assert_ne!(errors_with(MakefileVariant::GNUMake, "one two:=three\n"), 0);
+    }
 }
