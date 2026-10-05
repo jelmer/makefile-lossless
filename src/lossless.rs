@@ -1191,35 +1191,62 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
         }
 
-        /// Whether `self.tokens[i]` is an `export`/`override`/`private`
+        /// Whether `tokens` starts with an `export`/`override`/`private`
         /// modifier followed by whitespace and the start of a variable name,
         /// as in `all: export CFLAGS = -O2`.
-        fn is_assignment_modifier(&self, i: usize) -> bool {
-            i >= 2
-                && self.tokens[i].0 == IDENTIFIER
-                && matches!(self.tokens[i].1.as_str(), "export" | "override" | "private")
-                && self.tokens[i - 1].0 == WHITESPACE
-                && matches!(self.tokens[i - 2].0, IDENTIFIER | DOLLAR | BACKSLASH)
+        fn at_assignment_modifier<'a, I>(mut tokens: std::iter::Peekable<I>) -> bool
+        where
+            I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        {
+            tokens.next().is_some_and(|(kind, text)| {
+                *kind == IDENTIFIER && matches!(text.as_str(), "export" | "override" | "private")
+            }) && Self::skip_ws_and_continuation_tokens(&mut tokens)
+                && matches!(tokens.peek(), Some((IDENTIFIER | DOLLAR | BACKSLASH, _)))
+        }
+
+        /// Advance `tokens` past whitespace and line continuations. Returns
+        /// whether anything was skipped.
+        fn skip_ws_and_continuation_tokens<'a, I>(tokens: &mut std::iter::Peekable<I>) -> bool
+        where
+            I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        {
+            let mut skipped = false;
+            loop {
+                let at_continuation = matches!(tokens.peek(), Some((BACKSLASH, _)))
+                    && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
+                if at_continuation {
+                    tokens.nth(1);
+                    tokens.next_if(|(kind, _)| *kind == INDENT);
+                } else if tokens.next_if(|(kind, _)| *kind == WHITESPACE).is_none() {
+                    return skipped;
+                }
+                skipped = true;
+            }
         }
 
         /// Look ahead (without consuming) for the
         /// `(MODIFIER WS)* NAME (WS)? OPERATOR` pattern that marks a
         /// target-specific variable assignment such as `all: CFLAGS = -O2`.
         /// NAME is what [`Self::parse_variable_name`] accepts, e.g.
-        /// `obj-$(X)`.
+        /// `obj-$(X)`. Line continuations may appear wherever WS may.
+        /// Only GNU make has target-specific variables; elsewhere `X=1`
+        /// after the colon is a prerequisite or, in BSD make, a special
+        /// source as in `.SHELL: name=sh`.
         fn looks_like_target_specific_assignment(&self) -> bool {
-            let Some(mut i) = self.tokens.len().checked_sub(1) else {
+            if !matches!(self.variant, None | Some(MakefileVariant::GNUMake)) {
                 return false;
-            };
-            while self.is_assignment_modifier(i) {
-                i -= 2;
             }
             // tokens is reversed (last = current), so iterate from the end.
-            let mut tokens = self.tokens[..=i].iter().rev().peekable();
+            let mut tokens = self.tokens.iter().rev().peekable();
+            Self::skip_ws_and_continuation_tokens(&mut tokens);
+            while Self::at_assignment_modifier(tokens.clone()) {
+                tokens.next();
+                Self::skip_ws_and_continuation_tokens(&mut tokens);
+            }
             if Self::skip_variable_name(&mut tokens) != Some(true) {
                 return false;
             }
-            tokens.next_if(|(kind, _)| *kind == WHITESPACE);
+            Self::skip_ws_and_continuation_tokens(&mut tokens);
             tokens.next().is_some_and(|(kind, text)| {
                 *kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text.as_str())
             })
@@ -1233,11 +1260,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
         {
             let mut seen_name = false;
+            // Whether the previous token is an unescaped backslash.
+            let mut escaped = false;
             loop {
                 match tokens.peek().copied() {
                     // A backslash is part of the name unless it continues
                     // the line.
-                    Some((BACKSLASH, _)) if matches!(tokens.clone().nth(1), Some((NEWLINE, _))) => {
+                    Some((BACKSLASH, _))
+                        if !escaped && matches!(tokens.clone().nth(1), Some((NEWLINE, _))) =>
+                    {
                         return Some(seen_name)
                     }
                     Some((DOLLAR, _)) => {
@@ -1246,9 +1277,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             return None;
                         }
                         seen_name = true;
+                        escaped = false;
                         continue;
                     }
-                    Some((kind, text)) if Self::is_gnu_name_token(*kind, text) => {}
+                    Some((kind, text)) if Self::is_gnu_name_token(*kind, text) => {
+                        escaped = *kind == BACKSLASH && !escaped;
+                    }
                     _ => return Some(seen_name),
                 }
                 tokens.next();
@@ -1309,12 +1343,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// child `VARIABLE` node. Consumes through the end-of-line.
         fn parse_target_specific_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
-            while self.is_assignment_modifier(self.tokens.len() - 1) {
+            self.skip_ws_and_continuations();
+            while Self::at_assignment_modifier(self.tokens.iter().rev().peekable()) {
                 self.bump();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
             self.parse_variable_name();
-            self.skip_ws();
+            self.skip_ws_and_continuations();
             // Assignment operator.
             if self.current() == Some(OPERATOR) {
                 self.bump();
@@ -2978,13 +3013,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 && Self::is_define_modifier(&self.tokens.last().unwrap().1)
             {
                 self.bump();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
             self.bump();
             // Optional whitespace then the variable name.
-            self.skip_ws();
+            self.skip_ws_and_continuations();
             self.bump_define_name();
-            self.skip_ws();
+            // TODO: GNU make joins words on either side of a continuation
+            // into the name, as in `define A \<newline>B`; here B ends up in
+            // the body instead.
+            self.skip_ws_and_continuations();
             // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
             if self.current() == Some(OPERATOR) {
                 self.bump();
@@ -3041,12 +3079,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// span several tokens, e.g. `\n` lexes as BACKSLASH + IDENTIFIER and
         /// `foo bar` contains whitespace.
         fn bump_define_name(&mut self) {
-            let len = self
-                .tokens
-                .iter()
-                .rev()
-                .take_while(|(kind, _)| !matches!(*kind, OPERATOR | NEWLINE | COMMENT))
-                .count();
+            let mut tokens = self.tokens.iter().rev().peekable();
+            let mut len = 0;
+            // Whether the previous token is an unescaped backslash.
+            let mut escaped = false;
+            while let Some((kind, _)) = tokens.peek() {
+                let at_continuation = *kind == BACKSLASH
+                    && !escaped
+                    && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
+                if at_continuation || matches!(*kind, OPERATOR | NEWLINE | COMMENT) {
+                    break;
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+                tokens.next();
+                len += 1;
+            }
             let trailing_ws = self.tokens[self.tokens.len() - len..]
                 .iter()
                 .take_while(|(kind, _)| *kind == WHITESPACE)
@@ -3074,14 +3121,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Whether the current line starts a `define` block, optionally
         /// preceded by modifiers such as `override define NAME`.
         fn is_define_line(&self) -> bool {
-            self.gnu_directives_enabled()
-                && self
-                    .tokens
-                    .iter()
-                    .rev()
-                    .filter(|(kind, _)| *kind != WHITESPACE)
-                    .find(|(kind, text)| !(*kind == IDENTIFIER && Self::is_define_modifier(text)))
-                    .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "define")
+            if !self.gnu_directives_enabled() {
+                return false;
+            }
+            let mut tokens = self.tokens.iter().rev().peekable();
+            loop {
+                Self::skip_ws_and_continuation_tokens(&mut tokens);
+                match tokens.next() {
+                    Some((IDENTIFIER, text)) if text == "define" => return true,
+                    Some((IDENTIFIER, text)) if Self::is_define_modifier(text) => {}
+                    _ => return false,
+                }
+            }
         }
 
         /// Return the text of the first non-whitespace token on the current
@@ -5569,6 +5620,114 @@ mod tests {
     }
 
     #[test]
+    fn test_assignment_continuation_before_operator() {
+        // As in linux/scripts/Makefile.gcc-plugins.
+        let check = |code: &str, expected: Vec<(&str, &str, &str)>| {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            assert_eq!(root.rules().count(), 0, "{code:?}");
+            let vars = root
+                .variable_definitions()
+                .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+                .collect::<Vec<_>>();
+            let expected = expected
+                .into_iter()
+                .map(|(name, op, value)| {
+                    (
+                        Some(name.to_string()),
+                        Some(op.to_string()),
+                        Some(value.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(vars, expected, "{code:?}");
+        };
+        check("X \\\n\t+= a\n", vec![("X", "+=", "a")]);
+        check("X \\\r\n\t+= a\r\n", vec![("X", "+=", "a")]);
+        check("X\\\n= 1\n", vec![("X", "=", "1")]);
+        check("X \\\n \\\n := 2\n", vec![("X", ":=", "2")]);
+        check("a\\\\ \\\n = 1\n", vec![("a\\\\", "=", "1")]);
+        check("export \\\n Y = 1\n", vec![("Y", "=", "1")]);
+        check("override \\\n X \\\n = 1\n", vec![("X", "=", "1")]);
+        check(
+            "ifdef C\nX \\\n\t+= a\nendif\n$(X) \\\n += b\n",
+            vec![("X", "+=", "a"), ("$(X)", "+=", "b")],
+        );
+    }
+
+    #[test]
+    fn test_target_specific_assignment_continuation_before_operator() {
+        for code in [
+            "all: X \\\n\t= 1\n",
+            "all: X \\\r\n\t= 1\r\n",
+            "all: \\\n X = 1\n",
+            "all: export \\\n X \\\n = 1\n",
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            let rule = root.rules().next().unwrap();
+            let var = rule.scoped_assignment().unwrap();
+            assert_eq!(Some("X".to_string()), var.name(), "{code:?}");
+            assert_eq!(Some("=".to_string()), var.assignment_operator());
+            assert_eq!(Some("1".to_string()), var.raw_value());
+        }
+    }
+
+    #[test]
+    fn test_no_target_specific_assignment_outside_gnu_make() {
+        // Only GNU make has target-specific variables; elsewhere these are
+        // prerequisites, or special sources as in NetBSD's sh-errctl.mk.
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            for (code, prerequisites) in [
+                (
+                    ".SHELL: name=\"sh\" path=/bin/sh\n",
+                    vec!["name=\"sh\"", "path=/bin/sh"],
+                ),
+                (
+                    ".SHELL: \\\n\tname=\"sh\" \\\n\tpath=/bin/sh\n",
+                    vec!["name=\"sh\"", "path=/bin/sh"],
+                ),
+                ("all: \\\n  X=1\n", vec!["X=1"]),
+            ] {
+                let parsed = parse(code, Some(variant));
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rule = root.rules().next().unwrap();
+                assert!(rule.scoped_assignment().is_none(), "{variant:?} {code:?}");
+                assert_eq!(
+                    prerequisites,
+                    rule.prerequisites().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rule_continuation_before_second_target() {
+        let code = "foo \\\n bar: baz\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        assert_eq!(root.variable_definitions().count(), 0);
+        let rule = root.rules().next().unwrap();
+        assert_eq!(
+            vec!["foo".to_string(), "bar".to_string()],
+            rule.targets().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_define_endef() {
         let code = "define greeting\n\techo hello\n\techo world\nendef\n\nall:\n\t$(greeting)\n";
         let makefile: Makefile = code.parse().expect("define/endef should parse");
@@ -5682,6 +5841,57 @@ mod tests {
         assert_eq!(Some("a\\b".to_string()), var.name());
         assert_eq!(Some(":=".to_string()), var.assignment_operator());
         assert_eq!(Some("body\n".to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_define_continuation_before_operator() {
+        for (code, name, op, value) in [
+            ("define W \\\n =\nhi\nendef\n", "W", "=", "hi\n"),
+            ("define W\\\r\n:=\r\nhi\r\nendef\r\n", "W", ":=", "hi\n"),
+            ("define a\\\\ \\\n =\nhi\nendef\n", "a\\\\", "=", "hi\n"),
+            ("export \\\n define W \\\n =\nhi\nendef\n", "W", "=", "hi\n"),
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let makefile = parsed.root();
+            assert_eq!(code, makefile.to_string());
+            let vars = makefile
+                .variable_definitions()
+                .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vars,
+                vec![(
+                    Some(name.to_string()),
+                    Some(op.to_string()),
+                    Some(value.to_string())
+                )],
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escaped_backslash_before_operator_line() {
+        // An escaped backslash at the end of the line does not continue it,
+        // so the `=` on the next line is not the operator.
+        let code = "define a\\\\\n= 1\nendef\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let vars = makefile
+            .variable_definitions()
+            .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vars,
+            vec![(Some("a\\\\".to_string()), None, Some("= 1\n".to_string()))]
+        );
+
+        // GNU make reports a missing separator here.
+        let parsed = parse("a\\\\\n= 1\n", Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.root().variable_definitions().count(), 0);
     }
 
     #[test]
@@ -6801,6 +7011,7 @@ all: $(OBJS)
             "undefine\n",
             "undefine",
             "undefine # c\n",
+            "override undefine\n",
             "override undefine \\\n\n",
         ] {
             let parsed = parse(text, None);

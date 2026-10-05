@@ -33,23 +33,24 @@ impl VariableDefinition {
     /// Internal: the leading directive keywords (`export`/`unexport`/
     /// `override`/`private`/`define`/`undefine`). A keyword only counts as
     /// one when another word follows it, so `undefine = 1` assigns to a
-    /// variable named `undefine`. The exception is a lone keyword without an
-    /// assignment operator, such as a bare `export`.
+    /// variable named `undefine`. The exception is a trailing keyword without
+    /// an assignment operator, such as a bare `export` or the `undefine` in
+    /// `override undefine` with its name missing.
     fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
         let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
         let mut in_word = false;
         let mut has_operator = false;
         for it in self.syntax().children_with_tokens() {
+            if it.kind() == WHITESPACE || is_continuation(&it) {
+                in_word = false;
+                continue;
+            }
             match it.kind() {
                 OPERATOR => {
                     has_operator = true;
                     break;
                 }
                 NEWLINE | COMMENT => break,
-                WHITESPACE => {
-                    in_word = false;
-                    continue;
-                }
                 _ => {}
             }
             if !in_word {
@@ -71,7 +72,7 @@ impl VariableDefinition {
             _ => None,
         };
         let count = match words.as_slice() {
-            [word] if !has_operator && keyword(word).is_some() => 1,
+            [.., last] if !has_operator && keyword(last).is_some() => words.len(),
             _ => words.len().saturating_sub(1),
         };
         let mut keywords = Vec::new();
