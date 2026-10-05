@@ -741,6 +741,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Parse member name(s) - each as an ARCHIVE_MEMBER node
                 while self.current().is_some() && self.current() != Some(RPAREN) {
+                    // The member list may continue on the next physical line.
+                    if self.consume_line_continuation() {
+                        continue;
+                    }
                     match self.current() {
                         Some(IDENTIFIER) | Some(TEXT) => {
                             // Start an individual member node

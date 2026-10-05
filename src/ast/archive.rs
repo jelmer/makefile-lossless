@@ -124,4 +124,53 @@ mod tests {
             "Should find ARCHIVE_MEMBERS nodes in AST"
         );
     }
+
+    fn member_lists(parsed: &crate::lossless::Parse) -> Vec<Vec<String>> {
+        parsed
+            .root()
+            .syntax()
+            .descendants()
+            .filter_map(ArchiveMembers::cast)
+            .map(|m| m.member_names())
+            .collect()
+    }
+
+    #[test]
+    fn test_archive_member_target_line_continuation() {
+        let input = "lib(a.o \\\n b.o): x\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().syntax().to_string(), input);
+        assert_eq!(member_lists(&parsed), vec![vec!["a.o", "b.o"]]);
+        let rules: Vec<_> = parsed.root().rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["lib(a.o b.o)"]);
+        assert_eq!(rules[0].prerequisites().collect::<Vec<_>>(), vec!["x"]);
+    }
+
+    #[test]
+    fn test_archive_member_prerequisite_line_continuation() {
+        let input = "all: lib(a.o \\\n b.o) c\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().syntax().to_string(), input);
+        assert_eq!(member_lists(&parsed), vec![vec!["a.o", "b.o"]]);
+        let rules: Vec<_> = parsed.root().rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].prerequisites().collect::<Vec<_>>(),
+            vec!["lib(a.o b.o)", "c"]
+        );
+    }
+
+    #[test]
+    fn test_archive_member_line_continuation_crlf() {
+        let input = "lib(a.o \\\r\n\tb.o): x\r\n";
+        let parsed = parse(input, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().syntax().to_string(), input);
+        assert_eq!(member_lists(&parsed), vec![vec!["a.o", "b.o"]]);
+        let rules: Vec<_> = parsed.root().rules().collect();
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["lib(a.o b.o)"]);
+    }
 }
