@@ -863,13 +863,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut newline_count = 0;
 
             loop {
-                // BSD and nmake conditionals and BSD loops may wrap recipe
-                // lines; any other directive ends the rule.
                 if let Some((name, count)) = self.directive() {
-                    let is_block = is_bsd_if(name) || name == "for";
                     // Blank lines don't end a rule's recipe, so this
                     // belongs to the rule if it has recipe lines.
-                    if !is_block || (conditional_depth == 0 && !self.recipe_continues()) {
+                    if !self.bsd_directive_in_rule(name)
+                        || (conditional_depth == 0 && !self.recipe_continues())
+                    {
                         break;
                     }
                     newline_count = 0;
@@ -931,8 +930,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         } else if self.at_include_keyword() {
                             // Only BSD make keeps rule context across an
                             // include line; GNU make ends the rule there.
-                            if self.variant != Some(MakefileVariant::BSDMake)
-                                || (conditional_depth == 0 && newline_count >= 1)
+                            if !self.is_bsd_make()
+                                || (conditional_depth == 0
+                                    && newline_count >= 1
+                                    && !self.recipe_continues())
                             {
                                 break;
                             }
@@ -969,7 +970,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Look ahead (without consuming) from the current token, which
-        /// starts a comment or conditional, and check whether a recipe line
+        /// starts a comment or directive, and check whether a recipe line
         /// of the current rule is reached before rule context ends,
         /// following rule context the same way the parser does. GNU make
         /// ends a rule's recipe at the first line that is not a recipe line,
@@ -981,24 +982,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
-            // Pair each token with whether it starts a line. The current
-            // token always does.
+            // Pair each token with whether it starts a line, which the
+            // current token always does, and its end in the token stack.
             let n = self.tokens.len();
             let mut tokens = self
                 .tokens
                 .iter()
                 .rev()
                 .enumerate()
-                .map(|(i, token)| (token, i == 0 || self.tokens[n - i].0 == NEWLINE))
-                .filter(|((kind, _), _)| *kind != WHITESPACE)
+                .map(|(i, token)| (token, i == 0 || self.tokens[n - i].0 == NEWLINE, n - i))
+                .filter(|((kind, _), _, _)| *kind != WHITESPACE)
                 .peekable();
-            while let Some(&((kind, text), at_start)) = tokens.peek() {
+            while let Some(&((kind, text), at_start, end)) = tokens.peek() {
                 let word = |n: usize| {
                     tokens
                         .clone()
                         .nth(n)
-                        .filter(|((kind, _), _)| *kind == IDENTIFIER)
-                        .map(|((_, name), _)| name.as_str())
+                        .filter(|((kind, _), _, _)| *kind == IDENTIFIER)
+                        .map(|((_, name), _, _)| name.as_str())
                 };
                 // The name of a BSD directive such as `.if` or `.  if`, or the
                 // equivalent BSD name of an nmake directive such as `!IF`
@@ -1039,7 +1040,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     (IDENTIFIER, "else") => match stack.last_mut() {
                         Some(context) => {
-                            let is_final = !Self::is_else_if(tokens.clone().map(|(t, _)| t));
+                            let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
                             in_rule = context.next_branch(in_rule, is_final);
                         }
                         None => return false,
@@ -1048,6 +1049,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         Some(context) => in_rule = context.end(in_rule),
                         None => return false,
                     },
+                    _ if self
+                        .bsd_directive_at(end)
+                        .is_some_and(|(name, _)| self.bsd_directive_in_rule(name))
+                        || (self.is_bsd_make() && self.include_keyword_at(end)) => {}
                     _ => in_rule = RuleContext::Outside,
                 }
                 if stack.is_empty() && in_rule != RuleContext::Inside {
@@ -1055,7 +1060,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 // Skip to the start of the next line, following continuations
                 let mut prev = None;
-                for ((kind, _), _) in tokens.by_ref() {
+                for ((kind, _), _, _) in tokens.by_ref() {
                     if *kind == NEWLINE && prev != Some(BACKSLASH) {
                         break;
                     }
@@ -1073,7 +1078,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// whitespace, a comment or the end of the line, as make requires
         /// for its directives.
         fn at_keyword(&self, keywords: &[&str]) -> bool {
-            let mut tokens = self.tokens.iter().rev();
+            self.keyword_at(self.tokens.len(), keywords)
+        }
+
+        /// Like `at_keyword`, for the token at `end - 1` in the token stack.
+        fn keyword_at(&self, end: usize, keywords: &[&str]) -> bool {
+            let mut tokens = self.tokens[..end].iter().rev();
             tokens.next().is_some_and(|(kind, text)| {
                 *kind == IDENTIFIER && keywords.contains(&text.as_str())
             }) && matches!(
@@ -1096,15 +1106,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `include foo: bar`, as a rule. POSIX make has no `sinclude`, and
         /// nmake only has `!INCLUDE`.
         fn at_include_keyword(&self) -> bool {
+            self.include_keyword_at(self.tokens.len())
+        }
+
+        /// Like `at_include_keyword`, for the token at `end - 1` in the
+        /// token stack.
+        fn include_keyword_at(&self, end: usize) -> bool {
             let keywords: &[&str] = match self.variant {
                 Some(MakefileVariant::NMake) => &[],
                 Some(MakefileVariant::POSIXMake) => &["include", "-include"],
                 _ => &["include", "-include", "sinclude"],
             };
-            if !self.at_keyword(keywords) {
+            if !self.keyword_at(end, keywords) {
                 return false;
             }
-            let mut tokens = self.tokens.iter().rev().skip(1).peekable();
+            let mut tokens = self.tokens[..end].iter().rev().skip(1).peekable();
             if self.variant != Some(MakefileVariant::BSDMake) {
                 return true;
             }
@@ -2698,7 +2714,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_include(&mut self) {
-            self.in_rule = RuleContext::Outside;
+            // Unlike GNU make, BSD make doesn't end a rule's commands at an
+            // include.
+            if !self.is_bsd_make() {
+                self.in_rule = RuleContext::Outside;
+            }
             self.builder.start_node(INCLUDE.into());
 
             let directive = self.directive();
@@ -2925,6 +2945,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             matches!(self.variant, None | Some(MakefileVariant::BSDMake))
         }
 
+        /// Whether the BSD directive `name`, or the BSD name of an nmake
+        /// directive, can be part of a rule's body. Conditionals and loops
+        /// may wrap recipe lines. BSD make also
+        /// doesn't end a rule's commands at its other directives, only at
+        /// dependency lines and variable assignments.
+        fn bsd_directive_in_rule(&self, name: &str) -> bool {
+            is_bsd_if(name)
+                || name == "for"
+                || (self.is_bsd_make()
+                    && !is_bsd_elif(name)
+                    && !matches!(name, "else" | "endif" | "endfor"))
+        }
+
         /// If the current line starts with a BSD make directive, return its
         /// name without the leading dot (e.g. `if`, `-include`) and the
         /// number of tokens making up the keyword: `.if` is a single token,
@@ -2939,11 +2972,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.variant == Some(MakefileVariant::NMake) {
                 return self.nmake_directive();
             }
+            self.bsd_directive_at(self.tokens.len())
+        }
+
+        /// Like `directive`, for BSD make directives only and the line
+        /// starting at the token at `n - 1` in the token stack.
+        fn bsd_directive_at(&self, n: usize) -> Option<(&'static str, usize)> {
             if !self.bsd_directives_enabled() {
                 return None;
             }
-            let n = self.tokens.len();
-            let (kind, text) = self.tokens.last()?;
+            let tokens = &self.tokens[..n];
+            let (kind, text) = tokens.last()?;
             if *kind != IDENTIFIER {
                 return None;
             }
@@ -2953,16 +2992,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 let mut i = n - 1;
                 loop {
                     i = i.checked_sub(1)?;
-                    match self.tokens[i].0 {
+                    match tokens[i].0 {
                         WHITESPACE | INDENT => {}
-                        BACKSLASH if i > 0 && self.tokens[i - 1].0 == NEWLINE => i -= 1,
+                        BACKSLASH if i > 0 && tokens[i - 1].0 == NEWLINE => i -= 1,
                         _ => break,
                     }
                 }
-                if i == n - 2 || self.tokens[i].0 != IDENTIFIER {
+                if i == n - 2 || tokens[i].0 != IDENTIFIER {
                     return None;
                 }
-                (self.tokens[i].1.as_str(), n - i)
+                (tokens[i].1.as_str(), n - i)
             } else {
                 (text.strip_prefix('.')?, 1)
             };
@@ -2985,7 +3024,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         | "sinclude"
                         | "dinclude"
                 );
-            let next = self.tokens[..n - count].last();
+            let next = tokens[..n - count].last();
             if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
                 return None;
             }
@@ -14766,6 +14805,96 @@ test:
         assert_eq!(
             node_kinds(&parsed.syntax()),
             "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n  FOR_END\nRECIPE\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_bsd_directives_in_rule() {
+        // BSD make only ends a rule's commands at a dependency line or a
+        // variable assignment, so these directives are part of the rule.
+        for directive in [
+            ".info hi",
+            ".warning hi",
+            ".error hi",
+            ".undef X",
+            ".export X",
+            ".export-env X",
+            ".unexport X",
+            ".  undef X",
+            ".include \"x.mk\"",
+            ".-include \"x.mk\"",
+            ".sinclude \"x.mk\"",
+            ".dinclude \"x.mk\"",
+            "include x.mk",
+            "-include x.mk",
+            "sinclude x.mk",
+        ] {
+            let code = format!("all:\n\techo a\n{}\n\n\techo b\n", directive);
+            let parsed = parse(&code, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![], "{}", directive);
+            let kind = if directive.contains("include") {
+                "INCLUDE"
+            } else {
+                "DIRECTIVE"
+            };
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                format!(
+                    "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  {}\n    EXPR\n  RECIPE\n",
+                    kind
+                ),
+                "{}",
+                directive
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_bsd_directive_after_rule() {
+        // Without a recipe line after it, the directive isn't part of the
+        // rule, as for conditionals.
+        let code = "all:\n\techo a\n.info hi\nX = 1\n\techo b\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(5, "indented line not part of a rule")]
+        );
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nDIRECTIVE\n  EXPR\nVARIABLE\n  EXPR\nRECIPE\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_bsd_include_in_rule_inside_conditional() {
+        let code = "all:\n.if 1\n.include \"x.mk\"\n.endif\n\techo b\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    INCLUDE\n      EXPR\n    CONDITIONAL_ENDIF\n  RECIPE\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_include_ends_rule_in_gnu_make() {
+        let code = "all:\n\techo a\ninclude x.mk\n\techo b\n";
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.kind))
+                .collect::<Vec<_>>(),
+            vec![(4, ParseErrorKind::RecipeBeforeFirstTarget)]
         );
         assert_eq!(parsed.root().to_string(), code);
     }
