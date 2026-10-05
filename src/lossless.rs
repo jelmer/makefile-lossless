@@ -7094,6 +7094,11 @@ all: $(OBJS)
                 vec!["empty variable name"],
                 "{text:?}"
             );
+            assert_eq!(
+                parsed.errors.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+                vec![ParseErrorKind::ExpectedVariableName],
+                "{text:?}"
+            );
             let makefile = parsed.root();
             let vars = makefile.variable_definitions().collect::<Vec<_>>();
             assert_eq!(vars.len(), 1, "{text:?}");
