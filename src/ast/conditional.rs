@@ -1,6 +1,7 @@
 use super::bsd::keyword_token;
 use super::collapse_continuations;
 use super::makefile::MakefileItem;
+use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
     ErrorInfo, Lang, ParseError, Recipe,
@@ -226,6 +227,44 @@ impl ConditionalBranch {
         Some((a, b))
     }
 
+    /// For a BSD make branch (`.if`, `.elif`, `.ifdef`, ...), parse its
+    /// condition with [`parse_bsd_condition`].
+    ///
+    /// Returns `None` for GNU make conditionals and for a plain `.else`.
+    /// How bare words and values in the condition evaluate depends on
+    /// [`Self::conditional_type`]; see [`BsdCondition`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{BsdCondition, Makefile};
+    /// let makefile: Makefile = ".ifndef A || B\n.elif ${C}\n.else\n.endif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let branches: Vec<_> = cond
+    ///     .branches()
+    ///     .map(|b| (b.conditional_type(), b.bsd_condition().transpose().unwrap()))
+    ///     .collect();
+    /// assert_eq!(
+    ///     branches,
+    ///     vec![
+    ///         (
+    ///             Some(".ifndef".to_string()),
+    ///             Some(BsdCondition::Or(vec![
+    ///                 BsdCondition::Bare("A".to_string()),
+    ///                 BsdCondition::Bare("B".to_string()),
+    ///             ]))
+    ///         ),
+    ///         (Some(".if".to_string()), Some("${C}".parse().unwrap())),
+    ///         (None, None),
+    ///     ]
+    /// );
+    /// ```
+    pub fn bsd_condition(&self) -> Option<Result<BsdCondition, BsdConditionError>> {
+        if !self.conditional_type()?.starts_with('.') {
+            return None;
+        }
+        Some(parse_bsd_condition(&self.condition().unwrap_or_default()))
+    }
+
     /// The items in this branch in source order, including recipe lines
     /// and nested conditionals.
     ///
@@ -348,6 +387,12 @@ impl Conditional {
     /// ```
     pub fn ifeq_args(&self) -> Option<(String, String)> {
         self.if_branch()?.ifeq_args()
+    }
+
+    /// For a BSD make conditional, parse the condition of its initial
+    /// branch; see [`ConditionalBranch::bsd_condition`].
+    pub fn bsd_condition(&self) -> Option<Result<BsdCondition, BsdConditionError>> {
+        self.if_branch()?.bsd_condition()
     }
 
     /// The branches of this conditional in source order: the initial `if`,
@@ -737,7 +782,10 @@ mod tests {
 
     use super::{ConditionalBranch, ConditionalItem};
     use crate::lossless::Makefile;
-    use crate::{MakefileItem, MakefileVariant, RuleItem};
+    use crate::{
+        BsdComparisonOp, BsdCondition, BsdConditionError, BsdFunction, BsdOperand, MakefileItem,
+        MakefileVariant, RuleItem,
+    };
 
     fn describe_item(item: ConditionalItem) -> String {
         match item {
@@ -887,6 +935,70 @@ mod tests {
         let makefile: Makefile = ".if \"a\" == \"b\"\n.endif\n".parse().unwrap();
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.ifeq_args(), None);
+    }
+
+    #[test]
+    fn test_bsd_condition() {
+        let makefile: Makefile = ".if defined(A) && \\\n    ${B} == \"b\" # comment\n.elifmake install\n.elif ${C} ==\n.else\n.endif\n"
+            .parse()
+            .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches()
+                .map(|b| b.bsd_condition())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Ok(BsdCondition::And(vec![
+                    BsdCondition::Call {
+                        function: BsdFunction::Defined,
+                        argument: "A".to_string(),
+                    },
+                    BsdCondition::Compare {
+                        lhs: BsdOperand::VariableReference("${B}".to_string()),
+                        op: BsdComparisonOp::Equal,
+                        rhs: BsdOperand::String("b".to_string()),
+                    },
+                ]))),
+                Some(Ok(BsdCondition::Bare("install".to_string()))),
+                Some(Err(BsdConditionError {
+                    message: "missing right-hand side of operator \"==\"".to_string(),
+                    offset: 7,
+                })),
+                None,
+            ]
+        );
+        assert_eq!(
+            cond.bsd_condition(),
+            cond.branches().next().unwrap().bsd_condition()
+        );
+    }
+
+    #[test]
+    fn test_bsd_condition_gnu_conditional() {
+        let makefile: Makefile = "ifdef A\nelse ifeq ($(B),b)\nelse\nendif\n"
+            .parse()
+            .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.bsd_condition(), None);
+        assert_eq!(
+            cond.branches()
+                .map(|b| b.bsd_condition())
+                .collect::<Vec<_>>(),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn test_bsd_condition_missing() {
+        let parsed = Makefile::parse(".if\n.endif\n");
+        let cond = parsed.tree().conditionals().next().unwrap();
+        assert_eq!(
+            cond.bsd_condition(),
+            Some(Err(BsdConditionError {
+                message: "missing operand".to_string(),
+                offset: 0,
+            }))
+        );
     }
 
     #[test]
