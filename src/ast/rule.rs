@@ -547,11 +547,17 @@ impl Rule {
 
     /// Get the commands in the rule
     ///
+    /// A recipe given on the rule line after a `;` is the first command.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    ///
+    /// let rule: Rule = "rule: dependency ; first\n\tsecond\n".parse().unwrap();
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
+    /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["first", "second"]);
     /// ```
     pub fn recipes(&self) -> impl Iterator<Item = String> {
         self.recipe_nodes().map(|r| r.text())
@@ -675,6 +681,11 @@ impl Rule {
         let target_node = &recipes[i];
         let target_index = target_node.index();
 
+        if let Some(mut recipe) = Recipe::cast(target_node.clone()).filter(|r| r.is_inline()) {
+            recipe.replace_text(line);
+            return true;
+        }
+
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
@@ -744,11 +755,9 @@ impl Rule {
             return false;
         }
 
-        let target_node = &recipes[index];
-        let target_index = target_node.index();
-
-        self.syntax()
-            .splice_children(target_index..target_index + 1, vec![]);
+        if let Some(recipe) = Recipe::cast(recipes[index].clone()) {
+            recipe.remove();
+        }
         true
     }
 
@@ -773,16 +782,16 @@ impl Rule {
             return false;
         }
 
-        let target_index = if index == recipes.len() {
-            // Insert at the end - find position after last recipe
-            recipes.last().map(|n| n.index() + 1).unwrap_or_else(|| {
-                // No recipes exist, insert after the rule header
-                self.syntax().children_with_tokens().count()
-            })
-        } else {
-            // Insert before the recipe at the given index
-            recipes[index].index()
-        };
+        if let Some(recipe) = recipes.get(index).cloned().and_then(Recipe::cast) {
+            recipe.insert_before(line);
+            return true;
+        }
+
+        // Insert at the end - find position after last recipe
+        let target_index = recipes.last().map(|n| n.index() + 1).unwrap_or_else(|| {
+            // No recipes exist, insert after the rule header
+            self.syntax().children_with_tokens().count()
+        });
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
@@ -833,9 +842,8 @@ impl Rule {
         }
 
         // Remove all recipes in reverse order to maintain correct indices
-        for recipe in recipes.iter().rev() {
-            let index = recipe.index();
-            self.syntax().splice_children(index..index + 1, vec![]);
+        for recipe in recipes.into_iter().rev().filter_map(Recipe::cast) {
+            recipe.remove();
         }
     }
 
@@ -908,40 +916,44 @@ impl Rule {
                 .prev_sibling_or_token()
                 .is_some_and(|e| e.kind() == WHITESPACE);
             let children: Vec<_> = node.children_with_tokens().collect();
-            let pipe = children.iter().position(|e| {
-                e.kind() == OPERATOR && e.as_token().is_some_and(|t| t.text() == "|")
-            });
-            // Replace everything before the order-only part, including the
-            // whitespace in front of the `|`.
-            let (end, separator) = match pipe {
-                None => (children.len(), None),
-                Some(pipe) => {
-                    let whitespace = children[..pipe]
-                        .last()
-                        .and_then(|e| e.as_token())
-                        .filter(|t| t.kind() == WHITESPACE)
-                        .map(|t| t.text().to_string());
-                    let had_normal = children[..pipe].iter().any(|e| e.kind() == PREREQUISITE);
-                    let separator = match whitespace {
-                        _ if prereqs.is_empty() => None,
-                        Some(ws) => Some(ws),
-                        None if !had_normal => Some(" ".to_string()),
-                        None => None,
-                    };
-                    (pipe, separator)
-                }
+            let normal_end = children
+                .iter()
+                .position(|e| e.kind() == OPERATOR && e.as_token().is_some_and(|t| t.text() == "|"))
+                .unwrap_or(children.len());
+            // Replace the normal prerequisites, keeping whatever follows them:
+            // whitespace, a comment and any order-only prerequisites.
+            let last_prereq = children[..normal_end]
+                .iter()
+                .rposition(|e| e.kind() == PREREQUISITE);
+            let mut keep = last_prereq.map_or(0, |i| i + 1);
+            let next_kind = match children.get(keep) {
+                Some(e) => Some(e.kind()),
+                None => node.next_sibling_or_token().map(|e| e.kind()),
             };
-            let fresh =
-                build_prerequisites_node(&prereqs, !has_external_whitespace, separator.as_deref());
+            let separator = if prereqs.is_empty() {
+                // Avoid doubled whitespace before e.g. a `|`.
+                if has_external_whitespace && keep < children.len() && next_kind == Some(WHITESPACE)
+                {
+                    keep += 1;
+                }
+                None
+            } else if last_prereq.is_none()
+                && !matches!(next_kind, None | Some(WHITESPACE | NEWLINE))
+            {
+                Some(" ")
+            } else {
+                None
+            };
+            let fresh = build_prerequisites_node(&prereqs, !has_external_whitespace, separator);
             let old_green = node.green();
-            let order_only = old_green.children().skip(end).map(|c| c.to_owned());
+            let rest = old_green.children().skip(keep).map(|c| c.to_owned());
             let green = rowan::GreenNode::new(
                 PREREQUISITES.into(),
                 fresh
                     .green()
                     .children()
                     .map(|c| c.to_owned())
-                    .chain(order_only)
+                    .chain(rest)
                     .collect::<Vec<_>>(),
             );
             let index = node.index();
@@ -1676,5 +1688,227 @@ mod tests {
         assert!(rule.is_grouped());
         assert_eq!(rule.static_pattern(), Some("%.x".to_string()));
         assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
+    }
+
+    fn recipes(rule: &Rule) -> Vec<String> {
+        rule.recipes().collect()
+    }
+
+    #[test]
+    fn test_inline_recipe() {
+        let rule: Rule = "all: dep ; echo hi\n\techo there\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["dep".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["echo hi", "echo there"]);
+        let first = rule.recipe_nodes().next().unwrap();
+        assert_eq!(first.indent(), None);
+        assert_eq!(first.line(), 0);
+        assert_eq!(rule.to_string(), "all: dep ; echo hi\n\techo there\n");
+    }
+
+    #[test]
+    fn test_inline_recipe_without_spaces() {
+        let rule: Rule = "all:dep;@echo hi\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["dep".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["@echo hi"]);
+        assert!(rule.recipe_nodes().next().unwrap().is_silent());
+        assert_eq!(rule.to_string(), "all:dep;@echo hi\n");
+    }
+
+    #[test]
+    fn test_inline_recipe_hash_is_recipe_text() {
+        // Make passes the rest of the line to the shell, `#` included.
+        let rule: Rule = "all: dep ; echo hi # there ; x\n".parse().unwrap();
+        assert_eq!(recipes(&rule), vec!["echo hi # there ; x"]);
+        let first = rule.recipe_nodes().next().unwrap();
+        assert_eq!(first.comment(), None);
+        assert_eq!(first.full(), "echo hi # there ; x");
+    }
+
+    #[test]
+    fn test_inline_recipe_comment_only() {
+        // Like a tab-indented `# comment` recipe line.
+        let rule: Rule = "all: ; # nothing\n".parse().unwrap();
+        assert_eq!(recipes(&rule), vec![""]);
+        let first = rule.recipe_nodes().next().unwrap();
+        assert_eq!(first.comment(), Some("# nothing".to_string()));
+        assert_eq!(rule.to_string(), "all: ; # nothing\n");
+    }
+
+    #[test]
+    fn test_empty_inline_recipe() {
+        let rule: Rule = "all: ;\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec![], vec![]));
+        assert_eq!(recipes(&rule), vec![""]);
+        assert_eq!(rule.to_string(), "all: ;\n");
+    }
+
+    #[test]
+    fn test_inline_recipe_at_eof() {
+        let rule: Rule = "all: ; echo hi".parse().unwrap();
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+        assert_eq!(rule.to_string(), "all: ; echo hi");
+    }
+
+    #[test]
+    fn test_comment_before_semicolon() {
+        let rule: Rule = "all: dep # c ; echo hi\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["dep".to_string()], vec![]));
+        assert_eq!(recipes(&rule), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_semicolon_in_variable_reference() {
+        let rule: Rule = "all: $(shell a;b) ; echo hi\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["$(shell a;b)".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn test_semicolon_in_target_specific_assignment() {
+        let rule: Rule = "foo: X = a;b\n".parse().unwrap();
+        assert_eq!(recipes(&rule), Vec::<String>::new());
+        assert_eq!(
+            rule.scoped_assignment().unwrap().raw_value(),
+            Some("a;b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_recipe_with_continuation() {
+        let input = "all: ; echo a \\\n\tb\n\techo c\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(recipes(&rule), vec!["echo a \\\nb", "echo c"]);
+        assert_eq!(rule.to_string(), input);
+    }
+
+    #[test]
+    fn test_inline_recipe_with_other_rule_forms() {
+        let rule: Rule = "$(OBJS): %.o: %.c | dir ; $(CC) -c $<\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["%.c".to_string()], vec!["dir".to_string()])
+        );
+        assert_eq!(recipes(&rule), vec!["$(CC) -c $<"]);
+
+        let rule: Rule = "all:: dep ; echo hi\n".parse().unwrap();
+        assert!(rule.is_double_colon());
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+
+        let rule: Rule = "a b &: c ; touch a b\n".parse().unwrap();
+        assert!(rule.is_grouped());
+        assert_eq!(prereqs(&rule), (vec!["c".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["touch a b"]);
+
+        let rule: Rule = "foo: a:b ; echo hi\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), Some("a".to_string()));
+        assert_eq!(prereqs(&rule), (vec!["b".to_string()], vec![]));
+
+        let rule: Rule = "foo: a ; echo x:y\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+        assert_eq!(recipes(&rule), vec!["echo x:y"]);
+    }
+
+    #[test]
+    fn test_inline_recipe_bsd_dependency_operator() {
+        let makefile: Makefile = "a! b ; echo hi\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(prereqs(&rule), (vec!["b".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn test_replace_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n\techo 2\n".parse().unwrap();
+        assert!(rule.replace_command(0, "echo bye"));
+        assert_eq!(rule.to_string(), "all: dep ; echo bye\n\techo 2\n");
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        recipe.set_prefix("@");
+        assert_eq!(rule.to_string(), "all: dep ; @echo bye\n\techo 2\n");
+        assert_eq!(recipes(&rule), vec!["@echo bye", "echo 2"]);
+    }
+
+    #[test]
+    fn test_push_command_after_inline_recipe() {
+        let mut rule: Rule = "all: ; echo hi\n".parse().unwrap();
+        rule.push_command("echo 2");
+        assert_eq!(rule.to_string(), "all: ; echo hi\n\techo 2\n");
+        assert_eq!(recipes(&rule), vec!["echo hi", "echo 2"]);
+    }
+
+    #[test]
+    fn test_remove_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n\techo 2\n".parse().unwrap();
+        assert!(rule.remove_command(0));
+        assert_eq!(rule.to_string(), "all: dep\n\techo 2\n");
+        assert_eq!(recipes(&rule), vec!["echo 2"]);
+
+        let rule: Rule = "all: ; echo hi\n".parse().unwrap();
+        rule.recipe_nodes().next().unwrap().remove();
+        assert_eq!(rule.to_string(), "all:\n");
+    }
+
+    #[test]
+    fn test_insert_before_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n".parse().unwrap();
+        assert!(rule.insert_command(0, "echo 0"));
+        assert_eq!(rule.to_string(), "all: dep\n\techo 0\n\techo hi\n");
+
+        let rule: Rule = "all: ; echo hi\n".parse().unwrap();
+        rule.recipe_nodes().next().unwrap().insert_before("echo 0");
+        assert_eq!(rule.to_string(), "all:\n\techo 0\n\techo hi\n");
+        assert_eq!(recipes(&rule), vec!["echo 0", "echo hi"]);
+    }
+
+    #[test]
+    fn test_insert_after_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n".parse().unwrap();
+        assert!(rule.insert_command(1, "echo 2"));
+        assert_eq!(rule.to_string(), "all: dep ; echo hi\n\techo 2\n");
+    }
+
+    #[test]
+    fn test_clear_commands_with_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n\techo 2\n".parse().unwrap();
+        rule.clear_commands();
+        assert_eq!(rule.to_string(), "all: dep\n");
+        assert_eq!(rule.recipe_count(), 0);
+    }
+
+    #[test]
+    fn test_set_prerequisites_with_inline_recipe() {
+        let mut rule: Rule = "all: dep ; echo hi\n".parse().unwrap();
+        rule.add_prerequisite("dep2").unwrap();
+        assert_eq!(prereqs(&rule).0, vec!["dep", "dep2"]);
+        assert_eq!(recipes(&rule), vec!["echo hi"]);
+        assert_eq!(rule.to_string(), "all: dep dep2 ; echo hi\n");
+    }
+
+    #[test]
+    fn test_set_prerequisites_keeps_comment() {
+        let mut rule: Rule = "foo: a # c\n".parse().unwrap();
+        rule.add_prerequisite("b").unwrap();
+        assert_eq!(rule.to_string(), "foo: a b # c\n");
+        rule.set_prerequisites(vec![]).unwrap();
+        assert_eq!(rule.to_string(), "foo: # c\n");
+    }
+
+    #[test]
+    fn test_inline_recipe_continuation_after_hash() {
+        let input = "all: ; echo hi # x \\\n\techo more\n\techo next\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            recipes(&rule),
+            vec!["echo hi # x \\\necho more", "echo next"]
+        );
+        assert_eq!(rule.to_string(), input);
+    }
+
+    #[test]
+    fn test_inline_recipe_escaped_backslash() {
+        let input = "all: ; echo a\\\\\n\techo b\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(recipes(&rule), vec!["echo a\\\\", "echo b"]);
+        assert_eq!(rule.to_string(), input);
     }
 }
