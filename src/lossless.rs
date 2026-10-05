@@ -1794,11 +1794,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Consume the `define` keyword itself.
             self.bump();
-            // Optional whitespace then the variable name (an IDENTIFIER).
+            // Optional whitespace then the variable name.
             self.skip_ws();
-            if self.current() == Some(IDENTIFIER) {
-                self.bump();
-            }
+            self.bump_define_name();
             self.skip_ws();
             // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
             if self.current() == Some(OPERATOR) {
@@ -1840,6 +1838,39 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Consume the name in a `define` header as a single IDENTIFIER token.
+        ///
+        /// GNU make takes everything up to the assignment operator (or the end
+        /// of the line), minus surrounding whitespace, as the name. That may
+        /// span several tokens, e.g. `\n` lexes as BACKSLASH + IDENTIFIER and
+        /// `foo bar` contains whitespace.
+        fn bump_define_name(&mut self) {
+            let len = self
+                .tokens
+                .iter()
+                .rev()
+                .take_while(|(kind, _)| !matches!(*kind, OPERATOR | NEWLINE | COMMENT))
+                .count();
+            let trailing_ws = self.tokens[self.tokens.len() - len..]
+                .iter()
+                .take_while(|(kind, _)| *kind == WHITESPACE)
+                .count();
+            let mut name = String::new();
+            for _ in 0..len - trailing_ws {
+                let (_, text) = self.tokens.pop().unwrap();
+                name.push_str(&text);
+                if self.current_token_index > 0 {
+                    self.current_token_index -= 1;
+                }
+            }
+            if name.is_empty() {
+                self.error("empty variable name in `define`".to_string());
+                return;
+            }
+            self.pending_backslash_escape = false;
+            self.builder.token(IDENTIFIER.into(), &name);
         }
 
         /// Return the text of the first non-whitespace token on the current
@@ -3504,6 +3535,42 @@ mod tests {
         let code = "define outer\ndefine inner\nbody\nendef\nendef\n";
         let makefile: Makefile = code.parse().expect("nested define/endef should parse");
         assert_eq!(code, makefile.to_string());
+    }
+
+    #[test]
+    fn test_define_name_with_backslash() {
+        // devscripts defines a newline helper this way.
+        let code = "define \\n\n\n\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("\\n".to_string()), vars[0].name());
+        assert!(vars[0].is_define());
+        assert_eq!(None, vars[0].assignment_operator());
+        assert_eq!(Some("\n\n".to_string()), vars[0].raw_value());
+    }
+
+    #[test]
+    fn test_define_name_with_backslash_and_operator() {
+        let code = "define a\\b :=\nbody\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(Some("a\\b".to_string()), var.name());
+        assert_eq!(Some(":=".to_string()), var.assignment_operator());
+        assert_eq!(Some("body\n".to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_define_name_with_spaces() {
+        // GNU make takes the whole header up to the operator as the name.
+        let code = "define foo bar \nbody\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(code, makefile.to_string());
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(Some("foo bar".to_string()), var.name());
+        assert_eq!(Some("body\n".to_string()), var.raw_value());
     }
 
     #[test]
