@@ -297,8 +297,9 @@ mod tests {
         );
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec![": command"]);
 
+        // GNU make accepts this too.
         let parsed = Makefile::parse_with_variant(": empty-source\n", MakefileVariant::GNUMake);
-        assert!(!parsed.ok());
+        assert!(parsed.ok());
     }
 
     #[test]
@@ -669,5 +670,96 @@ mod tests {
         let cond = reparsed.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("defined(DEBUG)".to_string()));
         assert!(cond.has_else());
+    }
+
+    fn errors_with(variant: MakefileVariant, text: &str) -> usize {
+        Makefile::parse_with_variant(text, variant).errors().len()
+    }
+
+    #[test]
+    fn test_gnu_only_syntax_is_error_in_bsd_make() {
+        // BSD make reports these as "Invalid line" or, for `export`,
+        // "Variable/Value missing from export".
+        for text in [
+            "define X\nfoo\nendef\n",
+            "vpath %.c src\n",
+            "override X = 1\n",
+            "private X = 1\n",
+            "unexport X\n",
+            "undefine X\n",
+            "export X\n",
+            "export\n",
+            "ifdef X\nendif\n",
+        ] {
+            assert_ne!(errors_with(MakefileVariant::BSDMake, text), 0, "{text:?}");
+            assert_eq!(errors_with(MakefileVariant::GNUMake, text), 0, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_gmake_export_in_bsd_make() {
+        let parsed = Makefile::parse_with_variant("export X = 1\n", MakefileVariant::BSDMake);
+        assert!(parsed.ok());
+        let var = parsed.tree().variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert!(var.is_export());
+    }
+
+    #[test]
+    fn test_bsd_only_syntax_is_error_in_gnu_make() {
+        for text in [
+            ".if 1\n.endif\n",
+            ".include <bsd.prog.mk>\n",
+            ".for f in a\n.endfor\n",
+            ".undef X\n",
+            "a! b\n",
+            "!= echo\n",
+        ] {
+            assert_ne!(errors_with(MakefileVariant::GNUMake, text), 0, "{text:?}");
+            assert_eq!(errors_with(MakefileVariant::BSDMake, text), 0, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_gnu_variable_names() {
+        // GNU make allows any characters but whitespace, `:`, `#` and `=`.
+        let parsed = Makefile::parse_with_variant(
+            "EXP.[A-]= x\n*= y\na(b)= z\nx,y = w\n",
+            MakefileVariant::GNUMake,
+        );
+        assert!(parsed.ok());
+        assert_eq!(
+            parsed
+                .tree()
+                .variable_definitions()
+                .map(|v| v.name().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["EXP.[A-]", "*", "a(b)", "x,y"]
+        );
+        assert_ne!(errors_with(MakefileVariant::GNUMake, "a b = c\n"), 0);
+    }
+
+    #[test]
+    fn test_indented_line_outside_rule_in_bsd_make() {
+        // BSD make reads a tab-indented line as a shell command, which is an
+        // error outside of a rule, unless it only has a comment.
+        let parsed = Makefile::parse_with_variant("X=1\n\tA = 1\n", MakefileVariant::BSDMake);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "indented line not part of a rule")]
+        );
+        assert_eq!(parsed.tree().variable_definitions().count(), 1);
+        assert_eq!(
+            errors_with(MakefileVariant::BSDMake, "X=1\n\t\t# comment\n"),
+            0
+        );
+        // GNU make parses it as a normal line.
+        let parsed = Makefile::parse_with_variant("X=1\n\tA = 1\n", MakefileVariant::GNUMake);
+        assert!(parsed.ok());
+        assert_eq!(parsed.tree().variable_definitions().count(), 2);
     }
 }

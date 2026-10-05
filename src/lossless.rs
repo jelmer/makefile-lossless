@@ -207,6 +207,16 @@ impl ConditionalRuleContext {
     fn end(self, in_rule: bool) -> bool {
         in_rule && self.all_paths && (self.has_else || self.outer)
     }
+
+    /// A context for a BSD make `.for` loop, after which the rule context is
+    /// the one at the end of its body.
+    fn for_loop() -> Self {
+        Self {
+            outer: true,
+            all_paths: true,
+            has_else: true,
+        }
+    }
 }
 
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
@@ -761,11 +771,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match (*kind, text.as_str()) {
                     (NEWLINE | COMMENT, _) => {}
                     (INDENT, _) if in_rule => return true,
-                    // `.for` is tracked like a conditional with no else
-                    // branch, as its body may run zero times.
-                    _ if bsd_name.is_some_and(|n| is_bsd_if(n) || n == "for") => {
+                    _ if bsd_name.is_some_and(is_bsd_if) => {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
+                    // As in the parser, the rule context after a `.for` loop
+                    // is the one at the end of its body, so a `.for` only
+                    // needs to be balanced with its `.endfor`.
+                    _ if bsd_name == Some("for") => stack.push(ConditionalRuleContext::for_loop()),
                     _ if bsd_name.is_some_and(|n| is_bsd_elif(n) || n == "else") => {
                         match stack.last_mut() {
                             Some(context) => {
@@ -896,9 +908,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Parse targets in a TARGETS node
             self.skip_ws();
             self.builder.start_node(TARGETS.into());
-            // BSD make allows an empty list of targets, as in `: source`.
-            let has_target = (self.bsd_directives_enabled() && self.at_dependency_operator())
-                || self.parse_rule_targets();
+            // Both GNU and BSD make allow an empty list of targets, as in
+            // `: source`.
+            let has_target = self.at_dependency_operator() || self.parse_rule_targets();
             self.builder.finish_node();
 
             // Find and consume the colon
@@ -1041,12 +1053,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         {
             let mut seen_name = false;
             loop {
-                match tokens.peek().map(|(kind, _)| *kind) {
-                    Some(IDENTIFIER) => {}
+                match tokens.peek().copied() {
                     // A backslash is part of the name unless it continues
                     // the line.
-                    Some(BACKSLASH) if !matches!(tokens.clone().nth(1), Some((NEWLINE, _))) => {}
-                    Some(DOLLAR) => {
+                    Some((BACKSLASH, _)) if matches!(tokens.clone().nth(1), Some((NEWLINE, _))) => {
+                        return Some(seen_name)
+                    }
+                    Some((DOLLAR, _)) => {
                         tokens.next();
                         if !Self::skip_variable_reference(tokens) {
                             return None;
@@ -1054,10 +1067,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_name = true;
                         continue;
                     }
+                    Some((kind, text)) if Self::is_gnu_name_token(*kind, text) => {}
                     _ => return Some(seen_name),
                 }
                 tokens.next();
                 seen_name = true;
+            }
+        }
+
+        /// Whether a token can be part of a GNU make variable name, which may
+        /// contain any characters but whitespace, `:`, `#` and `=`.
+        fn is_gnu_name_token(kind: SyntaxKind, text: &str) -> bool {
+            match kind {
+                WHITESPACE | NEWLINE | COMMENT | INDENT => false,
+                OPERATOR => !text.contains([':', '=']),
+                _ => true,
             }
         }
 
@@ -1211,10 +1235,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// variable name itself, as in `override := 1`.
         fn at_assignment_prefix_keyword(&self) -> bool {
             self.current() == Some(IDENTIFIER)
-                && matches!(
-                    self.tokens.last().unwrap().1.as_str(),
-                    "export" | "unexport" | "override" | "private"
-                )
+                && match self.tokens.last().unwrap().1.as_str() {
+                    "export" => true,
+                    "unexport" | "override" | "private" => !self.is_bsd_make(),
+                    _ => false,
+                }
                 && self.peek_past_ws() != Some(OPERATOR)
         }
 
@@ -1237,7 +1262,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // `undefine NAME`, unless followed by an operator as in
             // `undefine = 1`, which assigns to a variable named "undefine".
-            let is_undefine = self.current() == Some(IDENTIFIER)
+            let is_undefine = !self.is_bsd_make()
+                && self.current() == Some(IDENTIFIER)
                 && self.tokens.last().unwrap().1 == "undefine"
                 && self.peek_past_ws() != Some(OPERATOR);
             if is_undefine {
@@ -1328,21 +1354,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.bsd_directives_enabled() {
                 return self.parse_bsd_variable_name();
             }
-            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR | BACKSLASH))
-                || self.is_line_continuation()
-            {
+            let at_name = |this: &Self| match this.tokens.last() {
+                // A backslash is part of the name unless it continues the line.
+                Some((BACKSLASH, _)) => !this.is_line_continuation(),
+                Some((kind, text)) => Self::is_gnu_name_token(*kind, text),
+                None => false,
+            };
+            if !at_name(self) {
                 return false;
             }
-            loop {
-                match self.current() {
-                    Some(IDENTIFIER) => self.bump(),
-                    // A backslash is part of the name unless it continues
-                    // the line.
-                    Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
-                    Some(DOLLAR) => self.parse_variable_reference(),
-                    _ => return true,
+            while at_name(self) {
+                if self.current() == Some(DOLLAR) {
+                    self.parse_variable_reference();
+                } else {
+                    self.bump();
                 }
             }
+            true
         }
 
         /// Parse a variable name as BSD make does: it may contain almost any
@@ -1879,7 +1907,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                     }
                     Some(INDENT) if self.in_rule => self.parse_recipe_line(),
-                    Some(INDENT) => self.relex_as_non_recipe_line(),
+                    Some(INDENT) => self.parse_indented_line_outside_rule(),
                     Some(WHITESPACE) => self.bump(),
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
@@ -1921,7 +1949,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.parse_assignment();
             } else if self.at_include_keyword() {
                 self.parse_include();
-            } else if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "vpath"
+            } else if !self.is_bsd_make()
+                && self.current() == Some(IDENTIFIER)
+                && self.tokens.last().unwrap().1 == "vpath"
             {
                 self.parse_vpath();
             } else if self.is_expression_statement_line() {
@@ -2099,6 +2129,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.bump();
             }
             self.builder.finish_node();
+        }
+
+        /// Whether parsing for BSD make only, where GNU make's directives
+        /// such as `define` and `override` are not recognized.
+        fn is_bsd_make(&self) -> bool {
+            self.variant == Some(MakefileVariant::BSDMake)
         }
 
         fn bsd_directives_enabled(&self) -> bool {
@@ -2300,7 +2336,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_block_item(&mut self) {
             match self.current() {
                 Some(INDENT) if self.in_rule => self.parse_recipe_line(),
-                Some(INDENT) => self.relex_as_non_recipe_line(),
+                Some(INDENT) => self.parse_indented_line_outside_rule(),
                 Some(NEWLINE) => self.bump(),
                 _ => {
                     self.parse_token();
@@ -2393,10 +2429,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.parse_directive_argument(None);
             self.builder.finish_node();
 
-            // The body may run zero times, so the rule context only continues
-            // after the loop if it holds both before and after the body.
-            let outer_in_rule = self.in_rule;
-
+            // As in BSD make, the rule context after the loop is the one at
+            // the end of its body, which is right unless the loop runs zero
+            // times.
             self.for_depth += 1;
             loop {
                 if self.is_at_eof() {
@@ -2405,7 +2440,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 match self.bsd_directive() {
                     Some((name, count)) if name == "endfor" => {
-                        self.in_rule &= outer_in_rule;
                         self.builder.start_node(FOR_END.into());
                         self.bump_n(count);
                         self.parse_bare_directive_end(name);
@@ -2534,12 +2568,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Whether the current line starts a `define` block, optionally
         /// preceded by modifiers such as `override define NAME`.
         fn is_define_line(&self) -> bool {
-            self.tokens
-                .iter()
-                .rev()
-                .filter(|(kind, _)| *kind != WHITESPACE)
-                .find(|(kind, text)| !(*kind == IDENTIFIER && Self::is_define_modifier(text)))
-                .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "define")
+            !self.is_bsd_make()
+                && self
+                    .tokens
+                    .iter()
+                    .rev()
+                    .filter(|(kind, _)| *kind != WHITESPACE)
+                    .find(|(kind, text)| !(*kind == IDENTIFIER && Self::is_define_modifier(text)))
+                    .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "define")
         }
 
         /// Return the text of the first non-whitespace token on the current
@@ -2612,7 +2648,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // after a blank line
                         self.parse_recipe_line();
                     } else {
-                        self.relex_as_non_recipe_line();
+                        self.parse_indented_line_outside_rule();
                     }
                     true
                 }
@@ -2627,14 +2663,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_assignment();
                     true
                 }
-                Some(OPERATOR)
-                    if self.bsd_directives_enabled() && self.at_dependency_operator() =>
-                {
+                Some(OPERATOR) if self.at_dependency_operator() => {
                     self.parse_rule();
                     true
                 }
                 Some(TEXT)
                     if self.line_has_dependency_operator()
+                        || self.is_assignment_line()
                         || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) =>
                 {
                     self.parse_normal_content();
@@ -2654,6 +2689,32 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// ordinary makefile line. The lexer treats every tab-indented line as
         /// a recipe line, but outside of rule context GNU make parses it like
         /// any other line.
+        /// Parse a tab-indented line outside of rule context. GNU make parses
+        /// it like any other line, while BSD make rejects it as a shell
+        /// command without a target.
+        fn parse_indented_line_outside_rule(&mut self) {
+            if self.is_bsd_make() {
+                // BSD make skips lines with only a comment.
+                let comment_only = self
+                    .tokens
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .find(|(kind, _)| *kind != WHITESPACE)
+                    .is_none_or(|(kind, text)| match kind {
+                        COMMENT | NEWLINE => true,
+                        TEXT => text.trim_start().starts_with('#'),
+                        _ => false,
+                    });
+                if !comment_only {
+                    self.record_error("indented line not part of a rule".to_string());
+                }
+                self.parse_recipe_line();
+            } else {
+                self.relex_as_non_recipe_line();
+            }
+        }
+
         fn relex_as_non_recipe_line(&mut self) {
             let consumed = self.token_positions.len() - self.tokens.len();
             let mut text = String::new();
@@ -2738,6 +2799,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             false
         }
 
+        /// Whether the line is a GNU make style `export VAR=value`, which BSD
+        /// make accepts if the line has no `:` in it.
+        fn at_gmake_export(&self) -> bool {
+            let mut tokens = self.tokens.iter().rev();
+            tokens
+                .next()
+                .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "export")
+                && tokens.next().is_some_and(|(kind, _)| *kind == WHITESPACE)
+                && self.has_assignment_operator_on_line()
+                && !self
+                    .tokens
+                    .iter()
+                    .rev()
+                    .take_while(|(kind, _)| *kind != NEWLINE)
+                    .any(|(_, text)| text.contains(':'))
+        }
+
         fn has_assignment_operator_on_line(&self) -> bool {
             self.tokens
                 .iter()
@@ -2749,11 +2827,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn is_assignment_line(&mut self) -> bool {
+            let bsd_make = self.is_bsd_make();
+            if bsd_make && self.at_gmake_export() {
+                return true;
+            }
             let is_directive = |text: &str| {
-                matches!(
-                    text,
-                    "export" | "unexport" | "override" | "private" | "undefine"
-                )
+                !bsd_make
+                    && matches!(
+                        text,
+                        "export" | "unexport" | "override" | "private" | "undefine"
+                    )
             };
             let mut tokens = self.tokens.iter().rev().peekable();
             let mut seen_name = false;
@@ -10929,12 +11012,21 @@ test:
 
     #[test]
     fn test_bsd_rule_context_after_conditional_branch() {
+        // BSD make always reads a tab-indented line as a shell command, and
+        // reports "Unassociated shell command" outside of a rule.
         let code = ".if defined(A)\nt:\n.else\n\tX = 1\n.endif\n";
         let parsed = parse(code, Some(MakefileVariant::BSDMake));
-        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, "indented line not part of a rule")]
+        );
         assert_eq!(
             node_kinds(&parsed.syntax()),
-            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\n"
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RECIPE\n  CONDITIONAL_ENDIF\n"
         );
         assert_eq!(parsed.root().to_string(), code);
     }
@@ -10952,22 +11044,24 @@ test:
 
     #[test]
     fn test_bsd_rule_context_in_for_loop() {
-        // A rule defined in the body only applies inside the body, as the
-        // loop may run zero times.
+        // As in BSD make, the rule from the last iteration of the loop is
+        // still current after it, so this is a recipe line.
         let code = ".for f in a b\n${f}:\n\techo ${f}\n.endfor\n\tX = 1\n";
         let parsed = parse(code, Some(MakefileVariant::BSDMake));
         assert_eq!(parsed.errors, vec![]);
         assert_eq!(
             node_kinds(&parsed.syntax()),
-            "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n  FOR_END\nVARIABLE\n  EXPR\n"
+            "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n  FOR_END\nRECIPE\n"
         );
         assert_eq!(parsed.root().to_string(), code);
     }
 
     #[test]
     fn test_error_position_after_relexed_line() {
+        // Outside of a rule, the tab-indented line is relexed as a normal line
+        // in the default mode. BSD make would reject it instead.
         let code = "\t.for in a\n.endfor\n";
-        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        let parsed = parse(code, None);
         assert_eq!(
             parsed
                 .positioned_errors
