@@ -1,6 +1,7 @@
 //! Accessors for BSD make constructs: `.for` loops and single-line
 //! directives such as `.undef` or `.error`.
 
+use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use crate::lossless::{node_text, Directive, ForLoop, SyntaxNode, SyntaxToken};
 use crate::SyntaxKind::*;
@@ -83,6 +84,35 @@ impl ForLoop {
     /// The items (rules, variables, nested loops, ...) in the loop body.
     pub fn items(&self) -> impl Iterator<Item = MakefileItem> + '_ {
         self.syntax().children().filter_map(MakefileItem::cast)
+    }
+
+    /// The items in the loop body in source order, including recipe lines,
+    /// which [`ForLoop::items`] skips. A loop inside a rule's body can
+    /// contain recipe lines.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{ConditionalItem, Makefile, MakefileItem, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant(
+    ///     "all:\n.for f in a b\n\techo ${f}\n.endfor\n",
+    ///     MakefileVariant::BSDMake,
+    /// )
+    /// .tree();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let Some(ConditionalItem::Item(MakefileItem::ForLoop(f))) = rule.body_items().next() else {
+    ///     panic!()
+    /// };
+    /// let recipes: Vec<String> = f
+    ///     .body_items()
+    ///     .map(|item| match item {
+    ///         ConditionalItem::Recipe(r) => r.text(),
+    ///         ConditionalItem::Item(_) => panic!("expected recipe"),
+    ///     })
+    ///     .collect();
+    /// assert_eq!(recipes, vec!["echo ${f}"]);
+    /// ```
+    pub fn body_items(&self) -> impl Iterator<Item = ConditionalItem> {
+        self.syntax().children().filter_map(ConditionalItem::cast)
     }
 
     /// Get the parent item of this loop, if any.
