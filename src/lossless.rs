@@ -1301,11 +1301,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
-                            if token == "include" || token == "-include" || token == "sinclude" {
-                                self.parse_include();
-                            } else {
-                                self.parse_normal_content();
-                            }
+                            self.parse_normal_content();
                         }
                     }
                     Some(INDENT) => self.parse_recipe_line(),
@@ -1329,14 +1325,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        // Helper to parse normal content (either assignment or rule)
+        // Helper to parse normal content (assignment, include, vpath or rule).
+        // This is shared by the top level and conditional bodies.
         fn parse_normal_content(&mut self) {
             // Skip any leading whitespace
             self.skip_ws();
 
-            // Check if this could be a variable assignment
+            // Like GNU Make, check for an assignment first so that e.g.
+            // "vpath = foo" defines a variable.
             if self.is_assignment_line() {
                 self.parse_assignment();
+            } else if self.current() == Some(IDENTIFIER)
+                && matches!(
+                    self.tokens.last().unwrap().1.as_str(),
+                    "include" | "-include" | "sinclude"
+                )
+            {
+                self.parse_include();
+            } else if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "vpath"
+            {
+                self.parse_vpath();
             } else {
                 // Try to handle as a rule
                 self.parse_rule();
@@ -1772,21 +1780,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_identifier_token(&mut self) -> bool {
             let token = &self.tokens.last().unwrap().1;
 
-            // Handle special cases first
-            if token.starts_with("%") {
-                self.parse_rule();
-                return true;
-            }
-
             if Self::is_conditional_start(token)
                 && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
             {
                 self.parse_conditional();
-                return true;
-            }
-
-            if token == "include" || token == "-include" || token == "sinclude" {
-                self.parse_include();
                 return true;
             }
 
@@ -1795,12 +1792,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            if token == "vpath" {
-                self.parse_vpath();
-                return true;
-            }
-
-            // Handle normal content (assignment or rule)
+            // Handle normal content (assignment, include, vpath or rule)
             self.parse_normal_content();
             true
         }
@@ -5135,6 +5127,97 @@ endif
         let parsed2 = parse(optional_include, None);
         // Test that parsing doesn't panic
         let _makefile = parsed2.root();
+    }
+
+    fn assert_vpath(item: &MakefileItem, pattern: Option<&str>, dirs: Option<&str>) {
+        let MakefileItem::Vpath(vpath) = item else {
+            panic!("expected a vpath directive, got {:?}", item.syntax());
+        };
+        assert_eq!(pattern.map(str::to_string), vpath.pattern());
+        assert_eq!(dirs.map(str::to_string), vpath.directories_text());
+    }
+
+    #[test]
+    fn test_vpath_in_conditional() {
+        let code = "ifdef X\nvpath %.c src\nelse\nvpath %.h\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(0, makefile.rules().count());
+        let cond = makefile.conditionals().next().unwrap();
+        let if_items: Vec<_> = cond.if_items().collect();
+        assert_eq!(1, if_items.len());
+        assert_vpath(&if_items[0], Some("%.c"), Some("src"));
+        let else_items: Vec<_> = cond.else_items().collect();
+        assert_eq!(1, else_items.len());
+        assert_vpath(&else_items[0], Some("%.h"), None);
+    }
+
+    #[test]
+    fn test_vpath_in_nested_conditional() {
+        let code = "ifdef X\nifeq ($(Y),1)\nvpath\nendif\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let outer = makefile.conditionals().next().unwrap();
+        let outer_items: Vec<_> = outer.if_items().collect();
+        assert_eq!(1, outer_items.len());
+        let MakefileItem::Conditional(inner) = &outer_items[0] else {
+            panic!("expected a conditional, got {:?}", outer_items[0].syntax());
+        };
+        let inner_items: Vec<_> = inner.if_items().collect();
+        assert_eq!(1, inner_items.len());
+        assert_vpath(&inner_items[0], None, None);
+    }
+
+    #[test]
+    fn test_vpath_in_conditional_in_rule() {
+        let code = "all:\n\techo hi\nifdef X\nvpath %.h inc\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(1, makefile.rules().count());
+        let vpaths: Vec<_> = makefile
+            .syntax()
+            .descendants()
+            .filter_map(Vpath::cast)
+            .collect();
+        assert_eq!(1, vpaths.len());
+        assert_vpath(
+            &MakefileItem::Vpath(vpaths[0].clone()),
+            Some("%.h"),
+            Some("inc"),
+        );
+    }
+
+    #[test]
+    fn test_directive_names_as_variables() {
+        // GNU Make treats these as plain assignments, both at the top level
+        // and inside a conditional.
+        let lines = "vpath = a\ninclude := b\n%x = c\n";
+        for code in [lines.to_string(), format!("ifdef X\n{}endif\n", lines)] {
+            let parsed = parse(&code, None);
+            assert_eq!(parsed.errors, vec![]);
+            let makefile = parsed.root();
+            assert_eq!(code, makefile.to_string());
+            let vars: Vec<_> = makefile
+                .syntax()
+                .descendants()
+                .filter_map(VariableDefinition::cast)
+                .map(|v| (v.name().unwrap(), v.raw_value().unwrap()))
+                .collect();
+            assert_eq!(
+                vec![
+                    ("vpath".to_string(), "a".to_string()),
+                    ("include".to_string(), "b".to_string()),
+                    ("%x".to_string(), "c".to_string()),
+                ],
+                vars
+            );
+        }
     }
 
     #[test]
