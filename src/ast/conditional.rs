@@ -447,7 +447,7 @@ impl Conditional {
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
-    /// let makefile: Makefile = "ifdef DEBUG\nVAR = 1\n".parse().unwrap();
+    /// let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nVAR = 1\n");
     /// let mut cond = makefile.conditionals().next().unwrap();
     /// assert!(cond.add_endif().unwrap());
     /// assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
@@ -548,7 +548,7 @@ endif
 
     #[test]
     fn test_add_endif_to_unterminated() {
-        let makefile: Makefile = "ifdef DEBUG\nVAR = 1\n".parse().unwrap();
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nVAR = 1\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
         assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
@@ -575,7 +575,7 @@ endif
 
     #[test]
     fn test_add_endif_with_else() {
-        let makefile: Makefile = "ifdef DEBUG\nA = 1\nelse\nA = 2\n".parse().unwrap();
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nA = 1\nelse\nA = 2\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
         assert_eq!(makefile.code(), "ifdef DEBUG\nA = 1\nelse\nA = 2\nendif\n");
@@ -595,7 +595,7 @@ endif
 
     #[test]
     fn test_add_endif_preserves_existing_body() {
-        let makefile: Makefile = "ifeq ($(X),y)\nA = 1\nB = 2\n".parse().unwrap();
+        let (makefile, _) = Makefile::from_str_relaxed("ifeq ($(X),y)\nA = 1\nB = 2\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
         assert_eq!(makefile.code(), "ifeq ($(X),y)\nA = 1\nB = 2\nendif\n");
