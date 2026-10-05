@@ -74,11 +74,16 @@ impl VariableDefinition {
             [word] if !has_operator && keyword(word).is_some() => 1,
             _ => words.len().saturating_sub(1),
         };
-        words
-            .iter()
-            .take(count)
-            .map_while(|word| keyword(word))
-            .collect()
+        let mut keywords = Vec::new();
+        for token in words.iter().take(count).map_while(|word| keyword(word)) {
+            let is_undefine = token.text() == "undefine";
+            keywords.push(token);
+            // Everything after `undefine` is part of the name.
+            if is_undefine {
+                break;
+            }
+        }
+        keywords
     }
 
     /// Internal: the elements making up the variable's name, i.e. the
@@ -88,6 +93,23 @@ impl VariableDefinition {
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
+        if self.is_undefine() {
+            // GNU make takes the rest of the line as the name, including any
+            // whitespace and line continuations inside it.
+            let mut elements: Vec<_> = self
+                .after_directive_keywords()
+                .take_while(|it| {
+                    is_continuation(it) || !matches!(it.kind(), NEWLINE | COMMENT | OPERATOR)
+                })
+                .collect();
+            while elements
+                .last()
+                .is_some_and(|it| it.kind() == WHITESPACE || is_continuation(it))
+            {
+                elements.pop();
+            }
+            return elements;
+        }
         // BSD make names may contain almost any character, as in `EXP.[A-]`
         // or `a:b`, including whitespace inside parentheses and braces.
         self.after_directive_keywords()
@@ -146,19 +168,39 @@ impl VariableDefinition {
     }
 
     /// Get the name of the variable definition
+    ///
+    /// For an `undefine` directive this is the rest of the line, which may
+    /// contain whitespace: `undefine A B` undefines the variable "A B". A
+    /// line continuation inside it reads as a single space.
     pub fn name(&self) -> Option<String> {
         let elements = self.name_elements();
         if elements.is_empty() {
             return None;
         }
-        Some(elements.iter().map(|it| it.to_string()).collect())
+        let mut name = String::new();
+        let mut in_continuation = false;
+        for it in &elements {
+            if is_continuation(it) {
+                if !in_continuation {
+                    name.truncate(name.trim_end().len());
+                    name.push(' ');
+                    in_continuation = true;
+                }
+            } else if !(in_continuation && it.kind() == WHITESPACE) {
+                name.push_str(&it.to_string());
+                in_continuation = false;
+            }
+        }
+        Some(name)
     }
 
     /// All variable names on this line, including variable references
     /// such as `$(VARS)` verbatim.
     ///
     /// Usually this is just [`Self::name`], but a bare `export` or
-    /// `unexport` directive can list several variables.
+    /// `unexport` directive can list several variables. An `undefine`
+    /// directive always has a single name, as in `undefine A B`, which
+    /// yields just "A B".
     ///
     /// # Example
     /// ```
@@ -171,6 +213,9 @@ impl VariableDefinition {
     /// );
     /// ```
     pub fn names(&self) -> impl Iterator<Item = String> {
+        if self.is_undefine() {
+            return self.name().into_iter().collect::<Vec<_>>().into_iter();
+        }
         let mut names = Vec::new();
         let mut current = String::new();
         for it in self.after_directive_keywords().take_while(|it| {
@@ -752,6 +797,18 @@ mod tests {
     }
 
     #[test]
+    fn test_set_name_undefine_with_spaces() {
+        let makefile: Makefile = "undefine A B # c\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(usize::from(var.name_range().unwrap().start()), 9);
+        assert_eq!(usize::from(var.name_range().unwrap().end()), 12);
+        var.set_name("C");
+        assert!(var.is_undefine());
+        assert_eq!(var.name(), Some("C".to_string()));
+        assert_eq!(makefile.code(), "undefine C # c\n");
+    }
+
+    #[test]
     fn test_set_name_does_not_touch_value_reference() {
         let makefile: Makefile = "FOO := $(FOO) extra\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
@@ -1165,16 +1222,12 @@ mod tests {
         assert_eq!(var.name(), Some("X".to_string()));
         assert_eq!(makefile.rules().count(), 1);
 
-        // Like `undefine X Y`, which names a single variable "X Y", this
-        // isn't supported, but the continued line must not become a rule.
-        let (makefile, errors) = Makefile::from_str_relaxed("undefine X \\\n  Y\n");
-        assert_eq!(
-            errors
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>(),
-            vec!["expected newline, got Some(IDENTIFIER)"]
-        );
+        // Like `undefine X Y`, this names a single variable "X Y".
+        let code = "undefine X \\\n  Y\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X Y".to_string()));
         assert_eq!(makefile.rules().count(), 0);
     }
 

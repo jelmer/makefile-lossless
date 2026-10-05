@@ -1299,7 +1299,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if is_undefine {
-                self.skip_ws_and_continuations();
+                // GNU make takes the rest of the line as a single name, so
+                // `undefine A B` undefines the variable "A B".
+                loop {
+                    self.skip_ws_and_continuations();
+                    // A BSD-style name may be empty, so check for progress.
+                    let remaining = self.tokens.len();
+                    if !self.parse_variable_name() || self.tokens.len() == remaining {
+                        break;
+                    }
+                }
                 self.expect_eol();
                 self.builder.finish_node();
                 return;
@@ -1324,8 +1333,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws_and_continuations();
 
             // A bare "export"/"unexport" directive may list several variables.
-            // With an assignment, GNU make treats "A B" as a single name, which
-            // isn't supported; leave that to the operator check below to report.
+            // With an operator, as in `export A B = x`, GNU make exports each
+            // word, including "=" and "x"; that is almost certainly a mistake,
+            // so leave it to the operator check below to report.
             if is_export_directive && !self.has_assignment_operator_on_line() {
                 loop {
                     match self.current() {
@@ -5962,6 +5972,57 @@ all: $(OBJS)
     }
 
     #[test]
+    fn test_undefine_name_with_spaces() {
+        // GNU make takes the rest of the line as a single name, keeping
+        // internal whitespace.
+        let text = "undefine A  B\noverride undefine B C # c\nundefine X \n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 3);
+        assert!(vars[0].is_undefine());
+        assert!(!vars[0].is_override());
+        assert_eq!(vars[0].name(), Some("A  B".to_string()));
+        assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["A  B"]);
+        assert!(vars[1].is_undefine());
+        assert!(vars[1].is_override());
+        assert_eq!(vars[1].name(), Some("B C".to_string()));
+        assert_eq!(vars[1].names().collect::<Vec<_>>(), vec!["B C"]);
+        assert_eq!(vars[2].name(), Some("X".to_string()));
+        assert_eq!(vars[2].names().collect::<Vec<_>>(), vec!["X"]);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_name_with_continuation() {
+        // The continuation and surrounding whitespace become a single space.
+        let text = "undefine A \\\n  $(B)\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_undefine());
+        assert_eq!(var.name(), Some("A $(B)".to_string()));
+        assert_eq!(var.names().collect::<Vec<_>>(), vec!["A $(B)"]);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_name_starting_with_keyword() {
+        // Words after `undefine` are part of the name, not modifiers.
+        let text = "undefine override X\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_undefine());
+        assert!(!var.is_override());
+        assert_eq!(var.name(), Some("override X".to_string()));
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
     fn test_undefine_as_rule_target() {
         let text = "undefine:\n\techo hi\n";
         let parsed = parse(text, None);
@@ -6005,7 +6066,6 @@ all: $(OBJS)
         for (text, message) in [
             ("undefine\n", "expected variable name"),
             ("undefine FOO = x\n", "expected newline, got Some(OPERATOR)"),
-            ("undefine A B\n", "expected newline, got Some(IDENTIFIER)"),
         ] {
             let parsed = parse(text, None);
             assert_eq!(
@@ -6090,7 +6150,7 @@ all: $(OBJS)
 
     #[test]
     fn test_export_multiple_words_with_assignment() {
-        // GNU make treats this as a single variable named "A B"
+        // GNU make exports the words "A", "B", "=" and "x"
         let parsed = parse("export A B = x\n", None);
         assert_eq!(
             parsed
