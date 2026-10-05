@@ -625,6 +625,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.bump();
                     true
                 }
+                // A backslash is part of the target name. Both GNU and BSD
+                // make keep it, and it stops a following whitespace or `:`
+                // from ending the name.
+                Some(BACKSLASH) if !self.is_line_continuation() => {
+                    while self.current() == Some(BACKSLASH) && !self.is_line_continuation() {
+                        self.bump();
+                    }
+                    if self.pending_backslash_escape && self.at_escapable_target_separator() {
+                        self.bump_escaped_char();
+                    }
+                    true
+                }
                 _ => {
                     self.error(
                         ParseErrorKind::MissingTarget,
@@ -632,6 +644,31 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     );
                     false
                 }
+            }
+        }
+
+        /// Whether the current token starts with a character that ends a
+        /// target name unless escaped with a backslash.
+        fn at_escapable_target_separator(&self) -> bool {
+            match self.tokens.last() {
+                Some((WHITESPACE, _)) => true,
+                Some((OPERATOR, op)) => {
+                    op.starts_with(':') || (op == "!" && self.is_dependency_operator(op))
+                }
+                _ => false,
+            }
+        }
+
+        /// Consume the first character of the current token as TEXT, as it
+        /// is escaped by a preceding backslash, leaving the rest of the
+        /// token as the current token.
+        fn bump_escaped_char(&mut self) {
+            let text = &self.tokens.last().unwrap().1;
+            let len = text.chars().next().unwrap().len_utf8();
+            if len == text.len() {
+                self.bump_as(TEXT);
+            } else {
+                self.bump_token_head_as(len, TEXT);
             }
         }
 
@@ -773,6 +810,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // next physical line.
             while let Some(kind) = self.current() {
                 match kind {
+                    // GNU make takes a backslash-escaped space as part of
+                    // the name; BSD make splits sources at any whitespace.
+                    WHITESPACE if self.pending_backslash_escape && !self.is_bsd_make() => {
+                        self.bump_escaped_char();
+                    }
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
                     TEXT if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
@@ -1042,12 +1084,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
+        /// Whether the rest of the physical line has a dependency operator.
+        /// A backslash escapes the first character of an operator, so `\:`
+        /// is not one.
         fn line_has_dependency_operator(&self) -> bool {
-            self.tokens
-                .iter()
-                .rev()
-                .take_while(|(kind, _)| *kind != NEWLINE)
-                .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text))
+            let mut escaped = self.pending_backslash_escape;
+            for (kind, text) in self.tokens.iter().rev() {
+                match kind {
+                    NEWLINE => break,
+                    OPERATOR => {
+                        let op = if escaped { &text[1..] } else { text.as_str() };
+                        if self.is_dependency_operator(op) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+            }
+            false
         }
 
         /// Whether the current token is at the start of a line that begins
@@ -1427,7 +1482,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Try to parse another target
                 match self.current() {
-                    Some(IDENTIFIER | DOLLAR | TEXT) => {
+                    Some(IDENTIFIER | DOLLAR | TEXT | BACKSLASH) => {
                         if !self.parse_rule_target() {
                             break;
                         }
@@ -1841,9 +1896,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// rest as the current token. If the rest starts an expression, it
         /// is lexed again so that the expression starts with a `$` token.
         fn bump_token_head(&mut self, len: usize) {
+            let kind = self.current().unwrap();
+            self.bump_token_head_as(len, kind);
+        }
+
+        /// As [`Self::bump_token_head`], but adding the head to the tree as
+        /// `kind`.
+        fn bump_token_head_as(&mut self, len: usize, kind: SyntaxKind) {
             let consumed = self.token_positions.len() - self.tokens.len();
-            let (kind, text) = self.tokens.last_mut().unwrap();
-            let kind = *kind;
+            let text = &mut self.tokens.last_mut().unwrap().1;
             let tail = text.split_off(len);
             let head = std::mem::replace(text, tail);
             self.token_positions[consumed].0 += rowan::TextSize::of(head.as_str());
@@ -3343,7 +3404,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_rule();
                     true
                 }
-                Some(TEXT)
+                Some(TEXT | BACKSLASH)
                     if self.line_has_dependency_operator()
                         || self.is_assignment_line()
                         || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) =>

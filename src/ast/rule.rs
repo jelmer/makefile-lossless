@@ -1,6 +1,6 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, line_ending};
+use super::{collapse_continuations, is_continuation, line_ending};
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
     ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
@@ -309,10 +309,11 @@ impl Rule {
                     IDENTIFIER => {
                         current_target.push_str(token.text());
                     }
-                    WHITESPACE | INDENT | BACKSLASH | NEWLINE => {
-                        // Whitespace and line continuations (backslash-newline
-                        // plus the continued line's indent) delimit targets,
-                        // unless we're inside parentheses.
+                    // Whitespace and line continuations (backslash-newline
+                    // plus the continued line's indent) delimit targets,
+                    // unless we're inside parentheses. The parser keeps an
+                    // escaped space as TEXT.
+                    kind if kind == WHITESPACE || is_continuation(&child) => {
                         if in_parens == 0 && !current_target.is_empty() {
                             result.push(current_target.clone());
                             current_target.clear();
@@ -350,6 +351,9 @@ impl Rule {
     }
 
     /// Targets of this rule
+    ///
+    /// Backslashes are kept as written, as for variable names: `a\ b` is
+    /// the single target `a\ b`, which GNU make reads as `a b`.
     ///
     /// # Example
     /// ```
@@ -497,7 +501,8 @@ impl Rule {
     /// Get the normal prerequisites in the rule
     ///
     /// Order-only prerequisites (those after a `|`) are not included; see
-    /// [`Rule::order_only_prerequisites`].
+    /// [`Rule::order_only_prerequisites`]. As with [`Rule::targets`],
+    /// backslashes are kept as written.
     ///
     /// # Example
     /// ```
@@ -2239,5 +2244,71 @@ mod tests {
         // BSD make has no `.RECIPEPREFIX`.
         let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::BSDMake);
         assert!(!parsed.ok());
+    }
+
+    /// Parse `text` as `variant`, check it round trips without errors and
+    /// return the targets and prerequisites of its single rule.
+    fn parse_rule_names(text: &str, variant: crate::MakefileVariant) -> (Vec<String>, Vec<String>) {
+        let parsed = Makefile::parse_with_variant(text, variant);
+        assert!(parsed.ok(), "{text:?}: {:?}", parsed.errors());
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1, "{text:?}");
+        (targets(&rules[0]), rules[0].prerequisites().collect())
+    }
+
+    #[test]
+    fn test_target_backslash() {
+        for variant in [
+            crate::MakefileVariant::GNUMake,
+            crate::MakefileVariant::POSIXMake,
+            crate::MakefileVariant::BSDMake,
+        ] {
+            for (text, expected) in [
+                ("a\\b: x\n", vec!["a\\b"]),
+                ("\\foo: x\n", vec!["\\foo"]),
+                ("a\\\\b: x\n", vec!["a\\\\b"]),
+                ("a\\b c\\d: x\n", vec!["a\\b", "c\\d"]),
+                ("a\\ b: x\n", vec!["a\\ b"]),
+                ("a\\  b: x\n", vec!["a\\ ", "b"]),
+                ("a\\:b: x\n", vec!["a\\:b"]),
+                ("a\\\\ b: x\n", vec!["a\\\\", "b"]),
+                ("a\\\\\\:: x\n", vec!["a\\\\\\:"]),
+                ("a\\\\: x\n", vec!["a\\\\"]),
+                ("a\\b \\\n c: x\n", vec!["a\\b", "c"]),
+                ("a\\\\\\\n c: x\n", vec!["a\\\\", "c"]),
+            ] {
+                assert_eq!(
+                    parse_rule_names(text, variant),
+                    (
+                        expected.into_iter().map(String::from).collect(),
+                        vec!["x".to_string()]
+                    ),
+                    "{variant:?} {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prerequisite_escaped_space() {
+        // GNU make takes `\ ` as part of the name, BSD make splits source
+        // names at any whitespace.
+        let text = "all: a\\b c\\ d e\\:f\n";
+        for variant in [
+            crate::MakefileVariant::GNUMake,
+            crate::MakefileVariant::POSIXMake,
+        ] {
+            assert_eq!(
+                parse_rule_names(text, variant).1,
+                vec!["a\\b", "c\\ d", "e\\:f"],
+                "{variant:?}"
+            );
+        }
+        assert_eq!(
+            parse_rule_names(text, crate::MakefileVariant::BSDMake).1,
+            vec!["a\\b", "c\\", "d", "e\\:f"]
+        );
     }
 }
