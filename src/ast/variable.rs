@@ -78,10 +78,10 @@ impl VariableDefinition {
         };
         let mut keywords = Vec::new();
         for token in words.iter().take(count).map_while(|word| keyword(word)) {
-            let is_undefine = token.text() == "undefine";
+            let is_last = matches!(token.text(), "define" | "undefine");
             keywords.push(token);
-            // Everything after `undefine` is part of the name.
-            if is_undefine {
+            // Everything after `define` or `undefine` is part of the name.
+            if is_last {
                 break;
             }
         }
@@ -95,12 +95,20 @@ impl VariableDefinition {
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
-        if self.is_undefine() {
+        let directive = self.directive_keywords().pop();
+        if let Some(directive) = directive.filter(|t| matches!(t.text(), "define" | "undefine")) {
             // GNU make takes the rest of the line as the name, including any
-            // whitespace and line continuations inside it.
+            // whitespace and line continuations inside it. The parser only
+            // emits an OPERATOR token after a `define` name if it is the
+            // assignment operator.
+            let is_define = directive.text() == "define";
             let mut elements: Vec<_> = self
                 .after_directive_keywords()
-                .take_while(|it| is_continuation(it) || !matches!(it.kind(), NEWLINE | COMMENT))
+                .take_while(|it| {
+                    is_continuation(it)
+                        || !(matches!(it.kind(), NEWLINE | COMMENT)
+                            || is_define && it.kind() == OPERATOR)
+                })
                 .collect();
             while elements
                 .last()
@@ -170,7 +178,8 @@ impl VariableDefinition {
     /// Get the name of the variable definition
     ///
     /// For an `undefine` directive this is the rest of the line, which may
-    /// contain whitespace: `undefine A B` undefines the variable "A B". A
+    /// contain whitespace: `undefine A B` undefines the variable "A B".
+    /// Likewise for a `define` header up to the assignment operator. A
     /// line continuation inside it reads as a single space.
     pub fn name(&self) -> Option<String> {
         let elements = self.name_elements();
@@ -199,8 +208,8 @@ impl VariableDefinition {
     ///
     /// Usually this is just [`Self::name`], but a bare `export` or
     /// `unexport` directive can list several variables. An `undefine`
-    /// directive always has a single name, as in `undefine A B`, which
-    /// yields just "A B".
+    /// or `define` directive always has a single name, as in `undefine A B`,
+    /// which yields just "A B".
     ///
     /// # Example
     /// ```
@@ -213,7 +222,7 @@ impl VariableDefinition {
     /// );
     /// ```
     pub fn names(&self) -> impl Iterator<Item = String> {
-        if self.is_undefine() {
+        if self.is_undefine() || self.is_define() {
             return self.name().into_iter().collect::<Vec<_>>().into_iter();
         }
         let mut names = Vec::new();
