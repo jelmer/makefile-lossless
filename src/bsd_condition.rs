@@ -10,6 +10,8 @@
 //!          | Leaf | Leaf CompareOp Leaf | BareWord
 //! ```
 
+use crate::reference::{ParsedReference, ReferenceError};
+use crate::MakefileVariant;
 use std::fmt;
 use std::str::FromStr;
 
@@ -457,7 +459,8 @@ impl Parser {
         self.pos = open;
         let argument = if function == BsdFunction::Empty {
             // The argument is parsed like the inside of `$(...)`.
-            let close = self.scan_variable_reference(open - 1)? - 1;
+            let expr = format!("${}", self.slice(open, self.text.len()));
+            let close = self.scan_expression(open - 1, &expr)? - 1;
             let argument = self.slice(open + 1, close);
             self.pos = close + 1;
             argument
@@ -519,12 +522,10 @@ impl Parser {
     }
 
     /// Return the end of the variable reference starting with the `$` at
-    /// `start`. Nested references are skipped, as are brackets of the same
-    /// kind as the delimiters, as long as they are balanced.
+    /// `start`.
     fn scan_variable_reference(&self, start: usize) -> Result<usize, BsdConditionError> {
-        let (open, close) = match self.peek_at(start + 1) {
-            Some(b'(') => (b'(', b')'),
-            Some(b'{') => (b'{', b'}'),
+        match self.peek_at(start + 1) {
+            Some(b'(' | b'{') => {}
             Some(_) => {
                 // A single-character variable name, such as `$@` or `$$`.
                 let len = std::str::from_utf8(&self.text[start + 1..])
@@ -535,27 +536,28 @@ impl Parser {
                 return Ok(start + 1 + len);
             }
             None => return Err(self.error_at(start, "incomplete variable reference")),
-        };
-        let mut depth = 0usize;
-        let mut pos = start + 2;
-        while let Some(c) = self.peek_at(pos) {
-            match c {
-                b'$' => {
-                    pos = self.scan_variable_reference(pos)?;
-                    continue;
-                }
-                b'\\' => {
-                    pos += 2;
-                    continue;
-                }
-                c if c == close && depth == 0 => return Ok(pos + 1),
-                c if c == close => depth -= 1,
-                c if c == open => depth += 1,
-                _ => {}
-            }
-            pos += 1;
         }
-        Err(self.error_at(start, "unclosed variable reference"))
+        let text =
+            std::str::from_utf8(&self.text[start..]).expect("split at a non-character boundary");
+        self.scan_expression(start, text)
+    }
+
+    /// Return the end of the expression `text`, which starts at `start` with
+    /// `$(` or `${`. As in make, where the expression ends depends on its
+    /// modifiers, so it is found by parsing them.
+    fn scan_expression(&self, start: usize, text: &str) -> Result<usize, BsdConditionError> {
+        match ParsedReference::parse_prefix(text, MakefileVariant::BSDMake) {
+            Ok((_, len)) => Ok(start + len),
+            Err(ReferenceError::Syntax { offset, message }) => {
+                Err(self.error_at(start + offset, message))
+            }
+            Err(ReferenceError::UnknownModifier { offset, modifier }) => {
+                Err(self.error_at(start + offset, format!("unknown modifier ':{}'", modifier)))
+            }
+            Err(e @ ReferenceError::FunctionCall { .. }) => {
+                unreachable!("function call in BSD make expression: {}", e)
+            }
+        }
     }
 
     /// Parse a leaf, optionally followed by a comparison operator and
@@ -903,6 +905,44 @@ mod tests {
     }
 
     #[test]
+    fn test_variable_reference_extent_follows_modifiers() {
+        assert_eq!(
+            parse("${A:S/{/x/} == x"),
+            compare(var("${A:S/{/x/}"), Equal, word("x"))
+        );
+        assert_eq!(
+            parse("${A:S,},x,} == x"),
+            compare(var("${A:S,},x,}"), Equal, word("x"))
+        );
+        assert_eq!(
+            parse("${A:C/[}]/x/} == x"),
+            compare(var("${A:C/[}]/x/}"), Equal, word("x"))
+        );
+        assert_eq!(
+            parse("$(A:S/(/x/) == x"),
+            compare(var("$(A:S/(/x/)"), Equal, word("x"))
+        );
+        assert_eq!(
+            parse("${A:S/${B}/{/} == x"),
+            compare(var("${A:S/${B}/{/}"), Equal, word("x"))
+        );
+        assert_eq!(parse("${A:M*\\}*}"), Value(var("${A:M*\\}*}")));
+        assert_eq!(parse("defined(${A:S/{/x/})"), defined("${A:S/{/x/}"));
+        assert_eq!(
+            parse("!empty(A:S/(/x/)"),
+            not(call(BsdFunction::Empty, "A:S/(/x/"))
+        );
+        assert_eq!(
+            error("!empty(A:M{*)"),
+            ("unclosed expression, expecting ')'".to_string(), 13)
+        );
+        assert_eq!(
+            error("${A:Z} == x"),
+            ("unknown modifier ':Z'".to_string(), 4)
+        );
+    }
+
+    #[test]
     fn test_bare_operand() {
         assert_eq!(parse("${FOO}"), Value(var("${FOO}")));
         assert_eq!(parse("0"), Value(number("0")));
@@ -1085,10 +1125,13 @@ mod tests {
             error("${A} = b"),
             ("expected \"&&\", \"||\" or end of condition".to_string(), 5)
         );
-        assert_eq!(error("${A"), ("unclosed variable reference".to_string(), 0));
+        assert_eq!(
+            error("${A"),
+            ("unclosed expression, expecting '}'".to_string(), 3)
+        );
         assert_eq!(
             error("defined(${A)"),
-            ("unclosed variable reference".to_string(), 8)
+            ("unclosed expression, expecting '}'".to_string(), 12)
         );
         assert_eq!(
             error("${A} == \"b"),
@@ -1104,7 +1147,7 @@ mod tests {
         );
         assert_eq!(
             error("empty(A"),
-            ("unclosed variable reference".to_string(), 4)
+            ("unclosed expression, expecting ')'".to_string(), 7)
         );
         assert_eq!(
             error("${A} == $"),
