@@ -11394,6 +11394,120 @@ endif
         assert_eq!(cond.else_items().count(), 1);
     }
 
+    fn item_without_newline(src: &str) -> MakefileItem {
+        let item = src.parse::<Makefile>().unwrap().items().next().unwrap();
+        assert_eq!(item.syntax().to_string(), src);
+        item
+    }
+
+    fn assert_matches_reparse(makefile: &Makefile) {
+        let reparsed: Makefile = makefile.to_string().parse().unwrap();
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.syntax())
+        );
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("Y = 2"));
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 2\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_else_item_without_newline() {
+        let makefile: Makefile = "ifdef X\nY = 1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("Y = 2"));
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nelse\nY = 2\nendif\n");
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_rule_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("a:\n\tcmd"));
+        assert_eq!(makefile.to_string(), "ifdef X\na:\n\tcmd\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_conditional_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("ifdef Y\nZ = 1\nendif"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nifdef Y\nZ = 1\nendif\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_with_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        let item = "Y = 2\n"
+            .parse::<Makefile>()
+            .unwrap()
+            .items()
+            .next()
+            .unwrap();
+        cond.add_if_item(item);
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 2\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_item_replace_without_newline() {
+        let makefile: Makefile = "X = 1\nY = 1\n".parse().unwrap();
+        let mut first = makefile.items().next().unwrap();
+        first.replace(item_without_newline("Z = 1")).unwrap();
+        assert_eq!(makefile.to_string(), "Z = 1\nY = 1\n");
+        assert_eq!(first.syntax().to_string(), "Z = 1\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_item_insert_before_without_newline() {
+        let makefile: Makefile = "X = 1\n".parse().unwrap();
+        let mut first = makefile.items().next().unwrap();
+        first.insert_before(item_without_newline("Z = 1")).unwrap();
+        assert_eq!(makefile.to_string(), "Z = 1\nX = 1\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_item_insert_after_without_newline() {
+        let makefile: Makefile = "X = 1\nY = 1\n".parse().unwrap();
+        let mut first = makefile.items().next().unwrap();
+        first.insert_after(item_without_newline("Z = 1")).unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\nZ = 1\nY = 1\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_replace_rule_without_newline() {
+        let mut makefile: Makefile = "a:\nb:\n".parse().unwrap();
+        makefile
+            .replace_rule(0, "c:\n\tcmd".parse().unwrap())
+            .unwrap();
+        assert_eq!(makefile.to_string(), "c:\n\tcmd\nb:\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_rule_without_newline() {
+        let mut makefile: Makefile = "a:\nb:\n".parse().unwrap();
+        makefile.insert_rule(0, "c:".parse().unwrap()).unwrap();
+        makefile.insert_rule(2, "d:".parse().unwrap()).unwrap();
+        makefile.insert_rule(4, "e:".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "c:\n\na:\n\nd:\n\nb:\n\ne:\n");
+    }
+
     #[test]
     fn test_add_conditional_with_items() {
         let mut makefile = Makefile::new();
@@ -14739,6 +14853,51 @@ mod test_crlf {
             makefile.to_string(),
             "ifdef X\r\nY = 1\r\nelse\r\nY = 2\r\nendif\r\n"
         );
+    }
+
+    fn item_without_newline(src: &str) -> MakefileItem {
+        let item = parse_crlf(src).items().next().unwrap();
+        assert_eq!(item.syntax().to_string(), src);
+        item
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_without_newline() {
+        let makefile = parse_crlf("ifdef X\r\nendif\r\n");
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("a:\r\n\tcmd"));
+        assert_eq!(makefile.to_string(), "ifdef X\r\na:\r\n\tcmd\r\nendif\r\n");
+    }
+
+    #[test]
+    fn test_conditional_add_else_item_without_newline() {
+        let makefile = parse_crlf("ifdef X\r\nY = 1\r\nendif\r\n");
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("Y = 2"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\r\nY = 1\r\nelse\r\nY = 2\r\nendif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_item_replace_and_insert_without_newline() {
+        let makefile = parse_crlf("X = 1\r\nY = 1\r\n");
+        let mut first = makefile.items().next().unwrap();
+        first.insert_after(item_without_newline("B = 1")).unwrap();
+        first.insert_before(item_without_newline("A = 1")).unwrap();
+        first.replace(item_without_newline("Z = 1")).unwrap();
+        assert_eq!(makefile.to_string(), "A = 1\r\nZ = 1\r\nB = 1\r\nY = 1\r\n");
+    }
+
+    #[test]
+    fn test_replace_and_insert_rule_without_newline() {
+        let mut makefile = parse_crlf("a:\r\nb:\r\n");
+        makefile
+            .replace_rule(0, "c:\r\n\tcmd".parse().unwrap())
+            .unwrap();
+        makefile.insert_rule(2, "d:".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "c:\r\n\tcmd\r\nb:\r\n\r\nd:\r\n");
     }
 
     #[test]

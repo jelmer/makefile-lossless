@@ -1,4 +1,4 @@
-use super::line_ending;
+use super::{line_ending, with_trailing_newline};
 use crate::lossless::{
     parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
     Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
@@ -214,15 +214,16 @@ impl MakefileItem {
     pub fn replace(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("replace", "replace")?;
         let current_index = self.syntax().index();
+        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
 
         // Replace the current node with the new item's syntax
         parent.splice_children(
             current_index..current_index + 1,
-            vec![new_item.syntax().clone().into()],
+            vec![new_node.clone().into()],
         );
 
         // Update self to point to the new item
-        *self = new_item;
+        *self = MakefileItem::cast(new_node).expect("new node has the same kind as new_item");
 
         Ok(())
     }
@@ -414,12 +415,10 @@ impl MakefileItem {
     pub fn insert_before(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert before", "insert_before")?;
         let current_index = self.syntax().index();
+        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
 
         // Insert the new item before the current item
-        parent.splice_children(
-            current_index..current_index,
-            vec![new_item.syntax().clone().into()],
-        );
+        parent.splice_children(current_index..current_index, vec![new_node.into()]);
 
         Ok(())
     }
@@ -443,12 +442,10 @@ impl MakefileItem {
     pub fn insert_after(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert after", "insert_after")?;
         let current_index = self.syntax().index();
+        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
 
         // Insert the new item after the current item
-        parent.splice_children(
-            current_index + 1..current_index + 1,
-            vec![new_item.syntax().clone().into()],
-        );
+        parent.splice_children(current_index + 1..current_index + 1, vec![new_node.into()]);
 
         Ok(())
     }
@@ -1211,11 +1208,11 @@ impl Makefile {
         let target_node = &rules[index];
         let target_index = target_node.index();
 
+        let new_node = with_trailing_newline(new_rule.syntax(), &line_ending(self.syntax()));
+
         // Replace the rule at the target index
-        self.syntax().splice_children(
-            target_index..target_index + 1,
-            vec![new_rule.syntax().clone().into()],
-        );
+        self.syntax()
+            .splice_children(target_index..target_index + 1, vec![new_node.into()]);
         Ok(())
     }
 
@@ -1310,6 +1307,7 @@ impl Makefile {
 
         // Build the nodes to insert
         let eol = line_ending(self.syntax());
+        let new_node = with_trailing_newline(new_rule.syntax(), &eol);
         let mut nodes_to_insert = Vec::new();
 
         // Determine if we need to add blank lines to maintain formatting consistency
@@ -1317,7 +1315,7 @@ impl Makefile {
             // Inserting before the first rule - check if first rule has a blank line before it
             // If so, we should add one after our new rule instead
             // For now, just add the rule without a blank line before it
-            nodes_to_insert.push(new_rule.syntax().clone().into());
+            nodes_to_insert.push(new_node.clone().into());
 
             // Add a blank line after the new rule
             let mut bl_builder = GreenNodeBuilder::new();
@@ -1360,7 +1358,7 @@ impl Makefile {
             }
 
             // Add the new rule
-            nodes_to_insert.push(new_rule.syntax().clone().into());
+            nodes_to_insert.push(new_node.clone().into());
 
             // Always add a blank line after the new rule to separate it from the next rule
             let mut bl_builder = GreenNodeBuilder::new();
@@ -1380,7 +1378,7 @@ impl Makefile {
             nodes_to_insert.push(blank_line.into());
 
             // Add the new rule
-            nodes_to_insert.push(new_rule.syntax().clone().into());
+            nodes_to_insert.push(new_node.clone().into());
         }
 
         // Insert all nodes at the target index

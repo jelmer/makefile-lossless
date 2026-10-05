@@ -9,11 +9,13 @@ pub mod rule;
 pub mod variable;
 pub mod vpath;
 
-use crate::lossless::{SyntaxElement, SyntaxNode, SyntaxToken};
+use crate::lossless::{Lang, SyntaxElement, SyntaxNode, SyntaxToken};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
-    BACKSLASH, COMMENT, DOLLAR, INDENT, LBRACE, LPAREN, NEWLINE, TEXT, WHITESPACE,
+    BACKSLASH, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, DOLLAR, FOR_END, INDENT, LBRACE, LPAREN,
+    NEWLINE, RECIPE, TEXT, WHITESPACE,
 };
+use rowan::{GreenNode, GreenNodeData, GreenToken, Language, NodeOrToken};
 
 /// Whether `token` is the backslash of a backslash-newline line
 /// continuation. A backslash escaped by an odd run of preceding backslashes
@@ -81,6 +83,31 @@ pub(crate) fn line_ending(node: &SyntaxNode) -> String {
         .filter_map(|it| it.into_token())
         .find(|t| t.kind() == NEWLINE)
         .map_or_else(|| "\n".to_string(), |t| t.text().to_string())
+}
+
+/// `node`, or a copy of it with `eol` appended if it doesn't end in a line
+/// break, so that it can be inserted in front of another line.
+pub(crate) fn with_trailing_newline(node: &SyntaxNode, eol: &str) -> SyntaxNode {
+    if node.last_token().is_some_and(|t| t.kind() == NEWLINE) {
+        return node.clone();
+    }
+    SyntaxNode::new_root_mut(append_newline(&node.green(), eol))
+}
+
+/// Append a NEWLINE token where the parser would have put it: inside a
+/// trailing recipe line or closing directive, otherwise as the last child.
+fn append_newline(green: &GreenNodeData, eol: &str) -> GreenNode {
+    let children = green.children();
+    let len = children.len();
+    if let Some(NodeOrToken::Node(last)) = children.last() {
+        if matches!(
+            Lang::kind_from_raw(last.kind()),
+            RECIPE | CONDITIONAL | CONDITIONAL_ENDIF | FOR_END
+        ) {
+            return green.replace_child(len - 1, append_newline(last, eol).into());
+        }
+    }
+    green.insert_child(len, GreenToken::new(NEWLINE.into(), eol).into())
 }
 
 /// How a make implementation forms a logical line from physical lines.

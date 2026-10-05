@@ -1,6 +1,6 @@
 use super::bsd::keyword_token;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, line_ending};
+use super::{collapse_continuations, line_ending, with_trailing_newline};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
@@ -701,7 +701,7 @@ impl Conditional {
     /// assert!(makefile.to_string().contains("CFLAGS = -g"));
     /// ```
     pub fn add_if_item(&mut self, item: MakefileItem) {
-        let item_node = item.syntax().clone();
+        let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
 
         // Find position after CONDITIONAL_IF
         let insert_pos = self
@@ -736,7 +736,7 @@ impl Conditional {
             self.add_else_clause();
         }
 
-        let item_node = item.syntax().clone();
+        let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
 
         // Find position after CONDITIONAL_ELSE
         let insert_pos = self
