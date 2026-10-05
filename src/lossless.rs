@@ -895,8 +895,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             // so we need to decrement after it returns
                             conditional_depth -= 1;
                         } else if self.at_include_keyword() {
-                            // Includes can appear in rules, with same blank line logic
-                            if conditional_depth == 0 && newline_count >= 1 {
+                            // Only BSD make keeps rule context across an
+                            // include line; GNU make ends the rule there.
+                            if self.variant != Some(MakefileVariant::BSDMake)
+                                || (conditional_depth == 0 && newline_count >= 1)
+                            {
                                 break;
                             }
                             newline_count = 0;
@@ -8227,6 +8230,46 @@ execute_after_dh_auto_install:
         assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
         assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
         assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
+    }
+
+    #[test]
+    fn test_include_ends_rule() {
+        // GNU make ends rule context at an include line, so a following
+        // recipe line is "recipe commences before first target".
+        for directive in ["include", "-include", "sinclude"] {
+            let text = format!("all:\n\techo a\n{directive} foo.mk\n");
+            for variant in [
+                None,
+                Some(MakefileVariant::GNUMake),
+                Some(MakefileVariant::POSIXMake),
+                Some(MakefileVariant::NMake),
+            ] {
+                let parsed = parse(&text, variant);
+                assert_eq!(parsed.errors, vec![]);
+                let root = parsed.root();
+                assert_eq!(root.code(), text);
+                let items: Vec<_> = root.items().map(|i| i.syntax().kind()).collect();
+                assert_eq!(items, vec![RULE, INCLUDE], "{text:?} {variant:?}");
+                let rule = root.rules().next().unwrap();
+                assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a"]);
+                assert_eq!(root.included_files().collect::<Vec<_>>(), vec!["foo.mk"]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_include_in_bsd_rule() {
+        // BSD make keeps rule context across an include line.
+        let text = "all:\n\techo a\ninclude foo.mk\n";
+        let parsed = parse(text, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.code(), text);
+        let items: Vec<_> = root.items().map(|i| i.syntax().kind()).collect();
+        assert_eq!(items, vec![RULE]);
+        let rule = root.rules().next().unwrap();
+        let kinds: Vec<_> = rule.syntax().children().map(|c| c.kind()).collect();
+        assert_eq!(kinds, vec![TARGETS, PREREQUISITES, RECIPE, INCLUDE]);
     }
 
     #[test]
