@@ -1,4 +1,4 @@
-use super::{line_ending, with_trailing_newline};
+use super::{line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
     parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
     Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
@@ -441,11 +441,12 @@ impl MakefileItem {
     /// ```
     pub fn insert_after(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert after", "insert_after")?;
-        let current_index = self.syntax().index();
-        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
+        let eol = line_ending(&parent);
+        let new_node = with_trailing_newline(new_item.syntax(), &eol);
+        let index = terminate_line_before(&parent, self.syntax().index() + 1, &eol);
 
         // Insert the new item after the current item
-        parent.splice_children(current_index + 1..current_index + 1, vec![new_node.into()]);
+        parent.splice_children(index..index, vec![new_node.into()]);
 
         Ok(())
     }
@@ -878,7 +879,11 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        let pos = self.syntax().children_with_tokens().count();
+        let pos = terminate_line_before(
+            self.syntax(),
+            self.syntax().children_with_tokens().count(),
+            &eol,
+        );
 
         // Add a blank line before the new rule if there are existing rules
         // This maintains standard makefile formatting
@@ -989,7 +994,11 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        let pos = self.syntax().children_with_tokens().count();
+        let pos = terminate_line_before(
+            self.syntax(),
+            self.syntax().children_with_tokens().count(),
+            &eol,
+        );
 
         // Add a blank line before the new conditional if there are existing elements
         let needs_blank_line = self
@@ -1121,7 +1130,11 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        let pos = self.syntax().children_with_tokens().count();
+        let pos = terminate_line_before(
+            self.syntax(),
+            self.syntax().children_with_tokens().count(),
+            &eol,
+        );
 
         // Add a blank line before the new conditional if there are existing elements
         let needs_blank_line = self
@@ -1382,6 +1395,7 @@ impl Makefile {
         }
 
         // Insert all nodes at the target index
+        let target_index = terminate_line_before(self.syntax(), target_index, &eol);
         self.syntax()
             .splice_children(target_index..target_index, nodes_to_insert);
         Ok(())
@@ -1663,9 +1677,8 @@ impl Makefile {
             }));
         }
 
-        let syntax = Include::new(path, &line_ending(self.syntax()))?
-            .syntax()
-            .clone();
+        let eol = line_ending(self.syntax());
+        let syntax = Include::new(path, &eol)?.syntax().clone();
 
         let target_index = if index == items.len() {
             // Insert at the end
@@ -1676,6 +1689,7 @@ impl Makefile {
         };
 
         // Insert the include node
+        let target_index = terminate_line_before(self.syntax(), target_index, &eol);
         self.syntax()
             .splice_children(target_index..target_index, vec![syntax.into()]);
 
@@ -1710,13 +1724,12 @@ impl Makefile {
         after: &MakefileItem,
         path: &str,
     ) -> Result<Include, Error> {
-        let syntax = Include::new(path, &line_ending(self.syntax()))?
-            .syntax()
-            .clone();
+        let eol = line_ending(self.syntax());
+        let syntax = Include::new(path, &eol)?.syntax().clone();
 
         // Find the position of the item to insert after
         let after_syntax = after.syntax();
-        let target_index = after_syntax.index() + 1;
+        let target_index = terminate_line_before(self.syntax(), after_syntax.index() + 1, &eol);
 
         // Insert the include node after the target item
         self.syntax()

@@ -1,6 +1,8 @@
 use super::bsd::keyword_token;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, line_ending, with_trailing_newline, LineSyntax};
+use super::{
+    collapse_continuations, line_ending, terminate_line_before, with_trailing_newline, LineSyntax,
+};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
@@ -784,6 +786,8 @@ impl Conditional {
             .map(|p| p + 1)
             .unwrap_or(0);
 
+        let insert_pos =
+            terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
@@ -819,6 +823,8 @@ impl Conditional {
             .map(|p| p + 1)
             .unwrap_or(0);
 
+        let insert_pos =
+            terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
@@ -861,25 +867,19 @@ impl Conditional {
             return Ok(false);
         }
 
-        // Need a newline before `endif` if the current tail doesn't already end
-        // with one.
-        let needs_newline = self
-            .syntax()
-            .last_token()
-            .is_none_or(|t| t.kind() != NEWLINE);
-
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ENDIF.into());
-        if needs_newline {
-            builder.token(NEWLINE.into(), &eol);
-        }
         self.build_keyword(&mut builder, "endif");
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let endif = SyntaxNode::new_root_mut(builder.finish());
-        let count = self.syntax().children_with_tokens().count();
+        let count = terminate_line_before(
+            self.syntax(),
+            self.syntax().children_with_tokens().count(),
+            &eol,
+        );
         self.syntax()
             .splice_children(count..count, vec![endif.into()]);
 
@@ -908,6 +908,7 @@ impl Conditional {
             .position(|n| n.kind() == CONDITIONAL_ENDIF)
             .unwrap_or(self.syntax().children_with_tokens().count());
 
+        let insert_pos = terminate_line_before(self.syntax(), insert_pos, &eol);
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![syntax.into()]);
     }
