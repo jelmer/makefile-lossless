@@ -190,10 +190,33 @@ impl Rule {
         self.syntax().parent().and_then(MakefileItem::cast)
     }
 
+    /// Check if this rule has grouped targets (`a b &: prereqs`), meaning
+    /// that a single invocation of the recipe updates all of its targets.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "foo.h foo.c &: foo.y\n\tbison --defines=foo.h -o foo.c foo.y\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// assert!(rule.is_grouped());
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["foo.h", "foo.c"]);
+    ///
+    /// let rule: Rule = "foo.h foo.c: foo.y\n".parse().unwrap();
+    /// assert!(!rule.is_grouped());
+    /// ```
+    pub fn is_grouped(&self) -> bool {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .any(|t| t.kind() == OPERATOR && matches!(t.text(), "&:" | "&::"))
+    }
+
     /// Check if this is a double-colon rule (`target:: prereqs`).
     ///
     /// Double-colon rules allow multiple recipe blocks for the same target,
-    /// each executed independently when its prerequisites are newer.
+    /// each executed independently when its prerequisites are newer. This
+    /// includes grouped double-colon rules (`a b &:: prereqs`).
     ///
     /// # Example
     /// ```
@@ -206,7 +229,7 @@ impl Rule {
         self.syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
-            .any(|t| t.kind() == OPERATOR && t.text() == "::")
+            .any(|t| t.kind() == OPERATOR && matches!(t.text(), "::" | "&::"))
     }
 
     // Helper method to collect variable references from tokens
@@ -1606,5 +1629,52 @@ mod tests {
         assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
         assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
         assert_eq!(rule.to_string(), "a.o b.o: \\\n  %.o: %.c\n");
+    }
+
+    #[test]
+    fn test_grouped_targets() {
+        let rule: Rule = "a b &: c\n\tcmd\n".parse().unwrap();
+        assert!(rule.is_grouped());
+        assert!(!rule.is_double_colon());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(prereqs(&rule), (vec!["c".to_string()], vec![]));
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["cmd"]);
+        assert_eq!(rule.to_string(), "a b &: c\n\tcmd\n");
+    }
+
+    #[test]
+    fn test_grouped_targets_without_spaces() {
+        let rule: Rule = "a b&:c|d\n".parse().unwrap();
+        assert!(rule.is_grouped());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["c".to_string()], vec!["d".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_grouped_double_colon() {
+        let rule: Rule = "a b &:: c\n".parse().unwrap();
+        assert!(rule.is_grouped());
+        assert!(rule.is_double_colon());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(prereqs(&rule), (vec!["c".to_string()], vec![]));
+    }
+
+    #[test]
+    fn test_not_grouped() {
+        let rule: Rule = "a b: c\n".parse().unwrap();
+        assert!(!rule.is_grouped());
+        let rule: Rule = "a b:: c\n".parse().unwrap();
+        assert!(!rule.is_grouped());
+    }
+
+    #[test]
+    fn test_grouped_static_pattern_rule() {
+        let rule: Rule = "a.x a.y &: %.x: %.c\n".parse().unwrap();
+        assert!(rule.is_grouped());
+        assert_eq!(rule.static_pattern(), Some("%.x".to_string()));
+        assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
     }
 }

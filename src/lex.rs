@@ -303,6 +303,28 @@ impl<'a> Lexer<'a> {
                         let text = self.input.by_ref().take(len).collect();
                         Some((SyntaxKind::OPERATOR, text))
                     }
+                    '&' => {
+                        // `&:` and `&::` separate grouped targets from their
+                        // prerequisites; any other `&` is just a character.
+                        let mut probe = self.input.clone();
+                        probe.next();
+                        let mut colons = 0;
+                        while probe.next_if_eq(&':').is_some() {
+                            colons += 1;
+                        }
+                        let len = if (1..=2).contains(&colons) && probe.peek() != Some(&'=') {
+                            colons + 1
+                        } else {
+                            1
+                        };
+                        let text: String = self.input.by_ref().take(len).collect();
+                        let kind = if len > 1 {
+                            SyntaxKind::OPERATOR
+                        } else {
+                            SyntaxKind::ERROR
+                        };
+                        Some((kind, text))
+                    }
                     '?' | '+' => {
                         let mut text = self.input.next().unwrap().to_string();
                         if let Some(eq) = self.input.next_if_eq(&'=') {
@@ -961,6 +983,11 @@ override_dh_auto_clean:
         assert_eq!(ops("$(OBJS): %.o: %.c\n"), vec![":", ":"]);
         assert_eq!(ops("$(X:.c=.o)\n"), vec![":", "="]);
         assert_eq!(ops("URL = http://x\n"), vec!["=", ":"]);
+        assert_eq!(ops("a b &: c\n"), vec!["&:"]);
+        assert_eq!(ops("a b&::c\n"), vec!["&::"]);
+        assert_eq!(ops("a&b: c\n"), vec![":"]);
+        assert_eq!(ops("X = a && b\n"), vec!["="]);
+        assert_eq!(ops("a &:= b\n"), vec![":="]);
     }
 
     #[test]

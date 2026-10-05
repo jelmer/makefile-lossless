@@ -624,10 +624,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Whether `op` separates targets from prerequisites. BSD make also
-        /// has `!`, which always rebuilds the target.
+        /// Whether `op` separates targets from prerequisites. `&:` and `&::`
+        /// mark grouped targets; BSD make also has `!`, which always
+        /// rebuilds the target.
         fn is_dependency_operator(&self, op: &str) -> bool {
-            matches!(op, ":" | "::") || (op == "!" && self.bsd_directives_enabled())
+            matches!(op, ":" | "::" | "&:" | "&::") || (op == "!" && self.bsd_directives_enabled())
         }
 
         fn at_dependency_operator(&self) -> bool {
@@ -2615,7 +2616,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => {
                         return seen_name || seen_directive
                     }
-                    OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
+                    // It's a rule if we see a colon first
+                    OPERATOR if matches!(text.as_str(), ":" | "::" | "&:" | "&::") => return false,
                     WHITESPACE => name_done = seen_name,
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
@@ -4686,6 +4688,29 @@ rule: dependency
       PREREQUISITE@11..14
         IDENTIFIER@11..14 "%.c"
     NEWLINE@14..15 "\n"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_grouped_targets() {
+        let parsed = parse("a b &: c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..9
+  RULE@0..9
+    TARGETS@0..4
+      IDENTIFIER@0..1 "a"
+      WHITESPACE@1..2 " "
+      IDENTIFIER@2..3 "b"
+      WHITESPACE@3..4 " "
+    OPERATOR@4..6 "&:"
+    WHITESPACE@6..7 " "
+    PREREQUISITES@7..8
+      PREREQUISITE@7..8
+        IDENTIFIER@7..8 "c"
+    NEWLINE@8..9 "\n"
 "#
         );
     }
