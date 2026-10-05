@@ -1248,13 +1248,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // BSD make reads `one two:=three` as the dependency operator `:`
             // followed by a target-local assignment `=three` with an empty
-            // variable name, which it ignores.
+            // variable name, which it ignores. Likewise `:::=` is `::`
+            // followed by `:=`, and `!=` is `!` followed by `=`.
             if has_target && self.bsd_directives_enabled() {
                 self.skip_ws();
                 if let Some((OPERATOR, op)) = self.tokens.last() {
-                    if matches!(op.as_str(), ":=" | "::=") {
+                    if matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=") {
                         let (_, op) = self.tokens.pop().unwrap();
-                        let (dependency_op, assignment_op) = op.split_at(op.len() - 1);
+                        let split = if op.starts_with("::") { 2 } else { 1 };
+                        let (dependency_op, assignment_op) = op.split_at(split);
                         self.builder.token(OPERATOR.into(), dependency_op);
                         self.builder.start_node(VARIABLE.into());
                         self.builder.token(OPERATOR.into(), assignment_op);

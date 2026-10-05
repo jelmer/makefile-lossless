@@ -994,4 +994,50 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_unbalanced_brackets_make_dependency_line() {
+        // BSD make's Parse_IsVar counts brackets and rejects these as
+        // assignments, so they are dependency lines whose sources form a
+        // target-local assignment to an empty variable name.
+        for (text, target, double_colon, op, value) in [
+            ("a}b := 1\n", "a}b", false, "=", "1"),
+            (")x := 1\n", ")x", false, "=", "1"),
+            ("a}b ::= 1\n", "a}b", true, "=", "1"),
+            ("a}b :::= 1\n", "a}b", true, ":=", "1"),
+            ("a}b != 1\n", "a}b", false, "=", "1"),
+        ] {
+            let makefile = parse_bsd(text);
+            assert_eq!(makefile.items().count(), 1, "{text:?}");
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec![target], "{text:?}");
+            assert_eq!(rule.is_double_colon(), double_colon, "{text:?}");
+            assert_eq!(rule.prerequisites().count(), 0, "{text:?}");
+            let var = rule.scoped_assignment().unwrap();
+            assert_eq!(var.name(), None, "{text:?}");
+            assert_eq!(var.assignment_operator(), Some(op.to_string()), "{text:?}");
+            assert_eq!(var.raw_value(), Some(value.to_string()), "{text:?}");
+        }
+        // GNU make assigns to a variable named `a}b`.
+        let parsed = Makefile::parse_with_variant("a}b := 1\n", MakefileVariant::GNUMake);
+        assert!(parsed.ok());
+        assert_eq!(
+            parsed.tree().variable_definitions().next().unwrap().name(),
+            Some("a}b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_targets_with_shell_assignment_operator() {
+        // `a b != c` is not an assignment as its left-hand side is not a
+        // single word, so BSD make reads the dependency operator `!`.
+        let makefile = parse_bsd("a b != c\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b"]);
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), None);
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("c".to_string()));
+        assert_ne!(errors_with(MakefileVariant::GNUMake, "a b != c\n"), 0);
+    }
 }
