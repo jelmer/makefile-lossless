@@ -20,23 +20,26 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
     builder.finish_node();
 }
 
+/// Whether `it` is whitespace or a directive keyword preceding the name(s).
+fn is_prefix_element(it: &crate::lossless::SyntaxElement) -> bool {
+    it.kind() == WHITESPACE
+        || it.as_token().is_some_and(|t| {
+            t.kind() == IDENTIFIER
+                && matches!(t.text(), "export" | "unexport" | "override" | "define")
+        })
+}
+
 impl VariableDefinition {
     /// Internal: the elements making up the variable's name, i.e. the
     /// IDENTIFIER tokens and variable references that follow any directive
-    /// keywords (`export`/`override`/`define`). A name usually is a single
+    /// keywords (`export`/`unexport`/`override`/`define`). A name usually is a single
     /// IDENTIFIER, but may contain references as in `CFLAGS.${PROG}`.
     /// Single source of truth for [`Self::name`], [`Self::name_range`] and
     /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
         self.syntax()
             .children_with_tokens()
-            .skip_while(|it| {
-                it.kind() == WHITESPACE
-                    || it.as_token().is_some_and(|t| {
-                        t.kind() == IDENTIFIER
-                            && matches!(t.text(), "export" | "override" | "define")
-                    })
-            })
+            .skip_while(is_prefix_element)
             .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
             .collect()
     }
@@ -57,6 +60,45 @@ impl VariableDefinition {
             return None;
         }
         Some(elements.iter().map(|it| it.to_string()).collect())
+    }
+
+    /// All variable names on this line, including variable references
+    /// such as `$(VARS)` verbatim.
+    ///
+    /// Usually this is just [`Self::name`], but a bare `export` or
+    /// `unexport` directive can list several variables.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "export quiet Q KBUILD_VERBOSE\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert_eq!(
+    ///     var.names().collect::<Vec<_>>(),
+    ///     vec!["quiet", "Q", "KBUILD_VERBOSE"]
+    /// );
+    /// ```
+    pub fn names(&self) -> impl Iterator<Item = String> {
+        let mut names = Vec::new();
+        let mut current = String::new();
+        for it in self
+            .syntax()
+            .children_with_tokens()
+            .skip_while(is_prefix_element)
+            .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR | WHITESPACE))
+        {
+            if it.kind() == WHITESPACE {
+                if !current.is_empty() {
+                    names.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push_str(&it.to_string());
+            }
+        }
+        if !current.is_empty() {
+            names.push(current);
+        }
+        names.into_iter()
     }
 
     /// The source range covering just the variable's name.
@@ -95,6 +137,23 @@ impl VariableDefinition {
         self.syntax()
             .children_with_tokens()
             .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+    }
+
+    /// Check if this variable definition uses the `unexport` directive
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "unexport CC\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.is_unexport());
+    /// assert!(!var.is_export());
+    /// ```
+    pub fn is_unexport(&self) -> bool {
+        self.syntax().children_with_tokens().any(|it| {
+            it.as_token()
+                .is_some_and(|token| token.text() == "unexport")
+        })
     }
 
     /// Check if this variable definition uses the `override` directive
