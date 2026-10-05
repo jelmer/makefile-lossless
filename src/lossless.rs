@@ -3283,15 +3283,45 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         TEXT => text.trim_start().starts_with('#'),
                         _ => false,
                     });
-                if !comment_only {
-                    self.record_error(
-                        ParseErrorKind::RecipeBeforeFirstTarget,
-                        "indented line not part of a rule".to_string(),
-                    );
+                if comment_only {
+                    self.parse_bsd_comment_line();
+                    return;
                 }
+                self.record_error(
+                    ParseErrorKind::RecipeBeforeFirstTarget,
+                    "indented line not part of a rule".to_string(),
+                );
                 self.parse_recipe_line();
             } else {
                 self.relex_as_non_recipe_line();
+            }
+        }
+
+        /// Parse a tab-indented line with only a comment, or nothing at all,
+        /// which BSD make skips. The comment, including any continuation
+        /// lines, becomes a single COMMENT token.
+        fn parse_bsd_comment_line(&mut self) {
+            self.bump_as(WHITESPACE);
+            while self.current() == Some(WHITESPACE) {
+                self.bump();
+            }
+            let mut comment = String::new();
+            while let Some((kind, text)) = self.tokens.last() {
+                if *kind == NEWLINE {
+                    let backslashes = comment.chars().rev().take_while(|c| *c == '\\').count();
+                    if backslashes % 2 == 0 || self.tokens.len() == 1 {
+                        break;
+                    }
+                }
+                comment.push_str(text);
+                self.tokens.pop();
+            }
+            if !comment.is_empty() {
+                self.pending_backslash_escape = false;
+                self.builder.token(COMMENT.into(), &comment);
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
             }
         }
 
@@ -12618,6 +12648,27 @@ test:
             panic!("expected recipe");
         };
         assert_eq!(recipe.text(), "echo hi");
+    }
+
+    #[test]
+    fn test_bsd_indented_comment_outside_rule() {
+        // BSD make skips lines with only whitespace and a comment, so they
+        // aren't recipe lines.
+        let input = "X = 1\n\t# c\n\t# d \\\n\tmore\n\t\n";
+        let parsed = parse(input, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().code(), input);
+        assert_eq!(node_kinds(&parsed.syntax()), "VARIABLE\n  EXPR\n");
+        assert_eq!(
+            parsed
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|it| it.into_token())
+                .filter(|t| t.kind() == COMMENT)
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>(),
+            vec!["# c", "# d \\\n\tmore"]
+        );
     }
 
     #[test]
