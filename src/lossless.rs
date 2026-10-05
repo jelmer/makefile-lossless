@@ -1083,6 +1083,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
+        /// Whether the rest of the logical line has a quoted string lexed
+        /// as a single QUOTE token.
+        fn line_has_quoted_string(&self) -> bool {
+            let mut prev = None;
+            for (kind, text) in self.tokens.iter().rev() {
+                match kind {
+                    NEWLINE if prev != Some(BACKSLASH) => return false,
+                    QUOTE if text.len() > 1 => return true,
+                    _ => {}
+                }
+                prev = Some(*kind);
+            }
+            false
+        }
+
         /// Whether the rest of the physical line has a dependency operator.
         /// A backslash escapes the first character of an operator, so `\:`
         /// is not one.
@@ -1914,7 +1929,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if !tail.starts_with('$') {
                 return;
             }
-            let pieces = lex_non_recipe_line(tail, self.variant).0;
+            let pieces = lex_non_recipe_line(tail, self.variant, true).0;
             // Keep token_positions in step with the new tokens.
             let mut position = self.token_positions[consumed].0;
             let positions: Vec<_> = pieces
@@ -2646,6 +2661,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 );
                 self.builder.finish_node();
                 return;
+            }
+            // Make does not group the quotes around a path: BSD make reads
+            // them as delimiters and GNU make as part of the file name, so
+            // what is between them is an ordinary expression.
+            if self.line_has_quoted_string() {
+                self.relex_as_non_recipe_line(false);
             }
             self.skip_ws_and_continuations();
             self.parse_file_list("include", true);
@@ -3540,7 +3561,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 );
                 self.parse_recipe_line();
             } else {
-                self.relex_as_non_recipe_line();
+                self.relex_as_non_recipe_line(true);
             }
         }
 
@@ -3572,7 +3593,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        fn relex_as_non_recipe_line(&mut self) {
+        /// Lex the rest of the current logical line again as an ordinary
+        /// makefile line, with quoted strings grouped if `group_quotes` is
+        /// set.
+        fn relex_as_non_recipe_line(&mut self, group_quotes: bool) {
             let consumed = self.token_positions.len() - self.tokens.len();
             let mut text = String::new();
             let tokens = loop {
@@ -3582,7 +3606,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         break;
                     }
                 }
-                let (tokens, continued) = lex_non_recipe_line(&text, self.variant);
+                let (tokens, continued) = lex_non_recipe_line(&text, self.variant, group_quotes);
                 if !continued || self.tokens.is_empty() {
                     break tokens;
                 }
