@@ -33,9 +33,9 @@ pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
-    ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ForLoop, Identifier,
-    Include, Lang, Makefile, ParseError, PositionedParseError, Recipe, RecipeVariableReference,
-    Rule, VariableDefinition, VariableReference, Vpath,
+    ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
+    ForLoop, Identifier, Include, Lang, Makefile, ParseError, PositionedParseError, Recipe,
+    RecipeVariableReference, Rule, VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
 pub use rowan::TextRange;
@@ -108,6 +108,8 @@ pub enum SyntaxKind {
     FOR_HEADER, // The `.for VAR in LIST` line
     FOR_END,    // The `.endfor` line
     DIRECTIVE,  // A single-line directive such as `.undef` or `.error`
+
+    EXPRESSION_STATEMENT, // A line of only references, e.g. `$(eval ...)` or `$(info ...)`
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.

@@ -1325,7 +1325,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        // Helper to parse normal content (assignment, include, vpath or rule).
+        // Helper to parse normal content (assignment, include, vpath, expression
+        // statement or rule).
         // This is shared by the top level and conditional bodies.
         fn parse_normal_content(&mut self) {
             // Skip any leading whitespace
@@ -1345,10 +1346,62 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             } else if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "vpath"
             {
                 self.parse_vpath();
+            } else if self.is_expression_statement_line() {
+                self.parse_expression_statement();
             } else {
                 // Try to handle as a rule
                 self.parse_rule();
             }
+        }
+
+        /// Returns true if the rest of the line consists only of `$(...)` and
+        /// `${...}` references, such as `$(eval ...)` or `$(info ...)`. Make
+        /// expands such lines for their side effects; anything else on the
+        /// line (e.g. a colon) makes it a rule or assignment instead.
+        fn is_expression_statement_line(&self) -> bool {
+            let mut tokens = self.tokens.iter().rev().map(|(kind, _)| *kind);
+            let mut seen_reference = false;
+            loop {
+                match tokens.next() {
+                    None | Some(NEWLINE) | Some(COMMENT) => return seen_reference,
+                    Some(WHITESPACE) => {}
+                    Some(DOLLAR) => {
+                        // Like make, only count the delimiter that opened the
+                        // reference.
+                        let (open, close) = match tokens.next() {
+                            Some(LPAREN) => (LPAREN, RPAREN),
+                            Some(LBRACE) => (LBRACE, RBRACE),
+                            _ => return false,
+                        };
+                        let mut depth = 1;
+                        let mut prev = open;
+                        while depth > 0 {
+                            let Some(kind) = tokens.next() else {
+                                return false;
+                            };
+                            match kind {
+                                k if k == open => depth += 1,
+                                k if k == close => depth -= 1,
+                                NEWLINE if prev != BACKSLASH => return false,
+                                _ => {}
+                            }
+                            prev = kind;
+                        }
+                        seen_reference = true;
+                    }
+                    Some(_) => return false,
+                }
+            }
+        }
+
+        fn parse_expression_statement(&mut self) {
+            self.builder.start_node(EXPRESSION_STATEMENT.into());
+            while self.current() == Some(DOLLAR) {
+                self.parse_variable_reference();
+                self.skip_ws();
+            }
+            self.expect_eol();
+            self.builder.finish_node();
         }
 
         fn parse_include(&mut self) {
@@ -2239,6 +2292,7 @@ ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(Vpath, VPATH);
+ast_node!(ExpressionStatement, EXPRESSION_STATEMENT);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
@@ -3981,6 +4035,143 @@ all: $(OBJS)
                 .map(|r| r.targets().collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn top_level_kinds(node: &SyntaxNode) -> Vec<SyntaxKind> {
+        node.children().map(|c| c.kind()).collect()
+    }
+
+    #[test]
+    fn test_bare_function_call() {
+        let parsed = parse("$(eval $(call gen_rule,foo))\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![EXPRESSION_STATEMENT]);
+        assert_eq!(root.to_string(), "$(eval $(call gen_rule,foo))\n");
+    }
+
+    #[test]
+    fn test_bare_function_call_before_rule() {
+        let parsed = parse("$(info building)\nall:\n\techo done\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(
+            top_level_kinds(root.syntax()),
+            vec![EXPRESSION_STATEMENT, RULE]
+        );
+        assert_eq!(
+            root.rules()
+                .map(|r| r.targets().collect())
+                .collect::<Vec<Vec<_>>>(),
+            vec![vec!["all".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_bare_function_call_after_rule() {
+        let parsed = parse("all:\n\techo done\n$(info x)\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.rules().count(), 1);
+        assert_eq!(
+            root.rules().next().unwrap().recipes().collect::<Vec<_>>(),
+            vec!["echo done".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bare_function_call_continuation() {
+        let text =
+            "$(if $(filter __%, $(MAKECMDGOALS)), \\\n\t$(error only for internal use))\nall:\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), text);
+        assert_eq!(root.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_bare_function_call_nested() {
+        let parsed = parse("$(foreach d,$(DIRS),$(eval $(call dir_rule,$(d))))\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().rules().count(), 0);
+    }
+
+    #[test]
+    fn test_bare_references_with_comment_and_whitespace() {
+        let text = "$(info a) $(info b) # note\n${X}  \n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.rules().count(), 0);
+        assert_eq!(root.to_string(), text);
+    }
+
+    #[test]
+    fn test_bare_function_call_in_conditional() {
+        let text = "ifeq ($(X),y)\n$(error bad)\nelse\n $(info ok)\nendif\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.rules().count(), 0);
+        assert_eq!(root.to_string(), text);
+    }
+
+    #[test]
+    fn test_references_before_bsd_dependency_operator() {
+        let text = "${PROG}: ${OBJS}\n\t${CC} -o $@\n${LIB}! ${SRCS}\n";
+        let parsed = parse(text, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![RULE, RULE]);
+        assert_eq!(root.to_string(), text);
+    }
+
+    #[test]
+    fn test_bare_reference_followed_by_word_is_error() {
+        let parsed = parse("foo bar\n$(X) bar\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expected ':'", "expected ':'"]
+        );
+    }
+
+    #[test]
+    fn test_unclosed_bare_reference_is_error() {
+        let parsed = parse("$(info x\n", None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unclosed variable reference", "expected ':'"]
+        );
+    }
+
+    #[test]
+    fn test_rule_with_reference_targets_unaffected() {
+        let parsed = parse("$(OBJS): foo.h\n$(X):\n\techo $@\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(
+            root.rules()
+                .map(|r| r.targets().collect())
+                .collect::<Vec<Vec<_>>>(),
+            vec![vec!["$(OBJS)".to_string()], vec!["$(X)".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_target_specific_assignment_with_reference_target_unaffected() {
+        let parsed = parse("$(OBJS): CFLAGS += -O2\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![RULE]);
     }
 
     #[test]

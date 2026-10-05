@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod bsd;
 pub mod conditional;
+pub mod expression_statement;
 pub mod include;
 pub mod makefile;
 pub mod rule;
