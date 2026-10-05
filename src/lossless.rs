@@ -535,8 +535,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
                         {
                             // If we're not inside a conditional (depth == 0) and there's a blank line,
-                            // this is a top-level conditional, not part of the rule
-                            if conditional_depth == 0 && newline_count >= 1 {
+                            // or it doesn't continue the recipe, this is a top-level conditional,
+                            // not part of the rule
+                            if conditional_depth == 0
+                                && (newline_count >= 1 || !self.conditional_continues_recipe())
+                            {
                                 break;
                             }
                             newline_count = 0;
@@ -579,6 +582,51 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn at_dependency_operator(&self) -> bool {
             matches!(self.tokens.last(), Some((OPERATOR, op)) if self.is_dependency_operator(op))
+        }
+
+        /// Look ahead (without consuming) at the conditional starting at the
+        /// current token, and check whether a recipe line comes before any
+        /// other line in one of its branches. GNU make ends a rule's recipe
+        /// at the first line that is not a recipe line, comment or
+        /// conditional directive, so if no branch starts with a recipe line
+        /// the conditional doesn't belong to the preceding rule.
+        fn conditional_continues_recipe(&self) -> bool {
+            // Whether each open conditional started in recipe context
+            let mut stack: Vec<bool> = Vec::new();
+            let mut in_recipe = true;
+            let mut tokens = self
+                .tokens
+                .iter()
+                .rev()
+                .filter(|(kind, _)| *kind != WHITESPACE)
+                .peekable();
+            while let Some((kind, text)) = tokens.peek() {
+                match (*kind, text.as_str()) {
+                    (NEWLINE | COMMENT, _) => {}
+                    (INDENT, _) if in_recipe => return true,
+                    (IDENTIFIER, t) if Self::is_conditional_start(t) => stack.push(in_recipe),
+                    (IDENTIFIER, "else") => match stack.last() {
+                        Some(outer) => in_recipe = *outer,
+                        None => return false,
+                    },
+                    (IDENTIFIER, "endif") => {
+                        stack.pop();
+                        if stack.is_empty() {
+                            return false;
+                        }
+                    }
+                    _ => in_recipe = false,
+                }
+                // Skip to the start of the next line, following continuations
+                let mut prev = None;
+                for (kind, _) in tokens.by_ref() {
+                    if *kind == NEWLINE && prev != Some(BACKSLASH) {
+                        break;
+                    }
+                    prev = Some(*kind);
+                }
+            }
+            false
         }
 
         fn find_and_consume_colon(&mut self) -> bool {
@@ -7668,6 +7716,100 @@ endif
         assert_eq!(rules[0].line(), 0);
         // Conditional is part of the rule, not top-level
         assert_eq!(conditionals.len(), 0);
+    }
+
+    #[test]
+    fn test_conditional_without_recipes_after_rule() {
+        let text = "t:: u\nifneq \"a\" \"b\"\nQ = 1\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].items().count(), 0);
+        assert_eq!(makefile.conditionals().count(), 1);
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Q"]);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_conditional_with_rule_after_rule() {
+        let text = "ifdef X\na:\n\tx\nifdef Y\nb:\n\ty\nendif\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .map(|r| r.targets().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(targets, vec!["a", "b"]);
+        let rule_a = makefile.find_rule_by_target("a").unwrap();
+        assert_eq!(rule_a.recipes().collect::<Vec<_>>(), vec!["x"]);
+        assert_eq!(rule_a.items().count(), 1);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_conditional_mixing_recipes_and_variables_after_rule() {
+        let text = "t:\n\techo a\nifdef X\n\techo b\nQ = 1\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        // The conditional starts with a recipe line, so it belongs to the rule
+        assert_eq!(rules[0].items().count(), 2);
+        assert_eq!(makefile.conditionals().count(), 0);
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Q"]);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_conditional_with_recipe_in_else_after_rule() {
+        let text = "t:\nifdef X\nQ = 1\nelse\n\techo b\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].items().count(), 1);
+        assert_eq!(makefile.conditionals().count(), 0);
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Q"]);
+    }
+
+    #[test]
+    fn test_nested_conditional_with_recipe_after_rule() {
+        let text = "t:\nifdef X\n# comment\nifdef Y\n\techo b\nendif\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].items().count(), 1);
+        assert_eq!(makefile.conditionals().count(), 0);
+    }
+
+    #[test]
+    fn test_bsd_loop_with_variable_in_rule() {
+        let text = "t:\n\techo a\n.for x in a\n\techo ${x}\nQ=1\n.endfor\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        let makefile = parsed.tree();
+
+        assert_eq!(makefile.rules().count(), 1);
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Q"]);
+        assert_eq!(makefile.code(), text);
     }
 
     #[test]
