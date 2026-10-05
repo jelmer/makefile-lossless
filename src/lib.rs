@@ -29,6 +29,7 @@ mod parse;
 mod pattern;
 mod text;
 
+pub use ast::conditional::{ConditionalBranch, ConditionalItem};
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use incremental::{apply_edit_to_text, TextEdit};
