@@ -852,4 +852,78 @@ mod tests {
             "include bar.mk # comment\n.include <bsd.own.mk> # c\n"
         );
     }
+
+    #[test]
+    fn test_bsd_quoted_path() {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            for (code, path, names) in [
+                (
+                    ".include \"${.CURDIR}/a\\#b.mk\" # c\n",
+                    "${.CURDIR}/a#b.mk",
+                    vec![".CURDIR"],
+                ),
+                (
+                    ".include \"${X:S/a/b/ \\\n  :S/c/d/}.mk\"\n",
+                    "${X:S/a/b/  :S/c/d/}.mk",
+                    vec!["X"],
+                ),
+                (". -include \"$(A)'$(B)'\"\n", "$(A)'$(B)'", vec!["A", "B"]),
+            ] {
+                let parsed = match variant {
+                    Some(variant) => Makefile::parse_with_variant(code, variant),
+                    None => Makefile::parse(code),
+                };
+                assert_eq!(parsed.errors(), &[]);
+                let makefile = parsed.tree();
+                assert_eq!(makefile.to_string(), code);
+                let inc = makefile.includes().next().unwrap();
+                assert_eq!(inc.path().as_deref(), Some(path));
+                assert_eq!(
+                    makefile
+                        .variable_references()
+                        .filter_map(|r| r.name())
+                        .collect::<Vec<_>>(),
+                    names
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gnu_quoted_path() {
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            let code = "-include \"$(X) b\\#c\" \"d\\\n   e\"\n";
+            let parsed = match variant {
+                Some(variant) => Makefile::parse_with_variant(code, variant),
+                None => Makefile::parse(code),
+            };
+            assert_eq!(parsed.errors(), &[]);
+            let makefile = parsed.tree();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(
+                makefile.included_files().collect::<Vec<_>>(),
+                vec!["\"$(X) b#c\" \"d e\""]
+            );
+            assert_eq!(
+                makefile
+                    .variable_references()
+                    .filter_map(|r| r.name())
+                    .collect::<Vec<_>>(),
+                vec!["X"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_bsd_quoted_set_path_escapes_hash() {
+        let makefile: Makefile = ". include \"old.mk\" # c\n".parse().unwrap();
+        let mut inc = makefile.includes().next().unwrap();
+        inc.set_path("${.CURDIR}/a#b").unwrap();
+        assert_eq!(makefile.to_string(), ". include \"${.CURDIR}/a\\#b\" # c\n");
+        assert_eq!(inc.path().as_deref(), Some("${.CURDIR}/a#b"));
+    }
 }

@@ -41,6 +41,8 @@ pub struct Lexer<'a> {
     recipe_prefix: char,
     /// Text of the current logical line, if it is not a recipe line.
     line: Option<String>,
+    /// Whether a quoted string becomes a single QUOTE token.
+    group_quotes: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -62,6 +64,7 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             line: Some(String::new()),
+            group_quotes: true,
         }
     }
 
@@ -364,7 +367,7 @@ impl<'a> Lexer<'a> {
                         self.read_while(Self::is_valid_identifier_char),
                     )),
                     '"' | '\'' => {
-                        if self.should_group_quote(c) {
+                        if self.group_quotes && self.should_group_quote(c) {
                             Some((SyntaxKind::QUOTE, self.read_quoted_string()))
                         } else {
                             // Lone quote — emit as a single-character QUOTE
@@ -536,12 +539,17 @@ pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxK
 /// Lex `input`, treating its first line as an ordinary makefile line even if
 /// it starts with a tab. Also returns whether the input ends in a line
 /// continuation.
+///
+/// Unless `group_quotes` is set, each quote is a QUOTE token of its own, so
+/// that what is between quotes is lexed as usual.
 pub(crate) fn lex_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
+    group_quotes: bool,
 ) -> (Vec<(SyntaxKind, String)>, bool) {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
+    lexer.group_quotes = group_quotes;
     let tokens: Vec<_> = lexer.by_ref().collect();
     // A continued comment takes in the newline and the next line, so if
     // the input ends in a newline that is part of a comment, the comment
