@@ -377,6 +377,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(RECIPE.into());
             self.bump_as(OPERATOR);
             self.skip_ws();
+            self.parse_text_to_eol(true);
+            self.builder.finish_node();
+        }
+
+        /// Consume the rest of the logical line, including any `#` and
+        /// continuation lines, as TEXT tokens. If `leading_comment` is set,
+        /// text starting with `#` becomes a COMMENT token instead.
+        fn parse_text_to_eol(&mut self, leading_comment: bool) {
             let mut first = true;
             loop {
                 let mut text = String::new();
@@ -392,7 +400,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     && text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
                 if !text.is_empty() {
                     // Mirror how a tab-indented `# ...` line is tokenized.
-                    let kind = if first && text.starts_with('#') {
+                    let kind = if leading_comment && first && text.starts_with('#') {
                         COMMENT
                     } else {
                         TEXT
@@ -410,7 +418,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.bump();
                 }
             }
-            self.builder.finish_node();
         }
 
         /// If the current token is a comment that the lexer continued onto
@@ -1980,19 +1987,28 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Returns true if the rest of the line consists only of `$(...)` and
-        /// `${...}` references, such as `$(eval ...)` or `$(info ...)`. Make
-        /// expands such lines for their side effects; anything else on the
-        /// line (e.g. a colon) makes it a rule or assignment instead.
+        /// `${...}` references, such as `$(eval ...)` or `$(info ...)`,
+        /// optionally followed (for GNU make) by a `;` and arbitrary text.
+        /// Make expands such lines for their side effects; anything else on
+        /// the line (e.g. a colon) makes it a rule or assignment instead.
         fn is_expression_statement_line(&self) -> bool {
-            let mut tokens = self.tokens.iter().rev().map(|(kind, _)| *kind);
+            let mut tokens = self.tokens.iter().rev();
             let mut seen_reference = false;
             loop {
-                match tokens.next() {
-                    None | Some(NEWLINE) | Some(COMMENT) => return seen_reference,
-                    Some(WHITESPACE) => {}
-                    Some(DOLLAR) => {
+                match tokens.next().map(|(kind, text)| (*kind, text.as_str())) {
+                    None | Some((NEWLINE | COMMENT, _)) => return seen_reference,
+                    // Only GNU make ignores the rest of such a line after a
+                    // `;`; bmake rejects it.
+                    Some((TEXT, ";"))
+                        if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
+                    {
+                        return seen_reference
+                    }
+                    Some((WHITESPACE, _)) => {}
+                    Some((DOLLAR, _)) => {
                         // Like make, only count the delimiter that opened the
                         // reference.
+                        let mut tokens = tokens.by_ref().map(|(kind, _)| *kind);
                         let (open, close) = match tokens.next() {
                             Some(LPAREN) => (LPAREN, RPAREN),
                             Some(LBRACE) => (LBRACE, RBRACE),
@@ -2025,7 +2041,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.parse_variable_reference();
                 self.skip_ws();
             }
-            self.expect_eol();
+            // When the references expand to nothing, make ignores the
+            // rest of the line after a `;`.
+            if self.current() == Some(TEXT) && self.at_text(";") {
+                self.bump_as(OPERATOR);
+                self.skip_ws();
+                self.parse_text_to_eol(false);
+            } else {
+                self.expect_eol();
+            }
             self.builder.finish_node();
         }
 
@@ -6206,6 +6230,99 @@ all: $(OBJS)
         let root = parsed.root();
         assert_eq!(top_level_kinds(root.syntax()), vec![EXPRESSION_STATEMENT]);
         assert_eq!(root.to_string(), "$(eval $(call gen_rule,foo))\n");
+    }
+
+    #[test]
+    fn test_bare_function_call_semicolon() {
+        for src in [
+            "$(info a);\n",
+            "$(info a) ;\n",
+            "$(info a); echo x\n",
+            "$(X);\n",
+            "$(X) ; @echo cmd\n",
+            "$(info a); # c\n",
+            "$(info a) # c ; x\n",
+        ] {
+            let parsed = parse(src, None);
+            assert_eq!(parsed.errors, vec![], "{src:?}");
+            let root = parsed.root();
+            assert_eq!(
+                top_level_kinds(root.syntax()),
+                vec![EXPRESSION_STATEMENT],
+                "{src:?}"
+            );
+            assert_eq!(root.to_string(), src);
+        }
+    }
+
+    #[test]
+    fn test_bare_function_call_semicolon_continuation() {
+        for src in [
+            "$(info a);echo \\\n more\nall:\n",
+            "$(info a); # c \\\nmore\nall:\n",
+        ] {
+            let parsed = parse(src, None);
+            assert_eq!(parsed.errors, vec![], "{src:?}");
+            let root = parsed.root();
+            assert_eq!(
+                top_level_kinds(root.syntax()),
+                vec![EXPRESSION_STATEMENT, RULE],
+                "{src:?}"
+            );
+            assert_eq!(root.to_string(), src);
+            assert_eq!(
+                root.rules()
+                    .map(|r| r.targets().collect())
+                    .collect::<Vec<Vec<_>>>(),
+                vec![vec!["all".to_string()]]
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_function_call_semicolon_gnu_only() {
+        let src = "${X} ; echo hi\n";
+        let parsed = parse(src, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            top_level_kinds(parsed.root().syntax()),
+            vec![EXPRESSION_STATEMENT]
+        );
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            let parsed = parse(src, Some(variant));
+            assert_eq!(parsed.root().to_string(), src);
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"],
+                "{variant:?}"
+            );
+            assert!(
+                !top_level_kinds(parsed.root().syntax()).contains(&EXPRESSION_STATEMENT),
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reference_target_with_inline_recipe() {
+        let src = "$(X): y ; cmd\n";
+        let parsed = parse(src, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![RULE]);
+        assert_eq!(root.to_string(), src);
+        let rule = root.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(X)"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["y"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["cmd"]);
     }
 
     #[test]
