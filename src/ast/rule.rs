@@ -2050,4 +2050,29 @@ mod tests {
         );
         assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
     }
+
+    #[test]
+    fn test_recipe_prefix() {
+        let text = ".RECIPEPREFIX = >\nall:\n> echo one\n>echo two\n\tx = 1\n.RECIPEPREFIX :=\nb:\n\techo b\n";
+        let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::GNUMake);
+        assert!(parsed.ok(), "{:?}", parsed.errors());
+        let makefile = parsed.tree();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec![" echo one", "echo two"]
+        );
+        assert_eq!(rules[1].recipes().collect::<Vec<_>>(), vec!["echo b"]);
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .filter_map(|v| v.name())
+            .collect();
+        assert_eq!(names, vec![".RECIPEPREFIX", "x", ".RECIPEPREFIX"]);
+        assert_eq!(makefile.to_string(), text);
+
+        // BSD make has no `.RECIPEPREFIX`.
+        let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::BSDMake);
+        assert!(!parsed.ok());
+    }
 }

@@ -1057,6 +1057,27 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let has_target = self.at_dependency_operator() || self.parse_rule_targets();
             self.builder.finish_node();
 
+            // BSD make reads `one two:=three` as the dependency operator `:`
+            // followed by a target-local assignment `=three` with an empty
+            // variable name, which it ignores.
+            if has_target && self.bsd_directives_enabled() {
+                self.skip_ws();
+                if let Some((OPERATOR, op)) = self.tokens.last() {
+                    if matches!(op.as_str(), ":=" | "::=") {
+                        let (_, op) = self.tokens.pop().unwrap();
+                        let (dependency_op, assignment_op) = op.split_at(op.len() - 1);
+                        self.builder.token(OPERATOR.into(), dependency_op);
+                        self.builder.start_node(VARIABLE.into());
+                        self.builder.token(OPERATOR.into(), assignment_op);
+                        self.skip_ws();
+                        self.parse_assignment_value();
+                        self.builder.finish_node(); // VARIABLE
+                        self.builder.finish_node(); // RULE
+                        return;
+                    }
+                }
+            }
+
             // Find and consume the colon
             let has_colon = if has_target {
                 self.find_and_consume_colon(tab_indented)
@@ -1866,14 +1887,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_parenthesized_expr_internal(true);
                     }
                 }
-            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE)) {
+            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
+                && !self.is_line_continuation()
+            {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
                 // before looking at what it contains.
                 self.bump();
             }
             // A `$` at the end of a line is accepted by both GNU and BSD
-            // make; it expands to nothing.
+            // make; it expands to nothing. Make joins continued lines before
+            // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
         }

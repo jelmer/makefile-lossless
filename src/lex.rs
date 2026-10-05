@@ -32,6 +32,12 @@ pub struct Lexer<'a> {
     reference_depth: usize,
     /// Number of `$` tokens directly before the current one.
     dollars: usize,
+    /// The character that starts a recipe line, set with GNU make's
+    /// `.RECIPEPREFIX`.
+    // TODO: The editing APIs still start new recipe lines with a tab.
+    recipe_prefix: char,
+    /// Text of the current logical line, if it is not a recipe line.
+    line: Option<String>,
 }
 
 impl<'a> Lexer<'a> {
@@ -47,6 +53,46 @@ impl<'a> Lexer<'a> {
             recipe_continuation: false,
             reference_depth: 0,
             dollars: 0,
+            recipe_prefix: '\t',
+            line: Some(String::new()),
+        }
+    }
+
+    /// Update the recipe prefix if `line` assigns to `.RECIPEPREFIX`.
+    // TODO: Handle `define .RECIPEPREFIX`.
+    fn update_recipe_prefix(&mut self, line: &str) {
+        let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
+        let mut rest = line.trim_start();
+        for keyword in ["override", "export"] {
+            if let Some(r) = rest.strip_prefix(keyword) {
+                if r.starts_with(Self::is_whitespace) {
+                    rest = r.trim_start();
+                }
+            }
+        }
+        let Some(rest) = rest.strip_prefix(".RECIPEPREFIX") else {
+            return;
+        };
+        let rest = rest.trim_start();
+        let Some((op, value)) = ["=", ":=", "::=", ":::=", "+=", "?="]
+            .iter()
+            .find_map(|op| Some((*op, rest.strip_prefix(op)?)))
+        else {
+            return;
+        };
+        let value = value.trim_start();
+        let first = match value.chars().next() {
+            None | Some('#') => None,
+            // An immediately expanded reference.
+            // TODO: Expand variable references.
+            Some('$') if op != "=" && !value.starts_with("$$") => return,
+            Some(c) => Some(c),
+        };
+        match op {
+            // `.RECIPEPREFIX` is always defined.
+            "?=" => {}
+            "+=" if self.recipe_prefix != '\t' => {}
+            _ => self.recipe_prefix = first.unwrap_or('\t'),
         }
     }
 
@@ -208,6 +254,18 @@ impl<'a> Lexer<'a> {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
             match (c, self.line_type) {
+                (c, None) if c == self.recipe_prefix && c != '\t' && !self.continuation => {
+                    self.input.next();
+                    self.line_type = Some(LineType::Recipe);
+                    return Some((SyntaxKind::INDENT, c.to_string()));
+                }
+                ('\t', None)
+                    if self.recipe_prefix != '\t' && !self.continuation && !recipe_continuation =>
+                {
+                    // Only the recipe prefix introduces a recipe line.
+                    self.line_type = Some(LineType::Other);
+                    return Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)));
+                }
                 ('\t', None) if !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
@@ -412,6 +470,18 @@ impl Iterator for Lexer<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let token = self.next_token()?;
+        if self.gnu {
+            if self.line_type == Some(LineType::Recipe) {
+                self.line = None;
+            } else if let Some(line) = &mut self.line {
+                line.push_str(&token.1);
+            }
+            if token.0 == SyntaxKind::NEWLINE && !self.continuation {
+                if let Some(line) = self.line.replace(String::new()) {
+                    self.update_recipe_prefix(&line);
+                }
+            }
+        }
         match token.0 {
             SyntaxKind::LPAREN | SyntaxKind::LBRACE
                 if self.reference_depth > 0 || self.dollars % 2 == 1 =>
@@ -1074,5 +1144,30 @@ override_dh_auto_clean:
                 (NEWLINE, "\n"),
             ]
         );
+    }
+
+    #[test]
+    fn test_recipe_prefix() {
+        let prefix = |text: &str| {
+            let mut lexer = Lexer::new(text, None);
+            lexer.by_ref().for_each(drop);
+            lexer.recipe_prefix
+        };
+        assert_eq!(prefix(".RECIPEPREFIX = >\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX := ab # comment\n"), 'a');
+        assert_eq!(prefix("override .RECIPEPREFIX ::= >\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX \\\n  = >\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX = >\n.RECIPEPREFIX =\n"), '\t');
+        assert_eq!(prefix(".RECIPEPREFIX = > # c\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX = # c\n"), '\t');
+        assert_eq!(prefix(".RECIPEPREFIX ?= >\n"), '\t');
+        assert_eq!(prefix(".RECIPEPREFIX += >\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX = >\n.RECIPEPREFIX += x\n"), '>');
+        assert_eq!(prefix(".RECIPEPREFIX = $(P)\n"), '$');
+        assert_eq!(prefix(".RECIPEPREFIXES = >\n"), '\t');
+        assert_eq!(prefix("all:\n\t.RECIPEPREFIX = >\n"), '\t');
+        let mut lexer = Lexer::new(".RECIPEPREFIX = >\n", Some(MakefileVariant::BSDMake));
+        lexer.by_ref().for_each(drop);
+        assert_eq!(lexer.recipe_prefix, '\t');
     }
 }

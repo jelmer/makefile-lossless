@@ -1255,4 +1255,13 @@ mod tests {
             assert_eq!(vars[0].assignment_operator(), Some(":=".to_string()));
         }
     }
+
+    #[test]
+    fn test_dollar_before_line_continuation() {
+        // Make joins the lines before expanding `$`, so this is `X = ab`.
+        let makefile: Makefile = "X = a$\\\n\tb\nY = 1\n".parse().unwrap();
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].raw_value(), Some("a$\\\n\tb".to_string()));
+    }
 }
