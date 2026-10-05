@@ -168,11 +168,9 @@ impl Rule {
     /// ```
     /// use makefile_lossless::Makefile;
     ///
-    /// let makefile: Makefile = r#"ifdef DEBUG
-    /// all:
-    ///     echo "test"
-    /// endif
-    /// "#.parse().unwrap();
+    /// let makefile: Makefile = "ifdef DEBUG\nall:\n\techo \"test\"\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
     ///
     /// let cond = makefile.conditionals().next().unwrap();
     /// let rule = cond.if_items().next().unwrap();
