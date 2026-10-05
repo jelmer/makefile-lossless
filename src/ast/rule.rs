@@ -7,8 +7,13 @@ use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
 
-// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes
-fn build_prerequisites_node(prereqs: &[String], include_leading_space: bool) -> SyntaxNode {
+// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes,
+// optionally followed by trailing whitespace.
+fn build_prerequisites_node(
+    prereqs: &[String],
+    include_leading_space: bool,
+    trailing_space: Option<&str>,
+) -> SyntaxNode {
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(PREREQUISITES.into());
 
@@ -22,6 +27,10 @@ fn build_prerequisites_node(prereqs: &[String], include_leading_space: bool) -> 
         builder.start_node(PREREQUISITE.into());
         builder.token(IDENTIFIER.into(), prereq);
         builder.finish_node();
+    }
+
+    if let Some(space) = trailing_space {
+        builder.token(WHITESPACE.into(), space);
     }
 
     builder.finish_node();
@@ -424,44 +433,68 @@ impl Rule {
         result.into_iter()
     }
 
-    /// Get the prerequisites in the rule
+    /// The PREREQUISITES node following the rule's operator, if any.
+    fn prerequisites_node(&self) -> Option<SyntaxNode> {
+        self.syntax()
+            .children_with_tokens()
+            .skip_while(|e| e.kind() != OPERATOR)
+            .find_map(|e| e.into_node().filter(|n| n.kind() == PREREQUISITES))
+    }
+
+    /// The normal and order-only prerequisites of the rule.
+    fn prerequisite_lists(&self) -> (Vec<String>, Vec<String>) {
+        let mut normal = Vec::new();
+        let mut order_only = Vec::new();
+        let Some(node) = self.prerequisites_node() else {
+            return (normal, order_only);
+        };
+        let mut seen_pipe = false;
+        for element in node.children_with_tokens() {
+            match element {
+                rowan::NodeOrToken::Token(t) if t.kind() == OPERATOR && t.text() == "|" => {
+                    seen_pipe = true;
+                }
+                rowan::NodeOrToken::Node(n) if n.kind() == PREREQUISITE => {
+                    let text = node_text(&n).trim().to_string();
+                    if seen_pipe {
+                        order_only.push(text);
+                    } else {
+                        normal.push(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (normal, order_only)
+    }
+
+    /// Get the normal prerequisites in the rule
+    ///
+    /// Order-only prerequisites (those after a `|`) are not included; see
+    /// [`Rule::order_only_prerequisites`].
     ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
+    /// let rule: Rule = "rule: dependency | dir\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
     pub fn prerequisites(&self) -> impl Iterator<Item = String> + '_ {
-        // Find PREREQUISITES node after OPERATOR token
-        let mut found_operator = false;
-        let mut prerequisites_node = None;
+        self.prerequisite_lists().0.into_iter()
+    }
 
-        for element in self.syntax().children_with_tokens() {
-            if let Some(token) = element.as_token() {
-                if token.kind() == OPERATOR {
-                    found_operator = true;
-                }
-            } else if let Some(node) = element.as_node() {
-                if found_operator && node.kind() == PREREQUISITES {
-                    prerequisites_node = Some(node.clone());
-                    break;
-                }
-            }
-        }
-
-        let result: Vec<String> = if let Some(prereqs) = prerequisites_node {
-            // Iterate over PREREQUISITE child nodes
-            prereqs
-                .children()
-                .filter(|child| child.kind() == PREREQUISITE)
-                .map(|child| node_text(&child).trim().to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        result.into_iter()
+    /// Get the order-only prerequisites in the rule, i.e. those after the
+    /// first `|` in the prerequisite list.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "foo.o: foo.c | build\n\tcc -c foo.c".parse().unwrap();
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["foo.c"]);
+    /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["build"]);
+    /// ```
+    pub fn order_only_prerequisites(&self) -> impl Iterator<Item = String> + '_ {
+        self.prerequisite_lists().1.into_iter()
     }
 
     /// Get the commands in the rule
@@ -761,6 +794,8 @@ impl Rule {
     /// Remove a prerequisite from this rule
     ///
     /// Returns `true` if the prerequisite was found and removed, `false` if it wasn't found.
+    /// Only normal prerequisites are considered; order-only prerequisites are
+    /// left alone.
     ///
     /// # Example
     /// ```
@@ -771,69 +806,32 @@ impl Rule {
     /// assert!(!rule.remove_prerequisite("nonexistent").unwrap());
     /// ```
     pub fn remove_prerequisite(&mut self, target: &str) -> Result<bool, Error> {
-        // Find the PREREQUISITES node after the OPERATOR
-        let mut found_operator = false;
-        let mut prereqs_node = None;
-
-        for child in self.syntax().children_with_tokens() {
-            if let Some(token) = child.as_token() {
-                if token.kind() == OPERATOR {
-                    found_operator = true;
-                }
-            } else if let Some(node) = child.as_node() {
-                if found_operator && node.kind() == PREREQUISITES {
-                    prereqs_node = Some(node.clone());
-                    break;
-                }
-            }
-        }
-
-        let prereqs_node = match prereqs_node {
-            Some(node) => node,
-            None => return Ok(false), // No prerequisites
-        };
-
-        // Collect current prerequisites
         let current_prereqs: Vec<String> = self.prerequisites().collect();
-
-        // Check if target exists
         if !current_prereqs.iter().any(|p| p == target) {
             return Ok(false);
         }
-
-        // Filter out the target
-        let new_prereqs: Vec<String> = current_prereqs
-            .into_iter()
-            .filter(|p| p != target)
-            .collect();
-
-        // Check if the existing PREREQUISITES node starts with whitespace
-        let has_leading_whitespace = prereqs_node
-            .children_with_tokens()
-            .next()
-            .map(|e| matches!(e.as_token().map(|t| t.kind()), Some(WHITESPACE)))
-            .unwrap_or(false);
-
-        // Rebuild the PREREQUISITES node with the new prerequisites
-        let prereqs_index = prereqs_node.index();
-        let new_prereqs_node = build_prerequisites_node(&new_prereqs, has_leading_whitespace);
-
-        self.syntax().splice_children(
-            prereqs_index..prereqs_index + 1,
-            vec![new_prereqs_node.into()],
-        );
-
+        self.set_prerequisites(
+            current_prereqs
+                .iter()
+                .map(|p| p.as_str())
+                .filter(|p| *p != target)
+                .collect(),
+        )?;
         Ok(true)
     }
 
     /// Add a prerequisite to this rule
     ///
+    /// The prerequisite is added to the end of the normal prerequisites,
+    /// before any order-only prerequisites.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let mut rule: Rule = "target: dep1\n".parse().unwrap();
+    /// let mut rule: Rule = "target: dep1 | dir\n".parse().unwrap();
     /// rule.add_prerequisite("dep2").unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1", "dep2"]);
+    /// assert_eq!(rule.to_string(), "target: dep1 dep2 | dir\n");
     /// ```
     pub fn add_prerequisite(&mut self, target: &str) -> Result<(), Error> {
         let mut current_prereqs: Vec<String> = self.prerequisites().collect();
@@ -843,75 +841,89 @@ impl Rule {
 
     /// Set the prerequisites for this rule, replacing any existing ones
     ///
+    /// Only the normal prerequisites are replaced; order-only prerequisites
+    /// (after a `|`) are kept.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
-    /// let mut rule: Rule = "target: old_dep\n".parse().unwrap();
+    /// let mut rule: Rule = "target: old_dep | dir\n".parse().unwrap();
     /// rule.set_prerequisites(vec!["new_dep1", "new_dep2"]).unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["new_dep1", "new_dep2"]);
+    /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["dir"]);
     /// ```
     pub fn set_prerequisites(&mut self, prereqs: Vec<&str>) -> Result<(), Error> {
-        // Find the PREREQUISITES node after the OPERATOR, or the position to insert it
-        let mut prereqs_index = None;
-        let mut operator_found = false;
+        let prereqs = prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        for child in self.syntax().children_with_tokens() {
-            if let Some(token) = child.as_token() {
-                if token.kind() == OPERATOR {
-                    operator_found = true;
+        if let Some(node) = self.prerequisites_node() {
+            let has_external_whitespace = node
+                .prev_sibling_or_token()
+                .is_some_and(|e| e.kind() == WHITESPACE);
+            let children: Vec<_> = node.children_with_tokens().collect();
+            let pipe = children.iter().position(|e| {
+                e.kind() == OPERATOR && e.as_token().is_some_and(|t| t.text() == "|")
+            });
+            // Replace everything before the order-only part, including the
+            // whitespace in front of the `|`.
+            let (end, separator) = match pipe {
+                None => (children.len(), None),
+                Some(pipe) => {
+                    let whitespace = children[..pipe]
+                        .last()
+                        .and_then(|e| e.as_token())
+                        .filter(|t| t.kind() == WHITESPACE)
+                        .map(|t| t.text().to_string());
+                    let had_normal = children[..pipe].iter().any(|e| e.kind() == PREREQUISITE);
+                    let separator = match whitespace {
+                        _ if prereqs.is_empty() => None,
+                        Some(ws) => Some(ws),
+                        None if !had_normal => Some(" ".to_string()),
+                        None => None,
+                    };
+                    (pipe, separator)
                 }
-            } else if let Some(node) = child.as_node() {
-                if operator_found && node.kind() == PREREQUISITES {
-                    prereqs_index = Some((node.index(), true)); // (index, exists)
-                    break;
-                }
-            }
+            };
+            let fresh =
+                build_prerequisites_node(&prereqs, !has_external_whitespace, separator.as_deref());
+            let old_green = node.green();
+            let order_only = old_green.children().skip(end).map(|c| c.to_owned());
+            let green = rowan::GreenNode::new(
+                PREREQUISITES.into(),
+                fresh
+                    .green()
+                    .children()
+                    .map(|c| c.to_owned())
+                    .chain(order_only)
+                    .collect::<Vec<_>>(),
+            );
+            let index = node.index();
+            self.syntax().splice_children(
+                index..index + 1,
+                vec![SyntaxNode::new_root_mut(green).into()],
+            );
+            return Ok(());
         }
 
-        match prereqs_index {
-            Some((idx, true)) => {
-                // Check if there's whitespace between OPERATOR and PREREQUISITES
-                let has_external_whitespace = self
-                    .syntax()
-                    .children_with_tokens()
-                    .skip_while(|e| !matches!(e.as_token().map(|t| t.kind()), Some(OPERATOR)))
-                    .nth(1) // Skip the OPERATOR itself and get next
-                    .map(|e| matches!(e.as_token().map(|t| t.kind()), Some(WHITESPACE)))
-                    .unwrap_or(false);
+        // Insert new PREREQUISITES (need leading space inside node)
+        let new_prereqs = build_prerequisites_node(&prereqs, true, None);
 
-                let new_prereqs = build_prerequisites_node(
-                    &prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    !has_external_whitespace, // Include leading space only if no external whitespace
-                );
-                self.syntax()
-                    .splice_children(idx..idx + 1, vec![new_prereqs.into()]);
-            }
-            _ => {
-                // Insert new PREREQUISITES (need leading space inside node)
-                let new_prereqs = build_prerequisites_node(
-                    &prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    true, // Include leading space
-                );
+        let insert_pos = self
+            .syntax()
+            .children_with_tokens()
+            .position(|t| t.as_token().map(|t| t.kind() == OPERATOR).unwrap_or(false))
+            .map(|p| p + 1)
+            .ok_or_else(|| {
+                Error::Parse(ParseError {
+                    errors: vec![ErrorInfo {
+                        message: "No operator found in rule".to_string(),
+                        line: 1,
+                        context: "set_prerequisites".to_string(),
+                    }],
+                })
+            })?;
 
-                let insert_pos = self
-                    .syntax()
-                    .children_with_tokens()
-                    .position(|t| t.as_token().map(|t| t.kind() == OPERATOR).unwrap_or(false))
-                    .map(|p| p + 1)
-                    .ok_or_else(|| {
-                        Error::Parse(ParseError {
-                            errors: vec![ErrorInfo {
-                                message: "No operator found in rule".to_string(),
-                                line: 1,
-                                context: "set_prerequisites".to_string(),
-                            }],
-                        })
-                    })?;
-
-                self.syntax()
-                    .splice_children(insert_pos..insert_pos, vec![new_prereqs.into()]);
-            }
-        }
+        self.syntax()
+            .splice_children(insert_pos..insert_pos, vec![new_prereqs.into()]);
 
         Ok(())
     }
@@ -1361,5 +1373,128 @@ mod tests {
             rule.prerequisites().collect::<Vec<_>>(),
             vec!["export".to_string(), "private".to_string()]
         );
+    }
+
+    fn prereqs(rule: &Rule) -> (Vec<String>, Vec<String>) {
+        (
+            rule.prerequisites().collect(),
+            rule.order_only_prerequisites().collect(),
+        )
+    }
+
+    #[test]
+    fn test_order_only_prerequisites() {
+        let rule: Rule = "foo: a b | c d\n".parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()]
+            )
+        );
+        assert_eq!(rule.to_string(), "foo: a b | c d\n");
+    }
+
+    #[test]
+    fn test_order_only_prerequisites_without_spaces() {
+        let rule: Rule = "foo: a|b c\n".parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a".to_string()],
+                vec!["b".to_string(), "c".to_string()]
+            )
+        );
+        assert_eq!(rule.to_string(), "foo: a|b c\n");
+    }
+
+    #[test]
+    fn test_only_order_only_prerequisites() {
+        let rule: Rule = "foo: | dir\n\tcmd\n".parse().unwrap();
+        assert_eq!(prereqs(&rule), (vec![], vec!["dir".to_string()]));
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["cmd"]);
+    }
+
+    #[test]
+    fn test_second_pipe_is_order_only_prerequisite() {
+        // Like GNU make, only the first `|` separates the two lists.
+        let rule: Rule = "foo: a | b | c\n".parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a".to_string()],
+                vec!["b".to_string(), "|".to_string(), "c".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_order_only_with_variable_reference() {
+        let rule: Rule = "foo: $(A) | $(shell echo a|b) $(DIR)\n".parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["$(A)".to_string()],
+                vec!["$(shell echo a|b)".to_string(), "$(DIR)".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_no_order_only_prerequisites() {
+        let rule: Rule = "foo: a b\n".parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["a".to_string(), "b".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn test_add_prerequisite_keeps_order_only() {
+        let mut rule: Rule = "foo: a | c\n".parse().unwrap();
+        rule.add_prerequisite("b").unwrap();
+        assert_eq!(rule.to_string(), "foo: a b | c\n");
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_add_prerequisite_before_order_only_only() {
+        let mut rule: Rule = "foo: | c\n".parse().unwrap();
+        rule.add_prerequisite("b").unwrap();
+        assert_eq!(rule.to_string(), "foo: b | c\n");
+    }
+
+    #[test]
+    fn test_add_prerequisite_without_spaces_around_pipe() {
+        let mut rule: Rule = "foo: a|c\n".parse().unwrap();
+        rule.add_prerequisite("b").unwrap();
+        assert_eq!(rule.to_string(), "foo: a b|c\n");
+    }
+
+    #[test]
+    fn test_remove_prerequisite_keeps_order_only() {
+        let mut rule: Rule = "foo: a b | c\n".parse().unwrap();
+        assert!(rule.remove_prerequisite("a").unwrap());
+        assert_eq!(rule.to_string(), "foo: b | c\n");
+        assert!(rule.remove_prerequisite("b").unwrap());
+        assert_eq!(rule.to_string(), "foo: | c\n");
+        // Order-only prerequisites are not removed.
+        assert!(!rule.remove_prerequisite("c").unwrap());
+        assert_eq!(rule.to_string(), "foo: | c\n");
+    }
+
+    #[test]
+    fn test_set_prerequisites_keeps_order_only() {
+        let mut rule: Rule = "foo: a b | c\n".parse().unwrap();
+        rule.set_prerequisites(vec!["x"]).unwrap();
+        assert_eq!(rule.to_string(), "foo: x | c\n");
+        rule.set_prerequisites(vec![]).unwrap();
+        assert_eq!(rule.to_string(), "foo: | c\n");
     }
 }

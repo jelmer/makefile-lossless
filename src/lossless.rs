@@ -458,6 +458,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn parse_rule_dependencies(&mut self) {
             self.builder.start_node(PREREQUISITES.into());
+            // Only the first `|` separates normal from order-only
+            // prerequisites; GNU make takes any later one as a file name.
+            let mut seen_pipe = false;
 
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 // The prerequisite list may continue on the next physical line.
@@ -472,12 +475,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Trailing comment ends the prerequisite list.
                         self.bump();
                     }
+                    Some(ERROR) if !seen_pipe && self.at_text("|") => {
+                        seen_pipe = true;
+                        self.bump_as(OPERATOR);
+                    }
                     Some(_) => {
                         // Collect contiguous non-whitespace tokens into one
                         // PREREQUISITE node, preserving structures like
                         // `$$(@:.out=.src)` or `lib(member.o)` as a single
                         // word.
-                        self.parse_prerequisite_word();
+                        self.parse_prerequisite_word(!seen_pipe);
                     }
                     None => break,
                 }
@@ -486,11 +493,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node(); // End PREREQUISITES
         }
 
+        /// Whether the current token's text is `text`.
+        fn at_text(&self, text: &str) -> bool {
+            self.tokens.last().is_some_and(|(_, t)| t == text)
+        }
+
         /// Parse a single prerequisite word: consume tokens up to the next
         /// whitespace/newline/comment, descending into variable references
         /// (`$(...)`, `${...}`, `$X`, `$$`) and archive-member parentheses
-        /// without treating them as word boundaries.
-        fn parse_prerequisite_word(&mut self) {
+        /// without treating them as word boundaries. If `stop_at_pipe` is
+        /// set, a `|` also ends the word.
+        fn parse_prerequisite_word(&mut self, stop_at_pipe: bool) {
             self.builder.start_node(PREREQUISITE.into());
 
             // Archive member syntax: `lib(member.o)` — keep as a unit.
@@ -507,6 +520,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match kind {
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
+                    ERROR if stop_at_pipe && self.at_text("|") => break,
                     DOLLAR => self.parse_variable_reference(),
                     _ => self.bump(),
                 }
@@ -2558,6 +2572,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
         }
+        /// Advance one token, adding it to the tree as `kind`.
+        fn bump_as(&mut self, kind: SyntaxKind) {
+            let (_, text) = self.tokens.pop().unwrap();
+            self.pending_backslash_escape = false;
+            self.builder.token(kind.into(), text.as_str());
+        }
+
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
             self.tokens.last().map(|(kind, _)| *kind)
@@ -4556,6 +4577,31 @@ rule: dependency
         let variable = variables.pop().unwrap();
         assert_eq!(variable.name(), Some("VARIABLE".to_string()));
         assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_order_only_prerequisites() {
+        let parsed = parse("foo: a | b\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..11
+  RULE@0..11
+    TARGETS@0..3
+      IDENTIFIER@0..3 "foo"
+    OPERATOR@3..4 ":"
+    WHITESPACE@4..5 " "
+    PREREQUISITES@5..10
+      PREREQUISITE@5..6
+        IDENTIFIER@5..6 "a"
+      WHITESPACE@6..7 " "
+      OPERATOR@7..8 "|"
+      WHITESPACE@8..9 " "
+      PREREQUISITE@9..10
+        IDENTIFIER@9..10 "b"
+    NEWLINE@10..11 "\n"
+"#
+        );
     }
 
     #[test]
@@ -10575,10 +10621,7 @@ test:
                 (false, vec!["$(DEPS)".to_string()]),
                 (false, vec!["a".to_string(), "b".to_string()]),
                 (false, vec!["%.o:".to_string(), "%.c".to_string()]),
-                (
-                    false,
-                    vec!["a".to_string(), "|".to_string(), "$(DIR)".to_string()]
-                ),
+                (false, vec!["a".to_string()]),
                 (false, vec!["$(SRCS:.c=.o)".to_string()]),
             ]
         );
@@ -11173,6 +11216,18 @@ mod test_crlf {
         );
         let comments: Vec<_> = rules[0].recipe_nodes().map(|r| r.comment()).collect();
         assert_eq!(comments, vec![None, None, Some("# note".to_string())]);
+    }
+
+    #[test]
+    fn test_order_only_prerequisites() {
+        let makefile = parse_crlf("all: a \\\r\n  b | c $(wildcard d \\\r\n  e)\r\n\techo hi\r\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            rule.order_only_prerequisites().collect::<Vec<_>>(),
+            vec!["c", "$(wildcard d \\\n  e)"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
     }
 
     #[test]
