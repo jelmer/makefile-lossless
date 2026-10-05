@@ -810,6 +810,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
+            // `undefine NAME`, unless followed by an operator as in
+            // `undefine = 1`, which assigns to a variable named "undefine".
+            let is_undefine = self.current() == Some(IDENTIFIER)
+                && self.tokens.last().unwrap().1 == "undefine"
+                && self.peek_past_ws() != Some(OPERATOR);
+            if is_undefine {
+                self.bump();
+                self.skip_ws();
+            }
+
             // Parse variable name, which may be built from several parts
             // such as `CFLAGS.${PROG}`.
             if !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
@@ -823,6 +833,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(DOLLAR) => self.parse_variable_reference(),
                     _ => break,
                 }
+            }
+
+            if is_undefine {
+                self.expect_eol();
+                self.builder.finish_node();
+                return;
             }
 
             // Skip whitespace and parse operator
@@ -1919,7 +1935,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
+                    IDENTIFIER if matches!(text.as_str(), "export" | "override" | "undefine") => {
+                        seen_directive = true
+                    }
                     IDENTIFIER if !name_done => seen_name = true,
                     DOLLAR if !name_done => {
                         // Skip over a variable reference that is part of
@@ -1973,6 +1991,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
             self.tokens.last().map(|(kind, _)| *kind)
+        }
+
+        /// Kind of the first non-whitespace token after the current one.
+        fn peek_past_ws(&self) -> Option<SyntaxKind> {
+            self.tokens
+                .iter()
+                .rev()
+                .skip(1)
+                .map(|(kind, _)| *kind)
+                .find(|kind| *kind != WHITESPACE)
         }
 
         fn expect_eol(&mut self) {
@@ -3963,6 +3991,134 @@ all: $(OBJS)
         let rules = makefile.rules().collect::<Vec<_>>();
         assert_eq!(rules.len(), 1);
         assert!(rules[0].targets().any(|t| t == "all"));
+    }
+
+    #[test]
+    fn test_undefine() {
+        let text = "FOO = 1\nundefine FOO\nall:\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        assert!(!vars[0].is_undefine());
+        assert!(vars[1].is_undefine());
+        assert!(!vars[1].is_override());
+        assert_eq!(vars[1].name(), Some("FOO".to_string()));
+        assert_eq!(vars[1].assignment_operator(), None);
+        assert_eq!(vars[1].raw_value(), None);
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_override_undefine() {
+        let text = "override undefine FOO\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert!(vars[0].is_undefine());
+        assert!(vars[0].is_override());
+        assert_eq!(vars[0].name(), Some("FOO".to_string()));
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_variable_reference() {
+        let text = "undefine $(NAME)\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert!(vars[0].is_undefine());
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_computed_name() {
+        let text = "override undefine CFLAGS.${PROG}\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_undefine());
+        assert!(var.is_override());
+        assert_eq!(var.name(), Some("CFLAGS.${PROG}".to_string()));
+        assert_eq!(var.raw_value(), None);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_at_eof() {
+        let text = "undefine FOO";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_as_rule_target() {
+        let text = "undefine:\n\techo hi\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(makefile.variable_definitions().count(), 0);
+        let rules = makefile.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["undefine"]);
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_as_variable_name() {
+        let text = "undefine = 1\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let vars = makefile.variable_definitions().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 1);
+        assert!(!vars[0].is_undefine());
+        assert_eq!(vars[0].name(), Some("undefine".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("1".to_string()));
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_with_comment() {
+        let text = "undefine FOO # gone\n";
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_undefine());
+        assert_eq!(var.name(), Some("FOO".to_string()));
+        assert_eq!(makefile.code(), text);
+    }
+
+    #[test]
+    fn test_undefine_errors() {
+        for (text, message) in [
+            ("undefine\n", "expected variable name"),
+            ("undefine FOO = x\n", "expected newline, got Some(OPERATOR)"),
+            ("undefine A B\n", "expected newline, got Some(IDENTIFIER)"),
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec![message],
+                "{text:?}"
+            );
+            assert_eq!(parsed.root().code(), text);
+        }
     }
 
     #[test]
