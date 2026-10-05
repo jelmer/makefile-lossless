@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 #[derive(Debug)]
 /// An error that can occur when parsing a makefile
+#[non_exhaustive]
 pub enum Error {
     /// An I/O error occurred
     Io(std::io::Error),

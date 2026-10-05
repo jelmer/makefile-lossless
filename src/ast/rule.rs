@@ -57,6 +57,7 @@ fn build_targets_node(targets: &[String]) -> SyntaxNode {
 
 /// Represents different types of items that can appear in a Rule's body
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum RuleItem {
     /// A recipe line (command to execute)
     Recipe(String),

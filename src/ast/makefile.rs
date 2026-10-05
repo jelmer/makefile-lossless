@@ -21,6 +21,7 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
 
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum MakefileItem {
     /// A rule definition (e.g., "target: prerequisites")
     Rule(Rule),

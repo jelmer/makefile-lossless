@@ -96,6 +96,7 @@ pub enum BsdCondition {
 
 /// The functions that can be called in a BSD make conditional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum BsdFunction {
     /// `defined(VAR)`: whether the variable is defined.
     Defined,
