@@ -111,6 +111,7 @@ pub enum SyntaxKind {
     DIRECTIVE,  // A single-line directive such as `.undef` or `.error`
 
     EXPRESSION_STATEMENT, // A line of only references, e.g. `$(eval ...)` or `$(info ...)`
+    TARGET_PATTERN,       // The target pattern of a static pattern rule
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.

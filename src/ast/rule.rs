@@ -497,6 +497,31 @@ impl Rule {
         self.prerequisite_lists().1.into_iter()
     }
 
+    /// Get the target pattern of a static pattern rule.
+    ///
+    /// For a rule like `$(OBJS): %.o: %.c`, this returns `%.o`, while
+    /// [`Rule::prerequisites`] returns the prerequisite patterns. Returns
+    /// `None` if this is not a static pattern rule.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "$(OBJS): %.o: %.c | build\n\t$(CC) -c $<\n".parse().unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(OBJS)"]);
+    /// assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+    /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["%.c"]);
+    /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["build"]);
+    ///
+    /// let rule: Rule = "foo.o: foo.c\n".parse().unwrap();
+    /// assert_eq!(rule.static_pattern(), None);
+    /// ```
+    pub fn static_pattern(&self) -> Option<String> {
+        self.syntax()
+            .children()
+            .find(|n| n.kind() == TARGET_PATTERN)
+            .map(|n| node_text(&n).trim().to_string())
+    }
+
     /// Get the commands in the rule
     ///
     /// # Example
@@ -1496,5 +1521,90 @@ mod tests {
         assert_eq!(rule.to_string(), "foo: x | c\n");
         rule.set_prerequisites(vec![]).unwrap();
         assert_eq!(rule.to_string(), "foo: | c\n");
+    }
+
+    #[test]
+    fn test_static_pattern_rule() {
+        let rule: Rule = "$(OBJS): %.o: %.c | dir\n\t$(CC) -c $<\n".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(OBJS)"]);
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["%.c".to_string()], vec!["dir".to_string()])
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["$(CC) -c $<"]);
+        assert_eq!(rule.to_string(), "$(OBJS): %.o: %.c | dir\n\t$(CC) -c $<\n");
+    }
+
+    #[test]
+    fn test_static_pattern_rule_without_spaces() {
+        let rule: Rule = "a.o b.o:%.o:%.c %.h\n".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a.o", "b.o"]);
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["%.c".to_string(), "%.h".to_string()], vec![])
+        );
+        assert_eq!(rule.to_string(), "a.o b.o:%.o:%.c %.h\n");
+    }
+
+    #[test]
+    fn test_static_pattern_rule_without_prerequisites() {
+        let rule: Rule = "a.o: %.o:\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(prereqs(&rule), (vec![], vec![]));
+    }
+
+    #[test]
+    fn test_static_pattern_with_variable_reference() {
+        let rule: Rule = "$(OBJS): $(OBJDIR)/%.o: $(SRCS:.x=.y)\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), Some("$(OBJDIR)/%.o".to_string()));
+        assert_eq!(prereqs(&rule), (vec!["$(SRCS:.x=.y)".to_string()], vec![]));
+    }
+
+    #[test]
+    fn test_no_static_pattern() {
+        let rule: Rule = "foo: $(X:a=b) ${Y:c=d}\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+        assert_eq!(
+            prereqs(&rule),
+            (vec!["$(X:a=b)".to_string(), "${Y:c=d}".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn test_escaped_colon_is_not_static_pattern() {
+        let rule: Rule = "foo: a\\:b\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+        assert_eq!(prereqs(&rule), (vec!["a\\:b".to_string()], vec![]));
+    }
+
+    #[test]
+    fn test_target_specific_assignment_is_not_static_pattern() {
+        let rule: Rule = "foo: X := a:b\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+        assert_eq!(prereqs(&rule), (vec![], vec![]));
+        assert_eq!(
+            rule.scoped_assignment().unwrap().raw_value(),
+            Some("a:b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_prerequisites_static_pattern() {
+        let mut rule: Rule = "$(OBJS): %.o: %.c\n".parse().unwrap();
+        rule.add_prerequisite("%.h").unwrap();
+        assert_eq!(rule.to_string(), "$(OBJS): %.o: %.c %.h\n");
+        rule.set_prerequisites(vec!["%.cc"]).unwrap();
+        assert_eq!(rule.to_string(), "$(OBJS): %.o: %.cc\n");
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+    }
+
+    #[test]
+    fn test_static_pattern_rule_with_continuation() {
+        let rule: Rule = "a.o b.o: \\\n  %.o: %.c\n".parse().unwrap();
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(prereqs(&rule), (vec!["%.c".to_string()], vec![]));
+        assert_eq!(rule.to_string(), "a.o b.o: \\\n  %.o: %.c\n");
     }
 }

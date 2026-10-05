@@ -788,6 +788,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.looks_like_target_specific_assignment() {
                     self.parse_target_specific_assignment();
                 } else {
+                    if self.has_static_pattern_colon() {
+                        self.parse_static_pattern();
+                    }
                     self.parse_rule_dependencies();
                     self.expect_eol();
 
@@ -798,6 +801,64 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Look ahead (without consuming) for a second, unescaped `:` in
+        /// the prerequisites, which makes this a static pattern rule such as
+        /// `$(OBJS): %.o: %.c`. Colons inside variable references, after an
+        /// inline recipe's `;` or in a comment don't count.
+        fn has_static_pattern_colon(&self) -> bool {
+            let mut escaped = self.pending_backslash_escape;
+            let mut tokens = self.tokens.iter().rev().peekable();
+            while let Some((kind, text)) = tokens.next() {
+                match (*kind, text.as_str()) {
+                    (OPERATOR, ":") if !escaped => return true,
+                    (BACKSLASH, _) if !escaped && matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        escaped = false;
+                        continue;
+                    }
+                    (NEWLINE | COMMENT, _) | (ERROR, ";") => return false,
+                    (DOLLAR, _) if !Self::skip_variable_reference(&mut tokens) => return false,
+                    _ => {}
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+            }
+            false
+        }
+
+        /// Parse the target pattern of a static pattern rule and the colon
+        /// that follows it.
+        fn parse_static_pattern(&mut self) {
+            while self.consume_line_continuation() {
+                self.skip_ws();
+            }
+            self.builder.start_node(TARGET_PATTERN.into());
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(OPERATOR) if self.at_text(":") && !self.pending_backslash_escape => break,
+                    Some(WHITESPACE)
+                        if self
+                            .tokens
+                            .iter()
+                            .rev()
+                            .find(|(kind, _)| *kind != WHITESPACE)
+                            .is_some_and(|(kind, text)| *kind == OPERATOR && text == ":") =>
+                    {
+                        break
+                    }
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(_) => self.bump(),
+                    None => break,
+                }
+            }
+            self.builder.finish_node();
+            self.skip_ws();
+            self.bump();
+            self.skip_ws();
         }
 
         /// Whether `self.tokens[i]` is an `export`/`override`/`private`
@@ -4600,6 +4661,31 @@ rule: dependency
       PREREQUISITE@9..10
         IDENTIFIER@9..10 "b"
     NEWLINE@10..11 "\n"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_static_pattern_rule() {
+        let parsed = parse("a.o: %.o : %.c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..15
+  RULE@0..15
+    TARGETS@0..3
+      IDENTIFIER@0..3 "a.o"
+    OPERATOR@3..4 ":"
+    WHITESPACE@4..5 " "
+    TARGET_PATTERN@5..8
+      IDENTIFIER@5..8 "%.o"
+    WHITESPACE@8..9 " "
+    OPERATOR@9..10 ":"
+    WHITESPACE@10..11 " "
+    PREREQUISITES@11..14
+      PREREQUISITE@11..14
+        IDENTIFIER@11..14 "%.c"
+    NEWLINE@14..15 "\n"
 "#
         );
     }
@@ -10620,7 +10706,7 @@ test:
             vec![
                 (false, vec!["$(DEPS)".to_string()]),
                 (false, vec!["a".to_string(), "b".to_string()]),
-                (false, vec!["%.o:".to_string(), "%.c".to_string()]),
+                (false, vec!["%.c".to_string()]),
                 (false, vec!["a".to_string()]),
                 (false, vec!["$(SRCS:.c=.o)".to_string()]),
             ]
@@ -11228,6 +11314,20 @@ mod test_crlf {
             vec!["c", "$(wildcard d \\\n  e)"]
         );
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn test_static_pattern_rule() {
+        let makefile = parse_crlf("a.o b.o: \\\r\n  %.o: %.c \\\r\n  %.h | dir\r\n\tcc -c $<\r\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a.o", "b.o"]);
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["%.c", "%.h"]);
+        assert_eq!(
+            rule.order_only_prerequisites().collect::<Vec<_>>(),
+            vec!["dir"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["cc -c $<"]);
     }
 
     #[test]
