@@ -778,7 +778,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        fn parse_rule_dependencies(&mut self) {
+        /// Parse a rule's prerequisites. If `target_locals` is set, stop at
+        /// a source that starts a BSD make target-local assignment.
+        fn parse_rule_dependencies(&mut self, target_locals: bool) {
             self.builder.start_node(PREREQUISITES.into());
             // Only the first `|` separates normal from order-only
             // prerequisites; GNU make takes any later one as a file name.
@@ -805,6 +807,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_pipe = true;
                         self.bump_as(OPERATOR);
                     }
+                    Some(_) if target_locals && self.is_bsd_target_local_assignment() => break,
                     Some(_) => {
                         // Collect contiguous non-whitespace tokens into one
                         // PREREQUISITE node, preserving structures like
@@ -1234,6 +1237,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Parse targets in a TARGETS node
             self.skip_ws();
+            // BSD make takes the sources of most dependency lines that look
+            // like an assignment as a target-local variable.
+            let target_locals = self.is_bsd_make() && !self.at_bsd_special_sources_target();
             self.builder.start_node(TARGETS.into());
             // Both GNU and BSD make allow an empty list of targets, as in
             // `: source`.
@@ -1253,8 +1259,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.builder.start_node(VARIABLE.into());
                         self.builder.token(OPERATOR.into(), assignment_op);
                         self.skip_ws();
-                        self.parse_assignment_value();
-                        self.builder.finish_node(); // VARIABLE
+                        if self.is_bsd_make() {
+                            self.parse_bsd_target_local_value();
+                            self.in_rule = RuleContext::Inside;
+                            self.parse_rule_recipes();
+                        } else {
+                            self.parse_assignment_value();
+                            self.builder.finish_node(); // VARIABLE
+                        }
                         self.builder.finish_node(); // RULE
                         return;
                     }
@@ -1284,8 +1296,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     if self.has_static_pattern_colon() {
                         self.parse_static_pattern();
                     }
-                    self.parse_rule_dependencies();
-                    if self.current() == Some(TEXT) && self.at_text(";") {
+                    if !(target_locals && self.is_bsd_target_local_assignment()) {
+                        self.parse_rule_dependencies(target_locals);
+                    }
+                    if target_locals && self.is_bsd_target_local_assignment() {
+                        self.parse_bsd_target_local_assignment();
+                    } else if self.current() == Some(TEXT) && self.at_text(";") {
                         self.parse_inline_recipe();
                     } else {
                         self.expect_eol();
@@ -1401,9 +1417,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// target-specific variable assignment such as `all: CFLAGS = -O2`.
         /// NAME is what [`Self::parse_variable_name`] accepts, e.g.
         /// `obj-$(X)`. Line continuations may appear wherever WS may.
-        /// Only GNU make has target-specific variables; elsewhere `X=1`
-        /// after the colon is a prerequisite or, in BSD make, a special
-        /// source as in `.SHELL: name=sh`.
+        /// BSD make's target-local variables follow different rules, see
+        /// [`Self::parse_bsd_target_local_assignment`]; in other makes `X=1`
+        /// after the colon is a prerequisite.
         fn looks_like_target_specific_assignment(&self) -> bool {
             if !matches!(self.variant, None | Some(MakefileVariant::GNUMake)) {
                 return false;
@@ -1530,6 +1546,93 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
             self.parse_assignment_value();
             self.builder.finish_node(); // VARIABLE
+        }
+
+        /// Parse a BSD make target-local assignment in a dependency line, as
+        /// in `prog: CFLAGS += -O2`, through the end of the line. Unlike in
+        /// GNU make, it may follow other sources and the line may have
+        /// commands. Whether make actually assigns the variable depends on
+        /// `.MAKE.TARGET_LOCAL_VARIABLES` at that point, which is left to
+        /// the caller.
+        fn parse_bsd_target_local_assignment(&mut self) {
+            self.builder.start_node(VARIABLE.into());
+            self.skip_ws_and_continuations();
+            self.parse_bsd_variable_name();
+            self.skip_ws();
+            match self.sunsh_modifier() {
+                Some((count, true)) => self.bump_merged(OPERATOR, count),
+                sunsh => {
+                    if let Some((count, false)) = sunsh {
+                        self.bump_n(count - 1);
+                    }
+                    self.skip_ws_and_continuations();
+                    if self.at_assignment_operator() {
+                        self.bump();
+                    } else {
+                        self.error(
+                            ParseErrorKind::ExpectedAssignmentOperator,
+                            "expected assignment operator".to_string(),
+                        );
+                    }
+                }
+            }
+            self.skip_ws();
+            self.parse_bsd_target_local_value();
+        }
+
+        /// Parse the value of a BSD make target-local assignment, which ends
+        /// at a `;` that starts a command, and finish the `VARIABLE` node.
+        fn parse_bsd_target_local_value(&mut self) {
+            self.builder.start_node(EXPR.into());
+            loop {
+                match self.current() {
+                    None | Some(NEWLINE | COMMENT) => break,
+                    Some(TEXT) if self.at_text(";") => break,
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    _ if self.consume_line_continuation() => {}
+                    _ => self.bump(),
+                }
+            }
+            self.builder.finish_node(); // EXPR
+            if self.at_text(";") {
+                self.builder.finish_node(); // VARIABLE
+                self.parse_inline_recipe();
+            } else {
+                self.expect_eol();
+                self.builder.finish_node(); // VARIABLE
+            }
+        }
+
+        /// Whether the line starts with a BSD make special target whose
+        /// sources are never target-local assignments, as in
+        /// `.SHELL: name=sh`.
+        fn at_bsd_special_sources_target(&self) -> bool {
+            let target: String = self
+                .tokens
+                .iter()
+                .rev()
+                .take_while(|(kind, _)| !matches!(kind, WHITESPACE | NEWLINE | OPERATOR))
+                .map(|(_, text)| text.as_str())
+                .collect();
+            target.starts_with(".PATH")
+                || matches!(
+                    target.as_str(),
+                    ".DELETE_ON_ERROR"
+                        | ".INCLUDES"
+                        | ".LIBS"
+                        | ".MAKEFLAGS"
+                        | ".MFLAGS"
+                        | ".NOREADONLY"
+                        | ".NOTPARALLEL"
+                        | ".NO_PARALLEL"
+                        | ".NULL"
+                        | ".OBJDIR"
+                        | ".READONLY"
+                        | ".SHELL"
+                        | ".SINGLESHELL"
+                        | ".SUFFIXES"
+                        | ".SYSPATH"
+                )
         }
 
         fn parse_rule_targets(&mut self) -> bool {
@@ -3956,6 +4059,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// operator before any whitespace-separated second word. The name
         /// may contain almost any character, as in `EXP.[A-]=` or `a:b=c`.
         fn is_bsd_assignment_line(&self) -> bool {
+            self.is_bsd_assignment(false)
+        }
+
+        /// Whether the rest of a dependency line's sources is a target-local
+        /// assignment. BSD make cuts off the command after a `;` first.
+        fn is_bsd_target_local_assignment(&self) -> bool {
+            self.is_bsd_assignment(true)
+        }
+
+        fn is_bsd_assignment(&self, stop_at_semicolon: bool) -> bool {
             let mut level = 0i32;
             let mut seen_name = false;
             let mut seen_space = false;
@@ -3988,6 +4101,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_space = seen_name;
                     }
                     _ if level != 0 => {}
+                    TEXT if stop_at_semicolon && text == ";" => return false,
                     WHITESPACE => seen_space = seen_name,
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
                     _ if seen_space => return false,
@@ -6477,14 +6591,10 @@ mod tests {
     }
 
     #[test]
-    fn test_no_target_specific_assignment_outside_gnu_make() {
-        // Only GNU make has target-specific variables; elsewhere these are
-        // prerequisites, or special sources as in NetBSD's sh-errctl.mk.
-        for variant in [
-            MakefileVariant::BSDMake,
-            MakefileVariant::POSIXMake,
-            MakefileVariant::NMake,
-        ] {
+    fn test_no_target_specific_assignment_outside_gnu_and_bsd_make() {
+        // POSIX make and nmake have no target-specific variables, so these
+        // are prerequisites.
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
             for (code, prerequisites) in [
                 (
                     ".SHELL: name=\"sh\" path=/bin/sh\n",
