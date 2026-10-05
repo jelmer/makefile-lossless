@@ -1,6 +1,6 @@
 use super::bsd::keyword_token;
-use super::collapse_continuations;
 use super::makefile::MakefileItem;
+use super::{collapse_continuations, line_ending};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
@@ -747,16 +747,17 @@ impl Conditional {
             .last_token()
             .is_none_or(|t| t.kind() != NEWLINE);
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ENDIF.into());
         if needs_newline {
-            builder.token(NEWLINE.into(), "\n");
+            builder.token(NEWLINE.into(), &eol);
         }
         builder.token(
             IDENTIFIER.into(),
             if self.is_bsd() { ".endif" } else { "endif" },
         );
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let endif = SyntaxNode::new_root_mut(builder.finish());
@@ -773,13 +774,14 @@ impl Conditional {
             return;
         }
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ELSE.into());
         builder.token(
             IDENTIFIER.into(),
             if self.is_bsd() { ".else" } else { "else" },
         );
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());

@@ -20,6 +20,11 @@
 //!
 //! assert_eq!(makefile.rules().count(), 3);
 //! ```
+//!
+//! Editing methods that add new lines end them the same way as the first
+//! line of the file, so that files with CRLF line endings keep them. Nodes
+//! that are not yet part of a file, such as those created by [`Rule::new`],
+//! use `"\n"`.
 
 mod ast;
 mod bsd_condition;

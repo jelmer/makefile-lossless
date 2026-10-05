@@ -1,6 +1,6 @@
-use super::collapse_continuations;
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
+use super::{collapse_continuations, line_ending};
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
     ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
@@ -731,11 +731,12 @@ impl Rule {
             return true;
         }
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
@@ -768,11 +769,12 @@ impl Rule {
             |it| it.index() + 1,
         );
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
@@ -838,11 +840,12 @@ impl Rule {
             self.syntax().children_with_tokens().count()
         });
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 

@@ -70,6 +70,19 @@ fn in_reference(token: &SyntaxToken, root: &SyntaxNode) -> bool {
     false
 }
 
+/// The line ending to use for new lines in the tree containing `node`: that
+/// of the tree's first line break, or `"\n"` if it has none yet.
+pub(crate) fn line_ending(node: &SyntaxNode) -> String {
+    let root = node
+        .ancestors()
+        .last()
+        .expect("ancestors() includes the node itself");
+    root.descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .find(|t| t.kind() == NEWLINE)
+        .map_or_else(|| "\n".to_string(), |t| t.text().to_string())
+}
+
 /// How a make implementation forms a logical line from physical lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LineSyntax {

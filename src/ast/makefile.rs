@@ -1,3 +1,4 @@
+use super::line_ending;
 use crate::lossless::{
     parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
     Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
@@ -162,11 +163,12 @@ impl MakefileItem {
     /// Helper to parse comment text and extract properly formatted comment tokens
     fn parse_comment_tokens(
         comment_text: &str,
+        eol: &str,
     ) -> (
         rowan::SyntaxToken<crate::lossless::Lang>,
         Option<rowan::SyntaxToken<crate::lossless::Lang>>,
     ) {
-        let comment_line = format!("# {}\n", comment_text);
+        let comment_line = format!("# {}{}", comment_text, eol);
         let temp_makefile = crate::lossless::parse(&comment_line, None);
         let root = temp_makefile.root();
 
@@ -242,7 +244,8 @@ impl MakefileItem {
         let current_index = self.syntax().index();
 
         // Get properly formatted comment tokens
-        let (comment_token, newline_token) = Self::parse_comment_tokens(comment_text);
+        let (comment_token, newline_token) =
+            Self::parse_comment_tokens(comment_text, &line_ending(self.syntax()));
 
         let mut elements = vec![rowan::NodeOrToken::Token(comment_token)];
         if let Some(newline) = newline_token {
@@ -379,7 +382,8 @@ impl MakefileItem {
 
         if let Some(element) = comment_element {
             let idx = element.index();
-            let (new_comment_token, _) = Self::parse_comment_tokens(new_comment_text);
+            let (new_comment_token, _) =
+                Self::parse_comment_tokens(new_comment_text, &line_ending(self.syntax()));
             parent.splice_children(
                 idx..idx + 1,
                 vec![rowan::NodeOrToken::Token(new_comment_token)],
@@ -867,11 +871,12 @@ impl Makefile {
     /// assert_eq!(makefile.to_string(), "rule:\n");
     /// ```
     pub fn add_rule(&mut self, target: &str) -> Rule {
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RULE.into());
         builder.token(IDENTIFIER.into(), target);
         builder.token(OPERATOR.into(), ":");
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
@@ -885,7 +890,7 @@ impl Makefile {
             // Create a BLANK_LINE node
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
 
@@ -938,6 +943,7 @@ impl Makefile {
             }));
         };
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL.into());
 
@@ -951,7 +957,7 @@ impl Makefile {
         builder.token(IDENTIFIER.into(), condition);
         builder.finish_node();
 
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         // Add if body content
@@ -960,11 +966,11 @@ impl Makefile {
                 if !line.is_empty() {
                     builder.token(IDENTIFIER.into(), line);
                 }
-                builder.token(NEWLINE.into(), "\n");
+                builder.token(NEWLINE.into(), &eol);
             }
             // Add final newline if if_body doesn't end with one
             if !if_body.ends_with('\n') && !if_body.is_empty() {
-                builder.token(NEWLINE.into(), "\n");
+                builder.token(NEWLINE.into(), &eol);
             }
         }
 
@@ -972,7 +978,7 @@ impl Makefile {
         if let Some(else_content) = else_body {
             builder.start_node(CONDITIONAL_ELSE.into());
             builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), "\n");
+            builder.token(NEWLINE.into(), &eol);
             builder.finish_node();
 
             // Add else body content
@@ -981,11 +987,11 @@ impl Makefile {
                     if !line.is_empty() {
                         builder.token(IDENTIFIER.into(), line);
                     }
-                    builder.token(NEWLINE.into(), "\n");
+                    builder.token(NEWLINE.into(), &eol);
                 }
                 // Add final newline if else_content doesn't end with one
                 if !else_content.ends_with('\n') && !else_content.is_empty() {
-                    builder.token(NEWLINE.into(), "\n");
+                    builder.token(NEWLINE.into(), &eol);
                 }
             }
         }
@@ -993,7 +999,7 @@ impl Makefile {
         // Build CONDITIONAL_ENDIF
         builder.start_node(CONDITIONAL_ENDIF.into());
         builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         builder.finish_node();
@@ -1011,7 +1017,7 @@ impl Makefile {
             // Create a BLANK_LINE node
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
 
@@ -1081,6 +1087,7 @@ impl Makefile {
             }));
         };
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL.into());
 
@@ -1094,7 +1101,7 @@ impl Makefile {
         builder.token(IDENTIFIER.into(), condition);
         builder.finish_node();
 
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         // Add if branch items
@@ -1103,28 +1110,28 @@ impl Makefile {
             let item_text = item.syntax().to_string();
             // Parse it again to get green nodes
             builder.token(IDENTIFIER.into(), item_text.trim());
-            builder.token(NEWLINE.into(), "\n");
+            builder.token(NEWLINE.into(), &eol);
         }
 
         // Add else clause if provided
         if let Some(else_iter) = else_items {
             builder.start_node(CONDITIONAL_ELSE.into());
             builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), "\n");
+            builder.token(NEWLINE.into(), &eol);
             builder.finish_node();
 
             // Add else branch items
             for item in else_iter {
                 let item_text = item.syntax().to_string();
                 builder.token(IDENTIFIER.into(), item_text.trim());
-                builder.token(NEWLINE.into(), "\n");
+                builder.token(NEWLINE.into(), &eol);
             }
         }
 
         // Build CONDITIONAL_ENDIF
         builder.start_node(CONDITIONAL_ENDIF.into());
         builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         builder.finish_node();
@@ -1142,7 +1149,7 @@ impl Makefile {
             // Create a BLANK_LINE node
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
 
@@ -1315,6 +1322,7 @@ impl Makefile {
         };
 
         // Build the nodes to insert
+        let eol = line_ending(self.syntax());
         let mut nodes_to_insert = Vec::new();
 
         // Determine if we need to add blank lines to maintain formatting consistency
@@ -1327,7 +1335,7 @@ impl Makefile {
             // Add a blank line after the new rule
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
             nodes_to_insert.push(blank_line.into());
@@ -1358,7 +1366,7 @@ impl Makefile {
             if !has_blank_before && index > 0 {
                 let mut bl_builder = GreenNodeBuilder::new();
                 bl_builder.start_node(BLANK_LINE.into());
-                bl_builder.token(NEWLINE.into(), "\n");
+                bl_builder.token(NEWLINE.into(), &eol);
                 bl_builder.finish_node();
                 let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
                 nodes_to_insert.push(blank_line.into());
@@ -1370,7 +1378,7 @@ impl Makefile {
             // Always add a blank line after the new rule to separate it from the next rule
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
             nodes_to_insert.push(blank_line.into());
@@ -1379,7 +1387,7 @@ impl Makefile {
             // Add a blank line before the new rule
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), "\n");
+            bl_builder.token(NEWLINE.into(), &eol);
             bl_builder.finish_node();
             let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
             nodes_to_insert.push(blank_line.into());
@@ -1620,6 +1628,7 @@ impl Makefile {
     /// assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["config.mk"]);
     /// ```
     pub fn add_include(&mut self, path: &str) -> Include {
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(INCLUDE.into());
         builder.token(IDENTIFIER.into(), "include");
@@ -1630,7 +1639,7 @@ impl Makefile {
         builder.token(IDENTIFIER.into(), path);
         builder.finish_node();
 
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
@@ -1672,6 +1681,7 @@ impl Makefile {
             }));
         }
 
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(INCLUDE.into());
         builder.token(IDENTIFIER.into(), "include");
@@ -1682,7 +1692,7 @@ impl Makefile {
         builder.token(IDENTIFIER.into(), path);
         builder.finish_node();
 
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
@@ -1726,6 +1736,7 @@ impl Makefile {
         after: &MakefileItem,
         path: &str,
     ) -> Result<Include, Error> {
+        let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(INCLUDE.into());
         builder.token(IDENTIFIER.into(), "include");
@@ -1736,7 +1747,7 @@ impl Makefile {
         builder.token(IDENTIFIER.into(), path);
         builder.finish_node();
 
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
