@@ -107,9 +107,13 @@ fn holds_line_break(kind: SyntaxKind) -> bool {
     )
 }
 
-/// The last token in `node`. Unlike `SyntaxNode::last_token`, this doesn't
-/// give up if the last child is an empty node, such as the prerequisites of
-/// `a:`.
+/// The last token in `node`.
+///
+/// rowan's `SyntaxNode::last_token` only follows the last child, so it returns
+/// None when that child is an empty node, which our trees contain (e.g. the
+/// prerequisites of `a:` or the value of `X =`).
+// TODO: rowan 0.18 walks past empty children, so this can probably be dropped
+// after upgrading to it.
 fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     node.descendants_with_tokens()
         .filter_map(|it| it.into_token())
