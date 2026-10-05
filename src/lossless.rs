@@ -1785,7 +1785,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Parse a variable name, which may be built from several parts such
         /// as `CFLAGS.${PROG}` or `a\b`. Returns false if there is no name.
         fn parse_variable_name(&mut self) -> bool {
-            if self.bsd_directives_enabled() {
+            // Without a variant, only names that BSD make would accept get
+            // its nesting rules: GNU make's name in `x{ = 1` is `x{`.
+            if self.is_bsd_make()
+                || (self.bsd_directives_enabled() && self.is_bsd_assignment_line())
+            {
                 return self.parse_bsd_variable_name();
             }
             let at_name = |this: &Self| match this.tokens.last() {
@@ -1817,7 +1821,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             {
                 return false;
             }
-            let mut level = 0usize;
+            // Like `Parse_IsVar`, let the level go negative, so that the name
+            // in `a}b{ = 1` is `a}b{`.
+            let mut level = 0isize;
             loop {
                 match self.current() {
                     None | Some(NEWLINE | COMMENT) => return true,
@@ -1835,7 +1841,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(kind) => {
                         match kind {
                             LPAREN | LBRACE => level += 1,
-                            RPAREN | RBRACE => level = level.saturating_sub(1),
+                            RPAREN | RBRACE => level -= 1,
                             _ => {}
                         }
                         self.bump();
@@ -2570,7 +2576,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
                     Some(DOLLAR) => self.parse_normal_content(),
-                    Some(BACKSLASH) if self.is_assignment_line() => self.parse_assignment(),
+                    Some(BACKSLASH) if self.is_variable_assignment_line() => {
+                        self.parse_assignment()
+                    }
                     Some(QUOTE) => self.parse_quoted_string(),
                     Some(_) => {
                         // Be more tolerant of unexpected tokens in conditionals
@@ -2601,12 +2609,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // that e.g. "vpath = foo" defines a variable.
             if self.is_define_line() {
                 self.parse_define();
-            } else if self.is_assignment_line()
-                || (self.bsd_directives_enabled()
-                    && self.is_bsd_assignment_line()
-                    && (self.variant == Some(MakefileVariant::BSDMake)
-                        || !self.line_has_dependency_operator()))
-            {
+            } else if self.is_variable_assignment_line() {
                 self.parse_assignment();
             } else if self.at_include_keyword() {
                 self.parse_include();
@@ -3709,7 +3712,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 // Variable names may start with a backslash, e.g. `\n := ...`
-                Some(BACKSLASH) if self.is_assignment_line() => {
+                Some(BACKSLASH) if self.is_variable_assignment_line() => {
                     self.parse_assignment();
                     true
                 }
@@ -4028,10 +4031,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 && !matches!(words.next(), Some((OPERATOR, _)))
         }
 
-        fn is_assignment_line(&mut self) -> bool {
-            if self.is_bsd_make() && self.at_gmake_export() {
-                return true;
+        /// Whether the line is a variable assignment for the variant being
+        /// parsed. BSD make only follows its own rule, so that `x{ = 1` is
+        /// an assignment for GNU make but not for BSD make.
+        fn is_variable_assignment_line(&mut self) -> bool {
+            if self.is_bsd_make() {
+                return self.at_gmake_export() || self.is_bsd_assignment_line();
             }
+            self.is_assignment_line()
+                || (self.bsd_directives_enabled()
+                    && self.is_bsd_assignment_line()
+                    && !self.line_has_dependency_operator())
+        }
+
+        fn is_assignment_line(&mut self) -> bool {
             if self.is_undefine_line() {
                 return true;
             }
@@ -9104,6 +9117,32 @@ all: $(OBJS)
         let root = parsed.root();
         assert_eq!(top_level_kinds(root.syntax()), vec![RULE, RULE]);
         assert_eq!(root.to_string(), text);
+    }
+
+    #[test]
+    fn test_bsd_unbalanced_brackets_not_assignment() {
+        // BSD make's Parse_IsVar ignores operators inside brackets, so these
+        // are invalid dependency lines rather than assignments.
+        for text in ["x{ = 1\n", "a{b = 1\n", "a}b = 1\n", "{x = 1\n", "}x = 1\n"] {
+            let parsed = parse(text, Some(MakefileVariant::BSDMake));
+            assert_eq!(
+                parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>(),
+                vec![ParseErrorKind::MissingSeparator],
+                "{text:?}"
+            );
+            let root = parsed.root();
+            assert_eq!(root.variable_definitions().count(), 0, "{text:?}");
+            assert_eq!(root.to_string(), text);
+        }
+        // With `:=` they are dependency lines, as in `a}b: = 1`.
+        for (text, target) in [("a}b := 1\n", "a}b"), (")x := 1\n", ")x")] {
+            let parsed = parse(text, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![], "{text:?}");
+            let root = parsed.root();
+            assert_eq!(root.to_string(), text);
+            let targets: Vec<Vec<String>> = root.rules().map(|r| r.targets().collect()).collect();
+            assert_eq!(targets, vec![vec![target.to_string()]], "{text:?}");
+        }
     }
 
     #[test]
