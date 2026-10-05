@@ -86,7 +86,8 @@ fn quoted_pair(s: &str) -> Option<Vec<String>> {
     }
 }
 
-/// An item in a branch of a [`Conditional`].
+/// An item in a branch of a [`Conditional`], in the body of a
+/// [`Rule`](crate::Rule) or in the body of a [`ForLoop`](crate::ForLoop).
 ///
 /// Conditionals that are part of a rule's recipe can contain recipe lines in
 /// addition to ordinary makefile items.
@@ -99,7 +100,7 @@ pub enum ConditionalItem {
 }
 
 impl ConditionalItem {
-    fn cast(node: SyntaxNode<Lang>) -> Option<Self> {
+    pub(crate) fn cast(node: SyntaxNode<Lang>) -> Option<Self> {
         match Recipe::cast(node.clone()) {
             Some(recipe) => Some(Self::Recipe(recipe)),
             None => MakefileItem::cast(node).map(Self::Item),

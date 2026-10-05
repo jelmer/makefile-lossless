@@ -1,4 +1,5 @@
 use super::collapse_continuations;
+use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
@@ -619,6 +620,9 @@ impl Rule {
     /// the rule, though `Makefile::rules()` and `Makefile::variable_definitions()`
     /// do include them.
     ///
+    /// Use [`Rule::body_items`] to get the [`Recipe`] nodes rather than just
+    /// their text, as well as BSD `.for` loops, which this skips.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Rule, RuleItem};
@@ -655,6 +659,46 @@ impl Rule {
             .children()
             .filter(|n| n.kind() == RECIPE || n.kind() == CONDITIONAL)
             .filter_map(RuleItem::cast)
+    }
+
+    /// Get the items in the rule's body in source order, with recipe lines
+    /// as [`Recipe`] nodes.
+    ///
+    /// This is like [`Rule::items`], but yields the [`Recipe`] node rather
+    /// than just its text, so that position information, prefixes and
+    /// [`Recipe::shell_text`] are available. It also includes the other
+    /// items the parser places in a rule's body, such as GNU conditionals
+    /// and BSD `.if` and `.for` blocks. A recipe given on the rule line
+    /// after a `;` is the first item.
+    ///
+    /// The items of a conditional are available through
+    /// [`ConditionalBranch::items`](crate::ConditionalBranch::items), and
+    /// those of a `.for` loop through
+    /// [`ForLoop::body_items`](crate::ForLoop::body_items).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{ConditionalItem, MakefileItem, Rule};
+    ///
+    /// let rule: Rule = "test: ; @echo start\nifdef V\n\techo verbose\nendif\n".parse().unwrap();
+    /// let items: Vec<_> = rule.body_items().collect();
+    /// assert_eq!(items.len(), 2);
+    ///
+    /// let ConditionalItem::Recipe(first) = &items[0] else { panic!() };
+    /// assert_eq!(first.shell_text(), "@echo start");
+    /// assert!(first.is_silent());
+    /// assert_eq!(first.line(), 0);
+    ///
+    /// let ConditionalItem::Item(MakefileItem::Conditional(cond)) = &items[1] else { panic!() };
+    /// assert_eq!(cond.conditional_type(), Some("ifdef".to_string()));
+    /// ```
+    pub fn body_items(&self) -> impl Iterator<Item = ConditionalItem> {
+        self.syntax()
+            .children()
+            // A VARIABLE child is a target-specific assignment on the rule
+            // line, not part of the body.
+            .filter(|n| n.kind() != VARIABLE)
+            .filter_map(ConditionalItem::cast)
     }
 
     /// Replace the command at index i with a new line
@@ -1276,7 +1320,7 @@ impl Default for Makefile {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Makefile, Rule};
+    use crate::{ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem};
 
     #[test]
     fn test_rules_with_pipe_in_shell_continuation() {
@@ -1700,6 +1744,123 @@ mod tests {
 
     fn recipes(rule: &Rule) -> Vec<String> {
         rule.recipes().collect()
+    }
+
+    fn describe_body_item(item: ConditionalItem) -> String {
+        match item {
+            ConditionalItem::Recipe(r) => format!("{}: {}", r.line(), r.text()),
+            ConditionalItem::Item(MakefileItem::Conditional(c)) => {
+                let branches: Vec<String> = c
+                    .branches()
+                    .map(|b| {
+                        let items: Vec<String> = b.items().map(describe_body_item).collect();
+                        format!(
+                            "{} [{}]",
+                            b.conditional_type().unwrap_or_else(|| "else".to_string()),
+                            items.join(", ")
+                        )
+                    })
+                    .collect();
+                branches.join(" ")
+            }
+            ConditionalItem::Item(MakefileItem::ForLoop(f)) => {
+                let items: Vec<String> = f.body_items().map(describe_body_item).collect();
+                format!(".for [{}]", items.join(", "))
+            }
+            ConditionalItem::Item(_) => "other".to_string(),
+        }
+    }
+
+    fn body(rule: &Rule) -> Vec<String> {
+        rule.body_items().map(describe_body_item).collect()
+    }
+
+    #[test]
+    fn test_body_items_plain_recipes() {
+        let rule: Rule = "all: dep\n\techo a\n\t@echo b\n".parse().unwrap();
+        assert_eq!(body(&rule), vec!["1: echo a", "2: @echo b"]);
+    }
+
+    #[test]
+    fn test_body_items_empty() {
+        let rule: Rule = "all: dep\n".parse().unwrap();
+        assert_eq!(body(&rule), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_body_items_scoped_assignment() {
+        let rule: Rule = "all: CFLAGS = -O2\n".parse().unwrap();
+        assert_eq!(body(&rule), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_body_items_inline_recipe() {
+        let rule: Rule = "all: dep ; echo a\n\techo b\n".parse().unwrap();
+        assert_eq!(body(&rule), vec!["0: echo a", "1: echo b"]);
+        let first = match rule.body_items().next() {
+            Some(ConditionalItem::Recipe(r)) => r,
+            _ => panic!("expected recipe"),
+        };
+        assert_eq!(first.indent(), None);
+    }
+
+    #[test]
+    fn test_body_items_conditional() {
+        let rule: Rule = "all:\n\techo a\nifdef X\n\techo b\nelse\n\t@echo c\nendif\n\techo d\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            body(&rule),
+            vec![
+                "1: echo a",
+                "ifdef [3: echo b] else [5: @echo c]",
+                "7: echo d"
+            ]
+        );
+        assert_eq!(
+            rule.items()
+                .map(|item| match item {
+                    RuleItem::Recipe(text) => text,
+                    RuleItem::Conditional(_) => "conditional".to_string(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["echo a", "conditional", "echo d"]
+        );
+    }
+
+    #[test]
+    fn test_body_items_nested_conditionals() {
+        let rule: Rule =
+            "all: ; echo a\nifdef X\n\techo b\nifeq ($(Y),1)\n\techo c\nendif\nendif\n\techo d\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            body(&rule),
+            vec![
+                "0: echo a",
+                "ifdef [2: echo b, ifeq [4: echo c]]",
+                "7: echo d"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_body_items_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            "all:\n\techo a\n.if defined(X)\n\techo b\n.endif\n.for f in a b\n\techo ${f}\n.endfor\n\techo c\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            body(&rule),
+            vec![
+                "1: echo a",
+                ".if [3: echo b]",
+                ".for [6: echo ${f}]",
+                "8: echo c"
+            ]
+        );
     }
 
     #[test]
