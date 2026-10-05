@@ -1946,6 +1946,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             // Skip any trailing whitespace on the header line.
             self.skip_ws();
+            // A comment on the header line is not part of the value.
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
             // Consume the header-terminating newline (kept as a child).
             if self.current() == Some(NEWLINE) {
                 self.bump();
@@ -3836,6 +3840,52 @@ mod tests {
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(Some("foo bar".to_string()), var.name());
         assert_eq!(Some("body\n".to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_define_header_comment() {
+        // make drops a comment on the define header line but keeps `#` in
+        // the body.
+        let code = "define foo # c\nbody # x\nendef\n";
+        let parsed = parse(code, None);
+        assert!(parsed.errors.is_empty());
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..30
+  VARIABLE@0..30
+    IDENTIFIER@0..6 "define"
+    WHITESPACE@6..7 " "
+    IDENTIFIER@7..10 "foo"
+    WHITESPACE@10..11 " "
+    COMMENT@11..14 "# c"
+    NEWLINE@14..15 "\n"
+    EXPR@15..24
+      IDENTIFIER@15..19 "body"
+      WHITESPACE@19..20 " "
+      COMMENT@20..23 "# x"
+      NEWLINE@23..24 "\n"
+    IDENTIFIER@24..29 "endef"
+    NEWLINE@29..30 "\n"
+"##
+        );
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("foo".to_string()), vars[0].name());
+        assert_eq!(Some("body # x\n".to_string()), vars[0].raw_value());
+    }
+
+    #[test]
+    fn test_define_header_comment_after_operator() {
+        let code = "define foo := # c\nb2\nendef\n";
+        let makefile: Makefile = code.parse().expect("define with comment should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(1, vars.len());
+        assert_eq!(Some("foo".to_string()), vars[0].name());
+        assert_eq!(Some(":=".to_string()), vars[0].assignment_operator());
+        assert_eq!(Some("b2\n".to_string()), vars[0].raw_value());
     }
 
     #[test]
