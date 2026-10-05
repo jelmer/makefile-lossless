@@ -2210,7 +2210,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
 
             // GNU make accepts an empty condition and treats the variable as
-            // undefined, so no name is required.
+            // undefined, so no name is required. It does require the
+            // expanded argument to be at most a single word. A literal after
+            // whitespace always survives expansion as a second word; anything
+            // involving references is left to the evaluator.
+            let mut seen_word = false;
+            let mut after_separator = false;
+            let mut reported_extra_word = false;
+
             loop {
                 match self.current() {
                     None | Some(NEWLINE | COMMENT) => break,
@@ -2221,12 +2228,30 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         break
                     }
-                    Some(WHITESPACE) => self.skip_ws(),
+                    Some(WHITESPACE) => {
+                        after_separator = seen_word;
+                        self.skip_ws();
+                    }
                     Some(BACKSLASH) if self.is_line_continuation() => {
+                        after_separator = seen_word;
                         self.consume_line_continuation();
                     }
-                    Some(DOLLAR) => self.parse_variable_reference(),
-                    Some(_) => self.bump(),
+                    Some(DOLLAR) => {
+                        seen_word = true;
+                        self.parse_variable_reference();
+                    }
+                    Some(_) => {
+                        if after_separator && !reported_extra_word {
+                            reported_extra_word = true;
+                            self.record_error(
+                                ParseErrorKind::InvalidConditional,
+                                "invalid syntax in conditional: expected a single variable name"
+                                    .to_string(),
+                            );
+                        }
+                        seen_word = true;
+                        self.bump();
+                    }
                 }
             }
 
