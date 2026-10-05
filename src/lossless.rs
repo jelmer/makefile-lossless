@@ -3547,30 +3547,62 @@ impl Parse {
     }
 }
 
+/// Offsets just past each newline in the text of `green`, in ascending order.
+fn line_starts(green: &rowan::GreenNodeData) -> Vec<rowan::TextSize> {
+    fn walk(
+        node: &rowan::GreenNodeData,
+        mut offset: rowan::TextSize,
+        out: &mut Vec<rowan::TextSize>,
+    ) {
+        for child in node.children() {
+            match child {
+                rowan::NodeOrToken::Node(n) => walk(n, offset, out),
+                rowan::NodeOrToken::Token(t) => {
+                    out.extend(
+                        t.text()
+                            .match_indices('\n')
+                            .map(|(idx, _)| offset + rowan::TextSize::from((idx + 1) as u32)),
+                    );
+                }
+            }
+            offset += child.text_len();
+        }
+    }
+    let mut out = Vec::new();
+    walk(green, 0.into(), &mut out);
+    out
+}
+
+thread_local! {
+    /// Line starts for the most recently queried tree.
+    ///
+    /// Green nodes are immutable and mutating a tree gives its root a new
+    /// green node, so the root green node identifies the text. Holding on to
+    /// it keeps its address from being reused by another tree.
+    static LINE_STARTS_CACHE: std::cell::RefCell<Option<(rowan::GreenNode, Vec<rowan::TextSize>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Calculate line and column (both 0-indexed) for the given offset in the tree.
 /// Column is measured in bytes from the start of the line.
 pub(crate) fn line_col_at_offset(node: &SyntaxNode, offset: rowan::TextSize) -> (usize, usize) {
     let root = node.ancestors().last().unwrap_or_else(|| node.clone());
-    let mut line = 0;
-    let mut last_newline_offset = rowan::TextSize::from(0);
-
-    for element in root.preorder_with_tokens() {
-        if let rowan::WalkEvent::Enter(rowan::NodeOrToken::Token(token)) = element {
-            if token.text_range().start() >= offset {
-                break;
-            }
-
-            // Count newlines and track position of last one
-            for (idx, _) in token.text().match_indices('\n') {
-                line += 1;
-                last_newline_offset =
-                    token.text_range().start() + rowan::TextSize::from((idx + 1) as u32);
-            }
+    let green = root.green();
+    LINE_STARTS_CACHE.with_borrow_mut(|cache| {
+        let cached = matches!(cache, Some((cached_green, _))
+            if std::ptr::eq::<rowan::GreenNodeData>(&**cached_green, &*green));
+        if !cached {
+            let starts = line_starts(&green);
+            *cache = Some((green.into_owned(), starts));
         }
-    }
-
-    let column: usize = (offset - last_newline_offset).into();
-    (line, column)
+        let starts = &cache.as_ref().unwrap().1;
+        let line = starts.partition_point(|&start| start <= offset);
+        let line_start = match line {
+            0 => rowan::TextSize::from(0),
+            _ => starts[line - 1],
+        };
+        (line, (offset - line_start).into())
+    })
 }
 
 macro_rules! ast_node {
@@ -10632,6 +10664,119 @@ endif
         assert_eq!(includes[0].column(), 0);
         assert_eq!(includes[1].line(), 3);
         assert_eq!(includes[1].column(), 0);
+    }
+
+    /// The original implementation of `line_col_at_offset`, which walks the
+    /// tree from the root on every call.
+    fn line_col_by_walking(node: &SyntaxNode, offset: rowan::TextSize) -> (usize, usize) {
+        let root = node.ancestors().last().unwrap_or_else(|| node.clone());
+        let mut line = 0;
+        let mut last_newline_offset = rowan::TextSize::from(0);
+        for element in root.preorder_with_tokens() {
+            if let rowan::WalkEvent::Enter(rowan::NodeOrToken::Token(token)) = element {
+                if token.text_range().start() >= offset {
+                    break;
+                }
+                for (idx, _) in token.text().match_indices('\n') {
+                    line += 1;
+                    last_newline_offset =
+                        token.text_range().start() + rowan::TextSize::from((idx + 1) as u32);
+                }
+            }
+        }
+        (line, (offset - last_newline_offset).into())
+    }
+
+    fn assert_line_cols_match_walking(root: &SyntaxNode) {
+        let positions = |f: fn(&SyntaxNode, rowan::TextSize) -> (usize, usize)| {
+            root.descendants_with_tokens()
+                .map(|element| {
+                    let start = element.text_range().start();
+                    let node = match &element {
+                        rowan::NodeOrToken::Node(n) => n.clone(),
+                        rowan::NodeOrToken::Token(t) => t.parent().unwrap(),
+                    };
+                    (element.kind(), start, f(&node, start))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            positions(line_col_by_walking),
+            positions(line_col_at_offset)
+        );
+    }
+
+    #[test]
+    fn test_line_col_matches_walking() {
+        let inputs = [
+            "",
+            "VAR = value",
+            "VAR = value\n\nrule: dep\n\tcommand\n",
+            "VAR = value\r\n\r\nrule: dep\r\n\tcommand\r\n",
+            "A = 1\r\nB = 2\nC = 3\r\n",
+            "VAR = a \\\n  b \\\n  c\nrule: x \\\n y\n\tcmd \\\n\t  more\n",
+            "# comment\nifdef A\nifeq ($(B),1)\nX = 1\nelse ifneq ($(C),)\nX = 2\nelse\nX = 3\nendif\nendif\n",
+            "rule:\n\techo a\nifdef V\n\techo verbose\nelse\n\t@echo quiet\nendif\n",
+            "define F\nline one\nline two\nendef\n$(eval $(call F,x))\n",
+            ".if ${A}\nX = 1\n.elif defined(B)\nX = 2\n.else\nX = 3\n.endif\n",
+            "include a.mk\n-include b.mk\nvpath %.c src\n",
+        ];
+        for input in inputs {
+            let (makefile, _) = Makefile::from_str_relaxed(input);
+            assert_line_cols_match_walking(makefile.syntax());
+        }
+    }
+
+    #[test]
+    fn test_line_col_after_mutation() {
+        let mut makefile: Makefile = "A = 1\nifdef X\nB = 2\nendif\nrule: dep\n\tcmd\n"
+            .parse()
+            .unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.line(), 4);
+
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value("one \\\n  two");
+        assert_eq!(rule.line(), 5);
+        assert_line_cols_match_walking(makefile.syntax());
+
+        rule.push_command("second");
+        let mut new_rule = makefile.add_rule("new");
+        new_rule.push_command("build");
+        assert_eq!(new_rule.line(), 9);
+        assert_line_cols_match_walking(makefile.syntax());
+
+        var.remove();
+        assert_eq!(rule.line(), 3);
+        assert_eq!(new_rule.line(), 7);
+        assert_line_cols_match_walking(makefile.syntax());
+    }
+
+    #[test]
+    fn test_line_col_multiple_trees() {
+        let a: Makefile = "A = 1\nrule:\n".parse().unwrap();
+        let b: Makefile = "\n\n\nrule:\n".parse().unwrap();
+        let rule_a = a.rules().next().unwrap();
+        let rule_b = b.rules().next().unwrap();
+        assert_eq!((rule_a.line(), rule_b.line()), (1, 3));
+        assert_eq!((rule_a.line(), rule_b.line()), (1, 3));
+    }
+
+    #[test]
+    fn test_item_text_range() {
+        let makefile: Makefile = "A = 1\nifdef X\nrule:\n\tcmd\nendif\n".parse().unwrap();
+        let ranges: Vec<_> = makefile.items().map(|i| i.text_range()).collect();
+        assert_eq!(
+            ranges,
+            vec![
+                rowan::TextRange::new(0.into(), 6.into()),
+                rowan::TextRange::new(6.into(), 31.into()),
+            ]
+        );
+        let cond = makefile.conditionals().next().unwrap();
+        let branch = cond.branches().next().unwrap();
+        let ranges: Vec<_> = branch.items().map(|i| i.text_range()).collect();
+        assert_eq!(ranges, vec![rowan::TextRange::new(14.into(), 25.into())]);
     }
 
     #[test]
