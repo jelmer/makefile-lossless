@@ -5030,6 +5030,63 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_in_reference_is_literal() {
+        let text = "X = ${A:M#*}\nY = $(a #b) c # d\nall: $(subst #,x,a#b)\n";
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), text);
+            assert_eq!(
+                makefile
+                    .variable_definitions()
+                    .map(|v| v.raw_value().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["${A:M#*}", "$(a #b) c "]
+            );
+            assert_eq!(
+                makefile
+                    .variable_references()
+                    .map(|r| (r.name(), r.syntax().to_string()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (Some("A".to_string()), "${A:M#*}".to_string()),
+                    (Some("a".to_string()), "$(a #b)".to_string()),
+                    (Some("subst".to_string()), "$(subst #,x,a#b)".to_string()),
+                ]
+            );
+            assert_eq!(
+                makefile
+                    .rules()
+                    .next()
+                    .unwrap()
+                    .prerequisites()
+                    .collect::<Vec<_>>(),
+                vec!["$(subst #,x,a#b)"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_in_reference_is_comment_in_bsd() {
+        let text = "X = ${A:M#*}\n";
+        let parsed = parse(text, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.root().to_string(), text);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unclosed variable reference"]
+        );
+    }
+
+    #[test]
     fn test_unclosed_reference_stops_at_newline() {
         let parsed = parse("A = ${B\nC = 1\n", None);
         assert_eq!(
