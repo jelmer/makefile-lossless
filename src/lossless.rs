@@ -1539,7 +1539,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Like GNU Make, check for an assignment before include/vpath so
             // that e.g. "vpath = foo" defines a variable.
-            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "define" {
+            if self.is_define_line() {
                 self.parse_define();
             } else if self.is_assignment_line() {
                 self.parse_assignment();
@@ -1992,7 +1992,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.in_rule = false;
             self.builder.start_node(VARIABLE.into());
 
-            // Consume the `define` keyword itself.
+            // Consume any `override`/`export`/`private` modifiers and the
+            // `define` keyword itself.
+            while self.current() == Some(IDENTIFIER)
+                && Self::is_define_modifier(&self.tokens.last().unwrap().1)
+            {
+                self.bump();
+                self.skip_ws();
+            }
             self.bump();
             // Optional whitespace then the variable name.
             self.skip_ws();
@@ -2072,6 +2079,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             self.pending_backslash_escape = false;
             self.builder.token(IDENTIFIER.into(), &name);
+        }
+
+        fn is_define_modifier(token: &str) -> bool {
+            matches!(token, "override" | "export" | "private")
+        }
+
+        /// Whether the current line starts a `define` block, optionally
+        /// preceded by modifiers such as `override define NAME`.
+        fn is_define_line(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .filter(|(kind, _)| *kind != WHITESPACE)
+                .find(|(kind, text)| !(*kind == IDENTIFIER && Self::is_define_modifier(text)))
+                .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "define")
         }
 
         /// Return the text of the first non-whitespace token on the current
@@ -3920,6 +3942,99 @@ mod tests {
         assert_eq!(Some("foo".to_string()), vars[0].name());
         assert_eq!(Some(":=".to_string()), vars[0].assignment_operator());
         assert_eq!(Some("b2\n".to_string()), vars[0].raw_value());
+    }
+
+    #[test]
+    fn test_define_with_modifiers() {
+        let code = "override define FOO :=\nbody\nendef\nexport define BAR\nline\nendef\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(0, makefile.rules().count());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(2, vars.len());
+
+        assert!(vars[0].is_define());
+        assert!(vars[0].is_override());
+        assert!(!vars[0].is_export());
+        assert_eq!(Some("FOO".to_string()), vars[0].name());
+        assert_eq!(Some(":=".to_string()), vars[0].assignment_operator());
+        assert_eq!(Some("body\n".to_string()), vars[0].raw_value());
+
+        assert!(vars[1].is_define());
+        assert!(!vars[1].is_override());
+        assert!(vars[1].is_export());
+        assert_eq!(Some("BAR".to_string()), vars[1].name());
+        assert_eq!(None, vars[1].assignment_operator());
+        assert_eq!(Some("line\n".to_string()), vars[1].raw_value());
+    }
+
+    #[test]
+    fn test_define_with_combined_modifiers() {
+        let code = "override export define OE =\nx\nendef\nprivate define P\ny\nendef\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(2, vars.len());
+
+        assert!(vars[0].is_define());
+        assert!(vars[0].is_override());
+        assert!(vars[0].is_export());
+        assert_eq!(Some("OE".to_string()), vars[0].name());
+        assert_eq!(Some("=".to_string()), vars[0].assignment_operator());
+        assert_eq!(Some("x\n".to_string()), vars[0].raw_value());
+
+        assert!(vars[1].is_define());
+        assert!(!vars[1].is_override());
+        assert!(!vars[1].is_export());
+        assert_eq!(Some("P".to_string()), vars[1].name());
+        assert_eq!(Some("y\n".to_string()), vars[1].raw_value());
+    }
+
+    #[test]
+    fn test_modifier_keyword_as_variable_name() {
+        let makefile: Makefile = "private = 1\n".parse().unwrap();
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(Some("private".to_string()), vars[0].name());
+    }
+
+    #[test]
+    fn test_define_with_modifier_in_conditional() {
+        let code = "ifdef X\noverride define FOO\nbody\nendef\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(0, makefile.rules().count());
+        let cond = makefile.conditionals().next().unwrap();
+        let if_items: Vec<_> = cond.if_items().collect();
+        assert_eq!(1, if_items.len());
+        let MakefileItem::Variable(var) = &if_items[0] else {
+            panic!("expected a variable, got {:?}", if_items[0].syntax());
+        };
+        assert!(var.is_define());
+        assert!(var.is_override());
+        assert_eq!(Some("FOO".to_string()), var.name());
+        assert_eq!(Some("body\n".to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_private_define_and_private_assignment() {
+        let code = "private define X\nbody\nendef\nprivate Y = 1\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(2, vars.len());
+        assert!(vars[0].is_define());
+        assert_eq!(Some("X".to_string()), vars[0].name());
+        assert!(!vars[1].is_define());
+        assert_eq!(Some("Y".to_string()), vars[1].name());
+        assert_eq!(Some("1".to_string()), vars[1].raw_value());
     }
 
     #[test]
