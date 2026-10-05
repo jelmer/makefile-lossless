@@ -100,8 +100,28 @@ impl<'a> Lexer<'a> {
         c == ' ' || c == '\t'
     }
 
-    fn is_newline(c: char) -> bool {
-        c == '\n' || c == '\r'
+    /// Whether the input is at a line ending. Like GNU make and BSD make,
+    /// only take LF and CRLF as line endings; a lone CR is an ordinary
+    /// character.
+    fn at_newline(&self) -> bool {
+        let mut probe = self.input.clone();
+        match probe.next() {
+            Some('\n') => true,
+            Some('\r') => probe.next() == Some('\n'),
+            _ => false,
+        }
+    }
+
+    /// Read up to the end of the line.
+    fn read_line(&mut self) -> String {
+        let mut result = String::new();
+        while !self.at_newline() {
+            let Some(c) = self.input.next() else {
+                break;
+            };
+            result.push(c);
+        }
+        result
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
@@ -124,7 +144,7 @@ impl<'a> Lexer<'a> {
         let mut probe = self.input.clone();
         probe.next(); // Skip the opening quote we already peeked.
         while let Some(c) = probe.next() {
-            if Self::is_newline(c) {
+            if c == '\n' {
                 return false;
             }
             if c == '\\' {
@@ -162,7 +182,7 @@ impl<'a> Lexer<'a> {
                 quoted.extend(probe.next());
             }
         }
-        let rest: Vec<char> = probe.take_while(|&c| !Self::is_newline(c)).collect();
+        let rest: Vec<char> = probe.take_while(|&c| c != '\n').collect();
         // Whether the open references are closed on this line.
         let closes = |chars: &mut dyn Iterator<Item = &char>| {
             let mut depth = self.reference_depth;
@@ -210,17 +230,16 @@ impl<'a> Lexer<'a> {
     /// Read a comment up to the end of the line. Outside recipes, a comment
     /// ending in an unescaped backslash continues on the next line.
     fn read_comment(&mut self) -> String {
-        let mut comment = self.read_while(|c| !Self::is_newline(c));
+        let mut comment = self.read_line();
         while self.line_type == Some(LineType::Other)
             && comment.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
-            && self.input.peek().is_some_and(|&c| Self::is_newline(c))
+            && self.at_newline()
         {
-            let newline = self.input.next().unwrap();
-            comment.push(newline);
-            if newline == '\r' && self.input.peek() == Some(&'\n') {
-                comment.push(self.input.next().unwrap());
+            if let Some(cr) = self.input.next_if_eq(&'\r') {
+                comment.push(cr);
             }
-            comment.push_str(&self.read_while(|c| !Self::is_newline(c)));
+            comment.extend(self.input.next());
+            comment.push_str(&self.read_line());
         }
         comment
     }
@@ -304,15 +323,12 @@ impl<'a> Lexer<'a> {
             }
 
             match c {
-                c if Self::is_newline(c) => {
+                _ if self.at_newline() => {
                     self.line_type = None;
-                    let mut text = self.input.next()?.to_string();
-                    // GNU make treats CRLF as a single line ending.
-                    if c == '\r' {
-                        if let Some(lf) = self.input.next_if_eq(&'\n') {
-                            text.push(lf);
-                        }
-                    }
+                    // Take CRLF as a single line ending.
+                    let mut text = String::new();
+                    text.extend(self.input.next_if_eq(&'\r'));
+                    text.extend(self.input.next());
                     return Some((SyntaxKind::NEWLINE, text));
                 }
                 '#' if !(self.bsd && after_lbracket && self.line_type == Some(LineType::Other)) => {
@@ -323,7 +339,7 @@ impl<'a> Lexer<'a> {
 
             match self.line_type.unwrap() {
                 LineType::Recipe => {
-                    let text = self.read_while(|c| !Self::is_newline(c));
+                    let text = self.read_line();
                     let trailing_backslashes =
                         text.chars().rev().take_while(|&c| c == '\\').count();
                     self.recipe_continuation = trailing_backslashes % 2 == 1;
@@ -445,7 +461,7 @@ impl<'a> Lexer<'a> {
                         }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
-                        if !escaped && self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
+                        if !escaped && self.at_newline() {
                             self.continuation = true;
                         }
                         self.pending_backslash_escape = !escaped;
@@ -520,9 +536,9 @@ pub(crate) fn lex_non_recipe_line(
     // A continued comment takes in the newline and the next line, so if
     // the input ends in a newline that is part of a comment, the comment
     // continues past it.
-    let comment_continues = tokens.last().is_some_and(|(kind, text)| {
-        *kind == SyntaxKind::COMMENT && text.ends_with(Lexer::is_newline)
-    });
+    let comment_continues = tokens
+        .last()
+        .is_some_and(|(kind, text)| *kind == SyntaxKind::COMMENT && text.ends_with('\n'));
     (tokens, lexer.continuation || comment_continues)
 }
 
@@ -596,6 +612,36 @@ rule: prerequisite
                 (INDENT, "\t".to_string()),
                 (TEXT, "echo".to_string()),
                 (NEWLINE, "\r\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lone_cr() {
+        // Only CRLF and LF end a line; a lone CR is an ordinary character.
+        assert_eq!(
+            lex_default("X = a\rb\\\rc\r\r\n# d\re\nall:\n\tf\rg\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (OPERATOR, "=".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (TEXT, "\r".to_string()),
+                (IDENTIFIER, "b".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (TEXT, "\r".to_string()),
+                (IDENTIFIER, "c".to_string()),
+                (TEXT, "\r".to_string()),
+                (NEWLINE, "\r\n".to_string()),
+                (COMMENT, "# d\re".to_string()),
+                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "all".to_string()),
+                (OPERATOR, ":".to_string()),
+                (NEWLINE, "\n".to_string()),
+                (INDENT, "\t".to_string()),
+                (TEXT, "f\rg".to_string()),
+                (NEWLINE, "\n".to_string()),
             ]
         );
     }

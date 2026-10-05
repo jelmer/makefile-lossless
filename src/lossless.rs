@@ -528,15 +528,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let Some((COMMENT, text)) = self.tokens.last() else {
                 return false;
             };
-            let Some(eol) = text.find(['\r', '\n']) else {
+            let Some(lf) = text.find('\n') else {
                 return false;
             };
-            let eol_end = eol
-                + if text[eol..].starts_with("\r\n") {
-                    2
-                } else {
-                    1
-                };
+            let eol = text[..lf].strip_suffix('\r').unwrap_or(&text[..lf]).len();
+            let eol_end = lf + 1;
             let rest = &text[eol_end..];
             let indent_end = eol_end + rest.len() - rest.trim_start_matches([' ', '\t']).len();
             let pieces: Vec<(SyntaxKind, String)> = [
@@ -1756,7 +1752,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     // A quoted string spanning lines. Its line continuation
                     // is not replaced, so stop here.
-                    _ if token.contains(['\n', '\r']) => {
+                    _ if token.contains('\n') => {
                         line.end = start;
                         break;
                     }
@@ -5138,6 +5134,14 @@ mod tests {
         assert_eq!(
             reference_texts("Y = $(X:S/)/y/)\n", MakefileVariant::BSDMake),
             vec!["$(X:S/)/y/)"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_closing_brace_with_lone_cr() {
+        assert_eq!(
+            reference_texts("Y = ${X:S,},\"a\rb\",} c\n", MakefileVariant::BSDMake),
+            vec!["${X:S,},\"a\rb\",}"]
         );
     }
 
@@ -13959,5 +13963,102 @@ mod test_crlf {
         let makefile = parse_crlf("X = 1\r\n");
         makefile.items().next().unwrap().add_comment("hi").unwrap();
         assert_eq!(makefile.to_string(), "# hi\r\nX = 1\r\n");
+    }
+
+    fn parse_lone_cr(src: &str, variant: Option<crate::MakefileVariant>) -> Makefile {
+        let parsed = match variant {
+            Some(variant) => Makefile::parse_with_variant(src, variant),
+            None => crate::Parse::<Makefile>::parse_makefile(src),
+        };
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), src);
+        makefile
+    }
+
+    const VARIANTS: [Option<crate::MakefileVariant>; 5] = [
+        None,
+        Some(crate::MakefileVariant::GNUMake),
+        Some(crate::MakefileVariant::BSDMake),
+        Some(crate::MakefileVariant::POSIXMake),
+        Some(crate::MakefileVariant::NMake),
+    ];
+
+    #[test]
+    fn test_lone_cr_in_value() {
+        for variant in VARIANTS {
+            let makefile = parse_lone_cr("X = a\rb\nY = c\r\r\nZ = d\\\re\n", variant);
+            assert_eq!(makefile.rules().count(), 0);
+            assert_eq!(
+                variables(&makefile),
+                vec![
+                    ("X".to_string(), "a\rb".to_string()),
+                    ("Y".to_string(), "c\r".to_string()),
+                    ("Z".to_string(), "d\\\re".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lone_cr_in_comment() {
+        for variant in VARIANTS {
+            let makefile = parse_lone_cr("# a\rb: c\nX = 1\n", variant);
+            assert_eq!(makefile.rules().count(), 0);
+            assert_eq!(
+                variables(&makefile),
+                vec![("X".to_string(), "1".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lone_cr_in_recipe() {
+        for variant in VARIANTS {
+            let makefile = parse_lone_cr("all: a\rb\n\techo a\rb\n\techo c\r\n", variant);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
+            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a\rb"]);
+            assert_eq!(
+                rule.recipes().collect::<Vec<_>>(),
+                vec!["echo a\rb", "echo c"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lone_cr_in_quoted_value() {
+        let makefile = parse_lone_cr("X = a \"b\rc\" \\\n  d\n", None);
+        assert_eq!(
+            variables(&makefile),
+            vec![("X".to_string(), "a \"b\rc\" \\\n  d".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_lone_cr_in_inline_recipe_comment() {
+        let makefile = parse_lone_cr("all: ; echo a # b\rc \\\n\td\n", None);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipe_nodes().map(|r| r.text()).collect::<Vec<_>>(),
+            vec!["echo a # b\rc \\\nd"]
+        );
+    }
+
+    #[test]
+    fn test_lone_cr_after_semicolon() {
+        let makefile = parse_lone_cr("$(info a); echo b\r", None);
+        let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
+            panic!("expected an expression statement");
+        };
+        assert_eq!(stmt.after_semicolon(), Some("echo b\r".to_string()));
+    }
+
+    #[test]
+    fn test_lone_cr_line_ending() {
+        let makefile = parse_lone_cr("X = a\rb\nall:\n\techo a\n", None);
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().next().unwrap().insert_after("echo b");
+        assert_eq!(makefile.to_string(), "X = a\rb\nall:\n\techo a\n\techo b\n");
     }
 }
