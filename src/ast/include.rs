@@ -605,4 +605,21 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["b.mk"]);
     }
+
+    #[test]
+    fn test_path_excludes_comment() {
+        let makefile: Makefile = "include foo.mk # comment\n.include <bsd.own.mk> # c\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile.includes().map(|i| i.path()).collect::<Vec<_>>(),
+            vec![Some("foo.mk".to_string()), Some("bsd.own.mk".to_string())]
+        );
+        let mut inc = makefile.includes().next().unwrap();
+        inc.set_path("bar.mk");
+        assert_eq!(
+            makefile.to_string(),
+            "include bar.mk # comment\n.include <bsd.own.mk> # c\n"
+        );
+    }
 }

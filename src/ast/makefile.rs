@@ -9,6 +9,16 @@ use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
 use std::collections::VecDeque;
 
+/// The `else` and `endif` keywords for a conditional of the given type,
+/// which may be a GNU make (`ifdef`) or BSD make (`.ifdef`) conditional.
+fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'static str)> {
+    match conditional_type {
+        "ifdef" | "ifndef" | "ifeq" | "ifneq" => Some(("else", "endif")),
+        ".if" | ".ifdef" | ".ifndef" | ".ifmake" | ".ifnmake" => Some((".else", ".endif")),
+        _ => None,
+    }
+}
+
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
 pub enum MakefileItem {
@@ -865,7 +875,8 @@ impl Makefile {
     /// Add a new conditional to the makefile
     ///
     /// # Arguments
-    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq"
+    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
+    ///   or for BSD make ".if", ".ifdef", ".ifndef", ".ifmake" or ".ifnmake"
     /// * `condition` - The condition expression (e.g., "DEBUG" for ifdef/ifndef, or "(a,b)" for ifeq/ifneq)
     /// * `if_body` - The content of the if branch
     /// * `else_body` - Optional content for the else branch
@@ -885,18 +896,18 @@ impl Makefile {
         else_body: Option<&str>,
     ) -> Result<Conditional, Error> {
         // Validate conditional type
-        if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&conditional_type) {
+        let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     message: format!(
-                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq",
+                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
                         conditional_type
                     ),
                     line: 1,
                     context: "add_conditional".to_string(),
                 }],
             }));
-        }
+        };
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL.into());
@@ -931,7 +942,7 @@ impl Makefile {
         // Add else clause if provided
         if let Some(else_content) = else_body {
             builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), "else");
+            builder.token(IDENTIFIER.into(), else_keyword);
             builder.token(NEWLINE.into(), "\n");
             builder.finish_node();
 
@@ -952,7 +963,7 @@ impl Makefile {
 
         // Build CONDITIONAL_ENDIF
         builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(IDENTIFIER.into(), endif_keyword);
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 
@@ -991,7 +1002,8 @@ impl Makefile {
     /// `MakefileItem` instead of raw strings.
     ///
     /// # Arguments
-    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq"
+    /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
+    ///   or for BSD make ".if", ".ifdef", ".ifndef", ".ifmake" or ".ifnmake"
     /// * `condition` - The condition expression (e.g., "DEBUG" for ifdef/ifndef, or "(a,b)" for ifeq/ifneq)
     /// * `if_items` - Items for the if branch
     /// * `else_items` - Optional items for the else branch
@@ -1026,18 +1038,18 @@ impl Makefile {
         I2: IntoIterator<Item = MakefileItem>,
     {
         // Validate conditional type
-        if !["ifdef", "ifndef", "ifeq", "ifneq"].contains(&conditional_type) {
+        let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     message: format!(
-                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq",
+                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
                         conditional_type
                     ),
                     line: 1,
                     context: "add_conditional_with_items".to_string(),
                 }],
             }));
-        }
+        };
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL.into());
@@ -1067,7 +1079,7 @@ impl Makefile {
         // Add else clause if provided
         if let Some(else_iter) = else_items {
             builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), "else");
+            builder.token(IDENTIFIER.into(), else_keyword);
             builder.token(NEWLINE.into(), "\n");
             builder.finish_node();
 
@@ -1081,7 +1093,7 @@ impl Makefile {
 
         // Build CONDITIONAL_ENDIF
         builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(IDENTIFIER.into(), endif_keyword);
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 

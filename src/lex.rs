@@ -19,6 +19,8 @@ pub struct Lexer<'a> {
     pending_backslash_escape: bool,
     /// Whether BSD make syntax is accepted.
     bsd: bool,
+    /// Whether GNU make syntax is accepted.
+    gnu: bool,
     /// Whether the previous token was a `[`. BSD make does not treat `#` as
     /// a comment there, so that the `:[#]` modifier works.
     after_lbracket: bool,
@@ -40,6 +42,7 @@ impl<'a> Lexer<'a> {
             line_type: None,
             pending_backslash_escape: false,
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
+            gnu: variant != Some(MakefileVariant::BSDMake),
             after_lbracket: false,
             recipe_continuation: false,
             reference_depth: 0,
@@ -303,7 +306,9 @@ impl<'a> Lexer<'a> {
                         let text = self.input.by_ref().take(len).collect();
                         Some((SyntaxKind::OPERATOR, text))
                     }
-                    '&' => {
+                    // BSD make has no grouped targets, and takes the `&` in
+                    // `a b &: c` as a target.
+                    '&' if self.gnu => {
                         // `&:` and `&::` separate grouped targets from their
                         // prerequisites; any other `&` is just a character.
                         let mut probe = self.input.clone();
@@ -321,7 +326,7 @@ impl<'a> Lexer<'a> {
                         let kind = if len > 1 {
                             SyntaxKind::OPERATOR
                         } else {
-                            SyntaxKind::ERROR
+                            SyntaxKind::TEXT
                         };
                         Some((kind, text))
                     }
@@ -388,10 +393,11 @@ impl<'a> Lexer<'a> {
                         self.pending_backslash_escape = !escaped;
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
+                    // Any other character is plain text to make.
                     _ => {
                         self.input.next();
                         self.after_lbracket = c == '[';
-                        Some((SyntaxKind::ERROR, c.to_string()))
+                        Some((SyntaxKind::TEXT, c.to_string()))
                     }
                 },
             }
@@ -588,9 +594,9 @@ rule: prerequisite
             (LBRACE, "{".to_string()),
             (IDENTIFIER, "L".to_string()),
             (OPERATOR, ":".to_string()),
-            (ERROR, "[".to_string()),
-            (ERROR, "#".to_string()),
-            (ERROR, "]".to_string()),
+            (TEXT, "[".to_string()),
+            (TEXT, "#".to_string()),
+            (TEXT, "]".to_string()),
             (RBRACE, "}".to_string()),
             (NEWLINE, "\n".to_string()),
         ];
@@ -605,7 +611,7 @@ rule: prerequisite
                 (LBRACE, "{".to_string()),
                 (IDENTIFIER, "L".to_string()),
                 (OPERATOR, ":".to_string()),
-                (ERROR, "[".to_string()),
+                (TEXT, "[".to_string()),
                 (COMMENT, "#]}".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
@@ -681,6 +687,26 @@ rule: prerequisite
                 (IDENTIFIER, "X".to_string()),
                 (OPERATOR, "=".to_string()),
                 (IDENTIFIER, "1".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_punctuation_is_text() {
+        assert_eq!(
+            lex_default("X = a && b\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (OPERATOR, "=".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (TEXT, "&".to_string()),
+                (TEXT, "&".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "b".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
         );
