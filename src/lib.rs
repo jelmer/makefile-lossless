@@ -119,7 +119,7 @@ pub enum SyntaxKind {
     FOR_END,    // The `.endfor` line
     DIRECTIVE,  // A single-line directive such as `.undef` or `.error`
 
-    EXPRESSION_STATEMENT, // A line of only references, e.g. `$(eval ...)` or `$(info ...)`
+    EXPRESSION_STATEMENT, // A line of only references, e.g. `$(eval ...)` or `$(info ...)`, optionally followed by `;` and text
     TARGET_PATTERN,       // The target pattern of a static pattern rule
 }
 

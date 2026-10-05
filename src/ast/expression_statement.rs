@@ -50,6 +50,42 @@ impl ExpressionStatement {
                 .to_string(),
         )
     }
+
+    /// Returns the text after a `;` following the references, or `None` if
+    /// there is no `;`.
+    ///
+    /// GNU make ignores this text when the references expand to nothing. If
+    /// they expand to a rule header such as `foo:`, it is that rule's
+    /// recipe instead.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let makefile: Makefile = "$(info a); echo b\n".parse().unwrap();
+    /// let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
+    ///     panic!("expected an expression statement");
+    /// };
+    /// assert_eq!(stmt.expression(), "$(info a)");
+    /// assert_eq!(stmt.after_semicolon(), Some("echo b".to_string()));
+    /// ```
+    pub fn after_semicolon(&self) -> Option<String> {
+        let mut tokens = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .skip_while(|t| !(t.kind() == OPERATOR && t.text() == ";"));
+        tokens.next()?;
+        let mut text: String = tokens
+            .skip_while(|t| t.kind() == WHITESPACE)
+            .map(|t| t.text().to_string())
+            .collect();
+        for eol in ["\n", "\r"] {
+            if let Some(stripped) = text.strip_suffix(eol) {
+                text.truncate(stripped.len());
+            }
+        }
+        Some(lf_line_endings(&text))
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +110,44 @@ mod tests {
             stmt.references().map(|r| r.to_string()).collect::<Vec<_>>(),
             vec!["$(foreach d,$(DIRS),$(eval $(call r,$(d))))", "${X}"]
         );
+    }
+
+    fn expression_statement(src: &str) -> crate::lossless::ExpressionStatement {
+        let makefile: Makefile = src.parse().unwrap();
+        assert_eq!(makefile.to_string(), src);
+        let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
+            panic!("expected an expression statement");
+        };
+        stmt
+    }
+
+    #[test]
+    fn test_semicolon() {
+        let stmt = expression_statement("$(info a) ; echo x # y\n");
+        assert_eq!(stmt.expression(), "$(info a)");
+        assert_eq!(
+            stmt.references().map(|r| r.to_string()).collect::<Vec<_>>(),
+            vec!["$(info a)"]
+        );
+        assert_eq!(stmt.after_semicolon(), Some("echo x # y".to_string()));
+    }
+
+    #[test]
+    fn test_semicolon_empty() {
+        let stmt = expression_statement("$(info a);\n");
+        assert_eq!(stmt.after_semicolon(), Some(String::new()));
+    }
+
+    #[test]
+    fn test_semicolon_continuation() {
+        let stmt = expression_statement("$(info a);echo \\\r\n  more\r\n");
+        assert_eq!(stmt.after_semicolon(), Some("echo \\\n  more".to_string()));
+    }
+
+    #[test]
+    fn test_no_semicolon() {
+        let stmt = expression_statement("$(info a) # c ; x\n");
+        assert_eq!(stmt.after_semicolon(), None);
     }
 
     #[test]
