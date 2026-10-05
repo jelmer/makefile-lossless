@@ -22,6 +22,9 @@ pub struct Lexer<'a> {
     /// Whether the previous token was a `[`. BSD make does not treat `#` as
     /// a comment there, so that the `:[#]` modifier works.
     after_lbracket: bool,
+    /// Whether the previous line was a recipe line ending in a backslash, so
+    /// that this line continues the recipe.
+    recipe_continuation: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -33,6 +36,7 @@ impl<'a> Lexer<'a> {
             pending_backslash_escape: false,
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
             after_lbracket: false,
+            recipe_continuation: false,
         }
     }
 
@@ -128,6 +132,8 @@ impl<'a> Lexer<'a> {
         let after_lbracket = self.after_lbracket;
         self.after_lbracket = false;
         if let Some(&c) = self.input.peek() {
+            let recipe_continuation =
+                self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
             match (c, self.line_type) {
                 ('\t', None) if !self.continuation => {
                     self.input.next();
@@ -141,17 +147,16 @@ impl<'a> Lexer<'a> {
                     self.continuation = false;
                     return Some((SyntaxKind::INDENT, "\t".to_string()));
                 }
+                (' ', None) if recipe_continuation => {
+                    // Space-indented continuation of a recipe line
+                    self.line_type = Some(LineType::Recipe);
+                    return Some((SyntaxKind::INDENT, self.read_while(|ch| ch == ' ')));
+                }
                 (' ', None) if !self.continuation => {
-                    // Check if this is the start of a space-indented recipe (2 or 4 spaces)
-                    let spaces = self.read_while(|ch| ch == ' ');
-                    if spaces.len() >= 2 {
-                        self.line_type = Some(LineType::Recipe);
-                        return Some((SyntaxKind::INDENT, spaces));
-                    } else {
-                        // If just a single space, treat as normal whitespace
-                        self.line_type = Some(LineType::Other);
-                        return Some((SyntaxKind::WHITESPACE, spaces));
-                    }
+                    // Only a tab introduces a recipe line; leading spaces are
+                    // allowed before ordinary makefile lines.
+                    self.line_type = Some(LineType::Other);
+                    return Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)));
                 }
                 (' ', None) => {
                     // Continuation line: spaces are indent but not a recipe
@@ -183,7 +188,11 @@ impl<'a> Lexer<'a> {
 
             match self.line_type.unwrap() {
                 LineType::Recipe => {
-                    Some((SyntaxKind::TEXT, self.read_while(|c| !Self::is_newline(c))))
+                    let text = self.read_while(|c| !Self::is_newline(c));
+                    let trailing_backslashes =
+                        text.chars().rev().take_while(|&c| c == '\\').count();
+                    self.recipe_continuation = trailing_backslashes % 2 == 1;
+                    Some((SyntaxKind::TEXT, text))
                 }
                 LineType::Other => match c {
                     c if Self::is_whitespace(c) => {
@@ -306,6 +315,19 @@ impl Iterator for Lexer<'_> {
 
 pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxKind, String)> {
     Lexer::new(input, variant).collect()
+}
+
+/// Lex `input`, treating its first line as an ordinary makefile line even if
+/// it starts with a tab. Also returns whether the input ends in a line
+/// continuation.
+pub(crate) fn lex_non_recipe_line(
+    input: &str,
+    variant: Option<MakefileVariant>,
+) -> (Vec<(SyntaxKind, String)>, bool) {
+    let mut lexer = Lexer::new(input, variant);
+    lexer.line_type = Some(LineType::Other);
+    let tokens = lexer.by_ref().collect();
+    (tokens, lexer.continuation)
 }
 
 #[cfg(test)]
@@ -761,6 +783,43 @@ override_dh_auto_clean:
                 (OPERATOR, "?="),
                 (OPERATOR, "="),
                 (IDENTIFIER, "y"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_space_indented_line() {
+        assert_eq!(
+            lex_default("  X = 1\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (WHITESPACE, "  "),
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "1"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_space_indented_recipe_continuation() {
+        assert_eq!(
+            lex_default("\techo a \\\n    b\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (INDENT, "\t"),
+                (TEXT, "echo a \\"),
+                (NEWLINE, "\n"),
+                (INDENT, "    "),
+                (TEXT, "b"),
                 (NEWLINE, "\n"),
             ]
         );
