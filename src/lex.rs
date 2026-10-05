@@ -446,8 +446,14 @@ pub(crate) fn lex_non_recipe_line(
 ) -> (Vec<(SyntaxKind, String)>, bool) {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
-    let tokens = lexer.by_ref().collect();
-    (tokens, lexer.continuation)
+    let tokens: Vec<_> = lexer.by_ref().collect();
+    // A continued comment takes in the newline and the next line, so if
+    // the input ends in a newline that is part of a comment, the comment
+    // continues past it.
+    let comment_continues = tokens.last().is_some_and(|(kind, text)| {
+        *kind == SyntaxKind::COMMENT && text.ends_with(Lexer::is_newline)
+    });
+    (tokens, lexer.continuation || comment_continues)
 }
 
 #[cfg(test)]
