@@ -361,6 +361,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_variable_reference();
                     true
                 }
+                // Characters such as `*` in `*.o: *.c`
+                Some(ERROR) => {
+                    self.bump();
+                    true
+                }
                 _ => {
                     self.error("expected rule target".to_string());
                     false
@@ -649,6 +654,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             false
         }
 
+        fn line_has_dependency_operator(&self) -> bool {
+            self.tokens
+                .iter()
+                .rev()
+                .take_while(|(kind, _)| *kind != NEWLINE)
+                .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text))
+        }
+
         fn find_and_consume_colon(&mut self) -> bool {
             // Skip whitespace before colon
             self.skip_ws();
@@ -659,15 +672,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return true;
             }
 
-            // Look ahead for a colon on the same line
-            let has_colon = self
-                .tokens
-                .iter()
-                .rev()
-                .take_while(|(kind, _)| *kind != NEWLINE)
-                .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text));
-
-            if has_colon {
+            if self.line_has_dependency_operator() {
                 // Consume tokens until we find the colon (staying on same line)
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
                     if self.at_dependency_operator() {
@@ -869,7 +874,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Try to parse another target
                 match self.current() {
-                    Some(IDENTIFIER) | Some(DOLLAR) => {
+                    Some(IDENTIFIER | DOLLAR | ERROR) => {
                         if !self.parse_rule_target() {
                             break;
                         }
@@ -2191,6 +2196,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // Variable names may start with a backslash, e.g. `\n := ...`
                 Some(BACKSLASH) if self.is_assignment_line() => {
                     self.parse_assignment();
+                    true
+                }
+                Some(ERROR) if self.line_has_dependency_operator() => {
+                    self.parse_normal_content();
                     true
                 }
                 Some(kind) => {
@@ -3543,6 +3552,16 @@ mod tests {
         let var = parsed.root().variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("${:UVAR{value}}".to_string()));
         assert_eq!(var.raw_value(), Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_wildcard_target() {
+        let parsed = parse("*.target: *.source\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["*.target"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["*.source"]);
     }
 
     #[test]
