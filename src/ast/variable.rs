@@ -98,9 +98,7 @@ impl VariableDefinition {
             // whitespace and line continuations inside it.
             let mut elements: Vec<_> = self
                 .after_directive_keywords()
-                .take_while(|it| {
-                    is_continuation(it) || !matches!(it.kind(), NEWLINE | COMMENT | OPERATOR)
-                })
+                .take_while(|it| is_continuation(it) || !matches!(it.kind(), NEWLINE | COMMENT))
                 .collect();
             while elements
                 .last()
@@ -353,6 +351,9 @@ impl VariableDefinition {
     /// or ":sh=" for BSD make's alternative shell assignment operator, which
     /// may also be written with whitespace as in `VAR :sh = cmd`.
     ///
+    /// Returns `None` for an `undefine` directive, even one such as
+    /// `undefine A = b` whose name contains an operator.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -361,6 +362,9 @@ impl VariableDefinition {
     /// assert_eq!(var.assignment_operator(), Some(":=".to_string()));
     /// ```
     pub fn assignment_operator(&self) -> Option<String> {
+        if self.is_undefine() {
+            return None;
+        }
         self.syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
