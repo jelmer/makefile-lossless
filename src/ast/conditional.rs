@@ -1,3 +1,4 @@
+use super::bsd::directive_keyword;
 use super::makefile::MakefileItem;
 use crate::lossless::{remove_with_preceding_comments, Conditional, Error, ErrorInfo, ParseError};
 use crate::SyntaxKind::*;
@@ -113,13 +114,22 @@ impl Conditional {
     }
 
     /// Get the type of conditional (ifdef, ifndef, ifeq, ifneq)
+    ///
+    /// For BSD make conditionals this includes the leading dot, e.g. `.if`
+    /// or `.ifdef`, regardless of any whitespace between the dot and the
+    /// keyword.
     pub fn conditional_type(&self) -> Option<String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == CONDITIONAL_IF)?
-            .children_with_tokens()
-            .find(|it| it.kind() == IDENTIFIER)
-            .map(|it| it.as_token().unwrap().text().to_string())
+        directive_keyword(
+            &self
+                .syntax()
+                .children()
+                .find(|it| it.kind() == CONDITIONAL_IF)?,
+        )
+    }
+
+    /// Whether this is a BSD make conditional (`.if` ... `.endif`).
+    fn is_bsd(&self) -> bool {
+        self.conditional_type().is_some_and(|t| t.starts_with('.'))
     }
 
     /// Get the condition expression
@@ -472,7 +482,10 @@ impl Conditional {
         if needs_newline {
             builder.token(NEWLINE.into(), "\n");
         }
-        builder.token(IDENTIFIER.into(), "endif");
+        builder.token(
+            IDENTIFIER.into(),
+            if self.is_bsd() { ".endif" } else { "endif" },
+        );
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 
@@ -492,7 +505,10 @@ impl Conditional {
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ELSE.into());
-        builder.token(IDENTIFIER.into(), "else");
+        builder.token(
+            IDENTIFIER.into(),
+            if self.is_bsd() { ".else" } else { "else" },
+        );
         builder.token(NEWLINE.into(), "\n");
         builder.finish_node();
 

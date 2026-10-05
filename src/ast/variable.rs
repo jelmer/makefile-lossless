@@ -21,25 +21,42 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
 }
 
 impl VariableDefinition {
-    /// Internal: the token holding the variable's name, i.e. the first
-    /// IDENTIFIER that isn't a directive keyword (`export`/`override`/
-    /// `define`). Single source of truth for [`Self::name`],
-    /// [`Self::name_range`] and [`Self::set_name`].
-    fn name_token(&self) -> Option<crate::lossless::SyntaxToken> {
+    /// Internal: the elements making up the variable's name, i.e. the
+    /// IDENTIFIER tokens and variable references that follow any directive
+    /// keywords (`export`/`override`/`define`). A name usually is a single
+    /// IDENTIFIER, but may contain references as in `CFLAGS.${PROG}`.
+    /// Single source of truth for [`Self::name`], [`Self::name_range`] and
+    /// [`Self::set_name`].
+    fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
         self.syntax()
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| {
-                t.kind() == IDENTIFIER
-                    && t.text() != "export"
-                    && t.text() != "override"
-                    && t.text() != "define"
+            .skip_while(|it| {
+                it.kind() == WHITESPACE
+                    || it.as_token().is_some_and(|t| {
+                        t.kind() == IDENTIFIER
+                            && matches!(t.text(), "export" | "override" | "define")
+                    })
             })
+            .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
+            .collect()
+    }
+
+    /// Internal: the EXPR node holding the value, which follows the
+    /// assignment operator (or, for `define`, the name).
+    fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
+        let name_end = self.name_elements().last()?.index();
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == EXPR && it.index() > name_end)
     }
 
     /// Get the name of the variable definition
     pub fn name(&self) -> Option<String> {
-        self.name_token().map(|t| t.text().to_string())
+        let elements = self.name_elements();
+        if elements.is_empty() {
+            return None;
+        }
+        Some(elements.iter().map(|it| it.to_string()).collect())
     }
 
     /// The source range covering just the variable's name.
@@ -59,7 +76,10 @@ impl VariableDefinition {
     /// assert_eq!(usize::from(range.end()), 10);
     /// ```
     pub fn name_range(&self) -> Option<rowan::TextRange> {
-        self.name_token().map(|t| t.text_range())
+        let elements = self.name_elements();
+        let first = elements.first()?.text_range();
+        let last = elements.last()?.text_range();
+        Some(first.cover(last))
     }
 
     /// Returns true if this assignment is a `define` ... `endef` block.
@@ -122,10 +142,7 @@ impl VariableDefinition {
 
     /// Get the raw value of the variable definition
     pub fn raw_value(&self) -> Option<String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.text().into())
+        self.value_expr().map(|it| it.text().into())
     }
 
     /// Get the parent item of this variable definition, if any
@@ -225,9 +242,8 @@ impl VariableDefinition {
     /// Rename the variable, preserving the operator, value and any
     /// `export`/`override`/`define` prefix.
     ///
-    /// The name is the first IDENTIFIER token that is not a directive
-    /// keyword (the same token [`Self::name`] returns). A no-op if the
-    /// definition has no such token.
+    /// Replaces the whole name as returned by [`Self::name`], including any
+    /// variable references in it. A no-op if the definition has no name.
     ///
     /// # Example
     /// ```
@@ -239,19 +255,23 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "export BAZ := bar\n");
     /// ```
     pub fn set_name(&mut self, new_name: &str) {
-        let Some(name_token) = self.name_token() else {
+        let elements = self.name_elements();
+        let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
             return;
         };
-        let name_index = name_token.index();
+        let name_indices = first.index()..=last.index();
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
         for child in self.syntax().children_with_tokens() {
-            match child {
-                rowan::NodeOrToken::Token(token) if token.index() == name_index => {
+            if name_indices.contains(&child.index()) {
+                if child.index() == *name_indices.start() {
                     builder.token(IDENTIFIER.into(), new_name);
                 }
+                continue;
+            }
+            match child {
                 rowan::NodeOrToken::Token(token) => {
                     builder.token(token.kind().into(), token.text());
                 }
@@ -298,7 +318,7 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = value\n");
     /// ```
     pub fn trim_trailing_value_whitespace(&mut self) -> bool {
-        let Some(expr) = self.syntax().children().find(|c| c.kind() == EXPR) else {
+        let Some(expr) = self.value_expr() else {
             return false;
         };
 
@@ -338,11 +358,7 @@ impl VariableDefinition {
     /// ```
     pub fn set_value(&mut self, new_value: &str) {
         // Find the EXPR node containing the value
-        let expr_index = self
-            .syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.index());
+        let expr_index = self.value_expr().map(|it| it.index());
 
         if let Some(expr_idx) = expr_index {
             // Build a new EXPR node with the new value
@@ -744,5 +760,47 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(!var.trim_trailing_value_whitespace());
         assert_eq!(makefile.code(), "VAR = foo \\\n\tbar\n");
+    }
+
+    #[test]
+    fn test_name_with_variable_reference() {
+        let makefile: Makefile = "CPPFLAGS.${PROG}+= -DX\nDIRS-$(CONFIG_FOO) += foo\n"
+            .parse()
+            .unwrap();
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars[0].name(), Some("CPPFLAGS.${PROG}".to_string()));
+        assert_eq!(vars[0].assignment_operator(), Some("+=".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("-DX".to_string()));
+        let range = vars[0].name_range().unwrap();
+        assert_eq!(
+            &makefile.code()[std::ops::Range::from(range)],
+            "CPPFLAGS.${PROG}"
+        );
+        assert_eq!(vars[1].name(), Some("DIRS-$(CONFIG_FOO)".to_string()));
+        assert_eq!(vars[1].raw_value(), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn test_set_name_with_variable_reference() {
+        let makefile: Makefile = "COPTS.${f}+=\t-O0\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("COPTS.foo.c");
+        assert_eq!(var.name(), Some("COPTS.foo.c".to_string()));
+        assert_eq!(makefile.code(), "COPTS.foo.c+=\t-O0\n");
+    }
+
+    #[test]
+    fn test_set_value_with_variable_reference_in_name() {
+        let makefile: Makefile = "A.${B} = old\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value("new");
+        assert_eq!(makefile.code(), "A.${B} = new\n");
+    }
+
+    #[test]
+    fn test_escaped_hash_in_value() {
+        let makefile: Makefile = "FOO = a\\#b # comment\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.raw_value(), Some("a\\#b ".to_string()));
     }
 }

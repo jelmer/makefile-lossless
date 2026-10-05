@@ -6,6 +6,9 @@ syntax tree (CST) that preserves all whitespace, comments and formatting.
 Because nothing is discarded, a parsed Makefile can be modified and written
 back out with only the intended changes applied.
 
+Both GNU make and BSD make (NetBSD make, bmake) syntax are supported. Use
+`Makefile::parse_with_variant` to restrict parsing to one of them.
+
 Parsing
 -------
 

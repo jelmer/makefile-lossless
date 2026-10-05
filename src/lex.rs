@@ -1,4 +1,4 @@
-use crate::SyntaxKind;
+use crate::{MakefileVariant, SyntaxKind};
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -17,15 +17,22 @@ pub struct Lexer<'a> {
     /// is literal, not a continuation. Mirrors the parser's
     /// `pending_backslash_escape`.
     pending_backslash_escape: bool,
+    /// Whether BSD make syntax is accepted.
+    bsd: bool,
+    /// Whether the previous token was a `[`. BSD make does not treat `#` as
+    /// a comment there, so that the `:[#]` modifier works.
+    after_lbracket: bool,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
+    pub fn new(input: &'a str, variant: Option<MakefileVariant>) -> Self {
         Lexer {
             input: input.chars().peekable(),
             continuation: false,
             line_type: None,
             pending_backslash_escape: false,
+            bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
+            after_lbracket: false,
         }
     }
 
@@ -118,6 +125,8 @@ impl<'a> Lexer<'a> {
         // resets the run.
         let escaped = self.pending_backslash_escape;
         self.pending_backslash_escape = false;
+        let after_lbracket = self.after_lbracket;
+        self.after_lbracket = false;
         if let Some(&c) = self.input.peek() {
             match (c, self.line_type) {
                 ('\t', None) if !self.continuation => {
@@ -163,7 +172,7 @@ impl<'a> Lexer<'a> {
                     self.line_type = None;
                     return Some((SyntaxKind::NEWLINE, self.input.next()?.to_string()));
                 }
-                '#' => {
+                '#' if !(self.bsd && after_lbracket && self.line_type == Some(LineType::Other)) => {
                     return Some((
                         SyntaxKind::COMMENT,
                         self.read_while(|c| !Self::is_newline(c)),
@@ -201,6 +210,18 @@ impl<'a> Lexer<'a> {
                                 .as_str();
                         Some((SyntaxKind::OPERATOR, text))
                     }
+                    '!' => {
+                        // `!=` is the shell assignment operator; a lone `!`
+                        // is the BSD make "always rebuild" dependency
+                        // operator, or negation in a conditional.
+                        self.input.next();
+                        if self.input.peek() == Some(&'=') {
+                            self.input.next();
+                            Some((SyntaxKind::OPERATOR, "!=".to_string()))
+                        } else {
+                            Some((SyntaxKind::OPERATOR, "!".to_string()))
+                        }
+                    }
                     '(' => {
                         self.input.next();
                         Some((SyntaxKind::LPAREN, "(".to_string()))
@@ -227,6 +248,12 @@ impl<'a> Lexer<'a> {
                     }
                     '\\' => {
                         self.input.next();
+                        // `\#` is a literal hash rather than the start of a
+                        // comment.
+                        if !escaped && self.input.peek() == Some(&'#') {
+                            self.input.next();
+                            return Some((SyntaxKind::TEXT, "\\#".to_string()));
+                        }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
                         if !escaped && self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
@@ -237,6 +264,7 @@ impl<'a> Lexer<'a> {
                     }
                     _ => {
                         self.input.next();
+                        self.after_lbracket = c == '[';
                         Some((SyntaxKind::ERROR, c.to_string()))
                     }
                 },
@@ -255,8 +283,8 @@ impl Iterator for Lexer<'_> {
     }
 }
 
-pub(crate) fn lex(input: &str) -> Vec<(SyntaxKind, String)> {
-    Lexer::new(input).collect()
+pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxKind, String)> {
+    Lexer::new(input, variant).collect()
 }
 
 #[cfg(test)]
@@ -265,19 +293,25 @@ mod tests {
 
     use crate::SyntaxKind::*;
 
+    fn lex_default(input: &str) -> Vec<(SyntaxKind, String)> {
+        lex(input, None)
+    }
+
     #[test]
     fn test_empty() {
-        assert_eq!(lex(""), vec![]);
+        assert_eq!(lex_default(""), vec![]);
     }
 
     #[test]
     fn test_simple() {
         assert_eq!(
-            lex(r#"VARIABLE = value
+            lex_default(
+                r#"VARIABLE = value
 
 rule: prerequisite
 	recipe
-"#)
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -302,10 +336,106 @@ rule: prerequisite
     }
 
     #[test]
+    fn test_shell_assignment_operator() {
+        assert_eq!(
+            lex_default("X!=cmd\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "!=".to_string()),
+                (IDENTIFIER, "cmd".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bang_operator() {
+        assert_eq!(
+            lex_default("a! b\n"),
+            vec![
+                (IDENTIFIER, "a".to_string()),
+                (OPERATOR, "!".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "b".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_escaped_hash() {
+        assert_eq!(
+            lex_default("X=a\\#b # c\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (TEXT, "\\#".to_string()),
+                (IDENTIFIER, "b".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (COMMENT, "# c".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_escaped_backslash_before_hash() {
+        // `\\#` is an escaped backslash followed by a comment.
+        assert_eq!(
+            lex_default("X=a\\\\#c\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (COMMENT, "#c".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hash_after_bracket() {
+        let bsd = vec![
+            (IDENTIFIER, "X".to_string()),
+            (OPERATOR, "=".to_string()),
+            (DOLLAR, "$".to_string()),
+            (LBRACE, "{".to_string()),
+            (IDENTIFIER, "L".to_string()),
+            (OPERATOR, ":".to_string()),
+            (ERROR, "[".to_string()),
+            (ERROR, "#".to_string()),
+            (ERROR, "]".to_string()),
+            (RBRACE, "}".to_string()),
+            (NEWLINE, "\n".to_string()),
+        ];
+        assert_eq!(lex("X=${L:[#]}\n", Some(MakefileVariant::BSDMake)), bsd);
+        assert_eq!(lex("X=${L:[#]}\n", None), bsd);
+        assert_eq!(
+            lex("X=${L:[#]}\n", Some(MakefileVariant::GNUMake)),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (DOLLAR, "$".to_string()),
+                (LBRACE, "{".to_string()),
+                (IDENTIFIER, "L".to_string()),
+                (OPERATOR, ":".to_string()),
+                (ERROR, "[".to_string()),
+                (COMMENT, "#]}".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_bare_export() {
         assert_eq!(
-            lex(r#"export
-"#)
+            lex_default(
+                r#"export
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -316,8 +446,10 @@ rule: prerequisite
     #[test]
     fn test_export() {
         assert_eq!(
-            lex(r#"export VARIABLE
-"#)
+            lex_default(
+                r#"export VARIABLE
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -333,8 +465,10 @@ rule: prerequisite
     #[test]
     fn test_export_assignment() {
         assert_eq!(
-            lex(r#"export VARIABLE := value
-"#)
+            lex_default(
+                r#"export VARIABLE := value
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -354,10 +488,12 @@ rule: prerequisite
     #[test]
     fn test_multiple_prerequisites() {
         assert_eq!(
-            lex(r#"rule: prerequisite1 prerequisite2
+            lex_default(
+                r#"rule: prerequisite1 prerequisite2
 	recipe
 
-"#)
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -380,7 +516,7 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            lex("VARIABLE ?= value\n")
+            lex_default("VARIABLE ?= value\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -398,9 +534,11 @@ rule: prerequisite
     #[test]
     fn test_conditional() {
         assert_eq!(
-            lex(r#"ifneq (a, b)
+            lex_default(
+                r#"ifneq (a, b)
 endif
-"#)
+"#
+            )
             .iter()
             .map(|(kind, text)| (*kind, text.as_str()))
             .collect::<Vec<_>>(),
@@ -423,7 +561,7 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            lex("VARIABLE = $(value)\n")
+            lex_default("VARIABLE = $(value)\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -444,7 +582,7 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            lex("VARIABLE = $(value)$(value2)\n")
+            lex_default("VARIABLE = $(value)$(value2)\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -499,13 +637,13 @@ override_dh_auto_clean:
 #EOF
     "#;
 
-        let _lexed = lex(text);
+        let _lexed = lex_default(text);
     }
 
     #[test]
     fn test_pattern_rule() {
         assert_eq!(
-            lex("%.o: %.c\n")
+            lex_default("%.o: %.c\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -522,7 +660,7 @@ override_dh_auto_clean:
     #[test]
     fn test_include_directive() {
         assert_eq!(
-            lex("-include .env\n")
+            lex_default("-include .env\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -538,7 +676,7 @@ override_dh_auto_clean:
     #[test]
     fn test_slash_in_identifier() {
         assert_eq!(
-            lex("usr/bin/foo: src/main.o\n")
+            lex_default("usr/bin/foo: src/main.o\n")
                 .iter()
                 .map(|(kind, text)| (*kind, text.as_str()))
                 .collect::<Vec<_>>(),
@@ -555,7 +693,7 @@ override_dh_auto_clean:
     #[test]
     fn test_backslash_in_variable_continuation() {
         let input = "VAR ?= $(shell cmd | \\\n\t\tsed -rne 's,^V: ([^-]+).*,\\1,p')\n";
-        let tokens = lex(input);
+        let tokens = lex_default(input);
         // Check that the backslash before '1' is preserved
         let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(input, text, "Token text reconstruction differs from input");

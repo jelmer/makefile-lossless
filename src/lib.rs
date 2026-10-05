@@ -33,9 +33,9 @@ pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
-    ArchiveMember, ArchiveMembers, Conditional, Error, ErrorInfo, Identifier, Include, Lang,
-    Makefile, ParseError, PositionedParseError, Recipe, RecipeVariableReference, Rule,
-    VariableDefinition, VariableReference, Vpath,
+    ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ForLoop, Identifier,
+    Include, Lang, Makefile, ParseError, PositionedParseError, Recipe, RecipeVariableReference,
+    Rule, VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
 pub use rowan::TextRange;
@@ -46,7 +46,8 @@ pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 pub enum MakefileVariant {
     /// GNU Make (most common, supports ifeq/ifneq/ifdef/ifndef conditionals, pattern rules, etc.)
     GNUMake,
-    /// BSD Make (FreeBSD, NetBSD, OpenBSD - uses .if/.ifdef/.ifndef directives)
+    /// BSD Make, including NetBSD make and its portable version bmake (also used
+    /// by FreeBSD). Uses `.if`/`.for`/`.include` style directives.
     BSDMake,
     /// Microsoft nmake (Windows - uses !IF/!IFDEF/!IFNDEF directives)
     NMake,
@@ -101,6 +102,12 @@ pub enum SyntaxKind {
 
     // Blank lines
     BLANK_LINE, // A blank line between top-level items
+
+    // BSD make
+    FOR_LOOP,   // A `.for` ... `.endfor` block
+    FOR_HEADER, // The `.for VAR in LIST` line
+    FOR_END,    // The `.endfor` line
+    DIRECTIVE,  // A single-line directive such as `.undef` or `.error`
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.

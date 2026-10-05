@@ -119,6 +119,49 @@ pub(crate) struct Parse {
     pub(crate) positioned_errors: Vec<PositionedParseError>,
 }
 
+/// BSD make directives, without the leading dot.
+const BSD_DIRECTIVES: &[&str] = &[
+    "include",
+    "-include",
+    "sinclude",
+    "dinclude",
+    "if",
+    "ifdef",
+    "ifndef",
+    "ifmake",
+    "ifnmake",
+    "elif",
+    "elifdef",
+    "elifndef",
+    "elifmake",
+    "elifnmake",
+    "else",
+    "endif",
+    "for",
+    "endfor",
+    "break",
+    "undef",
+    "export",
+    "export-env",
+    "export-literal",
+    "unexport",
+    "unexport-env",
+    "error",
+    "warning",
+    "info",
+];
+
+fn is_bsd_if(name: &str) -> bool {
+    matches!(name, "if" | "ifdef" | "ifndef" | "ifmake" | "ifnmake")
+}
+
+fn is_bsd_elif(name: &str) -> bool {
+    matches!(
+        name,
+        "elif" | "elifdef" | "elifndef" | "elifmake" | "elifnmake"
+    )
+}
+
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     struct Parser {
         /// input tokens, including whitespace,
@@ -472,6 +515,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_comment();
                     }
                     Some(IDENTIFIER) => {
+                        // BSD conditionals and loops may wrap recipe lines;
+                        // any other directive ends the rule.
+                        if let Some((name, count)) = self.bsd_directive() {
+                            let is_block = is_bsd_if(name) || name == "for";
+                            if !is_block || (conditional_depth == 0 && newline_count >= 1) {
+                                break;
+                            }
+                            newline_count = 0;
+                            self.parse_bsd_directive(name, count);
+                            continue;
+                        }
                         let token = &self.tokens.last().unwrap().1.clone();
                         // Check if this is a starting conditional directive
                         if Self::is_conditional_start(token)
@@ -514,14 +568,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Whether `op` separates targets from prerequisites. BSD make also
+        /// has `!`, which always rebuilds the target.
+        fn is_dependency_operator(&self, op: &str) -> bool {
+            matches!(op, ":" | "::") || (op == "!" && self.bsd_directives_enabled())
+        }
+
+        fn at_dependency_operator(&self) -> bool {
+            matches!(self.tokens.last(), Some((OPERATOR, op)) if self.is_dependency_operator(op))
+        }
+
         fn find_and_consume_colon(&mut self) -> bool {
             // Skip whitespace before colon
             self.skip_ws();
 
             // Check if we're at a colon or double-colon
-            if self.current() == Some(OPERATOR)
-                && matches!(self.tokens.last().unwrap().1.as_str(), ":" | "::")
-            {
+            if self.at_dependency_operator() {
                 self.bump();
                 return true;
             }
@@ -532,17 +594,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .iter()
                 .rev()
                 .take_while(|(kind, _)| *kind != NEWLINE)
-                .any(|(kind, text)| *kind == OPERATOR && (text == ":" || text == "::"));
+                .any(|(kind, text)| *kind == OPERATOR && self.is_dependency_operator(text));
 
             if has_colon {
                 // Consume tokens until we find the colon (staying on same line)
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
-                    if self.current() == Some(OPERATOR)
-                        && matches!(
-                            self.tokens.last().map(|(_, text)| text.as_str()),
-                            Some(":" | "::")
-                        )
-                    {
+                    if self.at_dependency_operator() {
                         self.bump();
                         return true;
                     }
@@ -750,14 +807,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
-            // Parse variable name
-            match self.current() {
-                Some(IDENTIFIER) => self.bump(),
-                Some(DOLLAR) => self.parse_variable_reference(),
-                _ => {
-                    self.error("expected variable name".to_string());
-                    self.builder.finish_node();
-                    return;
+            // Parse variable name, which may be built from several parts
+            // such as `CFLAGS.${PROG}`.
+            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
+                self.error("expected variable name".to_string());
+                self.builder.finish_node();
+                return;
+            }
+            loop {
+                match self.current() {
+                    Some(IDENTIFIER) => self.bump(),
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    _ => break,
                 }
             }
 
@@ -1230,6 +1291,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         break;
                     }
                     Some(IDENTIFIER) => {
+                        if let Some((name, count)) = self.bsd_directive() {
+                            self.parse_bsd_directive(name, count);
+                            continue;
+                        }
                         let token = self.tokens.last().unwrap().1.clone();
                         if !self.handle_conditional_token(&token, &mut depth) {
                             if token == "include" || token == "-include" || token == "sinclude" {
@@ -1273,15 +1338,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
-            if self.current() != Some(IDENTIFIER)
-                || (!["include", "-include", "sinclude"]
-                    .contains(&self.tokens.last().unwrap().1.as_str()))
+            if let Some((_, count)) = self.bsd_directive() {
+                self.bump_n(count);
+            } else if self.current() == Some(IDENTIFIER)
+                && ["include", "-include", "sinclude"]
+                    .contains(&self.tokens.last().unwrap().1.as_str())
             {
+                self.bump();
+            } else {
                 self.error("expected include directive".to_string());
                 self.builder.finish_node();
                 return;
             }
-            self.bump();
             self.skip_ws();
 
             // Parse file paths
@@ -1361,6 +1429,256 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(NEWLINE) {
                 self.bump();
             }
+            self.builder.finish_node();
+        }
+
+        fn bsd_directives_enabled(&self) -> bool {
+            matches!(self.variant, None | Some(MakefileVariant::BSDMake))
+        }
+
+        /// If the current line starts with a BSD make directive, return its
+        /// name without the leading dot (e.g. `if`, `-include`) and the
+        /// number of tokens making up the keyword: `.if` is a single token,
+        /// while `.  if` (whitespace after the dot, used for indenting
+        /// nested directives) is three.
+        fn bsd_directive(&self) -> Option<(&'static str, usize)> {
+            if !self.bsd_directives_enabled() {
+                return None;
+            }
+            let n = self.tokens.len();
+            let (kind, text) = self.tokens.last()?;
+            if *kind != IDENTIFIER {
+                return None;
+            }
+            let (name, count) = if text == "." {
+                if n < 3 || self.tokens[n - 2].0 != WHITESPACE || self.tokens[n - 3].0 != IDENTIFIER
+                {
+                    return None;
+                }
+                (self.tokens[n - 3].1.as_str(), 3)
+            } else {
+                (text.strip_prefix('.')?, 1)
+            };
+            let name = *BSD_DIRECTIVES.iter().find(|d| **d == name)?;
+            // Something like `.export: foo` or `.info = x` is a rule or an
+            // assignment rather than a directive.
+            let next = self.tokens[..n - count]
+                .iter()
+                .rev()
+                .find(|(kind, _)| *kind != WHITESPACE);
+            if matches!(next, Some((OPERATOR, op)) if op != "!") {
+                return None;
+            }
+            Some((name, count))
+        }
+
+        fn bump_n(&mut self, count: usize) {
+            for _ in 0..count {
+                self.bump();
+            }
+        }
+
+        /// Record an error at the current position without consuming any
+        /// tokens.
+        fn report_error(&mut self, message: String) {
+            let consumed = self.token_positions.len() - self.tokens.len();
+            let (start, end) = self
+                .token_positions
+                .get(consumed)
+                .copied()
+                .unwrap_or_else(|| {
+                    let end = rowan::TextSize::of(self.original_text.as_str());
+                    (end, end)
+                });
+            let line = self.original_text[..usize::from(start)]
+                .matches('\n')
+                .count()
+                + 1;
+            self.errors.push(ErrorInfo {
+                message: message.clone(),
+                line,
+                context: self.get_context_for_line(line),
+            });
+            self.positioned_errors.push(PositionedParseError {
+                message,
+                range: rowan::TextRange::new(start, end),
+                code: None,
+            });
+        }
+
+        /// Dispatch a BSD make directive found by `bsd_directive`.
+        fn parse_bsd_directive(&mut self, name: &str, count: usize) {
+            match name {
+                _ if is_bsd_if(name) => self.parse_bsd_conditional(name, count),
+                "for" => self.parse_bsd_for(count),
+                "include" | "-include" | "sinclude" | "dinclude" => self.parse_include(),
+                _ if is_bsd_elif(name) || matches!(name, "else" | "endif" | "endfor") => {
+                    let opener = if name == "endfor" { "for" } else { "if" };
+                    self.report_error(format!(".{} without matching .{}", name, opener));
+                    self.builder.start_node(ERROR.into());
+                    self.skip_until_newline();
+                    self.builder.finish_node();
+                }
+                _ => {
+                    self.builder.start_node(DIRECTIVE.into());
+                    self.bump_n(count);
+                    self.parse_directive_argument(None);
+                    self.builder.finish_node();
+                }
+            }
+        }
+
+        /// Parse the rest of a directive line into an EXPR node, followed by
+        /// an optional comment and the newline. If `required` names the
+        /// directive, an empty argument is reported as an error.
+        fn parse_directive_argument(&mut self, required: Option<&str>) {
+            self.skip_ws();
+            self.builder.start_node(EXPR.into());
+            let mut found = false;
+            while let Some(kind) = self.current() {
+                match kind {
+                    NEWLINE | COMMENT => break,
+                    BACKSLASH if self.is_line_continuation() => {
+                        self.consume_line_continuation();
+                    }
+                    DOLLAR => {
+                        found = true;
+                        self.parse_variable_reference();
+                    }
+                    _ => {
+                        found = true;
+                        self.bump();
+                    }
+                }
+            }
+            self.builder.finish_node();
+            if let (Some(name), false) = (required, found) {
+                self.report_error(format!("expected condition after .{}", name));
+            }
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+        }
+
+        /// Consume the remainder of a directive that takes no arguments, such
+        /// as `.else` or `.endif`, allowing a trailing comment.
+        fn parse_bare_directive_end(&mut self, name: &str) {
+            self.skip_ws();
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
+            match self.current() {
+                None => {}
+                Some(NEWLINE) => self.bump(),
+                Some(_) => {
+                    self.report_error(format!("unexpected text after .{}", name));
+                    self.skip_until_newline();
+                }
+            }
+        }
+
+        /// Parse one line inside a BSD `.if` or `.for` body.
+        fn parse_block_item(&mut self) {
+            match self.current() {
+                Some(INDENT) => self.parse_recipe_line(),
+                Some(NEWLINE) => self.bump(),
+                _ => {
+                    self.parse_token();
+                }
+            }
+        }
+
+        /// Parse a BSD `.if`/`.ifdef`/`.ifndef`/`.ifmake`/`.ifnmake` block,
+        /// including any `.elif*`/`.else` branches and the closing `.endif`.
+        ///
+        /// Uses the same node kinds as GNU conditionals: `.elif*` and `.else`
+        /// become CONDITIONAL_ELSE nodes and `.endif` a CONDITIONAL_ENDIF.
+        fn parse_bsd_conditional(&mut self, name: &str, count: usize) {
+            self.builder.start_node(CONDITIONAL.into());
+            self.builder.start_node(CONDITIONAL_IF.into());
+            self.bump_n(count);
+            self.parse_directive_argument(Some(name));
+            self.builder.finish_node();
+
+            loop {
+                if self.is_at_eof() {
+                    self.report_error("unterminated .if (missing .endif)".to_string());
+                    break;
+                }
+                let Some((name, count)) = self.bsd_directive() else {
+                    self.parse_block_item();
+                    continue;
+                };
+                match name {
+                    _ if is_bsd_elif(name) => {
+                        self.builder.start_node(CONDITIONAL_ELSE.into());
+                        self.bump_n(count);
+                        self.parse_directive_argument(Some(name));
+                        self.builder.finish_node();
+                    }
+                    "else" => {
+                        self.builder.start_node(CONDITIONAL_ELSE.into());
+                        self.bump_n(count);
+                        self.parse_bare_directive_end(name);
+                        self.builder.finish_node();
+                    }
+                    "endif" => {
+                        self.builder.start_node(CONDITIONAL_ENDIF.into());
+                        self.bump_n(count);
+                        self.parse_bare_directive_end(name);
+                        self.builder.finish_node();
+                        break;
+                    }
+                    _ => self.parse_block_item(),
+                }
+            }
+
+            self.builder.finish_node();
+        }
+
+        /// Parse a BSD `.for VAR... in LIST` ... `.endfor` loop.
+        fn parse_bsd_for(&mut self, count: usize) {
+            self.builder.start_node(FOR_LOOP.into());
+            self.builder.start_node(FOR_HEADER.into());
+            self.bump_n(count);
+            self.skip_ws();
+            let mut found_variable = false;
+            while self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 != "in" {
+                found_variable = true;
+                self.bump();
+                self.skip_ws();
+            }
+            if !found_variable {
+                self.report_error("expected variable name after .for".to_string());
+            }
+            if self.current() == Some(IDENTIFIER) {
+                self.bump();
+            } else {
+                self.report_error("expected 'in' in .for".to_string());
+            }
+            self.parse_directive_argument(None);
+            self.builder.finish_node();
+
+            loop {
+                if self.is_at_eof() {
+                    self.report_error("unterminated .for (missing .endfor)".to_string());
+                    break;
+                }
+                match self.bsd_directive() {
+                    Some((name, count)) if name == "endfor" => {
+                        self.builder.start_node(FOR_END.into());
+                        self.bump_n(count);
+                        self.parse_bare_directive_end(name);
+                        self.builder.finish_node();
+                        break;
+                    }
+                    _ => self.parse_block_item(),
+                }
+            }
+
             self.builder.finish_node();
         }
 
@@ -1482,6 +1800,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             match self.current() {
                 None => false,
                 Some(IDENTIFIER) => {
+                    if let Some((name, count)) = self.bsd_directive() {
+                        self.parse_bsd_directive(name, count);
+                        return true;
+                    }
                     let token = &self.tokens.last().unwrap().1;
                     if self.is_conditional_directive(token)
                         && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
@@ -1584,29 +1906,53 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        // Simplify the is_assignment_line method by making it more direct
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-            let mut pos = self.tokens.len().saturating_sub(1);
-            let mut seen_identifier = false;
+            let mut tokens = self.tokens.iter().rev();
+            let mut seen_name = false;
+            // Whitespace after the name: anything but an operator now means
+            // this is not an assignment.
+            let mut name_done = false;
             let mut seen_directive = false; // export or override prefix
 
-            while pos > 0 {
-                let (kind, text) = &self.tokens[pos];
-
+            while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
                     IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
-                    IDENTIFIER if !seen_identifier => seen_identifier = true,
+                    IDENTIFIER if !name_done => seen_name = true,
+                    DOLLAR if !name_done => {
+                        // Skip over a variable reference that is part of
+                        // the name, e.g. `CFLAGS.${PROG}`.
+                        seen_name = true;
+                        let close = match tokens.next() {
+                            Some((LPAREN, _)) => RPAREN,
+                            Some((LBRACE, _)) => RBRACE,
+                            _ => continue,
+                        };
+                        let open = if close == RPAREN { LPAREN } else { LBRACE };
+                        let mut depth = 1;
+                        for (kind, _) in tokens.by_ref() {
+                            match *kind {
+                                NEWLINE => return false,
+                                k if k == open => depth += 1,
+                                k if k == close => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
-                        return seen_identifier || seen_directive
+                        return seen_name || seen_directive
                     }
                     OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
-                    WHITESPACE => (),
+                    WHITESPACE => name_done = seen_name,
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
-                pos = pos.saturating_sub(1);
             }
             // Bare "export VARNAME" (without assignment operator) is a valid GNU Make directive
             seen_directive
@@ -1733,7 +2079,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
     }
 
-    let mut tokens = lex(text);
+    let mut tokens = lex(text, variant);
 
     // Build token positions in forward order before reversing
     let mut token_positions = Vec::with_capacity(tokens.len());
@@ -1895,6 +2241,8 @@ ast_node!(Vpath, VPATH);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
 ast_node!(Conditional, CONDITIONAL);
+ast_node!(ForLoop, FOR_LOOP);
+ast_node!(Directive, DIRECTIVE);
 
 /// A reference to a variable in the makefile, e.g. `$(FOO)` or `${BAR}`.
 ///
@@ -8234,7 +8582,7 @@ mod test_continuation {
     #[test]
     fn test_lex_braces() {
         use crate::lex::lex;
-        let tokens = lex("${FOO}");
+        let tokens = lex("${FOO}", None);
         let kinds: Vec<_> = tokens.iter().map(|(k, _)| *k).collect();
         assert!(kinds.contains(&DOLLAR));
         assert!(kinds.contains(&LBRACE));
