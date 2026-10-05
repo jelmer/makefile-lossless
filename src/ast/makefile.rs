@@ -460,27 +460,24 @@ impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(item) = self.stack.pop_front() {
-            match item {
+            let children: Vec<_> = match item {
                 MakefileItem::Conditional(ref cond) => {
-                    // Push in natural order since we pop from front
-                    self.stack.extend(cond.if_items());
-                    self.stack.extend(cond.else_items());
+                    cond.if_items().chain(cond.else_items()).collect()
                 }
-                MakefileItem::ForLoop(ref f) => self.stack.extend(f.items()),
-                MakefileItem::Rule(ref rule) => {
-                    // Conditionals and loops in a rule's recipe can also
-                    // contain non-recipe items, such as variables or other
-                    // rules. Prepend them to keep document order.
-                    let children: Vec<_> = rule
-                        .syntax()
-                        .children()
-                        .filter_map(MakefileItem::cast)
-                        .collect();
-                    for child in children.into_iter().rev() {
-                        self.stack.push_front(child);
-                    }
-                }
-                _ => {}
+                MakefileItem::ForLoop(ref f) => f.items().collect(),
+                // Conditionals and loops in a rule's recipe can also contain
+                // non-recipe items, such as variables or other rules.
+                MakefileItem::Rule(ref rule) => rule
+                    .syntax()
+                    .children()
+                    .filter_map(MakefileItem::cast)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // Prepend the nested items so they are yielded before any items
+            // following their parent, preserving document order
+            for child in children.into_iter().rev() {
+                self.stack.push_front(child);
             }
             if let Some(extracted) = T::extract(item) {
                 return Some(extracted);
@@ -2414,5 +2411,65 @@ override_dh_auto_configure:
         let mut makefile: Makefile = "a:\n\tx\n".parse().unwrap();
         let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
         assert!(makefile.insert_rule(5, new_rule).is_err());
+    }
+
+    #[test]
+    fn test_variable_definitions_document_order() {
+        let makefile: Makefile = "ifdef X\nA = 1\nendif\nB = 2\nC = 3\n".parse().unwrap();
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_variable_definitions_document_order_nested() {
+        let makefile: Makefile =
+            "A = 1\nifdef X\nB = 2\nifdef Y\nC = 3\nendif\nD = 4\nelse\nE = 5\nendif\nF = 6\n"
+                .parse()
+                .unwrap();
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D", "E", "F"]);
+    }
+
+    #[test]
+    fn test_rules_document_order() {
+        let makefile: Makefile =
+            "ifdef X\nifdef Y\na:\n\tx\nendif\nb:\n\ty\nelse\nc:\n\tz\nendif\nd:\n\tw\n"
+                .parse()
+                .unwrap();
+        let targets: Vec<_> = makefile
+            .rules()
+            .map(|r| r.targets().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(targets, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_find_variable_document_order() {
+        let makefile: Makefile = "ifdef X\nA = 1\nendif\nA = 2\n".parse().unwrap();
+        let values: Vec<_> = makefile
+            .find_variable("A")
+            .map(|v| v.raw_value().unwrap())
+            .collect();
+        assert_eq!(values, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_variable_definitions_document_order_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            ".if 1\nA=1\n.elif 2\nB=2\n.else\nC=3\n.endif\n.for x in a\nD=4\n.endfor\nE=5\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        let names: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.name().unwrap())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D", "E"]);
     }
 }
