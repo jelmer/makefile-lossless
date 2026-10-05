@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use makefile_edit::{apply_edit_to_text, Makefile, Parse, TextEdit, TextRange};
+use makefile_lossless::{apply_edit_to_text, Makefile, Parse, TextEdit, TextRange};
 
 // Input layout:
 //   u16 (LE) start offset

@@ -11,7 +11,7 @@ impl ExpressionStatement {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::{Makefile, MakefileItem};
+    /// use makefile_lossless::{Makefile, MakefileItem};
     /// let makefile: Makefile = "$(eval $(call gen_rule,foo))\n".parse().unwrap();
     /// let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
     ///     panic!("expected an expression statement");
@@ -32,7 +32,7 @@ impl ExpressionStatement {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::{Makefile, MakefileItem};
+    /// use makefile_lossless::{Makefile, MakefileItem};
     /// let makefile: Makefile = "$(info a) \\\n  $(info b) # log\n".parse().unwrap();
     /// let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
     ///     panic!("expected an expression statement");
@@ -65,7 +65,7 @@ impl ExpressionStatement {
     ///
     /// # Example
     /// ```
-    /// use makefile_edit::{Makefile, MakefileItem};
+    /// use makefile_lossless::{Makefile, MakefileItem};
     /// let makefile: Makefile = "$(info a); echo b\n".parse().unwrap();
     /// let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
     ///     panic!("expected an expression statement");

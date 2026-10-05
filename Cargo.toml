@@ -1,5 +1,5 @@
 [package]
-name = "makefile-edit"
+name = "makefile-lossless"
 repository = "https://github.com/jelmer/makefile-lossless"
 description = "Lossless Parser for Makefiles"
 version = "0.3.41"
