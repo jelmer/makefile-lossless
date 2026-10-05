@@ -745,4 +745,11 @@ mod tests {
         assert!(!var.trim_trailing_value_whitespace());
         assert_eq!(makefile.code(), "VAR = foo \\\n\tbar\n");
     }
+
+    #[test]
+    fn test_escaped_hash_in_value() {
+        let makefile: Makefile = "FOO = a\\#b # comment\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.raw_value(), Some("a\\#b ".to_string()));
+    }
 }

@@ -227,6 +227,12 @@ impl<'a> Lexer<'a> {
                     }
                     '\\' => {
                         self.input.next();
+                        // `\#` is a literal hash rather than the start of a
+                        // comment.
+                        if !escaped && self.input.peek() == Some(&'#') {
+                            self.input.next();
+                            return Some((SyntaxKind::TEXT, "\\#".to_string()));
+                        }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
                         if !escaped && self.input.peek().is_some_and(|&c| Self::is_newline(c)) {
@@ -297,6 +303,40 @@ rule: prerequisite
                 (INDENT, "\t"),
                 (TEXT, "recipe"),
                 (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_escaped_hash() {
+        assert_eq!(
+            lex("X=a\\#b # c\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (TEXT, "\\#".to_string()),
+                (IDENTIFIER, "b".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (COMMENT, "# c".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_escaped_backslash_before_hash() {
+        // `\\#` is an escaped backslash followed by a comment.
+        assert_eq!(
+            lex("X=a\\\\#c\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (OPERATOR, "=".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (COMMENT, "#c".to_string()),
+                (NEWLINE, "\n".to_string()),
             ]
         );
     }
