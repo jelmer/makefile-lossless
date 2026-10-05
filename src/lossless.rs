@@ -3262,6 +3262,75 @@ mod tests {
     }
 
     #[test]
+    fn test_escaped_hash_in_conditional() {
+        // `\#` does not start a comment, so the closing paren and the rest of
+        // the conditional must still be parsed.
+        let code = "all:\nifneq ($(X), \\#)\n\techo a\nendif\n";
+        let parsed = Makefile::parse(code);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(code, makefile.to_string());
+        let conditional = makefile
+            .syntax()
+            .descendants()
+            .find_map(Conditional::cast)
+            .expect("conditional");
+        assert_eq!(
+            Some(("$(X)".to_string(), "\\#".to_string())),
+            conditional.ifeq_args()
+        );
+        assert_eq!(Some("\techo a\n".to_string()), conditional.if_body());
+        assert!(conditional
+            .syntax()
+            .children()
+            .any(|n| n.kind() == CONDITIONAL_ENDIF));
+    }
+
+    #[test]
+    fn test_escaped_hash_in_toplevel_conditional() {
+        let code = "ifeq ($(X),a\\#b)\nY = 1\nendif\n";
+        let parsed = Makefile::parse(code);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(code, makefile.to_string());
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(1, conditionals.len());
+        assert_eq!(
+            Some(("$(X)".to_string(), "a\\#b".to_string())),
+            conditionals[0].ifeq_args()
+        );
+        assert_eq!(Some("Y = 1\n".to_string()), conditionals[0].if_body());
+    }
+
+    #[test]
+    fn test_escaped_hash_in_variable_value() {
+        let code = "X = a\\#b # comment\nY = c\\\\# comment\n";
+        let makefile: Makefile = code.parse().expect("escaped hash should parse");
+        assert_eq!(code, makefile.to_string());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(2, vars.len());
+        assert_eq!(Some("a\\#b ".to_string()), vars[0].raw_value());
+        assert_eq!(Some("c\\\\".to_string()), vars[1].raw_value());
+    }
+
+    #[test]
+    fn test_escaped_hash_in_prerequisites() {
+        let code = "foo: a\\#b c # comment\n\techo \\#x\n";
+        let makefile: Makefile = code.parse().expect("escaped hash should parse");
+        assert_eq!(code, makefile.to_string());
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(1, rules.len());
+        assert_eq!(
+            vec!["a\\#b".to_string(), "c".to_string()],
+            rules[0].prerequisites().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["echo \\#x".to_string()],
+            rules[0].recipes().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_assignment_with_tab_continuation() {
         // A variable value continued onto a tab-indented line, as commonly
         // seen in debian/rules. The continuation must not be mistaken for a
