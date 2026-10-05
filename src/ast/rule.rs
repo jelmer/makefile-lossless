@@ -1960,6 +1960,29 @@ mod tests {
     }
 
     #[test]
+    fn test_body_items_bsd_directives() {
+        let makefile = Makefile::parse_with_variant(
+            "all:\n\techo a\n.info hi\n\techo b\n.include \"x.mk\"\n\techo c\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        let rule = makefile.rules().next().unwrap();
+        let items: Vec<String> = rule
+            .body_items()
+            .map(|item| match item {
+                ConditionalItem::Item(MakefileItem::Directive(d)) => d.keyword().unwrap(),
+                ConditionalItem::Item(MakefileItem::Include(i)) => i.path().unwrap(),
+                item => describe_body_item(item),
+            })
+            .collect();
+        assert_eq!(
+            items,
+            vec!["1: echo a", ".info", "3: echo b", "x.mk", "5: echo c"]
+        );
+        assert_eq!(recipes(&rule), vec!["echo a", "echo b", "echo c"]);
+    }
+
+    #[test]
     fn test_inline_recipe() {
         let rule: Rule = "all: dep ; echo hi\n\techo there\n".parse().unwrap();
         assert_eq!(prereqs(&rule), (vec!["dep".to_string()], vec![]));
