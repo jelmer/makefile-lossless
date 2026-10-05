@@ -2402,9 +2402,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Returns true if the rest of the line consists only of `$(...)` and
-        /// `${...}` references, such as `$(eval ...)` or `$(info ...)`,
-        /// optionally followed (for GNU make) by a `;` and arbitrary text.
+        /// Returns true if the rest of the line consists only of `$(...)`,
+        /// `${...}` and `$X` references, such as `$(eval ...)` or
+        /// `$(info ...)`, optionally followed (for GNU make) by a `;` and
+        /// arbitrary text.
         /// Make expands such lines for their side effects; anything else on
         /// the line (e.g. a colon) makes it a rule or assignment instead.
         fn is_expression_statement_line(&self) -> bool {
@@ -2427,12 +2428,30 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some((DOLLAR, _)) => {
                         // Like make, only count the delimiter that opened the
                         // reference.
-                        let mut tokens = tokens.by_ref().map(|(kind, _)| *kind);
                         let (open, close) = match tokens.next() {
-                            Some(LPAREN) => (LPAREN, RPAREN),
-                            Some(LBRACE) => (LBRACE, RBRACE),
+                            Some((LPAREN, _)) => (LPAREN, RPAREN),
+                            Some((LBRACE, _)) => (LBRACE, RBRACE),
+                            // A single-character reference such as `$X` or
+                            // `$@`; `$$` is a literal `$`.
+                            Some((kind, text))
+                                if text.chars().count() == 1
+                                    && !matches!(
+                                        kind,
+                                        DOLLAR
+                                            | WHITESPACE
+                                            | NEWLINE
+                                            | BACKSLASH
+                                            | COMMENT
+                                            | RPAREN
+                                            | RBRACE
+                                    ) =>
+                            {
+                                seen_reference = true;
+                                continue;
+                            }
                             _ => return false,
                         };
+                        let mut tokens = tokens.by_ref().map(|(kind, _)| *kind);
                         let mut depth = 1;
                         let mut prev = open;
                         while depth > 0 {
@@ -7459,6 +7478,98 @@ all: $(OBJS)
             assert!(
                 !top_level_kinds(parsed.root().syntax()).contains(&EXPRESSION_STATEMENT),
                 "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_single_char_reference() {
+        for src in [
+            "$X\n",
+            "$@\n",
+            "$<\n",
+            "$X $(Y)\n",
+            "$X ${Y} $Z\n",
+            "$(X)$Y\n",
+            "$X # c\n",
+            "$X \\\n $Y\n",
+        ] {
+            for variant in [
+                None,
+                Some(MakefileVariant::GNUMake),
+                Some(MakefileVariant::BSDMake),
+                Some(MakefileVariant::POSIXMake),
+                Some(MakefileVariant::NMake),
+            ] {
+                let parsed = parse(src, variant);
+                assert_eq!(parsed.errors, vec![], "{src:?} {variant:?}");
+                let root = parsed.root();
+                assert_eq!(
+                    top_level_kinds(root.syntax()),
+                    vec![EXPRESSION_STATEMENT],
+                    "{src:?} {variant:?}"
+                );
+                assert_eq!(root.to_string(), src);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bare_single_char_reference_semicolon() {
+        let src = "$X $(Y) ; @echo cmd\nall:\n";
+        let parsed = parse(src, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(
+            top_level_kinds(root.syntax()),
+            vec![EXPRESSION_STATEMENT, RULE]
+        );
+        assert_eq!(root.to_string(), src);
+        let Some(MakefileItem::ExpressionStatement(stmt)) = root.items().next() else {
+            panic!("expected an expression statement");
+        };
+        assert_eq!(
+            stmt.references().map(|r| r.name()).collect::<Vec<_>>(),
+            vec![Some("X".to_string()), Some("Y".to_string())]
+        );
+        assert_eq!(stmt.expression(), "$X $(Y)");
+        assert_eq!(stmt.after_semicolon(), Some("@echo cmd".to_string()));
+    }
+
+    #[test]
+    fn test_single_char_reference_not_expression_statement() {
+        let parsed = parse("$X: y\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![RULE]);
+        let rule = root.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$X"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["y"]);
+
+        let parsed = parse("$X = 1\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(top_level_kinds(root.syntax()), vec![VARIABLE]);
+        let var = root.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("$X".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+
+        // `$XY` is `$X` followed by `Y`, and `$$` is a literal `$`.
+        for src in ["$XY\n", "$$\n"] {
+            let parsed = parse(src, None);
+            assert_eq!(parsed.root().to_string(), src);
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"],
+                "{src:?}"
+            );
+            assert!(
+                !top_level_kinds(parsed.root().syntax()).contains(&EXPRESSION_STATEMENT),
+                "{src:?}"
             );
         }
     }
