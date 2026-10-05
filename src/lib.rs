@@ -22,6 +22,7 @@
 //! ```
 
 mod ast;
+mod bsd_condition;
 mod incremental;
 mod lex;
 mod lossless;
@@ -33,6 +34,9 @@ mod text;
 pub use ast::conditional::{ConditionalBranch, ConditionalItem};
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::RuleItem;
+pub use bsd_condition::{
+    parse_bsd_condition, BsdComparisonOp, BsdCondition, BsdConditionError, BsdFunction, BsdOperand,
+};
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
