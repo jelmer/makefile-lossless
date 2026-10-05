@@ -61,8 +61,9 @@ impl VariableDefinition {
     /// Internal: the elements making up the variable's name, i.e. the
     /// IDENTIFIER tokens and variable references that follow any directive
     /// keywords. A name usually is a single IDENTIFIER, but may contain
-    /// references as in `CFLAGS.${PROG}`. Single source of truth for
-    /// [`Self::name`], [`Self::name_range`] and [`Self::set_name`].
+    /// references as in `CFLAGS.${PROG}` or backslashes as in `a\b`.
+    /// Single source of truth for [`Self::name`], [`Self::name_range`] and
+    /// [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
         let keywords = self.directive_keywords();
         self.syntax()
@@ -70,7 +71,7 @@ impl VariableDefinition {
             .skip_while(|it| {
                 it.kind() == WHITESPACE || it.as_token().is_some_and(|t| keywords.contains(t))
             })
-            .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
+            .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR))
             .collect()
     }
 
@@ -840,6 +841,17 @@ mod tests {
         var.set_name("COPTS.foo.c");
         assert_eq!(var.name(), Some("COPTS.foo.c".to_string()));
         assert_eq!(makefile.code(), "COPTS.foo.c+=\t-O0\n");
+    }
+
+    #[test]
+    fn test_set_name_with_backslash() {
+        let makefile: Makefile = "export a\\b = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(&makefile.code()[std::ops::Range::from(range)], "a\\b");
+        var.set_name("c");
+        assert_eq!(var.name(), Some("c".to_string()));
+        assert_eq!(makefile.code(), "export c = 1\n");
     }
 
     #[test]

@@ -825,8 +825,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             // Parse variable name, which may be built from several parts
-            // such as `CFLAGS.${PROG}`.
-            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
+            // such as `CFLAGS.${PROG}` or `a\b`.
+            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR | BACKSLASH))
+                || self.is_line_continuation()
+            {
                 self.error("expected variable name".to_string());
                 self.builder.finish_node();
                 return;
@@ -834,6 +836,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             loop {
                 match self.current() {
                     Some(IDENTIFIER) => self.bump(),
+                    // A backslash is part of the name unless it continues
+                    // the line.
+                    Some(BACKSLASH) if !self.is_line_continuation() => self.bump(),
                     Some(DOLLAR) => self.parse_variable_reference(),
                     _ => break,
                 }
@@ -1332,6 +1337,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(COMMENT) => self.parse_comment(),
                     Some(NEWLINE) => self.bump(),
                     Some(DOLLAR) => self.parse_normal_content(),
+                    Some(BACKSLASH) if self.is_assignment_line() => self.parse_assignment(),
                     Some(QUOTE) => self.parse_quoted_string(),
                     Some(_) => {
                         // Be more tolerant of unexpected tokens in conditionals
@@ -1987,6 +1993,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     true
                 }
+                // Variable names may start with a backslash, e.g. `\n := ...`
+                Some(BACKSLASH) if self.is_assignment_line() => {
+                    self.parse_assignment();
+                    true
+                }
                 Some(kind) => {
                     // `error()` already consumes the offending token; bumping
                     // again here would pop past the end of the stack when
@@ -2027,6 +2038,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_directive = true
                     }
                     IDENTIFIER if !name_done => seen_name = true,
+                    // A backslash is part of the name unless it continues the line
+                    BACKSLASH
+                        if !name_done && !matches!(tokens.clone().next(), Some((NEWLINE, _))) =>
+                    {
+                        seen_name = true
+                    }
                     DOLLAR if !name_done => {
                         // Skip over a variable reference that is part of
                         // the name, e.g. `CFLAGS.${PROG}`.
@@ -3516,6 +3533,73 @@ mod tests {
         assert_eq!(
             vec!["echo hi".to_string()],
             rules[1].recipes().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_assignment_name_with_backslash() {
+        let code = "\\n := 1\na\\b = 2\nx\\\\y ?= 3\na\\ += 4\nexport a\\b\\c = 5\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        assert_eq!(root.rules().count(), 0);
+        let vars = root
+            .variable_definitions()
+            .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+            .collect::<Vec<_>>();
+        let var = |name: &str, op: &str, value: &str| {
+            (
+                Some(name.to_string()),
+                Some(op.to_string()),
+                Some(value.to_string()),
+            )
+        };
+        assert_eq!(
+            vars,
+            vec![
+                var("\\n", ":=", "1"),
+                var("a\\b", "=", "2"),
+                var("x\\\\y", "?=", "3"),
+                var("a\\", "+=", "4"),
+                var("a\\b\\c", "=", "5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assignment_name_with_backslash_in_conditional() {
+        let code = "ifdef X\n\\n := 1\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let vars = root
+            .variable_definitions()
+            .map(|v| (v.name(), v.raw_value()))
+            .collect::<Vec<_>>();
+        assert_eq!(vars, vec![(Some("\\n".to_string()), Some("1".to_string()))]);
+    }
+
+    #[test]
+    fn test_assignment_name_with_backslash_value_continuation() {
+        // The trailing backslash continues the (empty) value onto the next
+        // line; it is not part of the name.
+        let code = "\\n :=\\\n\nfoo = bar\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let vars = root
+            .variable_definitions()
+            .map(|v| (v.name(), v.raw_value()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vars,
+            vec![
+                (Some("\\n".to_string()), Some("\\\n".to_string())),
+                (Some("foo".to_string()), Some("bar".to_string())),
+            ]
         );
     }
 
