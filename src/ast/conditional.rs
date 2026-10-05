@@ -1,12 +1,12 @@
-use super::bsd::directive_keyword;
+use super::bsd::keyword_token;
 use super::makefile::MakefileItem;
 use crate::lossless::{
-    lf_line_endings, node_text, remove_with_preceding_comments, Conditional, Error, ErrorInfo,
-    ParseError,
+    lf_line_endings, line_col_at_offset, node_text, remove_with_preceding_comments, Conditional,
+    Error, ErrorInfo, Lang, ParseError, Recipe,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
-use rowan::{GreenNodeBuilder, SyntaxNode};
+use rowan::{Direction, GreenNodeBuilder, SyntaxNode};
 
 /// Split `s` at the first top-level comma. A comma is "top-level" when it
 /// is not inside a `$(...)` / `${...}` group. Returns `None` if no such
@@ -84,6 +84,194 @@ fn quoted_pair(s: &str) -> Option<Vec<String>> {
     }
 }
 
+/// An item in a branch of a [`Conditional`].
+///
+/// Conditionals that are part of a rule's recipe can contain recipe lines in
+/// addition to ordinary makefile items.
+#[derive(Clone)]
+pub enum ConditionalItem {
+    /// A makefile item, such as a variable, rule or nested conditional
+    Item(MakefileItem),
+    /// A recipe line
+    Recipe(Recipe),
+}
+
+impl ConditionalItem {
+    fn cast(node: SyntaxNode<Lang>) -> Option<Self> {
+        match Recipe::cast(node.clone()) {
+            Some(recipe) => Some(Self::Recipe(recipe)),
+            None => MakefileItem::cast(node).map(Self::Item),
+        }
+    }
+}
+
+/// A single branch of a [`Conditional`]: the initial `if`, an `else if`
+/// (or BSD `.elif`) or the final plain `else`.
+///
+/// Obtained from [`Conditional::branches`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ConditionalBranch {
+    /// The CONDITIONAL_IF or CONDITIONAL_ELSE node starting this branch.
+    header: SyntaxNode<Lang>,
+}
+
+impl ConditionalBranch {
+    /// The conditional directive that guards this branch, or `None` for a
+    /// plain `else` / `.else`.
+    ///
+    /// For GNU make this is `ifdef`, `ifndef`, `ifeq` or `ifneq`, also for
+    /// an `else ifeq` etc. branch. For BSD make it is the `.if` form of
+    /// the directive including the leading dot, so `.elif` gives `.if` and
+    /// `.elifdef` gives `.ifdef`, matching [`Conditional::conditional_type`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = ".if ${A}\n.elifndef B\n.else\n.endif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let types: Vec<_> = cond.branches().map(|b| b.conditional_type()).collect();
+    /// assert_eq!(types, vec![Some(".if".to_string()), Some(".ifndef".to_string()), None]);
+    /// ```
+    pub fn conditional_type(&self) -> Option<String> {
+        let (_, keyword) = keyword_token(&self.header)?;
+        if let Some(rest) = keyword.strip_prefix(".elif") {
+            return Some(format!(".if{}", rest));
+        }
+        match keyword.as_str() {
+            "else" => {
+                // In `else ifeq ...` the directive is the second identifier.
+                let directive = self
+                    .header
+                    .children_with_tokens()
+                    .filter_map(|it| it.into_token())
+                    .filter(|t| t.kind() == IDENTIFIER)
+                    .nth(1)?;
+                Some(directive.text().to_string())
+            }
+            ".else" => None,
+            _ => Some(keyword),
+        }
+    }
+
+    /// Whether this is a plain `else` / `.else` branch, taken when no
+    /// earlier branch was.
+    pub fn is_else(&self) -> bool {
+        self.header.kind() == CONDITIONAL_ELSE && self.conditional_type().is_none()
+    }
+
+    /// The raw, unexpanded condition of this branch, or `None` for a plain
+    /// `else`.
+    ///
+    /// For `ifdef` / `ifndef` this is the variable name. For `ifeq` /
+    /// `ifneq` it is the full argument text, e.g. `($(A),b)`; use
+    /// [`Self::ifeq_args`] to get the two arguments.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nelse ifndef $(B)\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let conditions: Vec<_> = cond.branches().map(|b| b.condition()).collect();
+    /// assert_eq!(conditions, vec![Some("A".to_string()), Some("$(B)".to_string())]);
+    /// ```
+    pub fn condition(&self) -> Option<String> {
+        let expr = self.header.children().find(|it| it.kind() == EXPR)?;
+        Some(node_text(&expr).trim().to_string())
+    }
+
+    /// For an `ifeq` / `ifneq` branch, return the two argument strings
+    /// (unexpanded). Supports both the `(a,b)` and `"a" "b"` (or
+    /// `'a' 'b'`) syntaxes.
+    ///
+    /// Returns `None` for other directives (or if the args can't be
+    /// recovered).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifeq ($(A),a)\nelse ifneq \"$(A)\" 'b'\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let args: Vec<_> = cond.branches().map(|b| b.ifeq_args()).collect();
+    /// assert_eq!(
+    ///     args,
+    ///     vec![
+    ///         Some(("$(A)".to_string(), "a".to_string())),
+    ///         Some(("$(A)".to_string(), "b".to_string())),
+    ///     ]
+    /// );
+    /// ```
+    pub fn ifeq_args(&self) -> Option<(String, String)> {
+        if !matches!(self.conditional_type()?.as_str(), "ifeq" | "ifneq") {
+            return None;
+        }
+        let text = self.condition()?;
+        // Form 1: parenthesised `(a, b)`. Split at the top-level comma,
+        // ignoring commas inside nested `$(...)` / `${...}`.
+        if let Some(inner) = text
+            .strip_prefix('(')
+            .and_then(|s| s.trim_end().strip_suffix(')'))
+        {
+            if let Some((a, b)) = split_top_level_comma(inner) {
+                return Some((a.trim().to_string(), b.trim().to_string()));
+            }
+        }
+
+        // Form 2: quoted `"a" "b"` or `'a' 'b'`.
+        let mut parts = quoted_pair(&text)?;
+        let b = parts.pop()?;
+        let a = parts.pop()?;
+        Some((a, b))
+    }
+
+    /// The items in this branch in source order, including recipe lines
+    /// and nested conditionals.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{ConditionalItem, Makefile, MakefileItem, RuleItem};
+    /// let makefile: Makefile = "all:\nifdef V\n\techo verbose\nelse\n\t@echo quiet\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let Some(RuleItem::Conditional(cond)) = rule.items().next() else { panic!() };
+    /// let recipes: Vec<Vec<String>> = cond
+    ///     .branches()
+    ///     .map(|b| {
+    ///         b.items()
+    ///             .map(|item| match item {
+    ///                 ConditionalItem::Recipe(r) => r.text(),
+    ///                 ConditionalItem::Item(_) => panic!("expected recipe"),
+    ///             })
+    ///             .collect()
+    ///     })
+    ///     .collect();
+    /// assert_eq!(recipes, vec![vec!["echo verbose"], vec!["@echo quiet"]]);
+    /// ```
+    pub fn items(&self) -> impl Iterator<Item = ConditionalItem> {
+        self.header
+            .siblings(Direction::Next)
+            .skip(1)
+            .take_while(|n| !matches!(n.kind(), CONDITIONAL_ELSE | CONDITIONAL_ENDIF))
+            .filter_map(ConditionalItem::cast)
+    }
+
+    /// The line number (0-indexed) of the directive starting this branch.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nX = 1\nelse\nX = 2\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let lines: Vec<_> = cond.branches().map(|b| b.line()).collect();
+    /// assert_eq!(lines, vec![0, 2]);
+    /// ```
+    pub fn line(&self) -> usize {
+        line_col_at_offset(&self.header, self.header.text_range().start()).0
+    }
+}
+
 impl Conditional {
     /// Get the parent item of this conditional, if any
     ///
@@ -116,18 +304,21 @@ impl Conditional {
         self.syntax().parent().and_then(MakefileItem::cast)
     }
 
+    /// The initial `if` branch of this conditional.
+    fn if_branch(&self) -> Option<ConditionalBranch> {
+        self.syntax()
+            .children()
+            .find(|it| it.kind() == CONDITIONAL_IF)
+            .map(|header| ConditionalBranch { header })
+    }
+
     /// Get the type of conditional (ifdef, ifndef, ifeq, ifneq)
     ///
     /// For BSD make conditionals this includes the leading dot, e.g. `.if`
     /// or `.ifdef`, regardless of any whitespace between the dot and the
     /// keyword.
     pub fn conditional_type(&self) -> Option<String> {
-        directive_keyword(
-            &self
-                .syntax()
-                .children()
-                .find(|it| it.kind() == CONDITIONAL_IF)?,
-        )
+        self.if_branch()?.conditional_type()
     }
 
     /// Whether this is a BSD make conditional (`.if` ... `.endif`).
@@ -137,22 +328,14 @@ impl Conditional {
 
     /// Get the condition expression
     pub fn condition(&self) -> Option<String> {
-        let if_node = self
-            .syntax()
-            .children()
-            .find(|it| it.kind() == CONDITIONAL_IF)?;
-
-        // Find the EXPR node which contains the condition
-        let expr_node = if_node.children().find(|it| it.kind() == EXPR)?;
-
-        Some(node_text(&expr_node).trim().to_string())
+        self.if_branch()?.condition()
     }
 
     /// For an `ifeq` / `ifneq` conditional, return the two argument
     /// strings (unexpanded). Supports both the `(a,b)` and `"a" "b"`
     /// (or `'a' 'b'`) syntaxes.
     ///
-    /// Returns `None` for `ifdef` / `ifndef` (or if the args can't be
+    /// Returns `None` for other conditional types (or if the args can't be
     /// recovered).
     ///
     /// # Example
@@ -163,31 +346,47 @@ impl Conditional {
     /// assert_eq!(c.ifeq_args(), Some(("$(A)".to_string(), "$(B)".to_string())));
     /// ```
     pub fn ifeq_args(&self) -> Option<(String, String)> {
-        let if_node = self
-            .syntax()
+        self.if_branch()?.ifeq_args()
+    }
+
+    /// The branches of this conditional in source order: the initial `if`,
+    /// any `else ifeq`/`else ifdef`/... (or BSD `.elif*`) branches, and
+    /// the final plain `else`, if present.
+    ///
+    /// Unlike [`Self::else_items`], which lumps together the items of all
+    /// branches after the first, this gives access to the condition and
+    /// items of each branch separately.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = r#"ifeq ($(OS),Linux)
+    /// A = linux
+    /// else ifdef WINDIR
+    /// A = windows
+    /// else
+    /// A = other
+    /// endif
+    /// "#.parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let branches: Vec<_> = cond
+    ///     .branches()
+    ///     .map(|b| (b.conditional_type(), b.condition()))
+    ///     .collect();
+    /// assert_eq!(
+    ///     branches,
+    ///     vec![
+    ///         (Some("ifeq".to_string()), Some("($(OS),Linux)".to_string())),
+    ///         (Some("ifdef".to_string()), Some("WINDIR".to_string())),
+    ///         (None, None),
+    ///     ]
+    /// );
+    /// ```
+    pub fn branches(&self) -> impl Iterator<Item = ConditionalBranch> + '_ {
+        self.syntax()
             .children()
-            .find(|it| it.kind() == CONDITIONAL_IF)?;
-        // Inside CONDITIONAL_IF there is one EXPR node wrapping the args.
-        let wrapper = if_node.children().find(|it| it.kind() == EXPR)?;
-
-        let text = node_text(&wrapper);
-        let stripped = text.trim();
-        // Form 1: parenthesised — `(a, b)`. Split at the top-level comma,
-        // ignoring commas inside nested `$(...)` / `${...}`.
-        if let Some(inner) = stripped
-            .strip_prefix('(')
-            .and_then(|s| s.trim_end().strip_suffix(')'))
-        {
-            if let Some((a, b)) = split_top_level_comma(inner) {
-                return Some((a.trim().to_string(), b.trim().to_string()));
-            }
-        }
-
-        // Form 2: quoted — `"a" "b"` or `'a' 'b'`.
-        let mut parts = quoted_pair(&text)?;
-        let b = parts.pop()?;
-        let a = parts.pop()?;
-        Some((a, b))
+            .filter(|it| matches!(it.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE))
+            .map(|header| ConditionalBranch { header })
     }
 
     /// Check if this conditional has an else clause
@@ -351,6 +550,9 @@ impl Conditional {
     }
 
     /// Get all items (rules, variables, includes, nested conditionals) in the else branch
+    ///
+    /// For an `else ifeq ...` chain this includes the items of all branches
+    /// after the first; use [`Self::branches`] to tell them apart.
     ///
     /// # Example
     /// ```
@@ -532,7 +734,288 @@ impl Conditional {
 #[cfg(test)]
 mod tests {
 
+    use super::{ConditionalBranch, ConditionalItem};
     use crate::lossless::Makefile;
+    use crate::{MakefileItem, MakefileVariant, RuleItem};
+
+    fn describe_item(item: ConditionalItem) -> String {
+        match item {
+            ConditionalItem::Recipe(r) => format!("recipe {}", r.text()),
+            ConditionalItem::Item(MakefileItem::Variable(v)) => {
+                format!("var {}={}", v.name().unwrap(), v.raw_value().unwrap())
+            }
+            ConditionalItem::Item(MakefileItem::Rule(r)) => {
+                format!("rule {}", r.targets().collect::<Vec<_>>().join(" "))
+            }
+            ConditionalItem::Item(MakefileItem::Conditional(c)) => {
+                format!("conditional {}", c.conditional_type().unwrap())
+            }
+            ConditionalItem::Item(_) => "other".to_string(),
+        }
+    }
+
+    type BranchDescription = (Option<String>, Option<String>, usize, Vec<String>);
+
+    fn describe(branch: ConditionalBranch) -> BranchDescription {
+        (
+            branch.conditional_type(),
+            branch.condition(),
+            branch.line(),
+            branch.items().map(describe_item).collect(),
+        )
+    }
+
+    fn branch(
+        kind: Option<&str>,
+        condition: Option<&str>,
+        line: usize,
+        items: &[&str],
+    ) -> BranchDescription {
+        (
+            kind.map(str::to_string),
+            condition.map(str::to_string),
+            line,
+            items.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    fn rule_conditional(makefile: &Makefile) -> crate::Conditional {
+        let rule = makefile.rules().next().unwrap();
+        let cond = rule.items().find_map(|item| match item {
+            RuleItem::Conditional(c) => Some(c),
+            RuleItem::Recipe(_) => None,
+        });
+        cond.unwrap()
+    }
+
+    #[test]
+    fn test_branches_single() {
+        let makefile: Makefile = "ifdef A\nX = 1\nendif\n".parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifdef"), Some("A"), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_branches_else_ifdef_chain() {
+        let makefile: Makefile =
+            "ifdef A\nX = 1\nelse ifndef $(B)\nX = 2\nelse ifdef C\nelse\nX = 3\nY = 4\nendif\n"
+                .parse()
+                .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifdef"), Some("A"), 0, &["var X=1"]),
+                branch(Some("ifndef"), Some("$(B)"), 2, &["var X=2"]),
+                branch(Some("ifdef"), Some("C"), 4, &[]),
+                branch(None, None, 5, &["var X=3", "var Y=4"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches().map(|b| b.is_else()).collect::<Vec<_>>(),
+            vec![false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn test_branches_else_ifeq_chain() {
+        let makefile: Makefile = "ifeq ($(A),a)\nX = 1\nelse ifneq ($(A), $(call f,b))\nX = 2\nelse ifeq \"$(A)\" 'c'\nX = 3\nendif\n"
+            .parse()
+            .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifeq"), Some("($(A),a)"), 0, &["var X=1"]),
+                branch(Some("ifneq"), Some("($(A), $(call f,b))"), 2, &["var X=2"]),
+                branch(Some("ifeq"), Some("\"$(A)\" 'c'"), 4, &["var X=3"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches().map(|b| b.ifeq_args()).collect::<Vec<_>>(),
+            vec![
+                Some(("$(A)".to_string(), "a".to_string())),
+                Some(("$(A)".to_string(), "$(call f,b)".to_string())),
+                Some(("$(A)".to_string(), "c".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branches_crlf() {
+        let src = "ifeq ($(A),\\\r\n  a)\r\nX = 1\r\nelse ifneq \"$(A)\" 'b'\r\nX = 2\r\nelse ifdef C\r\nelse\r\nX = 3\r\nendif\r\n";
+        let makefile: Makefile = src.parse().unwrap();
+        assert_eq!(makefile.to_string(), src);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifeq"), Some("($(A),\\\n  a)"), 0, &["var X=1"]),
+                branch(Some("ifneq"), Some("\"$(A)\" 'b'"), 3, &["var X=2"]),
+                branch(Some("ifdef"), Some("C"), 5, &[]),
+                branch(None, None, 6, &["var X=3"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches().map(|b| b.ifeq_args()).collect::<Vec<_>>(),
+            vec![
+                Some(("$(A)".to_string(), "\\\n  a".to_string())),
+                Some(("$(A)".to_string(), "b".to_string())),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(cond.condition(), Some("($(A),\\\n  a)".to_string()));
+    }
+
+    #[test]
+    fn test_branch_ifeq_args_other_directives() {
+        let makefile: Makefile = "ifdef A\nelse\nendif\n".parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(|b| b.ifeq_args()).collect::<Vec<_>>(),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn test_ifeq_args_bsd_conditional() {
+        let makefile: Makefile = ".if \"a\" == \"b\"\n.endif\n".parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.ifeq_args(), None);
+    }
+
+    #[test]
+    fn test_branches_nested() {
+        let makefile: Makefile =
+            "ifdef A\nifeq ($(B),b)\nX = 1\nelse\nX = 2\nendif\nY = 3\nelse ifdef C\nZ = 4\nendif\n"
+                .parse()
+                .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(
+                    Some("ifdef"),
+                    Some("A"),
+                    0,
+                    &["conditional ifeq", "var Y=3"]
+                ),
+                branch(Some("ifdef"), Some("C"), 7, &["var Z=4"]),
+            ]
+        );
+        let Some(ConditionalItem::Item(MakefileItem::Conditional(inner))) =
+            cond.branches().next().unwrap().items().next()
+        else {
+            panic!("expected nested conditional");
+        };
+        assert_eq!(
+            inner.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifeq"), Some("($(B),b)"), 1, &["var X=1"]),
+                branch(None, None, 3, &["var X=2"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branches_recipes_in_rule() {
+        let makefile: Makefile =
+            "all:\n\techo start\nifdef V\n\techo verbose\nelse ifeq ($(Q),1)\nelse\n\t@echo quiet\n\t@true\nendif\n\techo end\n"
+                .parse()
+                .unwrap();
+        let cond = rule_conditional(&makefile);
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifdef"), Some("V"), 2, &["recipe echo verbose"]),
+                branch(Some("ifeq"), Some("($(Q),1)"), 4, &[]),
+                branch(None, None, 5, &["recipe @echo quiet", "recipe @true"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branches_nested_recipes_in_rule() {
+        let makefile: Makefile = "all:\nifdef A\nifdef B\n\techo ab\nendif\n\techo a\nendif\n"
+            .parse()
+            .unwrap();
+        let cond = rule_conditional(&makefile);
+        let items: Vec<_> = cond.branches().next().unwrap().items().collect();
+        assert_eq!(
+            items.iter().cloned().map(describe_item).collect::<Vec<_>>(),
+            vec!["conditional ifdef", "recipe echo a"]
+        );
+        let ConditionalItem::Item(MakefileItem::Conditional(inner)) = &items[0] else {
+            panic!("expected nested conditional");
+        };
+        assert_eq!(
+            inner.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifdef"), Some("B"), 2, &["recipe echo ab"])]
+        );
+    }
+
+    #[test]
+    fn test_branches_mixing_recipes_and_variables_after_rule() {
+        let makefile: Makefile = "t:\n\techo a\nifdef X\n\techo b\nQ = 1\nelse\nR = 2\nendif\n"
+            .parse()
+            .unwrap();
+        let cond = rule_conditional(&makefile);
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifdef"), Some("X"), 2, &["recipe echo b", "var Q=1"]),
+                branch(None, None, 5, &["var R=2"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branches_bsd() {
+        let parsed = Makefile::parse_with_variant(
+            ".if ${A} == \"a\" # comment\nX=1\n.elif defined(B)\nX=2\n.  elifndef C\n.  if 1\n.  endif\n.elifmake all\n.else\nX=3\n.endif\n",
+            MakefileVariant::BSDMake,
+        );
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some(".if"), Some("${A} == \"a\""), 0, &["var X=1"]),
+                branch(Some(".if"), Some("defined(B)"), 2, &["var X=2"]),
+                branch(Some(".ifndef"), Some("C"), 4, &["conditional .if"]),
+                branch(Some(".ifmake"), Some("all"), 7, &[]),
+                branch(None, None, 8, &["var X=3"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches().map(|b| b.is_else()).collect::<Vec<_>>(),
+            vec![false, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn test_branches_bsd_recipes_in_rule() {
+        let parsed = Makefile::parse_with_variant(
+            "t:\n.if defined(A)\n\techo a\n.elif defined(B)\n\techo b\n.else\n\techo c\n.endif\n",
+            MakefileVariant::BSDMake,
+        );
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        let cond = rule_conditional(&makefile);
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some(".if"), Some("defined(A)"), 1, &["recipe echo a"]),
+                branch(Some(".if"), Some("defined(B)"), 3, &["recipe echo b"]),
+                branch(None, None, 5, &["recipe echo c"]),
+            ]
+        );
+    }
 
     #[test]
     fn test_conditional_parent() {

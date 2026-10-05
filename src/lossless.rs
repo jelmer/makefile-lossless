@@ -2710,7 +2710,7 @@ impl Parse {
 
 /// Calculate line and column (both 0-indexed) for the given offset in the tree.
 /// Column is measured in bytes from the start of the line.
-fn line_col_at_offset(node: &SyntaxNode, offset: rowan::TextSize) -> (usize, usize) {
+pub(crate) fn line_col_at_offset(node: &SyntaxNode, offset: rowan::TextSize) -> (usize, usize) {
     let root = node.ancestors().last().unwrap_or_else(|| node.clone());
     let mut line = 0;
     let mut last_newline_offset = rowan::TextSize::from(0);
