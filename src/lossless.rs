@@ -941,25 +941,36 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             matches!(self.tokens.last(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str()))
         }
 
+        /// Whether the current token is one of `keywords`, followed by
+        /// whitespace, a comment or the end of the line, as make requires
+        /// for its directives.
+        fn at_keyword(&self, keywords: &[&str]) -> bool {
+            let mut tokens = self.tokens.iter().rev();
+            tokens.next().is_some_and(|(kind, text)| {
+                *kind == IDENTIFIER && keywords.contains(&text.as_str())
+            }) && matches!(
+                tokens.next(),
+                None | Some((WHITESPACE | NEWLINE | COMMENT, _))
+            )
+        }
+
+        /// Whether the current token is a GNU make `load` or `-load`
+        /// directive, which only GNU make supports. As for `include`,
+        /// `load: foo` is a rule.
+        fn at_load_keyword(&self) -> bool {
+            self.gnu_directives_enabled() && self.at_keyword(&["load", "-load"])
+        }
+
         /// Whether the current token is an `include`, `-include` or
         /// `sinclude` directive. Like make, this requires whitespace after
         /// the keyword, so `include: foo` is a rule. BSD make also treats a
         /// line with a dependency operator followed by whitespace, as in
         /// `include foo: bar`, as a rule.
         fn at_include_keyword(&self) -> bool {
-            let mut tokens = self.tokens.iter().rev();
-            if !tokens.next().is_some_and(|(kind, text)| {
-                *kind == IDENTIFIER && matches!(text.as_str(), "include" | "-include" | "sinclude")
-            }) {
+            if !self.at_keyword(&["include", "-include", "sinclude"]) {
                 return false;
             }
-            let mut tokens = tokens.peekable();
-            if !matches!(
-                tokens.peek(),
-                None | Some((WHITESPACE | NEWLINE | COMMENT, _))
-            ) {
-                return false;
-            }
+            let mut tokens = self.tokens.iter().rev().skip(1).peekable();
             if self.variant != Some(MakefileVariant::BSDMake) {
                 return true;
             }
@@ -2364,6 +2375,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.parse_assignment();
             } else if self.at_include_keyword() {
                 self.parse_include();
+            } else if self.at_load_keyword() {
+                self.parse_load();
             } else if !self.is_bsd_make()
                 && self.current() == Some(IDENTIFIER)
                 && self.tokens.last().unwrap().1 == "vpath"
@@ -2465,8 +2478,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return;
             }
             self.skip_ws_and_continuations();
+            self.parse_file_list("include", true);
+            self.builder.finish_node();
+        }
 
-            // Parse file paths
+        /// Parse a GNU make `load` or `-load` directive into a LOAD node.
+        fn parse_load(&mut self) {
+            self.in_rule = false;
+            self.builder.start_node(LOAD.into());
+            self.bump();
+            self.skip_ws_and_continuations();
+            // GNU make accepts a `load` without any objects.
+            self.parse_file_list("load", false);
+            self.builder.finish_node();
+        }
+
+        /// Parse the file names of an `include` or `load` directive into an
+        /// EXPR node, followed by an optional comment and the newline. If
+        /// `required` is set, an empty list is an error.
+        fn parse_file_list(&mut self, directive: &str, required: bool) {
             self.builder.start_node(EXPR.into());
             let mut found_path = false;
 
@@ -2496,10 +2526,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
-            if !found_path {
+            if required && !found_path {
                 self.error(
                     ParseErrorKind::MissingIncludePath,
-                    "expected file path after include".to_string(),
+                    format!("expected file path after {}", directive),
                 );
             }
 
@@ -2517,12 +2547,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             } else if !self.is_at_eof() {
                 self.error(
                     ParseErrorKind::ExtraneousText,
-                    "expected newline after include".to_string(),
+                    format!("expected newline after {}", directive),
                 );
                 self.skip_until_newline();
             }
-
-            self.builder.finish_node();
         }
 
         /// Parse a `vpath` directive in one of its three forms:
@@ -3716,6 +3744,7 @@ ast_node!(Identifier, IDENTIFIER);
 ast_node!(VariableDefinition, VARIABLE);
 ast_node!(Include, INCLUDE);
 ast_node!(Vpath, VPATH);
+ast_node!(Load, LOAD);
 ast_node!(ExpressionStatement, EXPRESSION_STATEMENT);
 ast_node!(ArchiveMembers, ARCHIVE_MEMBERS);
 ast_node!(ArchiveMember, ARCHIVE_MEMBER);
@@ -7065,6 +7094,24 @@ all: $(OBJS)
                 "{src:?}"
             );
             assert_eq!(root.to_string(), src);
+        }
+    }
+
+    #[test]
+    fn test_load_directive() {
+        for text in [
+            "load foo.so\n",
+            "load ./bar.so(init_func)\n",
+            "-load optional.so\n",
+            "load a.so b.so # comment\n",
+            "load \\\n  a.so\n",
+            "load $(OBJ)\nall:\n",
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.errors, vec![], "{text:?}");
+            let root = parsed.root();
+            assert_eq!(root.to_string(), text);
+            assert_eq!(root.rules().count(), text.matches("all:").count());
         }
     }
 
