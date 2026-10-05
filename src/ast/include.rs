@@ -1,7 +1,7 @@
 use super::bsd::{directive_keyword, keyword_token};
 use super::makefile::MakefileItem;
 use crate::lossless::{
-    remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
+    node_text, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
 use crate::SyntaxKind::{EXPR, IDENTIFIER, INCLUDE};
 use rowan::ast::AstNode;
@@ -55,7 +55,7 @@ impl Include {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
-            .map(|it| it.text().to_string().trim().to_string())
+            .map(|it| node_text(&it).trim().to_string())
     }
 
     /// Get the text range of the path portion of the include directive.

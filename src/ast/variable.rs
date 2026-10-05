@@ -1,5 +1,5 @@
 use super::makefile::MakefileItem;
-use crate::lossless::{remove_with_preceding_comments, VariableDefinition};
+use crate::lossless::{node_text, remove_with_preceding_comments, VariableDefinition};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
@@ -285,7 +285,7 @@ impl VariableDefinition {
 
     /// Get the raw value of the variable definition
     pub fn raw_value(&self) -> Option<String> {
-        self.value_expr().map(|it| it.text().into())
+        self.value_expr().map(|it| node_text(&it))
     }
 
     /// Get the parent item of this variable definition, if any

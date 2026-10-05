@@ -2,7 +2,7 @@
 //! directives such as `.undef` or `.error`.
 
 use super::makefile::MakefileItem;
-use crate::lossless::{Directive, ForLoop, SyntaxNode, SyntaxToken};
+use crate::lossless::{node_text, Directive, ForLoop, SyntaxNode, SyntaxToken};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -39,7 +39,7 @@ pub(crate) fn directive_keyword(node: &SyntaxNode) -> Option<String> {
 fn expr_text(node: &SyntaxNode) -> Option<String> {
     node.children()
         .find(|it| it.kind() == EXPR)
-        .map(|it| it.text().to_string().trim().to_string())
+        .map(|it| node_text(&it).trim().to_string())
 }
 
 impl ForLoop {

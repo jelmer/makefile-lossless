@@ -1,6 +1,6 @@
 //! Accessors for `vpath` directives.
 
-use crate::lossless::Vpath;
+use crate::lossless::{node_text, Vpath};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -57,7 +57,7 @@ impl Vpath {
         self.syntax()
             .children()
             .find(|c| c.kind() == EXPR)
-            .map(|n| n.text().to_string())
+            .map(|n| node_text(&n))
     }
 }
 

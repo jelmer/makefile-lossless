@@ -1,7 +1,7 @@
 use super::makefile::MakefileItem;
 use crate::lossless::{
-    remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error, ErrorInfo,
-    Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
+    node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
+    ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -302,7 +302,7 @@ impl Rule {
                 }
             } else if let Some(child_node) = child.as_node() {
                 // Handle nested nodes like ARCHIVE_MEMBERS
-                current_target.push_str(&child_node.text().to_string());
+                current_target.push_str(&node_text(child_node));
             }
         }
 
@@ -386,7 +386,7 @@ impl Rule {
                                 while let Some(token) = tokens.peek() {
                                     if let Some(node) = token.as_node() {
                                         if node.kind() == ARCHIVE_MEMBERS {
-                                            archive_target.push_str(&node.text().to_string());
+                                            archive_target.push_str(&node_text(node));
                                             tokens.next();
                                         } else {
                                             tokens.next();
@@ -455,7 +455,7 @@ impl Rule {
             prereqs
                 .children()
                 .filter(|child| child.kind() == PREREQUISITE)
-                .map(|child| child.text().to_string().trim().to_string())
+                .map(|child| node_text(&child).trim().to_string())
                 .collect()
         } else {
             Vec::new()

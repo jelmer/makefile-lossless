@@ -227,7 +227,14 @@ impl<'a> Lexer<'a> {
             match c {
                 c if Self::is_newline(c) => {
                     self.line_type = None;
-                    return Some((SyntaxKind::NEWLINE, self.input.next()?.to_string()));
+                    let mut text = self.input.next()?.to_string();
+                    // GNU make treats CRLF as a single line ending.
+                    if c == '\r' {
+                        if let Some(lf) = self.input.next_if_eq(&'\n') {
+                            text.push(lf);
+                        }
+                    }
+                    return Some((SyntaxKind::NEWLINE, text));
                 }
                 '#' if !(self.bsd && after_lbracket && self.line_type == Some(LineType::Other)) => {
                     return Some((
@@ -444,6 +451,32 @@ rule: prerequisite
                 (INDENT, "\t"),
                 (TEXT, "recipe"),
                 (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_crlf() {
+        assert_eq!(
+            lex_default("X = a \\\r\n\tb\r\nall:\r\n\techo\r\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (OPERATOR, "=".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (BACKSLASH, "\\".to_string()),
+                (NEWLINE, "\r\n".to_string()),
+                (INDENT, "\t".to_string()),
+                (IDENTIFIER, "b".to_string()),
+                (NEWLINE, "\r\n".to_string()),
+                (IDENTIFIER, "all".to_string()),
+                (OPERATOR, ":".to_string()),
+                (NEWLINE, "\r\n".to_string()),
+                (INDENT, "\t".to_string()),
+                (TEXT, "echo".to_string()),
+                (NEWLINE, "\r\n".to_string()),
             ]
         );
     }
