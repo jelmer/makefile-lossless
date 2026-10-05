@@ -1572,6 +1572,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Handle `export`/`unexport`/`override`/`private` modifiers, in
             // any order.
             self.skip_ws();
+            // BSD make takes everything between a gmake-style `export` and
+            // the `=` as the name, so `export override A = 1` exports a
+            // variable named "override A".
+            let bsd_gmake_export = self.is_bsd_make() && self.at_gmake_export();
             let mut is_export_directive = false;
             while self.at_assignment_prefix_keyword() {
                 is_export_directive |= matches!(
@@ -1580,6 +1584,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 );
                 self.bump();
                 self.skip_ws_and_continuations();
+                if bsd_gmake_export {
+                    break;
+                }
             }
 
             // `undefine NAME`, unless followed by an operator as in
@@ -1606,7 +1613,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.builder.finish_node();
                 return;
             }
-            if !export_all && !self.parse_variable_name() {
+            let has_name = if bsd_gmake_export {
+                self.bump_gmake_export_name()
+            } else {
+                export_all || self.parse_variable_name()
+            };
+            if !has_name {
                 self.error(
                     ParseErrorKind::ExpectedVariableName,
                     "expected variable name".to_string(),
@@ -3359,6 +3371,33 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 tokens.next();
                 len += 1;
             }
+            self.bump_as_identifier(len)
+        }
+
+        /// Consume a gmake-style `export` name in BSD make, which is
+        /// everything up to the operator, as a single IDENTIFIER token.
+        /// Returns false if the name is empty.
+        fn bump_gmake_export_name(&mut self) -> bool {
+            let mut tokens = self.tokens.iter().rev().peekable();
+            let mut len = 0;
+            let mut escaped = false;
+            while let Some((kind, _)) = tokens.peek() {
+                let at_continuation = *kind == BACKSLASH
+                    && !escaped
+                    && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
+                if at_continuation || matches!(*kind, OPERATOR | NEWLINE | COMMENT) {
+                    break;
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+                tokens.next();
+                len += 1;
+            }
+            self.bump_as_identifier(len)
+        }
+
+        /// Consume the next `len` tokens, minus trailing whitespace, as a
+        /// single IDENTIFIER token. Returns false if that leaves nothing.
+        fn bump_as_identifier(&mut self, len: usize) -> bool {
             let trailing_ws = self.tokens[self.tokens.len() - len..]
                 .iter()
                 .take_while(|(kind, _)| *kind == WHITESPACE)
@@ -3381,7 +3420,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether the current line starts a `define` block, optionally
-        /// preceded by modifiers such as `override define NAME`.
+        /// preceded by modifiers such as `override define NAME`. `define = 1`
+        /// instead assigns to a variable named "define".
         fn is_define_line(&self) -> bool {
             if !self.gnu_directives_enabled() {
                 return false;
@@ -3390,7 +3430,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             loop {
                 Self::skip_ws_and_continuation_tokens(&mut tokens);
                 match tokens.next() {
-                    Some((IDENTIFIER, text)) if text == "define" => return true,
+                    Some((IDENTIFIER, text)) if text == "define" => {
+                        Self::skip_ws_and_continuation_tokens(&mut tokens);
+                        return !matches!(
+                            tokens.next(),
+                            Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str())
+                        );
+                    }
                     Some((IDENTIFIER, text)) if Self::is_define_modifier(text) => {}
                     _ => return false,
                 }
@@ -7771,6 +7817,77 @@ all: $(OBJS)
         let text = ".undef A B\n";
         let parsed = parse(text, Some(MakefileVariant::BSDMake));
         assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().code(), text);
+    }
+
+    #[test]
+    fn test_define_as_variable_name() {
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            let text = "define = 1\n";
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let vars = parsed.root().variable_definitions().collect::<Vec<_>>();
+            assert_eq!(vars.len(), 1, "{variant:?}");
+            assert!(!vars[0].is_define(), "{variant:?}");
+            assert_eq!(vars[0].name(), Some("define".to_string()), "{variant:?}");
+            assert_eq!(vars[0].raw_value(), Some("1".to_string()), "{variant:?}");
+            assert_eq!(parsed.root().code(), text);
+        }
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let text = "override define := 1\nexport define = 2\n";
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let vars = parsed.root().variable_definitions().collect::<Vec<_>>();
+            assert_eq!(vars.len(), 2, "{variant:?}");
+            assert!(vars[0].is_override());
+            assert!(vars[1].is_export());
+            for var in &vars {
+                assert!(!var.is_define(), "{variant:?}");
+                assert_eq!(var.name(), Some("define".to_string()), "{variant:?}");
+            }
+            assert_eq!(parsed.root().code(), text);
+        }
+    }
+
+    #[test]
+    fn test_gmake_export_of_keyword_names_in_bsd_make() {
+        // BSD make takes everything between "export" and "=" as the name of
+        // the environment variable, so none of these are GNU make modifiers.
+        let text = "export undefine A = 1\nexport define B = 2\nexport override C = 3\n\
+                    export unexport D = 4\nexport private E = 5\nexport export F = 6\n";
+        let parsed = parse(text, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        let vars = parsed.root().variable_definitions().collect::<Vec<_>>();
+        assert_eq!(
+            vars.iter().map(|v| v.name()).collect::<Vec<_>>(),
+            [
+                "undefine A",
+                "define B",
+                "override C",
+                "unexport D",
+                "private E",
+                "export F"
+            ]
+            .map(|n| Some(n.to_string()))
+        );
+        for var in &vars {
+            assert!(var.is_export());
+            assert!(!var.is_undefine());
+            assert!(!var.is_define());
+            assert!(!var.is_override());
+            assert!(!var.is_unexport());
+            assert!(!var.is_private());
+        }
+        assert_eq!(
+            vars.iter().map(|v| v.raw_value()).collect::<Vec<_>>(),
+            ["1", "2", "3", "4", "5", "6"].map(|v| Some(v.to_string()))
+        );
         assert_eq!(parsed.root().code(), text);
     }
 
