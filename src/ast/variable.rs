@@ -848,8 +848,7 @@ mod tests {
         assert!(!var.is_export());
     }
 
-    /// Build a VARIABLE node directly, for directive forms the parser
-    /// does not produce yet.
+    /// Build a VARIABLE node directly, bypassing the parser.
     fn variable_from_tokens(tokens: &[(crate::SyntaxKind, &str)]) -> VariableDefinition {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
@@ -862,8 +861,8 @@ mod tests {
 
     #[test]
     fn test_bare_keyword_directive() {
-        // A bare `export` (export all variables) does not parse cleanly yet,
-        // so check the keyword logic on the tree it would produce.
+        // Check the keyword logic independently of the parser, including
+        // forms such as a bare `override` that it doesn't produce.
         let var = variable_from_tokens(&[(IDENTIFIER, "export"), (NEWLINE, "\n")]);
         assert!(var.is_export());
         assert!(!var.is_override());
