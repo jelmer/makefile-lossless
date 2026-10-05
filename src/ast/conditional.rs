@@ -938,6 +938,96 @@ mod tests {
     }
 
     #[test]
+    fn test_branches_header_comments() {
+        let code = "ifdef A # c\nX = 1\nelse ifeq (a,b) # c\nX = 2\nelse ifneq \"a\" 'b'# c\nX = 3\nelse # c\nX = 4\nendif # c\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some("ifdef"), Some("A"), 0, &["var X=1"]),
+                branch(Some("ifeq"), Some("(a,b)"), 2, &["var X=2"]),
+                branch(Some("ifneq"), Some("\"a\" 'b'"), 4, &["var X=3"]),
+                branch(None, None, 6, &["var X=4"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches().map(|b| b.ifeq_args()).collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(("a".to_string(), "b".to_string())),
+                Some(("a".to_string(), "b".to_string())),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ifeq_args_header_comment() {
+        let code = "ifeq ($(A),a) # c\nX = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("($(A),a)".to_string()));
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("$(A)".to_string(), "a".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_ifdef_only_comment() {
+        let code = "ifdef # c\nX = 1\nendif\n";
+        let parsed = Makefile::parse(code);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expected condition after conditional directive"]
+        );
+        let makefile = parsed.tree();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![branch(Some("ifdef"), Some(""), 0, &["var X=1"])]
+        );
+    }
+
+    #[test]
+    fn test_bsd_branches_header_comments() {
+        let code = ".if A # c\nX = 1\n.elif ${B} == b # c\nX = 2\n.else # c\nX = 3\n.endif # c\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.branches().map(describe).collect::<Vec<_>>(),
+            vec![
+                branch(Some(".if"), Some("A"), 0, &["var X=1"]),
+                branch(Some(".if"), Some("${B} == b"), 2, &["var X=2"]),
+                branch(None, None, 4, &["var X=3"]),
+            ]
+        );
+        assert_eq!(
+            cond.branches()
+                .map(|b| b.bsd_condition())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Ok(BsdCondition::Bare("A".to_string()))),
+                Some(Ok(BsdCondition::Compare {
+                    lhs: BsdOperand::VariableReference("${B}".to_string()),
+                    op: BsdComparisonOp::Equal,
+                    rhs: BsdOperand::Word("b".to_string()),
+                })),
+                None,
+            ]
+        );
+    }
+
+    #[test]
     fn test_branch_ifeq_args_other_directives() {
         let makefile: Makefile = "ifdef A\nelse\nendif\n".parse().unwrap();
         let cond = makefile.conditionals().next().unwrap();

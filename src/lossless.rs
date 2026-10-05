@@ -1920,9 +1920,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     ParseErrorKind::InvalidConditional,
                     "expected opening parenthesis or quote".to_string(),
                 );
+                self.builder.finish_node();
+                return;
             }
 
             self.builder.finish_node();
+
+            // A trailing comment is not part of the condition.
+            self.expect_eol();
         }
 
         // Internal helper to parse parenthesized expressions
@@ -1985,11 +1990,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             for _ in 0..open_nested {
                 self.builder.finish_node();
             }
-
-            if !is_variable_ref {
-                self.skip_ws();
-                self.expect_eol();
-            }
         }
 
         // Helper method to parse quoted comparison for ifeq/ifneq
@@ -2017,10 +2017,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     "expected second quoted argument".to_string(),
                 );
             }
-
-            // Skip trailing whitespace and expect end of line
-            self.skip_ws();
-            self.expect_eol();
         }
 
         // Handle parsing a quoted string. The lexer emits the entire quoted
@@ -2066,8 +2062,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Collect variable names
             let mut found_var = false;
 
-            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
+            loop {
                 match self.current() {
+                    None | Some(NEWLINE | COMMENT) => break,
+                    // Leave whitespace before a trailing comment out of the
+                    // condition.
+                    Some(WHITESPACE)
+                        if matches!(self.peek_past_ws(), None | Some(NEWLINE | COMMENT)) =>
+                    {
+                        break
+                    }
                     Some(WHITESPACE) => self.skip_ws(),
                     Some(BACKSLASH) if self.is_line_continuation() => {
                         self.consume_line_continuation();
@@ -2081,13 +2085,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         found_var = true;
                         self.bump();
                     }
-                    None => break,
                 }
             }
 
             if !found_var {
-                // Empty condition is an error in GNU Make
-                self.error(
+                // TODO: GNU make accepts an empty condition and treats it
+                // as undefined.
+                self.record_error(
                     ParseErrorKind::InvalidConditional,
                     "expected condition after conditional directive".to_string(),
                 );
@@ -2095,12 +2099,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             self.builder.finish_node();
 
-            // Expect end of line
-            if self.current() == Some(NEWLINE) {
-                self.bump();
-            } else if !self.is_at_eof() {
-                self.skip_until_newline();
-            }
+            // A trailing comment is not part of the condition.
+            self.expect_eol();
         }
 
         // Helper to check if a token starts a conditional block.
@@ -2175,6 +2175,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 // Plain 'else' with something else after it (not a conditional keyword)
                                 // The newline will be consumed by the conditional body loop
                             }
+                        } else if self.current() == Some(COMMENT) {
+                            // Plain 'else' with a trailing comment; the
+                            // newline will be consumed by the conditional
+                            // body loop
+                            self.bump();
                         } else {
                             // Plain 'else' - the newline will be consumed by the conditional body loop
                         }
@@ -2267,13 +2272,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 _ => unreachable!("Invalid conditional token"),
             }
-
-            // Skip any trailing whitespace and check for inline comments
-            self.skip_ws();
-            if self.current() == Some(COMMENT) {
-                self.parse_comment();
-            }
-            // Note: expect_eol is already called by parse_simple_condition() and parse_parenthesized_expr()
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
 
@@ -5252,6 +5250,56 @@ mod tests {
         let code = "ifeq ($(X), linux) # extra features\nFOO = bar\nendif\n";
         let makefile: Makefile = code.parse().expect("trailing comment should parse");
         assert_eq!(code, makefile.to_string());
+    }
+
+    #[test]
+    fn test_conditional_header_comment_tree() {
+        // make strips a comment from a conditional directive line, so it
+        // must not end up in the condition.
+        let code = "ifdef X # c\n# d\nelse ifeq (a,b) # c\nelse # c\nendif # c\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..55
+  CONDITIONAL@0..55
+    CONDITIONAL_IF@0..12
+      IDENTIFIER@0..5 "ifdef"
+      WHITESPACE@5..6 " "
+      EXPR@6..7
+        IDENTIFIER@6..7 "X"
+      WHITESPACE@7..8 " "
+      COMMENT@8..11 "# c"
+      NEWLINE@11..12 "\n"
+    COMMENT@12..15 "# d"
+    NEWLINE@15..16 "\n"
+    CONDITIONAL_ELSE@16..36
+      IDENTIFIER@16..20 "else"
+      WHITESPACE@20..21 " "
+      IDENTIFIER@21..25 "ifeq"
+      WHITESPACE@25..26 " "
+      EXPR@26..31
+        LPAREN@26..27 "("
+        IDENTIFIER@27..28 "a"
+        COMMA@28..29 ","
+        IDENTIFIER@29..30 "b"
+        RPAREN@30..31 ")"
+      WHITESPACE@31..32 " "
+      COMMENT@32..35 "# c"
+      NEWLINE@35..36 "\n"
+    CONDITIONAL_ELSE@36..44
+      IDENTIFIER@36..40 "else"
+      WHITESPACE@40..41 " "
+      COMMENT@41..44 "# c"
+    NEWLINE@44..45 "\n"
+    CONDITIONAL_ENDIF@45..55
+      IDENTIFIER@45..50 "endif"
+      WHITESPACE@50..51 " "
+      COMMENT@51..54 "# c"
+      NEWLINE@54..55 "\n"
+"##
+        );
+        assert_eq!(code, parsed.root().to_string());
     }
 
     #[test]
