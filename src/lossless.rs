@@ -360,6 +360,99 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
+        /// Parse a recipe given on the rule line after a `;`, up to the end
+        /// of the line. Like make, take everything after the `;` and any
+        /// whitespace following it as the recipe text, including `#`.
+        fn parse_inline_recipe(&mut self) {
+            self.builder.start_node(RECIPE.into());
+            self.bump_as(OPERATOR);
+            self.skip_ws();
+            let mut first = true;
+            loop {
+                let mut text = String::new();
+                while self.current().is_some_and(|kind| kind != NEWLINE) {
+                    if !self.split_continued_comment() {
+                        text.push_str(&self.tokens.pop().unwrap().1);
+                    }
+                }
+                self.pending_backslash_escape = false;
+                // An odd number of trailing backslashes continues the line,
+                // even after a `#`.
+                let continued = self.current() == Some(NEWLINE)
+                    && text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+                if !text.is_empty() {
+                    // Mirror how a tab-indented `# ...` line is tokenized.
+                    let kind = if first && text.starts_with('#') {
+                        COMMENT
+                    } else {
+                        TEXT
+                    };
+                    self.builder.token(kind.into(), &text);
+                }
+                if self.current() == Some(NEWLINE) {
+                    self.bump();
+                }
+                if !continued {
+                    break;
+                }
+                first = false;
+                if self.current() == Some(INDENT) {
+                    self.bump();
+                }
+            }
+            self.builder.finish_node();
+        }
+
+        /// If the current token is a comment that the lexer continued onto
+        /// the next line because it ends in a backslash, split it into its
+        /// first line, the line ending, the next line's indentation and the
+        /// rest. This is for places where `#` does not start a comment, such
+        /// as a recipe on the rule line.
+        fn split_continued_comment(&mut self) -> bool {
+            let Some((COMMENT, text)) = self.tokens.last() else {
+                return false;
+            };
+            let Some(eol) = text.find(['\r', '\n']) else {
+                return false;
+            };
+            let eol_end = eol
+                + if text[eol..].starts_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+            let rest = &text[eol_end..];
+            let indent_end = eol_end + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            let pieces: Vec<(SyntaxKind, String)> = [
+                (COMMENT, &text[..eol]),
+                (NEWLINE, &text[eol..eol_end]),
+                (INDENT, &text[eol_end..indent_end]),
+                (COMMENT, &text[indent_end..]),
+            ]
+            .into_iter()
+            .filter(|(_, piece)| !piece.is_empty())
+            .map(|(kind, piece)| (kind, piece.to_string()))
+            .collect();
+
+            // Keep token_positions in step with the new tokens.
+            let consumed = self.token_positions.len() - self.tokens.len();
+            let mut position = self.token_positions[consumed].0;
+            let positions: Vec<_> = pieces
+                .iter()
+                .map(|(_, piece)| {
+                    let start = position;
+                    position += rowan::TextSize::of(piece.as_str());
+                    (start, position)
+                })
+                .collect();
+            self.token_positions
+                .splice(consumed..consumed + 1, positions);
+
+            self.tokens.pop();
+            self.tokens.extend(pieces.into_iter().rev());
+            true
+        }
+
         fn parse_rule_target(&mut self) -> bool {
             match self.current() {
                 Some(IDENTIFIER) => {
@@ -458,6 +551,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn parse_rule_dependencies(&mut self) {
             self.builder.start_node(PREREQUISITES.into());
+            // Only the first `|` separates normal from order-only
+            // prerequisites; GNU make takes any later one as a file name.
+            let mut seen_pipe = false;
 
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 // The prerequisite list may continue on the next physical line.
@@ -472,12 +568,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Trailing comment ends the prerequisite list.
                         self.bump();
                     }
+                    // The rest of the line after a `;` is the first recipe line.
+                    Some(ERROR) if self.at_text(";") => break,
+                    Some(ERROR) if !seen_pipe && self.at_text("|") => {
+                        seen_pipe = true;
+                        self.bump_as(OPERATOR);
+                    }
                     Some(_) => {
                         // Collect contiguous non-whitespace tokens into one
                         // PREREQUISITE node, preserving structures like
                         // `$$(@:.out=.src)` or `lib(member.o)` as a single
                         // word.
-                        self.parse_prerequisite_word();
+                        self.parse_prerequisite_word(!seen_pipe);
                     }
                     None => break,
                 }
@@ -486,11 +588,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node(); // End PREREQUISITES
         }
 
+        /// Whether the current token's text is `text`.
+        fn at_text(&self, text: &str) -> bool {
+            self.tokens.last().is_some_and(|(_, t)| t == text)
+        }
+
         /// Parse a single prerequisite word: consume tokens up to the next
         /// whitespace/newline/comment, descending into variable references
         /// (`$(...)`, `${...}`, `$X`, `$$`) and archive-member parentheses
-        /// without treating them as word boundaries.
-        fn parse_prerequisite_word(&mut self) {
+        /// without treating them as word boundaries. If `stop_at_pipe` is
+        /// set, a `|` also ends the word.
+        fn parse_prerequisite_word(&mut self, stop_at_pipe: bool) {
             self.builder.start_node(PREREQUISITE.into());
 
             // Archive member syntax: `lib(member.o)` — keep as a unit.
@@ -507,6 +615,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match kind {
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
+                    ERROR if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
                     DOLLAR => self.parse_variable_reference(),
                     _ => self.bump(),
                 }
@@ -610,10 +719,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Whether `op` separates targets from prerequisites. BSD make also
-        /// has `!`, which always rebuilds the target.
+        /// Whether `op` separates targets from prerequisites. `&:` and `&::`
+        /// mark grouped targets; BSD make also has `!`, which always
+        /// rebuilds the target.
         fn is_dependency_operator(&self, op: &str) -> bool {
-            matches!(op, ":" | "::") || (op == "!" && self.bsd_directives_enabled())
+            matches!(op, ":" | "::" | "&:" | "&::") || (op == "!" && self.bsd_directives_enabled())
         }
 
         fn at_dependency_operator(&self) -> bool {
@@ -774,8 +884,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.looks_like_target_specific_assignment() {
                     self.parse_target_specific_assignment();
                 } else {
+                    if self.has_static_pattern_colon() {
+                        self.parse_static_pattern();
+                    }
                     self.parse_rule_dependencies();
-                    self.expect_eol();
+                    if self.current() == Some(ERROR) && self.at_text(";") {
+                        self.parse_inline_recipe();
+                    } else {
+                        self.expect_eol();
+                    }
 
                     // Parse recipe lines
                     self.in_rule = true;
@@ -784,6 +901,64 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.builder.finish_node();
+        }
+
+        /// Look ahead (without consuming) for a second, unescaped `:` in
+        /// the prerequisites, which makes this a static pattern rule such as
+        /// `$(OBJS): %.o: %.c`. Colons inside variable references, after an
+        /// inline recipe's `;` or in a comment don't count.
+        fn has_static_pattern_colon(&self) -> bool {
+            let mut escaped = self.pending_backslash_escape;
+            let mut tokens = self.tokens.iter().rev().peekable();
+            while let Some((kind, text)) = tokens.next() {
+                match (*kind, text.as_str()) {
+                    (OPERATOR, ":") if !escaped => return true,
+                    (BACKSLASH, _) if !escaped && matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        escaped = false;
+                        continue;
+                    }
+                    (NEWLINE | COMMENT, _) | (ERROR, ";") => return false,
+                    (DOLLAR, _) if !Self::skip_variable_reference(&mut tokens) => return false,
+                    _ => {}
+                }
+                escaped = *kind == BACKSLASH && !escaped;
+            }
+            false
+        }
+
+        /// Parse the target pattern of a static pattern rule and the colon
+        /// that follows it.
+        fn parse_static_pattern(&mut self) {
+            while self.consume_line_continuation() {
+                self.skip_ws();
+            }
+            self.builder.start_node(TARGET_PATTERN.into());
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(OPERATOR) if self.at_text(":") && !self.pending_backslash_escape => break,
+                    Some(WHITESPACE)
+                        if self
+                            .tokens
+                            .iter()
+                            .rev()
+                            .find(|(kind, _)| *kind != WHITESPACE)
+                            .is_some_and(|(kind, text)| *kind == OPERATOR && text == ":") =>
+                    {
+                        break
+                    }
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(_) => self.bump(),
+                    None => break,
+                }
+            }
+            self.builder.finish_node();
+            self.skip_ws();
+            self.bump();
+            self.skip_ws();
         }
 
         /// Whether `self.tokens[i]` is an `export`/`override`/`private`
@@ -2540,7 +2715,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => {
                         return seen_name || seen_directive
                     }
-                    OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
+                    // It's a rule if we see a colon first
+                    OPERATOR if matches!(text.as_str(), ":" | "::" | "&:" | "&::") => return false,
                     WHITESPACE => name_done = seen_name,
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
@@ -2558,6 +2734,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
         }
+        /// Advance one token, adding it to the tree as `kind`.
+        fn bump_as(&mut self, kind: SyntaxKind) {
+            let (_, text) = self.tokens.pop().unwrap();
+            self.pending_backslash_escape = false;
+            self.builder.token(kind.into(), text.as_str());
+        }
+
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
             self.tokens.last().map(|(kind, _)| *kind)
@@ -3161,7 +3344,8 @@ impl Recipe {
     /// Get the indentation string of this recipe line.
     ///
     /// Returns the leading indentation (typically a tab character) of this recipe line,
-    /// or `None` if no indent token is present.
+    /// or `None` if no indent token is present, as for a recipe on the rule
+    /// line after a `;`.
     ///
     /// # Example
     /// ```
@@ -3347,11 +3531,16 @@ impl Recipe {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
 
-        // Preserve the existing INDENT token if present
-        if let Some(indent_token) = node
+        let inline_prefix = self.inline_prefix();
+        if !inline_prefix.is_empty() {
+            for token in &inline_prefix {
+                builder.token(token.kind().into(), token.text());
+            }
+        } else if let Some(indent_token) = node
             .children_with_tokens()
             .find(|it| it.as_token().map(|t| t.kind() == INDENT).unwrap_or(false))
         {
+            // Preserve the existing INDENT token
             builder.token(INDENT.into(), indent_token.as_token().unwrap().text());
         } else {
             builder.token(INDENT.into(), "\t");
@@ -3399,7 +3588,9 @@ impl Recipe {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hello", "echo world"]);
     /// ```
     pub fn insert_before(&self, text: &str) {
-        let node = self.syntax();
+        // A recipe on the rule line has to move to its own line first.
+        let this = self.move_to_own_line().unwrap_or_else(|| self.clone());
+        let node = this.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
         let node_index = node.index();
 
@@ -3461,10 +3652,108 @@ impl Recipe {
     pub fn remove(&self) {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
-        let node_index = node.index();
 
-        // Remove this recipe node from its parent
-        parent.splice_children(node_index..node_index + 1, vec![]);
+        if !self.is_inline() {
+            let node_index = node.index();
+            parent.splice_children(node_index..node_index + 1, vec![]);
+            return;
+        }
+
+        // A recipe on the rule line also holds the rule line's newline,
+        // which has to stay.
+        self.trim_preceding_whitespace();
+        let newline = node
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == NEWLINE)
+            .map(|t| t.text().to_string());
+        let mut replacement = Vec::new();
+        if let Some(newline) = newline {
+            replacement.extend(detached_elements(&[(NEWLINE, &newline)], None));
+        }
+        let node_index = node.index();
+        parent.splice_children(node_index..node_index + 1, replacement);
+    }
+
+    /// Whether this recipe is on the rule line, after a `;`.
+    pub(crate) fn is_inline(&self) -> bool {
+        self.syntax()
+            .first_token()
+            .is_some_and(|t| t.kind() == OPERATOR && t.text() == ";")
+    }
+
+    /// For a recipe on the rule line, the `;` and the whitespace after it.
+    fn inline_prefix(&self) -> Vec<SyntaxToken> {
+        if !self.is_inline() {
+            return Vec::new();
+        }
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .enumerate()
+            .take_while(|(i, t)| *i == 0 || t.kind() == WHITESPACE)
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    /// Remove whitespace at the end of the rule line, before a recipe on
+    /// the rule line.
+    fn trim_preceding_whitespace(&self) {
+        // Walk the siblings rather than using prev_token(), which stops at
+        // an empty node such as the PREREQUISITES of `all: ; cmd`.
+        let mut current = self.syntax().prev_sibling_or_token();
+        while let Some(element) = current {
+            current = element.prev_sibling_or_token();
+            match element {
+                rowan::NodeOrToken::Token(token) if token.kind() == WHITESPACE => token.detach(),
+                rowan::NodeOrToken::Node(node) => {
+                    while let Some(token) = node.last_token().filter(|t| t.kind() == WHITESPACE) {
+                        token.detach();
+                    }
+                    if node.first_token().is_some() {
+                        break;
+                    }
+                }
+                rowan::NodeOrToken::Token(_) => break,
+            }
+        }
+    }
+
+    /// Move a recipe on the rule line to a line of its own, returning the
+    /// new recipe node, or `None` if this recipe is not on the rule line.
+    fn move_to_own_line(&self) -> Option<Recipe> {
+        if !self.is_inline() {
+            return None;
+        }
+        let node = self.syntax();
+        let parent = node.parent().expect("Recipe node must have a parent");
+        let skip = self.inline_prefix().len();
+        self.trim_preceding_whitespace();
+
+        let body: Vec<(SyntaxKind, String)> = node
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .skip(skip)
+            .map(|t| (t.kind(), t.text().to_string()))
+            .collect();
+        // End the rule line the same way as the recipe line, so that a file
+        // with CRLF line endings keeps them.
+        let newline = body
+            .iter()
+            .rev()
+            .find(|(kind, _)| *kind == NEWLINE)
+            .map_or("\n", |(_, text)| text.as_str());
+        let mut recipe = vec![(INDENT, "\t")];
+        recipe.extend(body.iter().map(|(kind, text)| (*kind, text.as_str())));
+        let elements = detached_elements(&[(NEWLINE, newline)], Some(&recipe));
+
+        let node_index = node.index();
+        parent.splice_children(node_index..node_index + 1, elements);
+        parent
+            .children_with_tokens()
+            .nth(node_index + 1)
+            .and_then(|it| it.into_node())
+            .and_then(Recipe::cast)
     }
 
     /// Iterate `$(VAR)` and `${VAR}` variable references inside this recipe.
@@ -3591,6 +3880,33 @@ pub(crate) fn node_text(node: &SyntaxNode) -> String {
 ///
 /// This removes trailing NEWLINE tokens from the end of a RULE node to avoid
 /// extra blank lines at the end of a file when the last rule is removed.
+/// Build detached tree elements for splicing into a mutable tree: the given
+/// tokens, followed by a RECIPE node holding `recipe` if given.
+fn detached_elements(
+    tokens: &[(SyntaxKind, &str)],
+    recipe: Option<&[(SyntaxKind, &str)]>,
+) -> Vec<SyntaxElement> {
+    let mut builder = GreenNodeBuilder::new();
+    builder.start_node(ROOT.into());
+    for (kind, text) in tokens {
+        builder.token((*kind).into(), text);
+    }
+    if let Some(recipe) = recipe {
+        builder.start_node(RECIPE.into());
+        for (kind, text) in recipe {
+            builder.token((*kind).into(), text);
+        }
+        builder.finish_node();
+    }
+    builder.finish_node();
+    let root = SyntaxNode::new_root_mut(builder.finish());
+    let elements: Vec<_> = root.children_with_tokens().collect();
+    for element in &elements {
+        element.detach();
+    }
+    elements
+}
+
 pub(crate) fn trim_trailing_newlines(node: &SyntaxNode) {
     // Collect all trailing NEWLINE tokens at the end of the rule and within RECIPE nodes
     let mut newlines_to_remove = vec![];
@@ -4556,6 +4872,108 @@ rule: dependency
         let variable = variables.pop().unwrap();
         assert_eq!(variable.name(), Some("VARIABLE".to_string()));
         assert_eq!(variable.raw_value(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_order_only_prerequisites() {
+        let parsed = parse("foo: a | b\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..11
+  RULE@0..11
+    TARGETS@0..3
+      IDENTIFIER@0..3 "foo"
+    OPERATOR@3..4 ":"
+    WHITESPACE@4..5 " "
+    PREREQUISITES@5..10
+      PREREQUISITE@5..6
+        IDENTIFIER@5..6 "a"
+      WHITESPACE@6..7 " "
+      OPERATOR@7..8 "|"
+      WHITESPACE@8..9 " "
+      PREREQUISITE@9..10
+        IDENTIFIER@9..10 "b"
+    NEWLINE@10..11 "\n"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_static_pattern_rule() {
+        let parsed = parse("a.o: %.o : %.c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..15
+  RULE@0..15
+    TARGETS@0..3
+      IDENTIFIER@0..3 "a.o"
+    OPERATOR@3..4 ":"
+    WHITESPACE@4..5 " "
+    TARGET_PATTERN@5..8
+      IDENTIFIER@5..8 "%.o"
+    WHITESPACE@8..9 " "
+    OPERATOR@9..10 ":"
+    WHITESPACE@10..11 " "
+    PREREQUISITES@11..14
+      PREREQUISITE@11..14
+        IDENTIFIER@11..14 "%.c"
+    NEWLINE@14..15 "\n"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_grouped_targets() {
+        let parsed = parse("a b &: c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..9
+  RULE@0..9
+    TARGETS@0..4
+      IDENTIFIER@0..1 "a"
+      WHITESPACE@1..2 " "
+      IDENTIFIER@2..3 "b"
+      WHITESPACE@3..4 " "
+    OPERATOR@4..6 "&:"
+    WHITESPACE@6..7 " "
+    PREREQUISITES@7..8
+      PREREQUISITE@7..8
+        IDENTIFIER@7..8 "c"
+    NEWLINE@8..9 "\n"
+"#
+        );
+    }
+
+    #[test]
+    fn test_parse_inline_recipe() {
+        let parsed = parse("all: dep ; echo hi # x\n\tcmd\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..28
+  RULE@0..28
+    TARGETS@0..3
+      IDENTIFIER@0..3 "all"
+    OPERATOR@3..4 ":"
+    WHITESPACE@4..5 " "
+    PREREQUISITES@5..9
+      PREREQUISITE@5..8
+        IDENTIFIER@5..8 "dep"
+      WHITESPACE@8..9 " "
+    RECIPE@9..23
+      OPERATOR@9..10 ";"
+      WHITESPACE@10..11 " "
+      TEXT@11..22 "echo hi # x"
+      NEWLINE@22..23 "\n"
+    RECIPE@23..28
+      INDENT@23..24 "\t"
+      TEXT@24..27 "cmd"
+      NEWLINE@27..28 "\n"
+"#
+        );
     }
 
     #[test]
@@ -9663,6 +10081,23 @@ test:
     }
 
     #[test]
+    fn test_recipe_shell_text_inline_recipe() {
+        assert_eq!(
+            shell_texts("all: dep ; echo hi # x\n\techo b\n"),
+            vec!["echo hi # x", "echo b"]
+        );
+        assert_eq!(shell_texts("all: dep ;\t# x\n"), vec!["# x"]);
+        assert_eq!(
+            shell_texts("all: ; # a \\\n\t  b \\\n\tc\n"),
+            vec!["# a \\\n  b \\\nc"]
+        );
+        assert_eq!(
+            shell_texts("all: dep ;echo a \\\n\tb\n"),
+            vec!["echo a \\\nb"]
+        );
+    }
+
+    #[test]
     fn test_recipe_set_prefix_add() {
         let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -10574,11 +11009,8 @@ test:
             vec![
                 (false, vec!["$(DEPS)".to_string()]),
                 (false, vec!["a".to_string(), "b".to_string()]),
-                (false, vec!["%.o:".to_string(), "%.c".to_string()]),
-                (
-                    false,
-                    vec!["a".to_string(), "|".to_string(), "$(DIR)".to_string()]
-                ),
+                (false, vec!["%.c".to_string()]),
+                (false, vec!["a".to_string()]),
                 (false, vec!["$(SRCS:.c=.o)".to_string()]),
             ]
         );
@@ -11176,6 +11608,32 @@ mod test_crlf {
     }
 
     #[test]
+    fn test_order_only_prerequisites() {
+        let makefile = parse_crlf("all: a \\\r\n  b | c $(wildcard d \\\r\n  e)\r\n\techo hi\r\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            rule.order_only_prerequisites().collect::<Vec<_>>(),
+            vec!["c", "$(wildcard d \\\n  e)"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn test_static_pattern_rule() {
+        let makefile = parse_crlf("a.o b.o: \\\r\n  %.o: %.c \\\r\n  %.h | dir\r\n\tcc -c $<\r\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a.o", "b.o"]);
+        assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["%.c", "%.h"]);
+        assert_eq!(
+            rule.order_only_prerequisites().collect::<Vec<_>>(),
+            vec!["dir"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["cc -c $<"]);
+    }
+
+    #[test]
     fn test_define() {
         let makefile = parse_crlf("define FOO\r\nline1\r\nline2\r\nendef\r\nX = 1\r\n");
         assert_eq!(
@@ -11271,5 +11729,51 @@ mod test_crlf {
             panic!("expected a directive");
         };
         assert_eq!(directive.argument(), Some("bad \\\n  thing".to_string()));
+    }
+
+    #[test]
+    fn test_inline_recipe() {
+        let makefile = parse_crlf("all: dep ; echo a \\\r\n\tb # x\r\n\techo c\r\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep"]);
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(
+            recipes.iter().map(|r| r.text()).collect::<Vec<_>>(),
+            vec!["echo a \\\nb # x", "echo c"]
+        );
+        assert_eq!(
+            recipes.iter().map(|r| r.shell_text()).collect::<Vec<_>>(),
+            vec!["echo a \\\nb # x", "echo c"]
+        );
+    }
+
+    #[test]
+    fn test_inline_recipe_continuation_after_hash() {
+        let makefile = parse_crlf("all: ; echo hi # x \\\r\n\techo more\r\n\techo next\r\n");
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(
+            recipes.iter().map(|r| r.shell_text()).collect::<Vec<_>>(),
+            vec!["echo hi # x \\\necho more", "echo next"]
+        );
+    }
+
+    #[test]
+    fn test_insert_before_inline_recipe() {
+        let makefile = parse_crlf("all: dep ; echo hi\r\n");
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes()
+            .next()
+            .unwrap()
+            .insert_before("echo first");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo first", "echo hi"]
+        );
+        // TODO: the inserted recipe line itself still ends in LF.
+        assert_eq!(
+            makefile.to_string(),
+            "all: dep\r\n\techo first\n\techo hi\r\n"
+        );
     }
 }
