@@ -203,12 +203,33 @@ impl<'a> Lexer<'a> {
                             Some((SyntaxKind::QUOTE, c.to_string()))
                         }
                     }
-                    ':' | '=' | '?' | '+' => {
-                        let text = self.input.next().unwrap().to_string()
-                            + self
-                                .read_while(|c| c == ':' || c == '=' || c == '?')
-                                .as_str();
+                    ':' => {
+                        // Only take as many characters as form a valid
+                        // operator (`:`, `::`, `:=`, `::=` or `:::=`); the
+                        // rest belongs to whatever follows, e.g. `X:==y`.
+                        let mut probe = self.input.clone();
+                        let mut colons = 0;
+                        while probe.next_if_eq(&':').is_some() {
+                            colons += 1;
+                        }
+                        let len = if colons <= 3 && probe.peek() == Some(&'=') {
+                            colons + 1
+                        } else {
+                            colons.min(2)
+                        };
+                        let text = self.input.by_ref().take(len).collect();
                         Some((SyntaxKind::OPERATOR, text))
+                    }
+                    '?' | '+' => {
+                        let mut text = self.input.next().unwrap().to_string();
+                        if let Some(eq) = self.input.next_if_eq(&'=') {
+                            text.push(eq);
+                        }
+                        Some((SyntaxKind::OPERATOR, text))
+                    }
+                    '=' => {
+                        self.input.next();
+                        Some((SyntaxKind::OPERATOR, "=".to_string()))
                     }
                     '!' => {
                         // `!=` is the shell assignment operator; a lone `!`
@@ -697,5 +718,51 @@ override_dh_auto_clean:
         // Check that the backslash before '1' is preserved
         let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(input, text, "Token text reconstruction differs from input");
+    }
+
+    #[test]
+    fn test_operator_not_greedy() {
+        let ops = |input: &str| {
+            lex_default(input)
+                .into_iter()
+                .filter(|(kind, _)| *kind == OPERATOR)
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ops("X?==y\n"), vec!["?=", "="]);
+        assert_eq!(ops("X+==y\n"), vec!["+=", "="]);
+        assert_eq!(ops("X:==y\n"), vec![":=", "="]);
+        assert_eq!(ops("X::==y\n"), vec!["::=", "="]);
+        assert_eq!(ops("X:::==y\n"), vec![":::=", "="]);
+        assert_eq!(ops("X ?= =y\n"), vec!["?=", "="]);
+        assert_eq!(ops("X?=?y\n"), vec!["?=", "?"]);
+        assert_eq!(ops("X?=:y\n"), vec!["?=", ":"]);
+        assert_eq!(ops("X=::y\n"), vec!["=", "::"]);
+        assert_eq!(ops("X==y\n"), vec!["=", "="]);
+        assert_eq!(ops("a::?b\n"), vec!["::", "?"]);
+        assert_eq!(ops("a:::b\n"), vec!["::", ":"]);
+        assert_eq!(ops("a?:b\n"), vec!["?", ":"]);
+        assert_eq!(ops("a:=:b\n"), vec![":=", ":"]);
+        assert_eq!(ops("a:: b\n"), vec!["::"]);
+        assert_eq!(ops("$(OBJS): %.o: %.c\n"), vec![":", ":"]);
+        assert_eq!(ops("$(X:.c=.o)\n"), vec![":", "="]);
+        assert_eq!(ops("URL = http://x\n"), vec!["=", ":"]);
+    }
+
+    #[test]
+    fn test_operator_followed_by_equals_tokens() {
+        assert_eq!(
+            lex_default("X?==y\n")
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (IDENTIFIER, "X"),
+                (OPERATOR, "?="),
+                (OPERATOR, "="),
+                (IDENTIFIER, "y"),
+                (NEWLINE, "\n"),
+            ]
+        );
     }
 }
