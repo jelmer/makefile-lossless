@@ -2542,27 +2542,46 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws_and_continuations();
 
             // Optional pattern (rest of header until whitespace).
-            if self.current().is_some() && self.current() != Some(NEWLINE) {
+            if !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
                 // The pattern token sequence (until whitespace or newline).
                 while let Some(kind) = self.current() {
                     match kind {
-                        WHITESPACE | NEWLINE => break,
+                        WHITESPACE | NEWLINE | COMMENT => break,
                         BACKSLASH if self.is_line_continuation() => break,
                         _ => self.bump(),
                     }
                 }
                 self.skip_ws_and_continuations();
 
-                // Optional directory list (everything else on the line).
-                if self.current().is_some() && self.current() != Some(NEWLINE) {
+                // Optional directory list (everything else on the line, up
+                // to any trailing comment).
+                if !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
                     self.builder.start_node(EXPR.into());
-                    while self.current().is_some() && self.current() != Some(NEWLINE) {
-                        if !self.consume_line_continuation() {
-                            self.bump();
+                    loop {
+                        match self.current() {
+                            None | Some(NEWLINE | COMMENT) => break,
+                            Some(WHITESPACE)
+                                if matches!(
+                                    self.peek_past_ws(),
+                                    None | Some(NEWLINE | COMMENT)
+                                ) =>
+                            {
+                                break
+                            }
+                            _ => {
+                                if !self.consume_line_continuation() {
+                                    self.bump();
+                                }
+                            }
                         }
                     }
                     self.builder.finish_node();
                 }
+            }
+
+            self.skip_ws();
+            if self.current() == Some(COMMENT) {
+                self.bump();
             }
 
             // Consume the trailing newline.

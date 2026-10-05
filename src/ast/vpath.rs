@@ -33,7 +33,7 @@ impl Vpath {
                             break;
                         }
                     }
-                    if t.kind() == NEWLINE {
+                    if matches!(t.kind(), NEWLINE | COMMENT) {
                         break;
                     }
                     out.push_str(t.text());
@@ -52,14 +52,14 @@ impl Vpath {
         }
     }
 
-    /// Returns the raw directory-list text (everything after the pattern)
-    /// with line continuations collapsed, or `None` if the directive has no
-    /// directories.
+    /// Returns the raw directory-list text (everything after the pattern,
+    /// excluding any trailing comment) with line continuations collapsed,
+    /// or `None` if the directive has no directories.
     pub fn directories_text(&self) -> Option<String> {
         self.syntax()
             .children()
             .find(|c| c.kind() == EXPR)
-            .map(|n| collapse_continuations(&n))
+            .map(|n| collapse_continuations(&n).trim_end().to_string())
     }
 }
 
@@ -138,5 +138,74 @@ mod tests {
         assert_eq!(vpath.syntax().to_string(), code);
         assert_eq!(vpath.pattern(), Some("%.c".to_string()));
         assert_eq!(vpath.directories_text(), Some("src:lib".to_string()));
+    }
+
+    #[test]
+    fn test_directories_text_excludes_comment() {
+        let code = "vpath %.c src lib # comment\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("src lib".to_string()));
+        assert_eq!(
+            vpath
+                .syntax()
+                .children_with_tokens()
+                .map(|c| c.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                IDENTIFIER, WHITESPACE, IDENTIFIER, WHITESPACE, EXPR, WHITESPACE, COMMENT, NEWLINE
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directories_text_excludes_comment_without_space() {
+        assert_eq!(
+            vpath_of("vpath %.c src#comment\n").directories_text(),
+            Some("src".to_string())
+        );
+    }
+
+    #[test]
+    fn test_directories_text_escaped_hash() {
+        assert_eq!(
+            vpath_of("vpath %.c a\\#b # comment\n").directories_text(),
+            Some("a\\#b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_directories_text_comment_after_continuation() {
+        let code = "vpath %.c src \\\n  lib # comment\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.directories_text(), Some("src lib".to_string()));
+    }
+
+    #[test]
+    fn test_comment_on_continued_line() {
+        let code = "vpath %.c src \\\n  # comment\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.directories_text(), Some("src".to_string()));
+    }
+
+    #[test]
+    fn test_pattern_followed_by_comment() {
+        let code = "vpath %.c # comment\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), None);
+    }
+
+    #[test]
+    fn test_keyword_followed_by_comment() {
+        let code = "vpath # comment\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.pattern(), None);
+        assert_eq!(vpath.directories_text(), None);
     }
 }
