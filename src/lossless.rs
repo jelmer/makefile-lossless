@@ -8835,6 +8835,45 @@ test:
             assert_eq!(&src[r.text_range()], r.name());
         }
     }
+
+    #[test]
+    fn test_assignment_operator_followed_by_operator_chars() {
+        // Expected values match what GNU make 4.4 assigns for each line.
+        for (src, op, value) in [
+            ("X?==y\n", "?=", "=y"),
+            ("X+==y\n", "+=", "=y"),
+            ("X:==y\n", ":=", "=y"),
+            ("X::==y\n", "::=", "=y"),
+            ("X:::==y\n", ":::=", "=y"),
+            ("X ?= =y\n", "?=", "=y"),
+            ("X?=?y\n", "?=", "?y"),
+            ("X?=:y\n", "?=", ":y"),
+            ("X=::y\n", "=", "::y"),
+            ("X==y\n", "=", "=y"),
+        ] {
+            let makefile: Makefile = src.parse().unwrap();
+            let vars = makefile.variable_definitions().collect::<Vec<_>>();
+            assert_eq!(vars.len(), 1, "{src:?}");
+            assert_eq!(vars[0].name(), Some("X".to_string()), "{src:?}");
+            assert_eq!(
+                vars[0].assignment_operator(),
+                Some(op.to_string()),
+                "{src:?}"
+            );
+            assert_eq!(vars[0].raw_value(), Some(value.to_string()), "{src:?}");
+            assert_eq!(makefile.to_string(), src);
+        }
+    }
+
+    #[test]
+    fn test_target_specific_assignment_followed_by_equals() {
+        let rule: Rule = "foo: X?==1\n".parse().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["foo"]);
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some("?=".to_string()));
+        assert_eq!(var.raw_value(), Some("=1".to_string()));
+    }
 }
 
 #[cfg(test)]
