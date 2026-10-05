@@ -3432,14 +3432,27 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Return the text of the first non-whitespace token on the current
-        /// line, if it is an identifier. Used to detect `define`/`endef`.
+        /// line, if it is an identifier followed by whitespace, a line
+        /// continuation or the end of the line. Used to detect
+        /// `define`/`endef` in a define body, where make does not strip
+        /// comments first, so `endef#c` is not `endef`.
         fn first_token_on_line(&self) -> Option<&str> {
-            self.tokens
+            let mut tokens = self
+                .tokens
                 .iter()
                 .rev()
-                .find(|(kind, _)| !matches!(*kind, WHITESPACE | INDENT))
-                .filter(|(kind, _)| *kind == IDENTIFIER)
-                .map(|(_, text)| text.as_str())
+                .skip_while(|(kind, _)| matches!(*kind, WHITESPACE | INDENT));
+            let (kind, text) = tokens.next()?;
+            if *kind != IDENTIFIER {
+                return None;
+            }
+            match tokens.next().map(|(kind, _)| *kind) {
+                None | Some(WHITESPACE | NEWLINE) => Some(text.as_str()),
+                Some(BACKSLASH) if matches!(tokens.next(), Some((NEWLINE, _))) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            }
         }
 
         fn parse_identifier_token(&mut self) -> bool {
@@ -6629,6 +6642,67 @@ mod tests {
                 None,
                 Some("define B\nfoo\nendef junk\n".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn test_define_body_keyword_needs_separator() {
+        // In a define body make only recognises `define` and `endef` when
+        // followed by whitespace or the end of the line.
+        for (code, value) in [
+            ("define A\nfoo\nendef#c\nendef\n", "foo\nendef#c\n"),
+            ("define A\nfoo\nendef=x\nendef\n", "foo\nendef=x\n"),
+            ("define A\nfoo\nendef$(X)\nendef\n", "foo\nendef$(X)\n"),
+            ("define A\nfoo\n endef#c\nendef\n", "foo\n endef#c\n"),
+            ("define A\ndefine#c\nfoo\nendef\n", "define#c\nfoo\n"),
+            ("define A\ndefine=x\nfoo\nendef\n", "define=x\nfoo\n"),
+            ("define A\nfoo\nendef\t# c\n", "foo\n"),
+        ] {
+            assert_eq!(
+                parse_single_define(code, None),
+                (vec![], None, Some(value.to_string())),
+                "{code:?}"
+            );
+        }
+        let parsed = parse("define A\nfoo\nendef#c\n", None);
+        assert_eq!(
+            parsed.errors.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            vec![ParseErrorKind::MissingEndef]
+        );
+        // A line continuation separates the keyword from what follows.
+        assert_eq!(
+            parse_single_define("define A\nfoo\nendef\\\nbar\n", None),
+            (
+                vec![(ParseErrorKind::ExtraneousText, 4)],
+                None,
+                Some("foo\n".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_directive_followed_by_comment() {
+        // Outside a define body make strips comments first, so `endif#c` is
+        // still `endif`.
+        for code in [
+            "ifdef X\nA = 1\nendif#c\n",
+            "ifdef X\nA = 1\nelse#c\nA = 2\nendif\n",
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            assert_eq!(code, parsed.root().to_string());
+        }
+        assert_eq!(
+            error_kinds("define#c\nendef\n", None),
+            vec![ParseErrorKind::ExpectedVariableName]
+        );
+        assert_eq!(
+            error_kinds("endif#c\n", None),
+            vec![ParseErrorKind::ExtraneousEndif]
+        );
+        assert_eq!(
+            error_kinds("else#c\n", None),
+            vec![ParseErrorKind::ElseWithoutIf]
         );
     }
 
