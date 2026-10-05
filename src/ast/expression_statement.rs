@@ -84,10 +84,8 @@ impl ExpressionStatement {
             .skip_while(|t| t.kind() == WHITESPACE)
             .map(|t| t.text().to_string())
             .collect();
-        for eol in ["\n", "\r"] {
-            if let Some(stripped) = text.strip_suffix(eol) {
-                text.truncate(stripped.len());
-            }
+        if let Some(stripped) = text.strip_suffix('\n') {
+            text.truncate(stripped.strip_suffix('\r').unwrap_or(stripped).len());
         }
         Some(lf_line_endings(&text))
     }
