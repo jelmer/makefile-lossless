@@ -616,11 +616,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_variable_reference();
                     true
                 }
-                // Characters such as `*` in `*.o: *.c`
-                Some(TEXT) => {
-                    self.bump();
-                    true
-                }
                 // A backslash is part of the target name. Both GNU and BSD
                 // make keep it, and it stops a following whitespace or `:`
                 // from ending the name.
@@ -633,12 +628,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     true
                 }
-                _ => {
+                Some(WHITESPACE | INDENT | NEWLINE | COMMENT | OPERATOR | BACKSLASH) | None => {
                     self.error(
                         ParseErrorKind::MissingTarget,
                         "expected rule target".to_string(),
                     );
                     false
+                }
+                // Anything else is literal text in the target name, such as
+                // `*` in `*.o: *.c` or the stray `}` in `${X}}`.
+                Some(_) => {
+                    self.bump();
+                    true
                 }
             }
         }
@@ -1481,12 +1482,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Try to parse another target
                 match self.current() {
-                    Some(IDENTIFIER | DOLLAR | TEXT | BACKSLASH) => {
+                    Some(INDENT | NEWLINE | COMMENT | OPERATOR) | None => break,
+                    _ => {
                         if !self.parse_rule_target() {
                             break;
                         }
                     }
-                    _ => break,
                 }
             }
 
