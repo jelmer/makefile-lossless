@@ -369,13 +369,21 @@ impl VariableDefinition {
     /// assert!(makefile.code().contains("VAR ?= value"));
     /// ```
     pub fn set_assignment_operator(&mut self, op: &str) {
+        // The name may contain operator tokens too, as in BSD make's `a:b=c`.
+        let op_index = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == OPERATOR && ASSIGNMENT_OPERATORS.contains(&t.text()))
+            .map(|t| t.index());
+
         // Build a new VARIABLE node, copying all children but replacing the OPERATOR token
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
 
         for child in self.syntax().children_with_tokens() {
             match child {
-                rowan::NodeOrToken::Token(token) if token.kind() == OPERATOR => {
+                rowan::NodeOrToken::Token(token) if Some(token.index()) == op_index => {
                     builder.token(OPERATOR.into(), op);
                 }
                 rowan::NodeOrToken::Token(token) => {
@@ -1079,5 +1087,16 @@ mod tests {
         let makefile: Makefile = "FOO = a\\#b # comment\n".parse().unwrap();
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(var.raw_value(), Some("a\\#b ".to_string()));
+    }
+
+    #[test]
+    fn test_set_assignment_operator_with_operator_in_name() {
+        let parsed =
+            crate::Makefile::parse_with_variant("a:b=c\n", crate::MakefileVariant::BSDMake);
+        let makefile = parsed.tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("+=");
+        assert_eq!(var.name(), Some("a:b".to_string()));
+        assert_eq!(makefile.code(), "a:b+=c\n");
     }
 }
