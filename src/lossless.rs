@@ -176,8 +176,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         positioned_errors: Vec<PositionedParseError>,
         /// Token positions (start, end) in forward order, indexed by forward token index
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
-        /// current token index into token_positions (counting from the end since tokens are in reverse)
-        current_token_index: usize,
         /// The original text
         original_text: String,
         /// The makefile variant
@@ -203,27 +201,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Record an error without consuming the current token.
         fn record_error(&mut self, msg: String) {
-            let (line, context) = if self.current() == Some(INDENT) {
-                // For indented lines, report the error on the next line
-                let lines: Vec<&str> = self.original_text.lines().collect();
-                let tab_line = lines
-                    .iter()
-                    .enumerate()
-                    .find(|(_, line)| line.starts_with('\t'))
-                    .map(|(i, _)| i + 1)
-                    .unwrap_or(1);
-
-                // Use the next line as context if available
-                let next_line = tab_line + 1;
-                if next_line <= lines.len() {
-                    (next_line, lines[next_line - 1].to_string())
-                } else {
-                    (tab_line, lines[tab_line - 1].to_string())
-                }
-            } else {
-                let line = self.get_line_number_for_position(self.tokens.len());
-                (line, self.get_context_for_line(line))
-            };
+            let range = self.current_range();
+            let line = self.original_text[..usize::from(range.start())]
+                .matches('\n')
+                .count()
+                + 1;
+            let context = self.get_context_for_line(line);
 
             let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
                 if !self.tokens.is_empty() && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
@@ -241,42 +224,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 context,
             });
 
-            self.add_positioned_error(message, None);
-        }
-
-        /// Add a positioned error at the current token position
-        fn add_positioned_error(&mut self, message: String, code: Option<String>) {
-            let range = if self.current_token_index < self.token_positions.len() {
-                let (start, end) = self.token_positions[self.current_token_index];
-                rowan::TextRange::new(start, end)
-            } else {
-                // Default to end of text if no current token
-                let end = self
-                    .token_positions
-                    .last()
-                    .map(|(_, end)| *end)
-                    .unwrap_or_else(|| rowan::TextSize::from(0));
-                rowan::TextRange::new(end, end)
-            };
-
             self.positioned_errors.push(PositionedParseError {
                 message,
                 range,
-                code,
+                code: None,
             });
         }
 
-        fn get_line_number_for_position(&self, position: usize) -> usize {
-            if position >= self.tokens.len() {
-                return self.original_text.matches('\n').count() + 1;
+        /// Text range of the current token, or an empty range at the end of
+        /// the text if all tokens have been consumed.
+        fn current_range(&self) -> rowan::TextRange {
+            // tokens is stored in reverse, so the number of tokens already
+            // consumed is the forward index of the current one.
+            let index = self.token_positions.len() - self.tokens.len();
+            match self.token_positions.get(index) {
+                Some(&(start, end)) => rowan::TextRange::new(start, end),
+                None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text.as_str())),
             }
-
-            // Count newlines in the processed text up to this position
-            self.tokens[0..position]
-                .iter()
-                .filter(|(kind, _)| *kind == NEWLINE)
-                .count()
-                + 1
         }
 
         fn get_context_for_line(&self, line_number: usize) -> String {
@@ -1966,9 +1930,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // other token clears it. See `pending_backslash_escape`.
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
             self.builder.token(kind.into(), text.as_str());
-            if self.current_token_index > 0 {
-                self.current_token_index -= 1;
-            }
         }
         /// Peek at the first unprocessed token
         fn current(&self) -> Option<SyntaxKind> {
@@ -2092,7 +2053,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         position = end;
     }
 
-    let current_token_index = tokens.len().saturating_sub(1);
     tokens.reverse();
     Parser {
         tokens,
@@ -2100,7 +2060,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec::new(),
         positioned_errors: Vec::new(),
         token_positions,
-        current_token_index,
         original_text: text.to_string(),
         variant,
         pending_backslash_escape: false,
@@ -3712,13 +3671,13 @@ build-indep: build
         let direct_error = &parsed.errors[0];
 
         // Verify error is detected with correct details
-        assert_eq!(direct_error.line, 2);
+        assert_eq!(direct_error.line, 1);
         assert!(
             direct_error.message.contains("expected"),
             "Error message should contain 'expected': {}",
             direct_error.message
         );
-        assert_eq!(direct_error.context, "\tcommand");
+        assert_eq!(direct_error.context, "rule target");
 
         // Check public API
         let reader_result = Makefile::from_reader(input.as_bytes());
@@ -3732,8 +3691,8 @@ build-indep: build
 
         // Verify formatting includes line number and context
         let error_text = parse_error.to_string();
-        assert!(error_text.contains("Error at line 2:"));
-        assert!(error_text.contains("2| \tcommand"));
+        assert!(error_text.contains("Error at line 1:"));
+        assert!(error_text.contains("1| rule target"));
     }
 
     #[test]
@@ -3785,7 +3744,7 @@ build-indep: build
     fn test_line_number_calculation() {
         // Test inputs for various error locations
         let test_cases = [
-            ("rule dependency\n\tcommand", 2),             // Missing colon
+            ("rule dependency\n\tcommand", 1),             // Missing colon
             ("#comment\n\t(╯°□°)╯︵ ┻━┻", 2),              // Strange characters
             ("var = value\n#comment\n\tindented line", 3), // Indented line not part of a rule
         ];
@@ -8218,6 +8177,111 @@ test:
         // Tree should still be accessible
         let tree = parsed.tree();
         assert_eq!(tree.to_string(), input);
+    }
+
+    fn error_locations(input: &str) -> Vec<(String, usize, String, rowan::TextRange)> {
+        let parsed = Makefile::parse(input);
+        assert_eq!(parsed.errors().len(), parsed.positioned_errors().len());
+        parsed
+            .errors()
+            .iter()
+            .zip(parsed.positioned_errors())
+            .map(|(e, p)| {
+                assert_eq!(e.message, p.message);
+                (e.message.clone(), e.line, e.context.clone(), p.range)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_error_location_middle_of_file() {
+        assert_eq!(
+            error_locations("X = 1\nY = 2\nfoo bar\n"),
+            vec![(
+                "expected ':'".to_string(),
+                3,
+                "foo bar".to_string(),
+                rowan::TextRange::new(19.into(), 20.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_first_line() {
+        assert_eq!(
+            error_locations("foo bar\nX = 1\n"),
+            vec![(
+                "expected ':'".to_string(),
+                1,
+                "foo bar".to_string(),
+                rowan::TextRange::new(7.into(), 8.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_last_line_without_newline() {
+        assert_eq!(
+            error_locations("X = 1\nfoo bar"),
+            vec![(
+                "expected ':'".to_string(),
+                2,
+                "foo bar".to_string(),
+                rowan::TextRange::new(13.into(), 13.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_in_conditional() {
+        assert_eq!(
+            error_locations("ifdef A\nfoo bar\nendif\n"),
+            vec![(
+                "expected ':'".to_string(),
+                2,
+                "foo bar".to_string(),
+                rowan::TextRange::new(15.into(), 16.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_after_rule() {
+        assert_eq!(
+            error_locations("all:\n\techo\nfoo bar\n"),
+            vec![(
+                "expected ':'".to_string(),
+                3,
+                "foo bar".to_string(),
+                rowan::TextRange::new(18.into(), 19.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_points_at_token() {
+        assert_eq!(
+            error_locations("X = 1\nendif\n"),
+            vec![(
+                "unknown conditional directive: endif".to_string(),
+                2,
+                "endif".to_string(),
+                rowan::TextRange::new(6.into(), 11.into())
+            )]
+        );
+    }
+
+    #[test]
+    fn test_error_location_unclosed_paren() {
+        assert_eq!(
+            error_locations("X = 1\nifeq ($(X),y\nA = 1\nendif\n"),
+            vec![(
+                "unclosed parenthesis".to_string(),
+                2,
+                "ifeq ($(X),y".to_string(),
+                rowan::TextRange::new(18.into(), 19.into())
+            )]
+        );
     }
 
     #[test]
