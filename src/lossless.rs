@@ -3227,6 +3227,40 @@ impl VariableReference {
         }
     }
 
+    /// Parse this reference into the variable name and its modifiers.
+    ///
+    /// The variant determines which modifiers are recognized; see
+    /// [`crate::ParsedReference::parse`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant, Modifier, ModifierArg};
+    /// let makefile = Makefile::parse_with_variant(
+    ///     "OBJS = ${SRCS:M*.c:.c=.o}\n",
+    ///     MakefileVariant::BSDMake,
+    /// )
+    /// .tree();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// let parsed = refs[0].parse(MakefileVariant::BSDMake).unwrap();
+    /// assert_eq!(parsed.name, "SRCS");
+    /// assert_eq!(
+    ///     parsed.modifiers,
+    ///     vec![
+    ///         Modifier::Match("*.c".to_string()),
+    ///         Modifier::SysVSubstitute {
+    ///             from: ModifierArg::literal(".c"),
+    ///             to: ModifierArg::literal(".o"),
+    ///         },
+    ///     ]
+    /// );
+    /// ```
+    pub fn parse(
+        &self,
+        variant: crate::MakefileVariant,
+    ) -> Result<crate::ParsedReference, crate::ReferenceError> {
+        crate::ParsedReference::parse(&self.0.text().to_string(), variant)
+    }
+
     /// Get the line number (0-indexed) where this reference starts.
     pub fn line(&self) -> usize {
         line_col_at_offset(&self.0, self.0.text_range().start()).0

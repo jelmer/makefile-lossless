@@ -27,6 +27,7 @@ mod lex;
 mod lossless;
 mod parse;
 mod pattern;
+mod reference;
 mod text;
 
 pub use ast::conditional::{ConditionalBranch, ConditionalItem};
@@ -39,6 +40,10 @@ pub use lossless::{
     RecipeVariableReference, Rule, VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
+pub use reference::{
+    AssignOp, Modifier, ModifierArg, ModifierArgPart, ParsedReference, ReferenceError, SortOrder,
+    SubstituteFlags, WordSelector,
+};
 pub use rowan::TextRange;
 pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 
