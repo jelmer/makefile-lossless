@@ -2042,8 +2042,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
-                // before looking at what it contains.
-                self.bump();
+                // before looking at what it contains. Of a run of
+                // whitespace, only the first character is the name.
+                match self.tokens.last() {
+                    Some((WHITESPACE, text)) if text.len() > 1 => self.bump_token_head(1),
+                    _ => self.bump(),
+                }
             }
             // A `$` at the end of a line is accepted by both GNU and BSD
             // make; it expands to nothing. Make joins continued lines before
@@ -2539,19 +2543,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         let (open, close) = match tokens.next() {
                             Some((LPAREN, _)) => (LPAREN, RPAREN),
                             Some((LBRACE, _)) => (LBRACE, RBRACE),
-                            // A single-character reference such as `$X` or
-                            // `$@`; `$$` is a literal `$`.
+                            // A single-character reference such as `$X`, `$@`
+                            // or `$ `; `$$` is a literal `$`.
+                            Some((WHITESPACE, _)) => {
+                                seen_reference = true;
+                                continue;
+                            }
                             Some((kind, text))
                                 if text.chars().count() == 1
                                     && !matches!(
                                         kind,
-                                        DOLLAR
-                                            | WHITESPACE
-                                            | NEWLINE
-                                            | BACKSLASH
-                                            | COMMENT
-                                            | RPAREN
-                                            | RBRACE
+                                        DOLLAR | NEWLINE | BACKSLASH | COMMENT | RPAREN | RBRACE
                                     ) =>
                             {
                                 seen_reference = true;
@@ -8062,6 +8064,59 @@ all: $(OBJS)
     }
 
     #[test]
+    fn test_bare_whitespace_reference() {
+        for src in [
+            "$ \n",
+            "$  \n",
+            "$\t\n",
+            "$ $X\n",
+            "$  $(Y)\n",
+            "$X$ \n",
+            "$ # c\n",
+            "$ \\\n$X\n",
+        ] {
+            for variant in [
+                None,
+                Some(MakefileVariant::GNUMake),
+                Some(MakefileVariant::BSDMake),
+                Some(MakefileVariant::POSIXMake),
+                Some(MakefileVariant::NMake),
+            ] {
+                let parsed = parse(src, variant);
+                assert_eq!(parsed.errors, vec![], "{src:?} {variant:?}");
+                let root = parsed.root();
+                assert_eq!(
+                    top_level_kinds(root.syntax()),
+                    vec![EXPRESSION_STATEMENT],
+                    "{src:?} {variant:?}"
+                );
+                assert_eq!(root.to_string(), src);
+            }
+        }
+
+        let src = "$  $X ; x\n";
+        let parsed = parse(src, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), src);
+        let Some(MakefileItem::ExpressionStatement(stmt)) = root.items().next() else {
+            panic!("expected an expression statement");
+        };
+        assert_eq!(
+            stmt.references().map(|r| r.name()).collect::<Vec<_>>(),
+            vec![Some(" ".to_string()), Some("X".to_string())]
+        );
+        assert_eq!(
+            stmt.references()
+                .map(|r| r.syntax().to_string())
+                .collect::<Vec<_>>(),
+            vec!["$ ", "$X"]
+        );
+        assert_eq!(stmt.expression(), "$  $X");
+        assert_eq!(stmt.after_semicolon(), Some("x".to_string()));
+    }
+
+    #[test]
     fn test_single_char_reference_not_expression_statement() {
         let parsed = parse("$X: y\n", None);
         assert_eq!(parsed.errors, vec![]);
@@ -8079,8 +8134,9 @@ all: $(OBJS)
         assert_eq!(var.name(), Some("$X".to_string()));
         assert_eq!(var.raw_value(), Some("1".to_string()));
 
-        // `$XY` is `$X` followed by `Y`, and `$$` is a literal `$`.
-        for src in ["$XY\n", "$$\n"] {
+        // `$XY` is `$X` followed by `Y`, `$ E` is `$ ` followed by `E`, and
+        // `$$` is a literal `$`.
+        for src in ["$XY\n", "$ E\n", "$$\n"] {
             let parsed = parse(src, None);
             assert_eq!(parsed.root().to_string(), src);
             assert_eq!(
