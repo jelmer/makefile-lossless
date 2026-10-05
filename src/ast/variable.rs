@@ -1,3 +1,4 @@
+use super::is_continuation;
 use super::makefile::MakefileItem;
 use crate::lossless::{
     is_sunsh_operator, node_text, remove_with_preceding_comments, VariableDefinition,
@@ -91,6 +92,9 @@ impl VariableDefinition {
         // or `a:b`, including whitespace inside parentheses and braces.
         self.after_directive_keywords()
             .scan(0usize, |level, it| {
+                if is_continuation(&it) {
+                    return None;
+                }
                 let in_name = match &it {
                     rowan::NodeOrToken::Token(t) => match t.kind() {
                         LPAREN | LBRACE => {
@@ -119,7 +123,9 @@ impl VariableDefinition {
     fn after_directive_keywords(&self) -> impl Iterator<Item = crate::lossless::SyntaxElement> {
         let keywords = self.directive_keywords();
         self.syntax().children_with_tokens().skip_while(move |it| {
-            it.kind() == WHITESPACE || it.as_token().is_some_and(|t| keywords.contains(t))
+            it.kind() == WHITESPACE
+                || is_continuation(it)
+                || it.as_token().is_some_and(|t| keywords.contains(t))
         })
     }
 
@@ -167,11 +173,10 @@ impl VariableDefinition {
     pub fn names(&self) -> impl Iterator<Item = String> {
         let mut names = Vec::new();
         let mut current = String::new();
-        for it in self
-            .after_directive_keywords()
-            .take_while(|it| matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE))
-        {
-            if it.kind() == WHITESPACE {
+        for it in self.after_directive_keywords().take_while(|it| {
+            matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE) || is_continuation(it)
+        }) {
+            if it.kind() == WHITESPACE || is_continuation(&it) {
                 if !current.is_empty() {
                     names.push(std::mem::take(&mut current));
                 }
@@ -1114,5 +1119,62 @@ mod tests {
         var.set_assignment_operator("+=");
         assert_eq!(var.name(), Some("a:b".to_string()));
         assert_eq!(makefile.code(), "a:b+=c\n");
+    }
+
+    #[test]
+    fn test_export_names_line_continuation() {
+        for keyword in ["export", "unexport"] {
+            let code = format!("{} X \\\n  Y\\\n\t$(Z)\n", keyword);
+            let makefile: Makefile = code.parse().unwrap();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(makefile.rules().count(), 0);
+            let vars: Vec<_> = makefile.variable_definitions().collect();
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0].name(), Some("X".to_string()));
+            assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["X", "Y", "$(Z)"]);
+        }
+    }
+
+    #[test]
+    fn test_export_line_continuation_before_name() {
+        let code = "export \\\n  X Y\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_export());
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.names().collect::<Vec<_>>(), vec!["X", "Y"]);
+    }
+
+    #[test]
+    fn test_undefine_line_continuation_before_name() {
+        let code = "undefine \\\n  X\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_undefine());
+        assert_eq!(var.name(), Some("X".to_string()));
+    }
+
+    #[test]
+    fn test_undefine_line_continuation_after_name() {
+        let code = "undefine X \\\n\nall:\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(makefile.rules().count(), 1);
+
+        // Like `undefine X Y`, which names a single variable "X Y", this
+        // isn't supported, but the continued line must not become a rule.
+        let (makefile, errors) = Makefile::from_str_relaxed("undefine X \\\n  Y\n");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expected newline, got Some(IDENTIFIER)"]
+        );
+        assert_eq!(makefile.rules().count(), 0);
     }
 }

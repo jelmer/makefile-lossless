@@ -1,7 +1,8 @@
 use super::bsd::{directive_keyword, keyword_token};
+use super::collapse_continuations;
 use super::makefile::MakefileItem;
 use crate::lossless::{
-    node_text, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
+    remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
 use crate::SyntaxKind::{EXPR, IDENTIFIER, INCLUDE};
 use rowan::ast::AstNode;
@@ -50,12 +51,13 @@ impl Include {
         Some(raw)
     }
 
-    /// The path as written, including any delimiters.
+    /// The path as written, including any delimiters, with line
+    /// continuations collapsed.
     fn raw_path(&self) -> Option<String> {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
-            .map(|it| node_text(&it).trim().to_string())
+            .map(|it| collapse_continuations(&it).trim().to_string())
     }
 
     /// Get the text range of the path portion of the include directive.
@@ -559,5 +561,48 @@ mod tests {
             makefile.included_files().collect::<Vec<_>>(),
             vec!["new.mk", "new.mk"]
         );
+    }
+
+    #[test]
+    fn test_include_line_continuation() {
+        for (code, keyword_optional) in [
+            ("include a.mk \\\n  b.mk\n", false),
+            ("-include a.mk \\\n  b.mk\n", true),
+            ("sinclude a.mk\\\n\tb.mk\n", true),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            assert_eq!(makefile.to_string(), code);
+            let includes: Vec<_> = makefile.includes().collect();
+            assert_eq!(includes.len(), 1);
+            assert_eq!(includes[0].path(), Some("a.mk b.mk".to_string()));
+            assert_eq!(includes[0].is_optional(), keyword_optional);
+            assert_eq!(makefile.rules().count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_include_line_continuation_before_path() {
+        let code = "include \\\n  a.mk \\\n \\\n  b.mk\nc.mk: d\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["a.mk b.mk"]
+        );
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_include_escaped_backslash_not_continuation() {
+        let code = "include a.mk\\\\\nb.mk: c\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.to_string(), code);
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["a.mk\\\\"]
+        );
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["b.mk"]);
     }
 }
