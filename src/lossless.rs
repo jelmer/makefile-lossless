@@ -1866,14 +1866,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_parenthesized_expr_internal(true);
                     }
                 }
-            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE)) {
+            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
+                && !self.is_line_continuation()
+            {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
                 // before looking at what it contains.
                 self.bump();
             }
             // A `$` at the end of a line is accepted by both GNU and BSD
-            // make; it expands to nothing.
+            // make; it expands to nothing. Make joins continued lines before
+            // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
         }
