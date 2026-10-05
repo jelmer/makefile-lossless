@@ -250,6 +250,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// recipe line. Set by a rule line and cleared by any other line
         /// except comments, blank lines and conditional directives.
         in_rule: bool,
+        /// The logical line last used to find a BSD make expression.
+        bsd_line: Option<BsdLine>,
+        /// Number of times tokens were lexed again, which may change where
+        /// a logical line ends.
+        token_edits: usize,
+    }
+
+    /// The rest of a logical line, from [`Parser::bsd_logical_line`].
+    struct BsdLine {
+        text: String,
+        /// The source position of each token and its offset in `text`.
+        starts: Vec<(rowan::TextSize, usize)>,
+        /// The source position of the end of the line.
+        end: rowan::TextSize,
+        /// The value of `Parser::token_edits` when the line was built.
+        token_edits: usize,
     }
 
     impl Parser {
@@ -460,6 +476,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             self.tokens.pop();
             self.tokens.extend(pieces.into_iter().rev());
+            self.token_edits += 1;
             true
         }
 
@@ -1462,37 +1479,80 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// The offset of the current token in the rest of the logical line
+        /// as BSD make sees it when parsing an expression, which is kept in
+        /// `bsd_line`. The line is built once for all the expressions on it,
+        /// so that a long line takes linear time.
+        fn bsd_line_offset(&mut self) -> usize {
+            let pos = self.current_range().start();
+            if let Some(line) = self.bsd_line.as_ref().filter(|line| {
+                line.token_edits == self.token_edits
+                    && line.starts.first().is_some_and(|(start, _)| *start <= pos)
+                    && pos < line.end
+            }) {
+                let i = line.starts.partition_point(|(start, _)| *start <= pos) - 1;
+                let (start, offset) = line.starts[i];
+                return offset + usize::from(pos - start);
+            }
+            self.bsd_line = Some(self.bsd_logical_line());
+            0
+        }
+
         /// The rest of the logical line, as BSD make sees it when parsing an
         /// expression: up to the end of the line or a comment, with each
         /// line continuation and the indentation after it replaced by a
         /// space.
-        fn bsd_logical_line(&self) -> String {
-            let mut text = String::new();
+        fn bsd_logical_line(&self) -> BsdLine {
+            let consumed = self.token_positions.len() - self.tokens.len();
+            let mut line = BsdLine {
+                text: String::new(),
+                starts: vec![],
+                end: self.current_range().start(),
+                token_edits: self.token_edits,
+            };
             let mut escaped = self.pending_backslash_escape;
-            let mut tokens = self.tokens.iter().rev().peekable();
-            while let Some((kind, token)) = tokens.next() {
+            let mut tokens = self
+                .tokens
+                .iter()
+                .rev()
+                .zip(&self.token_positions[consumed..])
+                .peekable();
+            while let Some(((kind, token), &(start, end))) = tokens.next() {
+                line.starts.push((start, line.text.len()));
+                line.end = end;
                 match kind {
-                    NEWLINE | COMMENT => break,
-                    BACKSLASH if !escaped && tokens.peek().is_some_and(|(k, _)| *k == NEWLINE) => {
-                        tokens.next();
-                        tokens.next_if(|(k, _)| *k == INDENT);
-                        text.push(' ');
+                    NEWLINE | COMMENT => {
+                        line.end = start;
+                        break;
+                    }
+                    BACKSLASH
+                        if !escaped && tokens.peek().is_some_and(|((k, _), _)| *k == NEWLINE) =>
+                    {
+                        line.end = tokens.next().unwrap().1 .1;
+                        if let Some((_, (_, end))) = tokens.next_if(|((k, _), _)| *k == INDENT) {
+                            line.end = *end;
+                        }
+                        line.text.push(' ');
                         escaped = false;
                         continue;
                     }
                     // A quoted string spanning lines. Its line continuation
                     // is not replaced, so stop here.
-                    _ if token.contains(['\n', '\r']) => break,
+                    _ if token.contains(['\n', '\r']) => {
+                        line.end = start;
+                        break;
+                    }
                     _ => {}
                 }
                 escaped = *kind == BACKSLASH && !escaped;
-                text.push_str(token);
+                line.text.push_str(token);
             }
-            text
+            line
         }
 
-        /// Consume the tokens making up the next `len` bytes of
-        /// [`Self::bsd_logical_line`], splitting the last token if needed.
+        /// Consume the tokens making up the next `len` bytes of the logical
+        /// line from [`Self::bsd_logical_line`], splitting the last token if
+        /// needed.
         fn bump_logical_bytes(&mut self, mut len: usize) {
             while len > 0 {
                 if self.consume_line_continuation() {
@@ -1501,27 +1561,32 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 let token_len = self.tokens.last().expect("text comes from tokens").1.len();
                 if token_len > len {
-                    self.split_current_token(len);
+                    self.bump_token_head(len);
+                    return;
                 }
-                len -= token_len.min(len);
+                len -= token_len;
                 self.bump();
             }
         }
 
-        /// Split the current token after `len` bytes. If the rest starts an
-        /// expression, it is lexed again so that the expression starts with
-        /// a `$` token.
-        fn split_current_token(&mut self, len: usize) {
+        /// Consume the first `len` bytes of the current token, leaving the
+        /// rest as the current token. If the rest starts an expression, it
+        /// is lexed again so that the expression starts with a `$` token.
+        fn bump_token_head(&mut self, len: usize) {
             let consumed = self.token_positions.len() - self.tokens.len();
-            let (kind, text) = self.tokens.pop().unwrap();
-            let (head, tail) = text.split_at(len);
-            let mut pieces = vec![(kind, head.to_string())];
-            if tail.starts_with('$') {
-                pieces.extend(lex_non_recipe_line(tail, self.variant).0);
-            } else {
-                pieces.push((kind, tail.to_string()));
-            }
+            let (kind, text) = self.tokens.last_mut().unwrap();
+            let kind = *kind;
+            let tail = text.split_off(len);
+            let head = std::mem::replace(text, tail);
+            self.token_positions[consumed].0 += rowan::TextSize::of(head.as_str());
+            self.pending_backslash_escape = false;
+            self.builder.token(kind.into(), &head);
 
+            let tail = &self.tokens.last().unwrap().1;
+            if !tail.starts_with('$') {
+                return;
+            }
+            let pieces = lex_non_recipe_line(tail, self.variant).0;
             // Keep token_positions in step with the new tokens.
             let mut position = self.token_positions[consumed].0;
             let positions: Vec<_> = pieces
@@ -1534,6 +1599,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .collect();
             self.token_positions
                 .splice(consumed..consumed + 1, positions);
+            self.tokens.pop();
             self.tokens.extend(pieces.into_iter().rev());
         }
 
@@ -1543,12 +1609,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// start a nested expression as in `${X:S/$/x/}`. Returns false
         /// without consuming anything if the expression is malformed.
         fn parse_bsd_variable_reference(&mut self) -> bool {
-            let text = self.bsd_logical_line();
-            let Some((end, nested)) = crate::reference::bsd_expr_extent(&text) else {
-                return false;
-            };
-            self.emit_bsd_expr(&text[..end], &nested);
-            true
+            let offset = self.bsd_line_offset();
+            let line = self.bsd_line.take().expect("set by bsd_line_offset");
+            let text = &line.text[offset..];
+            let found = crate::reference::bsd_expr_extent(text);
+            if let Some((end, nested)) = &found {
+                self.emit_bsd_expr(&text[..*end], nested);
+            }
+            self.bsd_line = Some(line);
+            found.is_some()
         }
 
         /// Add an EXPR node for the expression `text`, which starts at the
@@ -2875,6 +2944,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .extend_from_slice(&rest[rest.len() - self.tokens.len()..]);
 
             self.tokens.extend(tokens.into_iter().rev());
+            self.token_edits += 1;
         }
 
         fn parse(mut self) -> Parse {
@@ -3163,6 +3233,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         for_depth: 0,
         pending_backslash_escape: false,
         in_rule: false,
+        bsd_line: None,
+        token_edits: 0,
     }
     .parse()
 }
@@ -3539,7 +3611,10 @@ impl VariableReference {
     /// Parse this reference into the variable name and its modifiers.
     ///
     /// The variant determines which modifiers are recognized; see
-    /// [`crate::ParsedReference::parse`].
+    /// [`crate::ParsedReference::parse`]. For BSD make, parse the makefile
+    /// with [`crate::MakefileVariant::BSDMake`] as well: otherwise the
+    /// reference may end at the wrong place, as described for
+    /// [`Makefile::parse`].
     ///
     /// # Example
     /// ```
@@ -4666,6 +4741,36 @@ mod tests {
         assert_eq!(
             reference_texts("X = ${X:S,},x \\\n\ty,}\n", MakefileVariant::BSDMake),
             vec!["${X:S,},x \\\n\ty,}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_references_on_one_logical_line() {
+        assert_eq!(
+            reference_texts(
+                "X = ${A:S/a/$b/} $c/d \\\n\t${B:S,},x,} $e/f\nY = ${C:S/$//}\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![
+                "${A:S/a/$b/}",
+                "$b",
+                "$c",
+                "${B:S,},x,}",
+                "$e",
+                "${C:S/$//}"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_default_variant_reference_counts_braces() {
+        assert_eq!(
+            Makefile::parse("Y = ${SRCS:S,},x,}\n")
+                .tree()
+                .variable_references()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+            vec!["${SRCS:S,}"]
         );
     }
 
