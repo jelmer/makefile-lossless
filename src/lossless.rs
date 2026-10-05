@@ -1,3 +1,4 @@
+use crate::ast::line_ending;
 use crate::lex::{lex, lex_non_recipe_line};
 use crate::MakefileVariant;
 use crate::SyntaxKind;
@@ -4456,7 +4457,7 @@ impl Recipe {
         {
             builder.token(NEWLINE.into(), newline_token.as_token().unwrap().text());
         } else {
-            builder.token(NEWLINE.into(), "\n");
+            builder.token(NEWLINE.into(), &line_ending(node));
         }
 
         builder.finish_node();
@@ -4500,7 +4501,7 @@ impl Recipe {
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), text);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &line_ending(node));
         builder.finish_node();
         let new_syntax = SyntaxNode::new_root_mut(builder.finish());
 
@@ -4530,7 +4531,7 @@ impl Recipe {
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), text);
-        builder.token(NEWLINE.into(), "\n");
+        builder.token(NEWLINE.into(), &line_ending(node));
         builder.finish_node();
         let new_syntax = SyntaxNode::new_root_mut(builder.finish());
 
@@ -4637,16 +4638,10 @@ impl Recipe {
             .skip(skip)
             .map(|t| (t.kind(), t.text().to_string()))
             .collect();
-        // End the rule line the same way as the recipe line, so that a file
-        // with CRLF line endings keeps them.
-        let newline = body
-            .iter()
-            .rev()
-            .find(|(kind, _)| *kind == NEWLINE)
-            .map_or("\n", |(_, text)| text.as_str());
+        let newline = line_ending(node);
         let mut recipe = vec![(INDENT, "\t")];
         recipe.extend(body.iter().map(|(kind, text)| (*kind, text.as_str())));
-        let elements = detached_elements(&[(NEWLINE, newline)], Some(&recipe));
+        let elements = detached_elements(&[(NEWLINE, &newline)], Some(&recipe));
 
         let node_index = node.index();
         parent.splice_children(node_index..node_index + 1, elements);
@@ -13840,10 +13835,146 @@ mod test_crlf {
             rule.recipes().collect::<Vec<_>>(),
             vec!["echo first", "echo hi"]
         );
-        // TODO: the inserted recipe line itself still ends in LF.
         assert_eq!(
             makefile.to_string(),
-            "all: dep\r\n\techo first\n\techo hi\r\n"
+            "all: dep\r\n\techo first\r\n\techo hi\r\n"
         );
+    }
+
+    #[test]
+    fn test_insert_before_inline_recipe_without_newline() {
+        let makefile = parse_crlf("X = 1\r\nall: ; echo hi");
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes()
+            .next()
+            .unwrap()
+            .insert_before("echo first");
+        assert_eq!(
+            makefile.to_string(),
+            "X = 1\r\nall:\r\n\techo first\r\n\techo hi"
+        );
+    }
+
+    #[test]
+    fn test_recipe_insert_after() {
+        let makefile = parse_crlf("all:\r\n\techo a\r\n");
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().next().unwrap().insert_after("echo b");
+        assert_eq!(makefile.to_string(), "all:\r\n\techo a\r\n\techo b\r\n");
+    }
+
+    #[test]
+    fn test_recipe_replace_text_without_newline() {
+        let makefile = parse_crlf("all:\r\n\techo a");
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().next().unwrap().replace_text("echo b");
+        assert_eq!(makefile.to_string(), "all:\r\n\techo b\r\n");
+    }
+
+    #[test]
+    fn test_rule_commands() {
+        let makefile = parse_crlf("all:\r\n\techo a\r\n");
+        let mut rule = makefile.rules().next().unwrap();
+        rule.push_command("echo c");
+        assert!(rule.insert_command(2, "echo d"));
+        assert!(rule.insert_command(0, "echo 0"));
+        assert!(rule.replace_command(1, "echo b"));
+        assert_eq!(
+            makefile.to_string(),
+            "all:\r\n\techo 0\r\n\techo b\r\n\techo c\r\n\techo d\r\n"
+        );
+    }
+
+    #[test]
+    fn test_add_rule() {
+        let mut makefile = parse_crlf("X = 1\r\nall:\r\n");
+        makefile.add_rule("new");
+        makefile.add_phony_target("all").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "X = 1\r\nall:\r\n\r\nnew:\r\n\r\n.PHONY: all\r\n"
+        );
+    }
+
+    #[test]
+    fn test_insert_rule() {
+        let mut makefile = parse_crlf("a:\r\nb:\r\n");
+        makefile
+            .insert_rule(0, parse_crlf("first:\r\n").rules().next().unwrap())
+            .unwrap();
+        makefile
+            .insert_rule(2, parse_crlf("middle:\r\n").rules().next().unwrap())
+            .unwrap();
+        makefile
+            .insert_rule(4, parse_crlf("last:\r\n").rules().next().unwrap())
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "first:\r\n\r\na:\r\n\r\nmiddle:\r\n\r\nb:\r\n\r\nlast:\r\n"
+        );
+    }
+
+    #[test]
+    fn test_add_include() {
+        let mut makefile = parse_crlf("X = 1\r\n");
+        makefile.add_include("a.mk");
+        makefile.insert_include(2, "c.mk").unwrap();
+        let first = makefile.items().next().unwrap();
+        makefile.insert_include_after(&first, "b.mk").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "include a.mk\r\ninclude b.mk\r\nX = 1\r\ninclude c.mk\r\n"
+        );
+    }
+
+    #[test]
+    fn test_add_conditional() {
+        let mut makefile = parse_crlf("X = 1\r\n");
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\n\nZ = 1\n", Some("Y = 2\n"))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "X = 1\r\n\r\nifdef DEBUG\r\nY = 1\r\n\r\nZ = 1\r\nelse\r\nY = 2\r\nendif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_with_items() {
+        let mut makefile = parse_crlf("X = 1\r\n");
+        let items = parse_crlf("Y = 1\r\nY = 2\r\n");
+        let mut items = items.items();
+        makefile
+            .add_conditional_with_items("ifdef", "DEBUG", items.next(), Some(items.next()))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "X = 1\r\n\r\nifdef DEBUG\r\nY = 1\r\nelse\r\nY = 2\r\nendif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_conditional_add_else_item() {
+        let makefile = parse_crlf("ifdef X\r\nY = 1\r\nendif\r\n");
+        let item = parse_crlf("Y = 2\r\n").items().next().unwrap();
+        makefile.conditionals().next().unwrap().add_else_item(item);
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\r\nY = 1\r\nelse\r\nY = 2\r\nendif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_conditional_add_endif() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\r\nY = 1");
+        assert!(makefile.conditionals().next().unwrap().add_endif().unwrap());
+        assert_eq!(makefile.to_string(), "ifdef X\r\nY = 1\r\nendif\r\n");
+    }
+
+    #[test]
+    fn test_add_comment() {
+        let makefile = parse_crlf("X = 1\r\n");
+        makefile.items().next().unwrap().add_comment("hi").unwrap();
+        assert_eq!(makefile.to_string(), "# hi\r\nX = 1\r\n");
     }
 }
