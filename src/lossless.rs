@@ -2404,7 +2404,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.parse_include();
             } else if self.at_load_keyword() {
                 self.parse_load();
-            } else if !self.is_bsd_make()
+            } else if self.gnu_directives_enabled()
                 && self.current() == Some(IDENTIFIER)
                 && self.tokens.last().unwrap().1 == "vpath"
             {
@@ -7189,6 +7189,43 @@ all: $(OBJS)
             assert_eq!(vars.len(), 2);
             assert!(vars[0].is_undefine());
             assert!(vars[1].is_define());
+        }
+    }
+
+    #[test]
+    fn test_vpath_gnu_only() {
+        let text = "vpath %.c src\nvpath\n";
+        for variant in [
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+            MakefileVariant::BSDMake,
+        ] {
+            let parsed = parse(text, Some(variant));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"; 2],
+                "{variant:?}"
+            );
+            assert_eq!(
+                top_level_kinds(parsed.root().syntax()),
+                vec![RULE, RULE],
+                "{variant:?}"
+            );
+            assert_eq!(parsed.root().code(), text);
+        }
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(
+                top_level_kinds(parsed.root().syntax()),
+                vec![VPATH, VPATH],
+                "{variant:?}"
+            );
+            assert_eq!(parsed.root().code(), text);
         }
     }
 
