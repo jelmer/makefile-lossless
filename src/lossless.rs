@@ -15635,7 +15635,7 @@ mod test_crlf {
     #[test]
     fn test_add_include() {
         let mut makefile = parse_crlf("X = 1\r\n");
-        makefile.add_include("a.mk");
+        makefile.add_include("a.mk").unwrap();
         makefile.insert_include(2, "c.mk").unwrap();
         let first = makefile.items().next().unwrap();
         makefile.insert_include_after(&first, "b.mk").unwrap();

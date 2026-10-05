@@ -5,7 +5,7 @@ use crate::lossless::{
     parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
 use crate::MakefileVariant;
-use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE, OPERATOR};
+use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE, NEWLINE, OPERATOR, WHITESPACE};
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode, SyntaxToken};
 
@@ -76,6 +76,21 @@ fn escape_hashes(path: &str, bsd: bool, before_comment: bool) -> String {
 }
 
 impl Include {
+    /// Internal: a detached `include` directive for `path`, ending in `eol`.
+    pub(crate) fn new(path: &str, eol: &str) -> Result<Include, Error> {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.token(IDENTIFIER.into(), "include");
+        builder.token(WHITESPACE.into(), " ");
+        builder.start_node(EXPR.into());
+        builder.finish_node();
+        builder.token(NEWLINE.into(), eol);
+        builder.finish_node();
+        let mut include = Include::cast(SyntaxNode::new_root_mut(builder.finish())).unwrap();
+        include.set_path(path)?;
+        Ok(include)
+    }
+
     /// Internal: the token holding the include keyword and the keyword
     /// name without any dot, such as `-include`.
     fn keyword(&self) -> Option<(SyntaxToken<Lang>, String)> {
@@ -386,7 +401,7 @@ mod tests {
     #[test]
     fn test_add_include() {
         let mut makefile = Makefile::new();
-        makefile.add_include("config.mk");
+        makefile.add_include("config.mk").unwrap();
 
         let includes: Vec<_> = makefile.includes().collect();
         assert_eq!(includes.len(), 1);
@@ -402,7 +417,7 @@ mod tests {
     #[test]
     fn test_add_include_to_existing() {
         let mut makefile: Makefile = "VAR = value\nrule:\n\tcommand\n".parse().unwrap();
-        makefile.add_include("config.mk");
+        makefile.add_include("config.mk").unwrap();
 
         // Include should be added at the beginning
         let files: Vec<_> = makefile.included_files().collect();
@@ -833,6 +848,50 @@ mod tests {
             let mut inc = makefile.includes().next().unwrap();
             assert!(inc.set_path(path).is_err(), "{path:?}");
             assert_eq!(makefile.to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_add_include_escapes_hash() {
+        for eol in ["\n", "\r\n"] {
+            for (path, written) in [
+                ("a#b", "a\\#b"),
+                ("a\\#b", "a\\\\\\#b"),
+                ("$(subst \\#,x,a)", "$(subst \\#,x,a)"),
+            ] {
+                let mut makefile: Makefile = format!("X = 1{eol}").parse().unwrap();
+                let first = makefile.items().next().unwrap();
+                let added = makefile.add_include(path).unwrap();
+                let inserted = makefile.insert_include(2, path).unwrap();
+                let after = makefile.insert_include_after(&first, path).unwrap();
+                assert_eq!(
+                    makefile.to_string(),
+                    format!("include {written}{eol}X = 1{eol}include {written}{eol}include {written}{eol}")
+                );
+                for inc in [added, inserted, after] {
+                    assert_eq!(inc.path().as_deref(), Some(path));
+                }
+                let reparsed: Makefile = makefile.to_string().parse().unwrap();
+                assert_eq!(reparsed.included_files().collect::<Vec<_>>(), vec![path; 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_include_unrepresentable() {
+        for eol in ["\n", "\r\n"] {
+            for path in ["a\nb", "a\\", " a", ""] {
+                let code = format!("X = 1{eol}");
+                let mut makefile: Makefile = code.parse().unwrap();
+                let first = makefile.items().next().unwrap();
+                assert!(makefile.add_include(path).is_err(), "{path:?}");
+                assert!(makefile.insert_include(1, path).is_err(), "{path:?}");
+                assert!(
+                    makefile.insert_include_after(&first, path).is_err(),
+                    "{path:?}"
+                );
+                assert_eq!(makefile.to_string(), code);
+            }
         }
     }
 
