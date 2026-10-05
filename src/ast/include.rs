@@ -1,18 +1,76 @@
 use super::bsd::{directive_keyword, keyword_token};
-use super::collapse_continuations;
 use super::makefile::MakefileItem;
+use super::{collapse_continuations, logical_text, LineSyntax};
 use crate::lossless::{
-    remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
+    parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
-use crate::SyntaxKind::{EXPR, IDENTIFIER, INCLUDE};
+use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE};
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode, SyntaxToken};
 
 /// Strip the `<...>` or `"..."` delimiters from a BSD make include path.
+///
+/// Like BSD make, this ignores anything after the closing delimiter.
 fn strip_delimiters(path: &str) -> Option<&str> {
-    path.strip_prefix('<')
-        .and_then(|p| p.strip_suffix('>'))
-        .or_else(|| path.strip_prefix('"').and_then(|p| p.strip_suffix('"')))
+    let (close, rest) = match path.chars().next()? {
+        '<' => ('>', &path[1..]),
+        '"' => ('"', &path[1..]),
+        _ => return None,
+    };
+    rest.find(close).map(|end| &rest[..end])
+}
+
+/// Escape each `#` in `path` outside variable references, so that make
+/// does not read it as the start of a comment.
+///
+/// GNU make halves the backslashes before `\#` and, if `before_comment`,
+/// those at the end of the path; BSD make does neither and also starts a
+/// comment at a `#` inside a variable reference.
+fn escape_hashes(path: &str, bsd: bool, before_comment: bool) -> String {
+    let mut escaped = String::new();
+    let mut backslashes = 0;
+    // The closing delimiters of the variable references `c` is in.
+    let mut closers = Vec::new();
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        escaped.push(c);
+        match c {
+            '\\' => {
+                backslashes += 1;
+                continue;
+            }
+            '$' => match chars.next_if(|n| matches!(n, '(' | '{' | '$')) {
+                Some('(') => {
+                    escaped.push('(');
+                    closers.push(')');
+                }
+                Some('{') => {
+                    escaped.push('{');
+                    closers.push('}');
+                }
+                Some(dollar) => escaped.push(dollar),
+                None => {}
+            },
+            '(' if !closers.is_empty() => closers.push(')'),
+            '{' if !closers.is_empty() => closers.push('}'),
+            ')' | '}' if closers.last() == Some(&c) => {
+                closers.pop();
+            }
+            '#' if bsd || closers.is_empty() => {
+                escaped.pop();
+                if !bsd {
+                    escaped.push_str(&"\\".repeat(backslashes));
+                }
+                escaped.push_str("\\#");
+            }
+            _ => {}
+        }
+        backslashes = 0;
+    }
+    if before_comment && !bsd {
+        escaped.push_str(&"\\".repeat(backslashes));
+    }
+    escaped
 }
 
 impl Include {
@@ -29,34 +87,52 @@ impl Include {
         directive_keyword(self.syntax()).is_some_and(|k| k.starts_with('.'))
     }
 
-    /// Get the path of the include directive
+    /// The EXPR node holding the path.
+    fn path_expr(&self) -> Option<SyntaxNode<Lang>> {
+        self.syntax().children().find(|it| it.kind() == EXPR)
+    }
+
+    /// Get the path of the include directive as make reads it, before
+    /// expansion.
     ///
-    /// For BSD make, the `<...>` or `"..."` delimiters around the path are
-    /// removed.
+    /// Line continuations are collapsed and `\#` is unescaped the way
+    /// BSD make does for `.include` and GNU make otherwise; see
+    /// [`crate::VariableDefinition::value`]. Variable references and
+    /// backslashes before whitespace are kept, since make only handles them
+    /// after expanding the path. For BSD make, the `<...>` or `"..."`
+    /// delimiters around the path are removed.
     ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
-    /// let makefile: Makefile = ".include <bsd.prog.mk>\n".parse().unwrap();
-    /// let inc = makefile.includes().next().unwrap();
-    /// assert_eq!(inc.path(), Some("bsd.prog.mk".to_string()));
+    /// let makefile: Makefile = ".include <bsd.prog.mk>\ninclude a\\#b.mk\n".parse().unwrap();
+    /// let paths: Vec<_> = makefile.includes().map(|i| i.path().unwrap()).collect();
+    /// assert_eq!(paths, vec!["bsd.prog.mk", "a#b.mk"]);
     /// ```
     pub fn path(&self) -> Option<String> {
-        let raw = self.raw_path()?;
+        let expr = self.path_expr()?;
+        let syntax = if self.is_bsd() {
+            LineSyntax::Bsd
+        } else {
+            LineSyntax::Gnu
+        };
+        let tokens = expr
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token());
+        let text = logical_text(&expr, tokens, syntax, true);
+        let path = text.trim();
         if self.is_bsd() {
-            if let Some(inner) = strip_delimiters(&raw) {
+            if let Some(inner) = strip_delimiters(path) {
                 return Some(inner.to_string());
             }
         }
-        Some(raw)
+        Some(path.to_string())
     }
 
     /// The path as written, including any delimiters, with line
     /// continuations collapsed.
     fn raw_path(&self) -> Option<String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
+        self.path_expr()
             .map(|it| collapse_continuations(&it).trim().to_string())
     }
 
@@ -71,10 +147,7 @@ impl Include {
     /// assert_eq!(&makefile.to_string()[std::ops::Range::from(range)], "config.mk");
     /// ```
     pub fn path_range(&self) -> Option<rowan::TextRange> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.text_range())
+        self.path_expr().map(|it| it.text_range())
     }
 
     /// Check if this is an optional include (-include or sinclude)
@@ -137,43 +210,73 @@ impl Include {
 
     /// Set the path of this include directive
     ///
+    /// `#` is escaped as needed, so that [`Self::path`] returns `new_path`.
+    /// Returns an error if the directive has no path or `new_path` can not
+    /// be written in it, such as a path containing a newline.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
     /// let mut makefile: Makefile = "include old.mk\n".parse().unwrap();
     /// let mut inc = makefile.includes().next().unwrap();
-    /// inc.set_path("new.mk");
-    /// assert_eq!(inc.path(), Some("new.mk".to_string()));
-    /// assert_eq!(makefile.to_string(), "include new.mk\n");
+    /// inc.set_path("new#1.mk").unwrap();
+    /// assert_eq!(inc.path(), Some("new#1.mk".to_string()));
+    /// assert_eq!(makefile.to_string(), "include new\\#1.mk\n");
     /// ```
-    pub fn set_path(&mut self, new_path: &str) {
-        // Keep the delimiters of a BSD include.
-        let new_path = match self.raw_path() {
-            Some(raw) if self.is_bsd() && strip_delimiters(&raw).is_some() => {
-                format!("{}{}{}", &raw[..1], new_path, &raw[raw.len() - 1..])
-            }
-            _ => new_path.to_string(),
+    pub fn set_path(&mut self, new_path: &str) -> Result<(), Error> {
+        let error = |message: String| {
+            Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
+                    message,
+                    line: 1,
+                    context: "include_set_path".to_string(),
+                }],
+            })
         };
-        // Find the EXPR node containing the path
-        let expr_index = self
-            .syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.index());
-
-        if let Some(expr_idx) = expr_index {
-            // Build a new EXPR node with the new path
-            let mut builder = GreenNodeBuilder::new();
-            builder.start_node(EXPR.into());
-            builder.token(IDENTIFIER.into(), &new_path);
-            builder.finish_node();
-
-            let new_expr = SyntaxNode::new_root_mut(builder.finish());
-
-            // Replace the old EXPR with the new one
-            self.syntax()
-                .splice_children(expr_idx..expr_idx + 1, vec![new_expr.into()]);
+        let expr = self
+            .path_expr()
+            .ok_or_else(|| error("Cannot set path: include has no path".to_string()))?;
+        let before_comment = expr
+            .next_sibling_or_token()
+            .is_some_and(|it| it.kind() == COMMENT);
+        let mut text = escape_hashes(new_path, self.is_bsd(), before_comment);
+        // Keep the delimiters of a BSD include.
+        if let Some(raw) = self.raw_path().filter(|_| self.is_bsd()) {
+            if strip_delimiters(&raw).is_some() {
+                let close = if raw.starts_with('<') { '>' } else { '"' };
+                text = format!("{}{}{}", &raw[..1], text, close);
+            }
         }
+
+        // Parse the directive with the new path, from its keyword on, to
+        // check that make reads it back as `new_path`.
+        let directive: String = self
+            .syntax()
+            .children_with_tokens()
+            .skip_while(|it| it.kind() != IDENTIFIER)
+            .map(|it| match it.as_node() {
+                Some(node) if node == &expr => text.clone(),
+                _ => it.to_string(),
+            })
+            .collect();
+        let parsed = parse(&directive, None);
+        let mut items = parsed.root().syntax().children();
+        let new_expr = items
+            .next()
+            .and_then(Include::cast)
+            .filter(|include| {
+                parsed.errors.is_empty()
+                    && items.next().is_none()
+                    && include.path().as_deref() == Some(new_path)
+            })
+            .and_then(|include| include.path_expr())
+            .ok_or_else(|| error(format!("Cannot write {:?} as an include path", new_path)))?;
+        let new_expr = SyntaxNode::new_root_mut(new_expr.green().into_owned());
+        let index = expr.index();
+        self.syntax()
+            .splice_children(index..index + 1, vec![new_expr.into()]);
+        Ok(())
     }
 
     /// Make this include optional (change "include" to "-include")
@@ -223,6 +326,7 @@ impl Include {
 mod tests {
 
     use crate::lossless::Makefile;
+    use crate::MakefileVariant;
 
     #[test]
     fn test_include_parent() {
@@ -367,7 +471,7 @@ mod tests {
     fn test_include_set_path() {
         let makefile: Makefile = "include old.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_path("new.mk");
+        inc.set_path("new.mk").unwrap();
 
         assert_eq!(inc.path(), Some("new.mk".to_string()));
         assert_eq!(makefile.to_string(), "include new.mk\n");
@@ -377,7 +481,7 @@ mod tests {
     fn test_include_set_path_preserves_optional() {
         let makefile: Makefile = "-include old.mk\n".parse().unwrap();
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_path("new.mk");
+        inc.set_path("new.mk").unwrap();
 
         assert_eq!(inc.path(), Some("new.mk".to_string()));
         assert!(inc.is_optional());
@@ -442,7 +546,7 @@ mod tests {
         let mut inc = makefile.includes().next().unwrap();
 
         // Change path and make optional
-        inc.set_path("new.mk");
+        inc.set_path("new.mk").unwrap();
         inc.set_optional(true);
 
         assert_eq!(inc.path(), Some("new.mk".to_string()));
@@ -551,7 +655,7 @@ mod tests {
             .parse()
             .unwrap();
         for mut inc in makefile.includes() {
-            inc.set_path("new.mk");
+            inc.set_path("new.mk").unwrap();
             assert_eq!(inc.path(), Some("new.mk".to_string()));
         }
         assert_eq!(
@@ -608,6 +712,86 @@ mod tests {
     }
 
     #[test]
+    fn test_path_unescapes_hash() {
+        let code = concat!(
+            "include a\\#b\n",
+            "include a\\\\\\#b # c\n",
+            "include a\\\\#b\n",
+            "include $(subst \\#,x,a) # c\n",
+        );
+        let parsed = Makefile::parse_with_variant(code, MakefileVariant::GNUMake);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["a#b", "a\\#b", "a\\", "$(subst \\#,x,a)"]
+        );
+        assert_eq!(
+            makefile
+                .includes()
+                .map(|i| &code[std::ops::Range::from(i.path_range().unwrap())])
+                .collect::<Vec<_>>(),
+            vec!["a\\#b", "a\\\\\\#b", "a\\\\", "$(subst \\#,x,a)"]
+        );
+
+        let makefile: Makefile = ".include <a\\#b> # c\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        assert_eq!(inc.path(), Some("a#b".to_string()));
+        assert_eq!(
+            &makefile.to_string()[std::ops::Range::from(inc.path_range().unwrap())],
+            "<a\\#b>"
+        );
+    }
+
+    #[test]
+    fn test_set_path_escapes_hash() {
+        for (code, path, expected) in [
+            ("include old.mk\n", "a#b", "include a\\#b\n"),
+            ("include old.mk\n", "a\\#b", "include a\\\\\\#b\n"),
+            ("include old.mk\n", "a\\\\", "include a\\\\\n"),
+            ("include old.mk# c\n", "a\\", "include a\\\\# c\n"),
+            (
+                "include old.mk\n",
+                "$(subst \\#,x,a)",
+                "include $(subst \\#,x,a)\n",
+            ),
+            ("-include old.mk\n", "a b#c", "-include a b\\#c\n"),
+            (".include <old.mk>\n", "a#b", ".include <a\\#b>\n"),
+            (
+                ".include <old.mk> # c\n",
+                "a\\\\#b",
+                ".include <a\\\\\\#b> # c\n",
+            ),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            let mut inc = makefile.includes().next().unwrap();
+            inc.set_path(path).unwrap();
+            assert_eq!(makefile.to_string(), expected);
+            assert_eq!(inc.path().as_deref(), Some(path));
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(
+                reparsed.included_files().collect::<Vec<_>>(),
+                vec![path.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_path_unrepresentable() {
+        for (code, path) in [
+            ("include old.mk\n", "a\nb"),
+            ("include old.mk\n", "a\\"),
+            (".include <old.mk>\n", "a>b"),
+            (".include <old.mk>\n", "a\\#b"),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            let mut inc = makefile.includes().next().unwrap();
+            assert!(inc.set_path(path).is_err(), "{path:?}");
+            assert_eq!(makefile.to_string(), code);
+        }
+    }
+
+    #[test]
     fn test_path_excludes_comment() {
         let makefile: Makefile = "include foo.mk # comment\n.include <bsd.own.mk> # c\n"
             .parse()
@@ -617,7 +801,7 @@ mod tests {
             vec![Some("foo.mk".to_string()), Some("bsd.own.mk".to_string())]
         );
         let mut inc = makefile.includes().next().unwrap();
-        inc.set_path("bar.mk");
+        inc.set_path("bar.mk").unwrap();
         assert_eq!(
             makefile.to_string(),
             "include bar.mk # comment\n.include <bsd.own.mk> # c\n"
