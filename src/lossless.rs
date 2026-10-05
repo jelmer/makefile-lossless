@@ -3749,15 +3749,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Re-lex the tab-indented line at the current position as an
-        /// ordinary makefile line. The lexer treats every tab-indented line as
-        /// a recipe line, but outside of rule context GNU make parses it like
-        /// any other line.
-        /// Parse a tab-indented line outside of rule context. GNU make parses
-        /// it like any other line, while BSD make rejects it as a shell
-        /// command without a target.
+        /// Parse an indented command line outside of rule context. GNU make
+        /// parses it like any other line, while BSD make, POSIX and nmake
+        /// read it as a command line, which is an error without a target.
         fn parse_indented_line_outside_rule(&mut self) {
-            if self.is_bsd_make() {
+            if self.indented_lines_are_commands() {
                 if self.at_bsd_comment_line() {
                     self.parse_bsd_comment_line();
                     return;
@@ -3779,18 +3775,34 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 RuleContext::Inside => self.parse_recipe_line(),
                 RuleContext::Outside => self.parse_indented_line_outside_rule(),
                 // Whether the line belongs to a rule depends on the branches
-                // make takes. BSD make reads it as a shell command either
-                // way, while GNU make reads it as an ordinary line outside
-                // of rule context, so it has to be a recipe line if it isn't
-                // valid as one.
-                RuleContext::Varies if self.is_bsd_make() && self.at_bsd_comment_line() => {
+                // make takes. BSD make, POSIX and nmake read it as a command
+                // either way, while GNU make reads it as an ordinary line
+                // outside of rule context, so it has to be a recipe line if
+                // it isn't valid as one.
+                RuleContext::Varies
+                    if self.indented_lines_are_commands() && self.at_bsd_comment_line() =>
+                {
                     self.parse_bsd_comment_line()
                 }
-                RuleContext::Varies if !self.is_bsd_make() && self.indented_line_is_statement() => {
+                RuleContext::Varies
+                    if !self.indented_lines_are_commands() && self.indented_line_is_statement() =>
+                {
                     self.relex_as_non_recipe_line(true)
                 }
                 RuleContext::Varies => self.parse_recipe_line(),
             }
+        }
+
+        /// Whether an indented line is always a command line, as in BSD make,
+        /// POSIX and nmake, rather than an ordinary line outside of rule
+        /// context as in GNU make.
+        fn indented_lines_are_commands(&self) -> bool {
+            matches!(
+                self.variant,
+                Some(
+                    MakefileVariant::BSDMake | MakefileVariant::POSIXMake | MakefileVariant::NMake
+                )
+            )
         }
 
         /// Whether the tab-indented line at the current position has only a
@@ -14761,6 +14773,44 @@ test:
             node_kinds(&parsed.syntax()),
             "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nVARIABLE\n  EXPR\n"
         );
+    }
+
+    #[test]
+    fn test_posix_tab_indented_line_outside_rule() {
+        // Only GNU make re-reads a tab-indented line outside of a rule as an
+        // ordinary makefile line; elsewhere it is a command line.
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
+            let code = "X = 1\n\tY = 2\nall:\n";
+            let parsed = parse(code, Some(variant));
+            assert_eq!(
+                parsed.errors,
+                vec![ErrorInfo {
+                    message: "indented line not part of a rule".to_string(),
+                    line: 2,
+                    context: "\tY = 2".to_string(),
+                    kind: ParseErrorKind::RecipeBeforeFirstTarget,
+                }]
+            );
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "VARIABLE\n  EXPR\nRECIPE\nRULE\n  TARGETS\n  PREREQUISITES\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_posix_tab_indented_comment_and_blank_outside_rule() {
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
+            let code = "X = 1\n\t# c\n\t\nall:\n";
+            let parsed = parse(code, Some(variant));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
     }
 
     #[test]
