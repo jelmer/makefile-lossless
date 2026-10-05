@@ -1,12 +1,57 @@
+use super::bsd::{directive_keyword, keyword_token};
 use super::makefile::MakefileItem;
-use crate::lossless::{remove_with_preceding_comments, Error, ErrorInfo, Include, ParseError};
+use crate::lossless::{
+    remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
+};
 use crate::SyntaxKind::{EXPR, IDENTIFIER, INCLUDE};
 use rowan::ast::AstNode;
-use rowan::{GreenNodeBuilder, SyntaxNode};
+use rowan::{GreenNodeBuilder, SyntaxNode, SyntaxToken};
+
+/// Strip the `<...>` or `"..."` delimiters from a BSD make include path.
+fn strip_delimiters(path: &str) -> Option<&str> {
+    path.strip_prefix('<')
+        .and_then(|p| p.strip_suffix('>'))
+        .or_else(|| path.strip_prefix('"').and_then(|p| p.strip_suffix('"')))
+}
 
 impl Include {
-    /// Get the raw path of the include directive
+    /// Internal: the token holding the include keyword and the keyword
+    /// name without any dot, such as `-include`.
+    fn keyword(&self) -> Option<(SyntaxToken<Lang>, String)> {
+        let (token, keyword) = keyword_token(self.syntax())?;
+        let name = keyword.trim_start_matches('.').to_string();
+        Some((token, name))
+    }
+
+    /// Whether this is a BSD make `.include` directive.
+    fn is_bsd(&self) -> bool {
+        directive_keyword(self.syntax()).is_some_and(|k| k.starts_with('.'))
+    }
+
+    /// Get the path of the include directive
+    ///
+    /// For BSD make, the `<...>` or `"..."` delimiters around the path are
+    /// removed.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = ".include <bsd.prog.mk>\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(inc.path(), Some("bsd.prog.mk".to_string()));
+    /// ```
     pub fn path(&self) -> Option<String> {
+        let raw = self.raw_path()?;
+        if self.is_bsd() {
+            if let Some(inner) = strip_delimiters(&raw) {
+                return Some(inner.to_string());
+            }
+        }
+        Some(raw)
+    }
+
+    /// The path as written, including any delimiters.
+    fn raw_path(&self) -> Option<String> {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
@@ -31,9 +76,11 @@ impl Include {
     }
 
     /// Check if this is an optional include (-include or sinclude)
+    ///
+    /// For BSD make, `.-include`, `.sinclude` and `.dinclude` are optional.
     pub fn is_optional(&self) -> bool {
-        let text = self.syntax().text();
-        text.to_string().starts_with("-include") || text.to_string().starts_with("sinclude")
+        self.keyword()
+            .is_some_and(|(_, name)| matches!(name.as_str(), "-include" | "sinclude" | "dinclude"))
     }
 
     /// Get the parent item of this include directive, if any
@@ -97,6 +144,13 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "include new.mk\n");
     /// ```
     pub fn set_path(&mut self, new_path: &str) {
+        // Keep the delimiters of a BSD include.
+        let new_path = match self.raw_path() {
+            Some(raw) if self.is_bsd() && strip_delimiters(&raw).is_some() => {
+                format!("{}{}{}", &raw[..1], new_path, &raw[raw.len() - 1..])
+            }
+            _ => new_path.to_string(),
+        };
         // Find the EXPR node containing the path
         let expr_index = self
             .syntax()
@@ -108,7 +162,7 @@ impl Include {
             // Build a new EXPR node with the new path
             let mut builder = GreenNodeBuilder::new();
             builder.start_node(EXPR.into());
-            builder.token(IDENTIFIER.into(), new_path);
+            builder.token(IDENTIFIER.into(), &new_path);
             builder.finish_node();
 
             let new_expr = SyntaxNode::new_root_mut(builder.finish());
@@ -121,7 +175,8 @@ impl Include {
 
     /// Make this include optional (change "include" to "-include")
     ///
-    /// If the include is already optional, this has no effect.
+    /// If the include is already optional, this has no effect. For BSD make
+    /// this switches between `.include` and `.-include`.
     ///
     /// # Example
     /// ```
@@ -133,15 +188,16 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
     pub fn set_optional(&mut self, optional: bool) {
-        let Some(token) = self
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == IDENTIFIER)
-        else {
+        let Some((token, name)) = self.keyword() else {
             return;
         };
-        let new_keyword = match (optional, token.text()) {
+        // In the `.include` form the dot is part of the keyword token.
+        let dot = if token.text().starts_with('.') {
+            "."
+        } else {
+            ""
+        };
+        let new_name = match (optional, name.as_str()) {
             (true, "include") => "-include",
             (false, "-include" | "sinclude") => "include",
             _ => return,
@@ -149,7 +205,7 @@ impl Include {
 
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(INCLUDE.into());
-        builder.token(IDENTIFIER.into(), new_keyword);
+        builder.token(IDENTIFIER.into(), &format!("{}{}", dot, new_name));
         builder.finish_node();
         let new_token = SyntaxNode::new_root_mut(builder.finish())
             .first_token()
@@ -443,5 +499,65 @@ mod tests {
         assert_eq!(makefile.to_string(), "-include $(TOP)/config.mk\n");
         inc.set_optional(false);
         assert_eq!(makefile.to_string(), "include $(TOP)/config.mk\n");
+    }
+
+    #[test]
+    fn test_bsd_set_optional() {
+        let makefile: Makefile = ".include <bsd.prog.mk>\n.  include \"x.mk\"\n"
+            .parse()
+            .unwrap();
+        for mut inc in makefile.includes() {
+            inc.set_optional(true);
+            assert!(inc.is_optional());
+        }
+        assert_eq!(
+            makefile.to_string(),
+            ".-include <bsd.prog.mk>\n.  -include \"x.mk\"\n"
+        );
+        for mut inc in makefile.includes() {
+            inc.set_optional(false);
+            assert!(!inc.is_optional());
+        }
+        assert_eq!(
+            makefile.to_string(),
+            ".include <bsd.prog.mk>\n.  include \"x.mk\"\n"
+        );
+    }
+
+    #[test]
+    fn test_bsd_optional_variants() {
+        let makefile: Makefile = ".sinclude <a.mk>\n.dinclude <b.mk>\n.include <c.mk>\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .includes()
+                .map(|i| (i.path().unwrap(), i.is_optional()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a.mk".to_string(), true),
+                ("b.mk".to_string(), true),
+                ("c.mk".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bsd_set_path_keeps_delimiters() {
+        let makefile: Makefile = ".include <bsd.prog.mk>\n. include \"old.mk\"\n"
+            .parse()
+            .unwrap();
+        for mut inc in makefile.includes() {
+            inc.set_path("new.mk");
+            assert_eq!(inc.path(), Some("new.mk".to_string()));
+        }
+        assert_eq!(
+            makefile.to_string(),
+            ".include <new.mk>\n. include \"new.mk\"\n"
+        );
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["new.mk", "new.mk"]
+        );
     }
 }

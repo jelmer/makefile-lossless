@@ -96,6 +96,12 @@ impl Parse<Makefile> {
         let parsed = crate::lossless::parse(text, None);
         Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
     }
+
+    /// Parse makefile text written for a specific make variant
+    pub fn parse_makefile_with_variant(text: &str, variant: crate::MakefileVariant) -> Self {
+        let parsed = crate::lossless::parse(text, Some(variant));
+        Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+    }
 }
 
 impl Parse<Rule> {

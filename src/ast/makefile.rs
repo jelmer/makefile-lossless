@@ -1,8 +1,9 @@
 use crate::lossless::{
-    parse, Conditional, Error, ErrorInfo, Include, Makefile, ParseError, Rule, SyntaxNode,
-    VariableDefinition, VariableReference, Vpath,
+    parse, Conditional, Directive, Error, ErrorInfo, ForLoop, Include, Makefile, ParseError, Rule,
+    SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
+use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
@@ -21,6 +22,10 @@ pub enum MakefileItem {
     Conditional(Conditional),
     /// A `vpath` directive (e.g., `vpath %.c src`)
     Vpath(Vpath),
+    /// A BSD make `.for` loop
+    ForLoop(ForLoop),
+    /// A BSD make single-line directive (e.g., `.undef FOO`)
+    Directive(Directive),
 }
 
 impl MakefileItem {
@@ -34,6 +39,10 @@ impl MakefileItem {
             Some(MakefileItem::Include(inc))
         } else if let Some(vp) = Vpath::cast(node.clone()) {
             Some(MakefileItem::Vpath(vp))
+        } else if let Some(f) = ForLoop::cast(node.clone()) {
+            Some(MakefileItem::ForLoop(f))
+        } else if let Some(d) = Directive::cast(node.clone()) {
+            Some(MakefileItem::Directive(d))
         } else {
             Conditional::cast(node).map(MakefileItem::Conditional)
         }
@@ -47,6 +56,8 @@ impl MakefileItem {
             MakefileItem::Include(i) => i.syntax(),
             MakefileItem::Conditional(c) => c.syntax(),
             MakefileItem::Vpath(v) => v.syntax(),
+            MakefileItem::ForLoop(f) => f.syntax(),
+            MakefileItem::Directive(d) => d.syntax(),
         }
     }
 
@@ -444,10 +455,14 @@ impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(item) = self.stack.pop_front() {
-            if let MakefileItem::Conditional(ref cond) = item {
-                // Push in natural order since we pop from front
-                self.stack.extend(cond.if_items());
-                self.stack.extend(cond.else_items());
+            match item {
+                MakefileItem::Conditional(ref cond) => {
+                    // Push in natural order since we pop from front
+                    self.stack.extend(cond.if_items());
+                    self.stack.extend(cond.else_items());
+                }
+                MakefileItem::ForLoop(ref f) => self.stack.extend(f.items()),
+                _ => {}
             }
             if let Some(extracted) = T::extract(item) {
                 return Some(extracted);
@@ -546,8 +561,33 @@ impl Makefile {
     }
 
     /// Parse makefile text, returning a Parse result
+    ///
+    /// Both GNU make and BSD make syntax are accepted. Use
+    /// [`Self::parse_with_variant`] to restrict parsing to a single variant.
     pub fn parse(text: &str) -> crate::Parse<Makefile> {
         crate::Parse::<Makefile>::parse_makefile(text)
+    }
+
+    /// Parse makefile text written for a specific make variant
+    ///
+    /// Directives of other variants are not recognized; for example, with
+    /// [`MakefileVariant::BSDMake`] a line starting with `ifdef` is not a
+    /// conditional.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let parsed = Makefile::parse_with_variant(
+    ///     ".if defined(DEBUG)\nCFLAGS+= -g\n.endif\n",
+    ///     MakefileVariant::BSDMake,
+    /// );
+    /// assert!(parsed.ok());
+    /// let makefile = parsed.tree();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// assert_eq!(cond.conditional_type(), Some(".if".to_string()));
+    /// ```
+    pub fn parse_with_variant(text: &str, variant: MakefileVariant) -> crate::Parse<Makefile> {
+        crate::Parse::<Makefile>::parse_makefile_with_variant(text, variant)
     }
 
     /// Get the text content of the makefile
@@ -1337,14 +1377,9 @@ impl Makefile {
         let includes = collect_includes(self.syntax());
 
         // Convert to an iterator of paths
-        includes.into_iter().map(|include| {
-            include
-                .syntax()
-                .children()
-                .find(|node| node.kind() == EXPR)
-                .map(|expr| expr.text().to_string().trim().to_string())
-                .unwrap_or_default()
-        })
+        includes
+            .into_iter()
+            .map(|include| include.path().unwrap_or_default())
     }
 
     /// Find the first rule with a specific target name
