@@ -237,12 +237,12 @@ pub(crate) fn logical_text(
     text
 }
 
-/// The text of `node` with each line continuation and the whitespace around
-/// it collapsed into a single space, as GNU make does outside recipes, and
-/// any other CRLF line endings converted to LF.
-pub(crate) fn collapse_continuations(node: &SyntaxNode) -> String {
+/// The text of `node` with each line continuation collapsed into a single
+/// space as described by `syntax`, and any other CRLF line endings
+/// converted to LF.
+pub(crate) fn collapse_continuations(node: &SyntaxNode, syntax: LineSyntax) -> String {
     let tokens = node
         .descendants_with_tokens()
         .filter_map(|it| it.into_token());
-    logical_text(node, tokens, LineSyntax::Gnu, false)
+    logical_text(node, tokens, syntax, false)
 }

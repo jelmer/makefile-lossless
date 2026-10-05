@@ -129,10 +129,11 @@ impl Include {
     ///
     /// Line continuations are collapsed and `\#` is unescaped the way
     /// BSD make does for `.include` and GNU make otherwise; see
-    /// [`crate::VariableDefinition::value`]. Variable references and
-    /// backslashes before whitespace are kept, since make only handles them
-    /// after expanding the path. For BSD make and nmake, the `<...>` or
-    /// `"..."` delimiters around the path are removed.
+    /// [`crate::VariableDefinition::value`] and [`Self::path_for`] for
+    /// other variants. Variable references and backslashes before
+    /// whitespace are kept, since make only handles them after expanding
+    /// the path. For BSD make and nmake, the `<...>` or `"..."` delimiters
+    /// around the path are removed.
     ///
     /// # Example
     /// ```
@@ -147,12 +148,42 @@ impl Include {
     /// assert_eq!(inc.path(), Some("win32.mak".to_string()));
     /// ```
     pub fn path(&self) -> Option<String> {
-        let expr = self.path_expr()?;
         let syntax = match self.prefix() {
             Some('.') => LineSyntax::Bsd,
             Some('!') => LineSyntax::NMake,
             _ => LineSyntax::Gnu,
         };
+        self.path_with(syntax)
+    }
+
+    /// Get the path of the include directive as `variant` reads it, before
+    /// expansion; see [`Self::path`].
+    ///
+    /// GNU make drops the whitespace before a line continuation, while
+    /// POSIX make (and GNU make after `.POSIX:`) and BSD make keep it. This
+    /// matters inside variable references, such as in function arguments
+    /// or BSD make modifiers.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile: Makefile = "include $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(
+    ///     inc.path_for(MakefileVariant::GNUMake),
+    ///     Some("$(subst a b,c,a  b)".to_string())
+    /// );
+    /// assert_eq!(
+    ///     inc.path_for(MakefileVariant::POSIXMake),
+    ///     Some("$(subst a  b,c,a  b)".to_string())
+    /// );
+    /// ```
+    pub fn path_for(&self, variant: MakefileVariant) -> Option<String> {
+        self.path_with(variant.into())
+    }
+
+    fn path_with(&self, syntax: LineSyntax) -> Option<String> {
+        let expr = self.path_expr()?;
         let tokens = expr
             .descendants_with_tokens()
             .filter_map(|it| it.into_token());
@@ -169,8 +200,11 @@ impl Include {
     /// The path as written, including any delimiters, with line
     /// continuations collapsed.
     fn raw_path(&self) -> Option<String> {
-        self.path_expr()
-            .map(|it| collapse_continuations(&it).trim().to_string())
+        self.path_expr().map(|it| {
+            collapse_continuations(&it, LineSyntax::Gnu)
+                .trim()
+                .to_string()
+        })
     }
 
     /// Get the text range of the path portion of the include directive.
@@ -984,5 +1018,50 @@ mod tests {
         inc.set_path("${.CURDIR}/a#b").unwrap();
         assert_eq!(makefile.to_string(), ". include \"${.CURDIR}/a\\#b\" # c\n");
         assert_eq!(inc.path().as_deref(), Some("${.CURDIR}/a#b"));
+    }
+
+    #[test]
+    fn test_path_for_variant() {
+        let makefile: Makefile = "include $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        assert_eq!(inc.path(), Some("$(subst a b,c,a  b)".to_string()));
+        assert_eq!(
+            inc.path_for(MakefileVariant::GNUMake),
+            Some("$(subst a b,c,a  b)".to_string())
+        );
+        assert_eq!(
+            inc.path_for(MakefileVariant::POSIXMake),
+            Some("$(subst a  b,c,a  b)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_path_for_bsd() {
+        let parsed = Makefile::parse_with_variant(
+            ".include <${DIR:S/a/b/ \\\n\t:S/c/d/}/x.mk>\n",
+            MakefileVariant::BSDMake,
+        );
+        assert!(parsed.ok(), "{:?}", parsed.errors());
+        let inc = parsed.tree().includes().next().unwrap();
+        assert_eq!(inc.path(), Some("${DIR:S/a/b/  :S/c/d/}/x.mk".to_string()));
+        assert_eq!(
+            inc.path_for(MakefileVariant::BSDMake),
+            Some("${DIR:S/a/b/  :S/c/d/}/x.mk".to_string())
+        );
+        assert_eq!(
+            inc.path_for(MakefileVariant::GNUMake),
+            Some("${DIR:S/a/b/ :S/c/d/}/x.mk".to_string())
+        );
+    }
+
+    #[test]
+    fn test_path_for_unescapes_hash() {
+        let makefile: Makefile = "include a\\#b \\\n  c.mk\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        assert_eq!(inc.path(), Some("a#b c.mk".to_string()));
+        assert_eq!(
+            inc.path_for(MakefileVariant::POSIXMake),
+            Some("a#b  c.mk".to_string())
+        );
     }
 }

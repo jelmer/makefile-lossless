@@ -1,11 +1,12 @@
 use super::bsd::keyword_token;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, line_ending, with_trailing_newline};
+use super::{collapse_continuations, line_ending, with_trailing_newline, LineSyntax};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
     ErrorInfo, Lang, ParseError, Recipe,
 };
+use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::{Direction, GreenNodeBuilder, SyntaxNode};
@@ -208,6 +209,9 @@ impl ConditionalBranch {
     /// `ifneq` it is the full argument text, e.g. `($(A),b)`; use
     /// [`Self::ifeq_args`] to get the two arguments.
     ///
+    /// Line continuations are collapsed as GNU make does; see
+    /// [`Self::condition_for`] for other variants.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -217,8 +221,39 @@ impl ConditionalBranch {
     /// assert_eq!(conditions, vec![Some("A".to_string()), Some("$(B)".to_string())]);
     /// ```
     pub fn condition(&self) -> Option<String> {
+        self.condition_with(LineSyntax::Gnu)
+    }
+
+    /// The raw, unexpanded condition of this branch with line
+    /// continuations collapsed as `variant` does, or `None` for a plain
+    /// `else`.
+    ///
+    /// GNU make drops the whitespace before a line continuation, while
+    /// POSIX make (and GNU make after `.POSIX:`) and BSD make keep it. This
+    /// matters inside variable references, such as in function arguments
+    /// or BSD make modifiers.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant(
+    ///     ".if ${A:S/a/b/ \\\n\t:S/c/d/} == x\n.endif\n",
+    ///     MakefileVariant::BSDMake,
+    /// )
+    /// .tree();
+    /// let branch = makefile.conditionals().next().unwrap().branches().next().unwrap();
+    /// assert_eq!(
+    ///     branch.condition_for(MakefileVariant::BSDMake),
+    ///     Some("${A:S/a/b/  :S/c/d/} == x".to_string())
+    /// );
+    /// ```
+    pub fn condition_for(&self, variant: MakefileVariant) -> Option<String> {
+        self.condition_with(variant.into())
+    }
+
+    fn condition_with(&self, syntax: LineSyntax) -> Option<String> {
         let expr = self.header.children().find(|it| it.kind() == EXPR)?;
-        Some(collapse_continuations(&expr).trim().to_string())
+        Some(collapse_continuations(&expr, syntax).trim().to_string())
     }
 
     /// For an `ifeq` / `ifneq` branch, return the two argument strings
@@ -226,7 +261,8 @@ impl ConditionalBranch {
     /// `'a' 'b'`) syntaxes.
     ///
     /// Returns `None` for other directives (or if the args can't be
-    /// recovered).
+    /// recovered). Line continuations are collapsed as GNU make does; see
+    /// [`Self::ifeq_args_for`] for other variants.
     ///
     /// # Example
     /// ```
@@ -245,10 +281,31 @@ impl ConditionalBranch {
     /// );
     /// ```
     pub fn ifeq_args(&self) -> Option<(String, String)> {
+        self.ifeq_args_with(LineSyntax::Gnu)
+    }
+
+    /// Like [`Self::ifeq_args`], but with line continuations collapsed as
+    /// `variant` does; see [`Self::condition_for`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile: Makefile = "ifeq ($(subst a \\\n  b,c,a  b),c)\nendif\n".parse().unwrap();
+    /// let branch = makefile.conditionals().next().unwrap().branches().next().unwrap();
+    /// assert_eq!(
+    ///     branch.ifeq_args_for(MakefileVariant::POSIXMake),
+    ///     Some(("$(subst a  b,c,a  b)".to_string(), "c".to_string()))
+    /// );
+    /// ```
+    pub fn ifeq_args_for(&self, variant: MakefileVariant) -> Option<(String, String)> {
+        self.ifeq_args_with(variant.into())
+    }
+
+    fn ifeq_args_with(&self, syntax: LineSyntax) -> Option<(String, String)> {
         if !matches!(self.conditional_type()?.as_str(), "ifeq" | "ifneq") {
             return None;
         }
-        let text = self.condition()?;
+        let text = self.condition_with(syntax)?;
         // Form 1: parenthesised `(a, b)`. Split at the top-level comma,
         // ignoring commas inside nested `$(...)` / `${...}`.
         if let Some(inner) = text
@@ -268,7 +325,8 @@ impl ConditionalBranch {
     }
 
     /// For a BSD make branch (`.if`, `.elif`, `.ifdef`, ...), parse its
-    /// condition with [`parse_bsd_condition`].
+    /// condition with [`parse_bsd_condition`], after collapsing line
+    /// continuations as BSD make does.
     ///
     /// Returns `None` for GNU make conditionals and for a plain `.else`.
     /// How bare words and values in the condition evaluate depends on
@@ -304,7 +362,8 @@ impl ConditionalBranch {
         if !self.conditional_type()?.starts_with('.') {
             return None;
         }
-        Some(parse_bsd_condition(&self.condition().unwrap_or_default()))
+        let condition = self.condition_with(LineSyntax::Bsd).unwrap_or_default();
+        Some(parse_bsd_condition(&condition))
     }
 
     /// The items in this branch in source order, including recipe lines
@@ -429,9 +488,17 @@ impl Conditional {
         }
     }
 
-    /// Get the condition expression
+    /// Get the condition expression of the initial branch; see
+    /// [`ConditionalBranch::condition`].
     pub fn condition(&self) -> Option<String> {
         self.if_branch()?.condition()
+    }
+
+    /// Get the condition expression of the initial branch with line
+    /// continuations collapsed as `variant` does; see
+    /// [`ConditionalBranch::condition_for`].
+    pub fn condition_for(&self, variant: MakefileVariant) -> Option<String> {
+        self.if_branch()?.condition_for(variant)
     }
 
     /// For an `ifeq` / `ifneq` conditional, return the two argument
@@ -450,6 +517,12 @@ impl Conditional {
     /// ```
     pub fn ifeq_args(&self) -> Option<(String, String)> {
         self.if_branch()?.ifeq_args()
+    }
+
+    /// Like [`Self::ifeq_args`], but with line continuations collapsed as
+    /// `variant` does; see [`ConditionalBranch::ifeq_args_for`].
+    pub fn ifeq_args_for(&self, variant: MakefileVariant) -> Option<(String, String)> {
+        self.if_branch()?.ifeq_args_for(variant)
     }
 
     /// For a BSD make conditional, parse the condition of its initial
@@ -1489,6 +1562,66 @@ endif
         assert_eq!(
             cond.ifeq_args(),
             Some(("$(A)".to_string(), "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_condition_for_variant() {
+        let makefile: Makefile = "ifeq ($(subst a \\\n  b,c,a  b), \\\n  c)\nendif\n"
+            .parse()
+            .unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.condition(),
+            Some("($(subst a b,c,a  b), c)".to_string())
+        );
+        assert_eq!(
+            cond.condition_for(MakefileVariant::GNUMake),
+            Some("($(subst a b,c,a  b), c)".to_string())
+        );
+        assert_eq!(
+            cond.condition_for(MakefileVariant::POSIXMake),
+            Some("($(subst a  b,c,a  b),  c)".to_string())
+        );
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("$(subst a b,c,a  b)".to_string(), "c".to_string()))
+        );
+        assert_eq!(
+            cond.ifeq_args_for(MakefileVariant::POSIXMake),
+            Some(("$(subst a  b,c,a  b)".to_string(), "c".to_string()))
+        );
+        let branch = cond.branches().next().unwrap();
+        assert_eq!(
+            branch.condition_for(MakefileVariant::POSIXMake),
+            Some("($(subst a  b,c,a  b),  c)".to_string())
+        );
+        assert_eq!(
+            branch.ifeq_args_for(MakefileVariant::GNUMake),
+            Some(("$(subst a b,c,a  b)".to_string(), "c".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_condition_for_bsd() {
+        let parsed = Makefile::parse_with_variant(
+            ".if ${A:S/a/b/ \\\n\t:S/c/d/} == x\n.endif\n",
+            MakefileVariant::BSDMake,
+        );
+        assert!(parsed.ok(), "{:?}", parsed.errors());
+        let cond = parsed.tree().conditionals().next().unwrap();
+        assert_eq!(
+            cond.condition(),
+            Some("${A:S/a/b/ :S/c/d/} == x".to_string())
+        );
+        assert_eq!(
+            cond.condition_for(MakefileVariant::BSDMake),
+            Some("${A:S/a/b/  :S/c/d/} == x".to_string())
+        );
+        let branch = cond.branches().next().unwrap();
+        assert_eq!(
+            branch.bsd_condition(),
+            Some(crate::parse_bsd_condition("${A:S/a/b/  :S/c/d/} == x"))
         );
     }
 }

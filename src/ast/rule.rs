@@ -1,10 +1,11 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, is_continuation, line_ending};
+use super::{collapse_continuations, is_continuation, line_ending, LineSyntax};
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
     ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
 };
+use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::GreenNodeBuilder;
@@ -298,7 +299,7 @@ impl Rule {
     }
 
     // Helper method to extract targets from a TARGETS node
-    fn extract_targets_from_node(node: &SyntaxNode) -> Vec<String> {
+    fn extract_targets_from_node(node: &SyntaxNode, syntax: LineSyntax) -> Vec<String> {
         let mut result = Vec::new();
         let mut current_target = String::new();
 
@@ -321,7 +322,7 @@ impl Rule {
                 }
             } else if let Some(child_node) = child.as_node() {
                 // Handle nested nodes like ARCHIVE_MEMBERS
-                current_target.push_str(&collapse_continuations(child_node));
+                current_target.push_str(&collapse_continuations(child_node, syntax));
             }
         }
 
@@ -336,7 +337,9 @@ impl Rule {
     /// Targets of this rule
     ///
     /// Backslashes are kept as written, as for variable names: `a\ b` is
-    /// the single target `a\ b`, which GNU make reads as `a b`.
+    /// the single target `a\ b`, which GNU make reads as `a b`. Line
+    /// continuations are collapsed as GNU make does; see
+    /// [`Self::targets_for`] for other variants.
     ///
     /// # Example
     /// ```
@@ -346,12 +349,42 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
     /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
+        self.targets_with(LineSyntax::Gnu)
+    }
+
+    /// Targets of this rule, with line continuations collapsed as
+    /// `variant` does.
+    ///
+    /// GNU make drops the whitespace before a line continuation, while
+    /// POSIX make (and GNU make after `.POSIX:`) and BSD make keep it. This
+    /// matters inside variable references, such as in function arguments
+    /// or BSD make modifiers.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{MakefileVariant, Rule};
+    ///
+    /// let rule: Rule = "$(subst a \\\n  b,c,a  b): x\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.targets_for(MakefileVariant::GNUMake).collect::<Vec<_>>(),
+    ///     vec!["$(subst a b,c,a  b)"]
+    /// );
+    /// assert_eq!(
+    ///     rule.targets_for(MakefileVariant::POSIXMake).collect::<Vec<_>>(),
+    ///     vec!["$(subst a  b,c,a  b)"]
+    /// );
+    /// ```
+    pub fn targets_for(&self, variant: MakefileVariant) -> impl Iterator<Item = String> + '_ {
+        self.targets_with(variant.into())
+    }
+
+    fn targets_with(&self, syntax: LineSyntax) -> std::vec::IntoIter<String> {
         // First check if there's a TARGETS node
         for child in self.syntax().children_with_tokens() {
             if let Some(node) = child.as_node() {
                 if node.kind() == TARGETS {
                     // Extract targets from the TARGETS node
-                    return Self::extract_targets_from_node(node).into_iter();
+                    return Self::extract_targets_from_node(node, syntax).into_iter();
                 }
             }
             // Stop at the operator
@@ -454,8 +487,9 @@ impl Rule {
             .find_map(|e| e.into_node().filter(|n| n.kind() == PREREQUISITES))
     }
 
-    /// The normal and order-only prerequisites of the rule.
-    fn prerequisite_lists(&self) -> (Vec<String>, Vec<String>) {
+    /// The normal and order-only prerequisites of the rule, with line
+    /// continuations collapsed as described by `syntax`.
+    fn prerequisite_lists(&self, syntax: LineSyntax) -> (Vec<String>, Vec<String>) {
         let mut normal = Vec::new();
         let mut order_only = Vec::new();
         let Some(node) = self.prerequisites_node() else {
@@ -468,7 +502,7 @@ impl Rule {
                     seen_pipe = true;
                 }
                 rowan::NodeOrToken::Node(n) if n.kind() == PREREQUISITE => {
-                    let text = collapse_continuations(&n).trim().to_string();
+                    let text = collapse_continuations(&n, syntax).trim().to_string();
                     if seen_pipe {
                         order_only.push(text);
                     } else {
@@ -485,7 +519,8 @@ impl Rule {
     ///
     /// Order-only prerequisites (those after a `|`) are not included; see
     /// [`Rule::order_only_prerequisites`]. As with [`Rule::targets`],
-    /// backslashes are kept as written.
+    /// backslashes are kept as written. Line continuations are collapsed
+    /// as GNU make does; see [`Self::prerequisites_for`] for other variants.
     ///
     /// # Example
     /// ```
@@ -494,7 +529,23 @@ impl Rule {
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
     pub fn prerequisites(&self) -> impl Iterator<Item = String> + '_ {
-        self.prerequisite_lists().0.into_iter()
+        self.prerequisite_lists(LineSyntax::Gnu).0.into_iter()
+    }
+
+    /// Get the normal prerequisites in the rule, with line continuations
+    /// collapsed as `variant` does; see [`Self::targets_for`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// let rule: Rule = "all: $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.prerequisites_for(MakefileVariant::POSIXMake).collect::<Vec<_>>(),
+    ///     vec!["$(subst a  b,c,a  b)"]
+    /// );
+    /// ```
+    pub fn prerequisites_for(&self, variant: MakefileVariant) -> impl Iterator<Item = String> + '_ {
+        self.prerequisite_lists(variant.into()).0.into_iter()
     }
 
     /// Get the order-only prerequisites in the rule, i.e. those after the
@@ -508,14 +559,36 @@ impl Rule {
     /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["build"]);
     /// ```
     pub fn order_only_prerequisites(&self) -> impl Iterator<Item = String> + '_ {
-        self.prerequisite_lists().1.into_iter()
+        self.prerequisite_lists(LineSyntax::Gnu).1.into_iter()
+    }
+
+    /// Get the order-only prerequisites in the rule, with line
+    /// continuations collapsed as `variant` does; see [`Self::targets_for`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// let rule: Rule = "all: | $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.order_only_prerequisites_for(MakefileVariant::POSIXMake)
+    ///         .collect::<Vec<_>>(),
+    ///     vec!["$(subst a  b,c,a  b)"]
+    /// );
+    /// ```
+    pub fn order_only_prerequisites_for(
+        &self,
+        variant: MakefileVariant,
+    ) -> impl Iterator<Item = String> + '_ {
+        self.prerequisite_lists(variant.into()).1.into_iter()
     }
 
     /// Get the target pattern of a static pattern rule.
     ///
     /// For a rule like `$(OBJS): %.o: %.c`, this returns `%.o`, while
     /// [`Rule::prerequisites`] returns the prerequisite patterns. Returns
-    /// `None` if this is not a static pattern rule.
+    /// `None` if this is not a static pattern rule. Line continuations are
+    /// collapsed as GNU make does; see [`Self::static_pattern_for`] for
+    /// other variants.
     ///
     /// # Example
     /// ```
@@ -530,10 +603,30 @@ impl Rule {
     /// assert_eq!(rule.static_pattern(), None);
     /// ```
     pub fn static_pattern(&self) -> Option<String> {
+        self.static_pattern_with(LineSyntax::Gnu)
+    }
+
+    /// Get the target pattern of a static pattern rule, with line
+    /// continuations collapsed as `variant` does; see [`Self::targets_for`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// let rule: Rule = "$(OBJS): $(X:a \\\n  b=%.o): %.c\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.static_pattern_for(MakefileVariant::POSIXMake),
+    ///     Some("$(X:a  b=%.o)".to_string())
+    /// );
+    /// ```
+    pub fn static_pattern_for(&self, variant: MakefileVariant) -> Option<String> {
+        self.static_pattern_with(variant.into())
+    }
+
+    fn static_pattern_with(&self, syntax: LineSyntax) -> Option<String> {
         self.syntax()
             .children()
             .find(|n| n.kind() == TARGET_PATTERN)
-            .map(|n| collapse_continuations(&n).trim().to_string())
+            .map(|n| collapse_continuations(&n, syntax).trim().to_string())
     }
 
     /// Get the commands in the rule
@@ -2356,6 +2449,69 @@ mod tests {
         assert_eq!(
             parse_rule_names(text, crate::MakefileVariant::BSDMake).1,
             vec!["a\\b", "c\\", "d", "e\\:f"]
+        );
+    }
+
+    #[test]
+    fn test_rule_accessors_for_variant() {
+        let text = "$(subst a \\\n  b,c,a  b) all: $(X:a \\\n  b=c): \\\n  \
+                    x$(subst a \\\n  b,c,a  b) | $(subst a \\\n  b,c,a  b)\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["$(subst a b,c,a  b)", "all"]
+        );
+        assert_eq!(
+            rule.targets_for(MakefileVariant::GNUMake)
+                .collect::<Vec<_>>(),
+            vec!["$(subst a b,c,a  b)", "all"]
+        );
+        assert_eq!(
+            rule.targets_for(MakefileVariant::POSIXMake)
+                .collect::<Vec<_>>(),
+            vec!["$(subst a  b,c,a  b)", "all"]
+        );
+        assert_eq!(rule.static_pattern(), Some("$(X:a b=c)".to_string()));
+        assert_eq!(
+            rule.static_pattern_for(MakefileVariant::POSIXMake),
+            Some("$(X:a  b=c)".to_string())
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["x$(subst a b,c,a  b)"]
+        );
+        assert_eq!(
+            rule.prerequisites_for(MakefileVariant::POSIXMake)
+                .collect::<Vec<_>>(),
+            vec!["x$(subst a  b,c,a  b)"]
+        );
+        assert_eq!(
+            rule.order_only_prerequisites().collect::<Vec<_>>(),
+            vec!["$(subst a b,c,a  b)"]
+        );
+        assert_eq!(
+            rule.order_only_prerequisites_for(MakefileVariant::POSIXMake)
+                .collect::<Vec<_>>(),
+            vec!["$(subst a  b,c,a  b)"]
+        );
+    }
+
+    #[test]
+    fn test_rule_accessors_for_bsd() {
+        let text = "${A:S/a/b/ \\\n\t:S/c/d/}: ${B:S/a/b/ \\\n\t:S/c/d/}\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        assert!(parsed.ok(), "{:?}", parsed.errors());
+        let rule = parsed.tree().rules().next().unwrap();
+        assert_eq!(
+            rule.targets_for(MakefileVariant::BSDMake)
+                .collect::<Vec<_>>(),
+            vec!["${A:S/a/b/  :S/c/d/}"]
+        );
+        assert_eq!(
+            rule.prerequisites_for(MakefileVariant::BSDMake)
+                .collect::<Vec<_>>(),
+            vec!["${B:S/a/b/  :S/c/d/}"]
         );
     }
 }
