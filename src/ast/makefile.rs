@@ -961,18 +961,11 @@ impl Makefile {
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
-        // Add if body content
-        if !if_body.is_empty() {
-            for line in if_body.lines() {
-                if !line.is_empty() {
-                    builder.token(IDENTIFIER.into(), line);
-                }
-                builder.token(NEWLINE.into(), &eol);
+        for line in if_body.lines() {
+            if !line.is_empty() {
+                builder.token(IDENTIFIER.into(), line);
             }
-            // Add final newline if if_body doesn't end with one
-            if !if_body.ends_with('\n') && !if_body.is_empty() {
-                builder.token(NEWLINE.into(), &eol);
-            }
+            builder.token(NEWLINE.into(), &eol);
         }
 
         // Add else clause if provided
@@ -982,18 +975,11 @@ impl Makefile {
             builder.token(NEWLINE.into(), &eol);
             builder.finish_node();
 
-            // Add else body content
-            if !else_content.is_empty() {
-                for line in else_content.lines() {
-                    if !line.is_empty() {
-                        builder.token(IDENTIFIER.into(), line);
-                    }
-                    builder.token(NEWLINE.into(), &eol);
+            for line in else_content.lines() {
+                if !line.is_empty() {
+                    builder.token(IDENTIFIER.into(), line);
                 }
-                // Add final newline if else_content doesn't end with one
-                if !else_content.ends_with('\n') && !else_content.is_empty() {
-                    builder.token(NEWLINE.into(), &eol);
-                }
+                builder.token(NEWLINE.into(), &eol);
             }
         }
 

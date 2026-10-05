@@ -10414,6 +10414,53 @@ endif
     }
 
     #[test]
+    fn test_add_conditional_body_without_trailing_newline() {
+        let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\nZ = 1", Some("Y = 2"))
+            .unwrap();
+        let text = makefile.to_string();
+        assert_eq!(
+            text,
+            "X = 1\n\nifdef DEBUG\nY = 1\nZ = 1\nelse\nY = 2\nendif\n"
+        );
+        assert_eq!(text.parse::<Makefile>().unwrap().to_string(), text);
+    }
+
+    #[test]
+    fn test_add_conditional_if_body_without_trailing_newline() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1", None)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "ifdef DEBUG\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_conditional_body_with_trailing_newline() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\n", Some("Y = 2\n"))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef DEBUG\nY = 1\nelse\nY = 2\nendif\n"
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_body_ending_in_blank_line() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\n\n", Some("Y = 2\n\n"))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef DEBUG\nY = 1\n\nelse\nY = 2\n\nendif\n"
+        );
+    }
+
+    #[test]
     fn test_add_conditional_invalid_type() {
         let mut makefile = Makefile::new();
         let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
@@ -13921,6 +13968,20 @@ mod test_crlf {
             makefile.to_string(),
             "X = 1\r\n\r\nifdef DEBUG\r\nY = 1\r\n\r\nZ = 1\r\nelse\r\nY = 2\r\nendif\r\n"
         );
+    }
+
+    #[test]
+    fn test_add_conditional_body_without_trailing_newline() {
+        let mut makefile = parse_crlf("X = 1\r\n");
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\r\nZ = 1", Some("Y = 2"))
+            .unwrap();
+        let text = makefile.to_string();
+        assert_eq!(
+            text,
+            "X = 1\r\n\r\nifdef DEBUG\r\nY = 1\r\nZ = 1\r\nelse\r\nY = 2\r\nendif\r\n"
+        );
+        assert_eq!(parse_crlf(&text).to_string(), text);
     }
 
     #[test]
