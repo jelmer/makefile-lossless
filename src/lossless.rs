@@ -594,41 +594,57 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        /// Look ahead (without consuming) for the `IDENTIFIER (WS)? OPERATOR`
+        /// Look ahead (without consuming) for the `NAME (WS)? OPERATOR`
         /// pattern that marks a target-specific variable assignment such as
-        /// `all: CFLAGS = -O2`.
+        /// `all: CFLAGS = -O2`. NAME is what [`Self::parse_variable_name`]
+        /// accepts, e.g. `obj-$(X)`.
         fn looks_like_target_specific_assignment(&self) -> bool {
-            // tokens is reversed (last = current). We look from the end.
-            let n = self.tokens.len();
-            if n < 2 {
-                return false;
-            }
-            // Current token must be an IDENTIFIER (the variable name).
-            if self.tokens[n - 1].0 != IDENTIFIER {
-                return false;
-            }
-            let mut i = n - 2;
-            // Optional whitespace.
-            if self.tokens[i].0 == WHITESPACE {
-                if i == 0 {
-                    return false;
+            // tokens is reversed (last = current), so iterate from the end.
+            let mut tokens = self.tokens.iter().rev().peekable();
+            let mut has_name = false;
+            while let Some((kind, _)) =
+                tokens.next_if(|(kind, _)| matches!(kind, IDENTIFIER | DOLLAR))
+            {
+                has_name = true;
+                if *kind == IDENTIFIER {
+                    continue;
                 }
-                i -= 1;
+                if tokens
+                    .next_if(|(kind, _)| matches!(kind, LPAREN | LBRACE))
+                    .is_none()
+                {
+                    // Single character reference like `$X`
+                    if tokens.next_if(|(kind, _)| *kind != NEWLINE).is_none() {
+                        return false;
+                    }
+                    continue;
+                }
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match tokens.next() {
+                        None | Some((NEWLINE, _)) => return false,
+                        Some((LPAREN | LBRACE, _)) => depth += 1,
+                        Some((RPAREN | RBRACE, _)) => depth -= 1,
+                        Some(_) => (),
+                    }
+                }
             }
-            // Next token must be an assignment OPERATOR.
-            self.tokens[i].0 == OPERATOR
-                && matches!(
-                    self.tokens[i].1.as_str(),
-                    "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
-                )
+            tokens.next_if(|(kind, _)| *kind == WHITESPACE);
+            has_name
+                && tokens.next().is_some_and(|(kind, text)| {
+                    *kind == OPERATOR
+                        && matches!(
+                            text.as_str(),
+                            "=" | ":=" | "::=" | ":::=" | "+=" | "?=" | "!="
+                        )
+                })
         }
 
         /// Parse `VAR [op] value` after the rule's `:` colon, wrapped in a
         /// child `VARIABLE` node. Consumes through the end-of-line.
         fn parse_target_specific_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
-            // Variable name (IDENTIFIER).
-            self.bump();
+            self.parse_variable_name();
             self.skip_ws();
             // Assignment operator.
             if self.current() == Some(OPERATOR) {
@@ -3156,6 +3172,90 @@ rule: dependency
         let scoped = root.rules().nth(3).unwrap().scoped_assignment().unwrap();
         assert_eq!(scoped.name(), Some("X".to_string()));
         assert_eq!(scoped.raw_value(), Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_target_specific_computed_variable_name() {
+        let code = "foo: obj-$(X) = 1\nfoo: $(V)_FLAGS += -g\n%.o: CFLAGS_$(ARCH) := -O2\nbar: ${Y}z?=$(Z)\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        assert_eq!(root.variable_definitions().count(), 0);
+        let scoped = root
+            .rules()
+            .map(|r| {
+                let v = r.scoped_assignment().unwrap();
+                (
+                    r.targets().collect::<Vec<_>>(),
+                    v.name(),
+                    v.assignment_operator(),
+                    v.raw_value(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scoped,
+            vec![
+                (
+                    vec!["foo".to_string()],
+                    Some("obj-$(X)".to_string()),
+                    Some("=".to_string()),
+                    Some("1".to_string())
+                ),
+                (
+                    vec!["foo".to_string()],
+                    Some("$(V)_FLAGS".to_string()),
+                    Some("+=".to_string()),
+                    Some("-g".to_string())
+                ),
+                (
+                    vec!["%.o".to_string()],
+                    Some("CFLAGS_$(ARCH)".to_string()),
+                    Some(":=".to_string()),
+                    Some("-O2".to_string())
+                ),
+                (
+                    vec!["bar".to_string()],
+                    Some("${Y}z".to_string()),
+                    Some("?=".to_string()),
+                    Some("$(Z)".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_rules_with_references_in_prerequisites() {
+        let parsed = parse(
+            "foo: $(DEPS)\nfoo: a b\n$(OBJS): %.o: %.c\nfoo: a | $(DIR)\nfoo: $(SRCS:.c=.o)\n",
+            None,
+        );
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.variable_definitions().count(), 0);
+        let rules = root
+            .rules()
+            .map(|r| {
+                (
+                    r.scoped_assignment().is_some(),
+                    r.prerequisites().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            vec![
+                (false, vec!["$(DEPS)".to_string()]),
+                (false, vec!["a".to_string(), "b".to_string()]),
+                (false, vec!["%.o:".to_string(), "%.c".to_string()]),
+                (
+                    false,
+                    vec!["a".to_string(), "|".to_string(), "$(DIR)".to_string()]
+                ),
+                (false, vec!["$(SRCS:.c=.o)".to_string()]),
+            ]
+        );
     }
 
     #[test]
