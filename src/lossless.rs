@@ -750,14 +750,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
-            // Parse variable name
-            match self.current() {
-                Some(IDENTIFIER) => self.bump(),
-                Some(DOLLAR) => self.parse_variable_reference(),
-                _ => {
-                    self.error("expected variable name".to_string());
-                    self.builder.finish_node();
-                    return;
+            // Parse variable name, which may be built from several parts
+            // such as `CFLAGS.${PROG}`.
+            if !matches!(self.current(), Some(IDENTIFIER | DOLLAR)) {
+                self.error("expected variable name".to_string());
+                self.builder.finish_node();
+                return;
+            }
+            loop {
+                match self.current() {
+                    Some(IDENTIFIER) => self.bump(),
+                    Some(DOLLAR) => self.parse_variable_reference(),
+                    _ => break,
                 }
             }
 
@@ -1584,29 +1588,53 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        // Simplify the is_assignment_line method by making it more direct
         fn is_assignment_line(&mut self) -> bool {
             let assignment_ops = ["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-            let mut pos = self.tokens.len().saturating_sub(1);
-            let mut seen_identifier = false;
+            let mut tokens = self.tokens.iter().rev();
+            let mut seen_name = false;
+            // Whitespace after the name: anything but an operator now means
+            // this is not an assignment.
+            let mut name_done = false;
             let mut seen_directive = false; // export or override prefix
 
-            while pos > 0 {
-                let (kind, text) = &self.tokens[pos];
-
+            while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
                     IDENTIFIER if text == "export" || text == "override" => seen_directive = true,
-                    IDENTIFIER if !seen_identifier => seen_identifier = true,
+                    IDENTIFIER if !name_done => seen_name = true,
+                    DOLLAR if !name_done => {
+                        // Skip over a variable reference that is part of
+                        // the name, e.g. `CFLAGS.${PROG}`.
+                        seen_name = true;
+                        let close = match tokens.next() {
+                            Some((LPAREN, _)) => RPAREN,
+                            Some((LBRACE, _)) => RBRACE,
+                            _ => continue,
+                        };
+                        let open = if close == RPAREN { LPAREN } else { LBRACE };
+                        let mut depth = 1;
+                        for (kind, _) in tokens.by_ref() {
+                            match *kind {
+                                NEWLINE => return false,
+                                k if k == open => depth += 1,
+                                k if k == close => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     OPERATOR if assignment_ops.contains(&text.as_str()) => {
-                        return seen_identifier || seen_directive
+                        return seen_name || seen_directive
                     }
                     OPERATOR if text == ":" || text == "::" => return false, // It's a rule if we see a colon first
-                    WHITESPACE => (),
+                    WHITESPACE => name_done = seen_name,
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
-                pos = pos.saturating_sub(1);
             }
             // Bare "export VARNAME" (without assignment operator) is a valid GNU Make directive
             seen_directive
