@@ -284,6 +284,12 @@ fn nmake_directive_name(first: &str, second: Option<&str>) -> Option<(&'static s
     Some((name, false))
 }
 
+/// Whether a token is only whitespace. The text after a recipe line's
+/// indent may be lexed as TEXT, even if it is only whitespace.
+fn is_blank_token((kind, text): &(SyntaxKind, String)) -> bool {
+    *kind == WHITESPACE || (*kind == TEXT && text.trim().is_empty())
+}
+
 /// Whether a tab-indented line is a recipe line.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuleContext {
@@ -378,6 +384,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         variant: Option<MakefileVariant>,
         /// Number of enclosing BSD `.for` loops.
         for_depth: usize,
+        /// Number of enclosing BSD `.if` or nmake `!IF` conditionals.
+        block_conditional_depth: usize,
         /// Parity of the current run of bumped BACKSLASH tokens: true once an
         /// odd number have been seen, meaning the next backslash is escaped
         /// (`\\`) and a following newline is a literal backslash, not a line
@@ -3263,6 +3271,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
 
             let mut rule_context = ConditionalRuleContext::new(self.in_rule);
+            self.block_conditional_depth += 1;
 
             loop {
                 if self.is_at_eof() {
@@ -3317,6 +3326,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
 
+            self.block_conditional_depth -= 1;
             self.builder.finish_node();
         }
 
@@ -3759,16 +3769,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Parse an indented command line outside of rule context. GNU make
         /// parses it like any other line, while BSD make, POSIX and nmake
         /// read it as a command line, which is an error without a target.
+        /// Inside a conditional it is only an error if make takes that
+        /// branch, as lines in other branches are skipped unread.
         fn parse_indented_line_outside_rule(&mut self) {
             if self.indented_lines_are_commands() {
                 if self.at_bsd_comment_line() {
                     self.parse_bsd_comment_line();
                     return;
                 }
-                self.record_error(
-                    ParseErrorKind::RecipeBeforeFirstTarget,
-                    "indented line not part of a rule".to_string(),
-                );
+                if self.block_conditional_depth == 0 {
+                    self.record_error(
+                        ParseErrorKind::RecipeBeforeFirstTarget,
+                        "indented line not part of a rule".to_string(),
+                    );
+                }
                 self.parse_recipe_line();
             } else {
                 self.relex_as_non_recipe_line(true);
@@ -3819,7 +3833,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .iter()
                 .rev()
                 .skip(1)
-                .find(|(kind, _)| *kind != WHITESPACE)
+                .find(|token| !is_blank_token(token))
                 .is_none_or(|(kind, text)| match kind {
                     COMMENT | NEWLINE => true,
                     TEXT => text.trim_start().starts_with('#'),
@@ -3865,8 +3879,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// lines, becomes a single COMMENT token.
         fn parse_bsd_comment_line(&mut self) {
             self.bump_as(WHITESPACE);
-            while self.current() == Some(WHITESPACE) {
-                self.bump();
+            while self.tokens.last().is_some_and(is_blank_token) {
+                self.bump_as(WHITESPACE);
             }
             let mut comment = String::new();
             while let Some((kind, text)) = self.tokens.last() {
@@ -4258,6 +4272,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         original_text: text.to_string(),
         variant,
         for_depth: 0,
+        block_conditional_depth: 0,
         pending_backslash_escape: false,
         in_rule: RuleContext::Outside,
         bsd_line: None,
@@ -15014,8 +15029,98 @@ test:
     #[test]
     fn test_bsd_rule_context_after_conditional_branch() {
         // BSD make always reads a tab-indented line as a shell command, and
-        // reports "Unassociated shell command" outside of a rule.
+        // reports "Unassociated shell command" outside of a rule. That
+        // only happens if it takes the `.else` branch, so it is not an error
+        // here.
         let code = ".if defined(A)\nt:\n.else\n\tX = 1\n.endif\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_whitespace_only_tab_line_outside_rule() {
+        // BSD make skips empty commands before checking for a target.
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            let code = "X = 1\n\t\t\n\t \t\nall:\n";
+            let parsed = parse(code, Some(variant));
+            assert_eq!(parsed.errors, vec![], "{:?}", variant);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_bsd_whitespace_only_tab_line_after_assignment() {
+        // From NetBSD's external/bsd/libpcap/bin/Makefile and
+        // external/gpl3/gcc/lib/libbacktrace/Makefile.
+        for code in [
+            "NOPROG=\n\t\t\n.include <bsd.prog.mk>\n",
+            "SRCS=\t\tdwarf.c elf.c \\\n\t\tposix.c state.c\n\t\t\nCPPFLAGS+=\t-I${DIST}/include\n",
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![], "{:?}", code);
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_bsd_tab_line_in_conditional_outside_rule() {
+        // BSD make only reads the lines in the branch it takes, so whether
+        // this is an unassociated command depends on the condition. From
+        // NetBSD's external/mit/xorg/server/drivers/Makefile.
+        let code = "SUBDIR+= \\\n\txf86-video-wsfb\n.if ${XORG_SERVER_SUBDIR} == \"xorg-server.old\"\n\txf86-video-apm \\\n\txf86-video-glint\n.endif\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "VARIABLE\n  EXPR\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n      EXPR\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_bsd_tab_line_in_for_loop_in_conditional_outside_rule() {
+        // From NetBSD's etc/etc.sparc64/Makefile.inc, which is included in
+        // rule context.
+        let code = ".if ${MACHINE_ARCH} == \"sparc64\"\n\n\t# build 32 bit programs\n.for _d in lib/csu lib\n.if ${MKOBJDIRS} != \"no\"\n\t(cd ${_d} && \\\n\t    ${MAKE} obj)\n.endif\n\t(cd ${_d} && ${MAKE} cleandir)\n.endfor\n.endif\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n      EXPR\n  FOR_LOOP\n    FOR_HEADER\n      EXPR\n    CONDITIONAL\n      CONDITIONAL_IF\n        EXPR\n          EXPR\n      RECIPE\n      CONDITIONAL_ENDIF\n    RECIPE\n    FOR_END\n  CONDITIONAL_ENDIF\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_nmake_tab_line_in_conditional_outside_rule() {
+        let code = "!IF \"$(X)\" == \"y\"\n\techo a\n!ENDIF\n";
+        let parsed = parse(code, Some(MakefileVariant::NMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+        );
+        assert_eq!(parsed.root().to_string(), code);
+    }
+
+    #[test]
+    fn test_bsd_tab_line_in_for_loop_outside_rule() {
+        // The body of a `.for` loop is read for every iteration, so this is
+        // an unassociated command unless the loop has no iterations.
+        let code = ".for f in a b\n\techo ${f}\n.endfor\n";
         let parsed = parse(code, Some(MakefileVariant::BSDMake));
         assert_eq!(
             parsed
@@ -15023,11 +15128,11 @@ test:
                 .iter()
                 .map(|e| (e.line, e.message.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(4, "indented line not part of a rule")]
+            vec![(2, "indented line not part of a rule")]
         );
         assert_eq!(
             node_kinds(&parsed.syntax()),
-            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+            "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RECIPE\n  FOR_END\n"
         );
         assert_eq!(parsed.root().to_string(), code);
     }
