@@ -12,15 +12,23 @@ use rowan::ast::AstNode;
 /// name, e.g. `.if` for both `.if` and `.  if`. In the latter form the
 /// returned token is `if`, without the dot.
 ///
+/// For nmake directives such as `!  if` the keyword is `!` followed by the
+/// name in upper case, e.g. `!IF`, and the returned token is the name.
+///
 /// For non-BSD constructs such as GNU `ifdef` the keyword is the first
 /// identifier as-is.
 pub(crate) fn keyword_token(node: &SyntaxNode) -> Option<(SyntaxToken, String)> {
-    let mut identifiers = node
-        .children_with_tokens()
-        .filter_map(|it| it.into_token())
-        .filter(|t| t.kind() == IDENTIFIER);
+    let mut tokens = node.children_with_tokens().filter_map(|it| it.into_token());
+    let nmake = tokens
+        .clone()
+        .next()
+        .is_some_and(|t| t.kind() == OPERATOR && t.text() == "!");
+    let mut identifiers = tokens.by_ref().filter(|t| t.kind() == IDENTIFIER);
     let first = identifiers.next()?;
-    if first.text() == "." {
+    if nmake {
+        let keyword = format!("!{}", first.text().to_ascii_uppercase());
+        Some((first, keyword))
+    } else if first.text() == "." {
         let name = identifiers.next()?;
         let keyword = format!(".{}", name.text());
         Some((name, keyword))
@@ -124,13 +132,22 @@ impl ForLoop {
 impl Directive {
     /// The directive keyword including the leading dot, e.g. `.undef`.
     ///
+    /// For nmake, the keyword is the `!` followed by the directive name in
+    /// upper case, e.g. `!UNDEF` for `! undef`.
+    ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant};
     /// let makefile: Makefile = ".  error unsupported platform\n".parse().unwrap();
     /// let MakefileItem::Directive(d) = makefile.items().next().unwrap() else { panic!() };
     /// assert_eq!(d.keyword(), Some(".error".to_string()));
     /// assert_eq!(d.argument(), Some("unsupported platform".to_string()));
+    ///
+    /// let makefile =
+    ///     Makefile::parse_with_variant("!message Building\n", MakefileVariant::NMake).tree();
+    /// let MakefileItem::Directive(d) = makefile.items().next().unwrap() else { panic!() };
+    /// assert_eq!(d.keyword(), Some("!MESSAGE".to_string()));
+    /// assert_eq!(d.argument(), Some("Building".to_string()));
     /// ```
     pub fn keyword(&self) -> Option<String> {
         directive_keyword(self.syntax())

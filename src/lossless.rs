@@ -248,6 +248,38 @@ fn is_bsd_elif(name: &str) -> bool {
     )
 }
 
+/// Map the keyword of an nmake preprocessing directive, `first` followed by
+/// the next word `second` if any, to the name of the equivalent BSD make
+/// directive, such as `elif` for `ELSEIF`. Also returns whether `second` is
+/// part of the keyword, as in `!ELSE IF`.
+fn nmake_directive_name(first: &str, second: Option<&str>) -> Option<(&'static str, bool)> {
+    let name = match first.to_ascii_lowercase().as_str() {
+        "if" => "if",
+        "ifdef" => "ifdef",
+        "ifndef" => "ifndef",
+        "elseif" => "elif",
+        "elseifdef" => "elifdef",
+        "elseifndef" => "elifndef",
+        "else" => {
+            let elif = match second.map(str::to_ascii_lowercase).as_deref() {
+                Some("if") => "elif",
+                Some("ifdef") => "elifdef",
+                Some("ifndef") => "elifndef",
+                _ => return Some(("else", false)),
+            };
+            return Some((elif, true));
+        }
+        "endif" => "endif",
+        "include" => "include",
+        "undef" => "undef",
+        "error" => "error",
+        "message" => "message",
+        "cmdswitches" => "cmdswitches",
+        _ => return None,
+    };
+    Some((name, false))
+}
+
 /// Tracks rule context (whether a tab-indented line is a recipe line) across
 /// the branches of a conditional. Only one branch is taken, so each branch
 /// starts in the context from before the conditional, and rule context only
@@ -757,6 +789,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut newline_count = 0;
 
             loop {
+                // BSD and nmake conditionals and BSD loops may wrap recipe
+                // lines; any other directive ends the rule.
+                if let Some((name, count)) = self.directive() {
+                    let is_block = is_bsd_if(name) || name == "for";
+                    // Blank lines don't end a rule's recipe, so this
+                    // belongs to the rule if it has recipe lines.
+                    if !is_block || (conditional_depth == 0 && !self.recipe_continues()) {
+                        break;
+                    }
+                    newline_count = 0;
+                    self.parse_directive(name, count);
+                    continue;
+                }
                 match self.current() {
                     Some(INDENT) if self.in_rule => {
                         newline_count = 0;
@@ -792,19 +837,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_comment();
                     }
                     Some(IDENTIFIER) => {
-                        // BSD conditionals and loops may wrap recipe lines;
-                        // any other directive ends the rule.
-                        if let Some((name, count)) = self.bsd_directive() {
-                            let is_block = is_bsd_if(name) || name == "for";
-                            // Blank lines don't end a rule's recipe, so this
-                            // belongs to the rule if it has recipe lines.
-                            if !is_block || (conditional_depth == 0 && !self.recipe_continues()) {
-                                break;
-                            }
-                            newline_count = 0;
-                            self.parse_bsd_directive(name, count);
-                            continue;
-                        }
                         let token = &self.tokens.last().unwrap().1.clone();
                         // Check if this is a starting conditional directive
                         if Self::is_conditional_start(token)
@@ -869,23 +901,36 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// preceding rule.
         fn recipe_continues(&self) -> bool {
             let bsd = self.bsd_directives_enabled();
+            let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
+            // Pair each token with whether it starts a line. The current
+            // token always does.
+            let n = self.tokens.len();
             let mut tokens = self
                 .tokens
                 .iter()
                 .rev()
-                .filter(|(kind, _)| *kind != WHITESPACE)
+                .enumerate()
+                .map(|(i, token)| (token, i == 0 || self.tokens[n - i].0 == NEWLINE))
+                .filter(|((kind, _), _)| *kind != WHITESPACE)
                 .peekable();
-            while let Some((kind, text)) = tokens.peek() {
-                // The name of a BSD directive such as `.if` or `.  if`
-                let bsd_name = match (*kind, text.as_str()) {
-                    (IDENTIFIER, ".") if bsd => tokens
+            while let Some(&((kind, text), at_start)) = tokens.peek() {
+                let word = |n: usize| {
+                    tokens
                         .clone()
-                        .nth(1)
-                        .filter(|(kind, _)| *kind == IDENTIFIER)
-                        .map(|(_, name)| name.as_str()),
+                        .nth(n)
+                        .filter(|((kind, _), _)| *kind == IDENTIFIER)
+                        .map(|((_, name), _)| name.as_str())
+                };
+                // The name of a BSD directive such as `.if` or `.  if`, or the
+                // equivalent BSD name of an nmake directive such as `!IF`
+                let bsd_name = match (*kind, text.as_str()) {
+                    (IDENTIFIER, ".") if bsd => word(1),
                     (IDENTIFIER, t) if bsd => t.strip_prefix('.'),
+                    (OPERATOR, "!") if nmake && at_start => {
+                        word(1).and_then(|first| Some(nmake_directive_name(first, word(2))?.0))
+                    }
                     _ => None,
                 };
                 match (*kind, text.as_str()) {
@@ -917,7 +962,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     (IDENTIFIER, "else") => match stack.last_mut() {
                         Some(context) => {
-                            let is_final = !Self::is_else_if(tokens.clone());
+                            let is_final = !Self::is_else_if(tokens.clone().map(|(t, _)| t));
                             in_rule = context.next_branch(in_rule, is_final);
                         }
                         None => return false,
@@ -933,7 +978,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 // Skip to the start of the next line, following continuations
                 let mut prev = None;
-                for (kind, _) in tokens.by_ref() {
+                for ((kind, _), _) in tokens.by_ref() {
                     if *kind == NEWLINE && prev != Some(BACKSLASH) {
                         break;
                     }
@@ -2324,8 +2369,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 match self.current() {
                     Some(IDENTIFIER) => {
-                        if let Some((name, count)) = self.bsd_directive() {
-                            self.parse_bsd_directive(name, count);
+                        if let Some((name, count)) = self.directive() {
+                            self.parse_directive(name, count);
                             continue;
                         }
                         let token = self.tokens.last().unwrap().1.clone();
@@ -2478,7 +2523,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
-            if let Some((_, count)) = self.bsd_directive() {
+            if let Some((_, count)) = self.directive() {
                 self.bump_n(count);
             } else if self.current() == Some(IDENTIFIER)
                 && ["include", "-include", "sinclude"]
@@ -2657,7 +2702,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// while `.  if` (whitespace after the dot, used for indenting
         /// nested directives) is three. Line continuations may also appear
         /// between the dot and the name.
-        fn bsd_directive(&self) -> Option<(&'static str, usize)> {
+        ///
+        /// For nmake, this finds its `!` preprocessing directives instead,
+        /// returning the name of the equivalent BSD make directive; see
+        /// [`Parser::nmake_directive`].
+        fn directive(&self) -> Option<(&'static str, usize)> {
+            if self.variant == Some(MakefileVariant::NMake) {
+                return self.nmake_directive();
+            }
             if !self.bsd_directives_enabled() {
                 return None;
             }
@@ -2709,6 +2761,60 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return None;
             }
             Some((name, count))
+        }
+
+        /// If the current line starts with an nmake preprocessing directive
+        /// such as `!IF` or `!  else ifdef`, return the name of the
+        /// equivalent BSD make directive (`if`, `elifdef`) and the number of
+        /// tokens making up the keyword. Like nmake, this only recognizes a
+        /// `!` in the first column, and ignores the case of the keyword.
+        fn nmake_directive(&self) -> Option<(&'static str, usize)> {
+            if !matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!") {
+                return None;
+            }
+            let start = usize::from(self.current_range().start());
+            if start > 0 && !self.original_text[..start].ends_with('\n') {
+                return None;
+            }
+            // The index in `self.tokens` of the word after the one at `i`,
+            // skipping whitespace.
+            let next_word = |i: usize| {
+                let i = (0..i).rev().find(|&j| self.tokens[j].0 != WHITESPACE)?;
+                (self.tokens[i].0 == IDENTIFIER).then_some(i)
+            };
+            let n = self.tokens.len();
+            let first = next_word(n - 1)?;
+            let second = next_word(first);
+            let (name, uses_second) = nmake_directive_name(
+                &self.tokens[first].1,
+                second.map(|i| self.tokens[i].1.as_str()),
+            )?;
+            let last = if uses_second { second? } else { first };
+            let count = n - last;
+            // As for BSD make, require whitespace or the end of the line
+            // after the name of directives other than conditionals and
+            // includes.
+            let lenient = is_bsd_if(name)
+                || is_bsd_elif(name)
+                || matches!(name, "else" | "endif" | "include");
+            let next = self.tokens[..last].last();
+            if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
+                return None;
+            }
+            Some((name, count))
+        }
+
+        /// How a directive found by [`Parser::directive`] is written in
+        /// messages, such as `.elif` for BSD make or `!ELSEIF` for nmake.
+        fn directive_display(&self, name: &str) -> String {
+            if self.variant != Some(MakefileVariant::NMake) {
+                return format!(".{}", name);
+            }
+            let name = match name.strip_prefix("elif") {
+                Some(rest) => format!("elseif{}", rest),
+                None => name.to_string(),
+            };
+            format!("!{}", name.to_ascii_uppercase())
         }
 
         fn bump_n(&mut self, count: usize) {
@@ -2768,10 +2874,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        /// Dispatch a BSD make directive found by `bsd_directive`.
-        fn parse_bsd_directive(&mut self, name: &str, count: usize) {
+        /// Dispatch a BSD make or nmake directive found by `directive`.
+        fn parse_directive(&mut self, name: &str, count: usize) {
             match name {
-                _ if is_bsd_if(name) => self.parse_bsd_conditional(name, count),
+                _ if is_bsd_if(name) => self.parse_block_conditional(name, count),
                 "for" => self.parse_bsd_for(count),
                 "include" | "-include" | "sinclude" | "dinclude" => self.parse_include(),
                 _ if is_bsd_elif(name) || matches!(name, "else" | "endif" | "endfor") => {
@@ -2780,7 +2886,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         "endif" => (ParseErrorKind::ExtraneousEndif, "if"),
                         _ => (ParseErrorKind::ElseWithoutIf, "if"),
                     };
-                    self.record_error(kind, format!(".{} without matching .{}", name, opener));
+                    let message = format!(
+                        "{} without matching {}",
+                        self.directive_display(name),
+                        self.directive_display(opener)
+                    );
+                    self.record_error(kind, message);
                     self.builder.start_node(ERROR.into());
                     self.skip_until_newline();
                     self.builder.finish_node();
@@ -2821,7 +2932,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if let (Some(name), false) = (required, found) {
                 self.record_error(
                     ParseErrorKind::InvalidConditional,
-                    format!("expected condition after .{}", name),
+                    format!("expected condition after {}", self.directive_display(name)),
                 );
             }
             if self.current() == Some(COMMENT) {
@@ -2845,7 +2956,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 Some(_) => {
                     self.record_error(
                         ParseErrorKind::ExtraneousText,
-                        format!("unexpected text after .{}", name),
+                        format!("unexpected text after {}", self.directive_display(name)),
                     );
                     self.skip_until_newline();
                 }
@@ -2865,11 +2976,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Parse a BSD `.if`/`.ifdef`/`.ifndef`/`.ifmake`/`.ifnmake` block,
-        /// including any `.elif*`/`.else` branches and the closing `.endif`.
+        /// including any `.elif*`/`.else` branches and the closing `.endif`,
+        /// or the equivalent nmake `!IF` ... `!ENDIF` block.
         ///
         /// Uses the same node kinds as GNU conditionals: `.elif*` and `.else`
         /// become CONDITIONAL_ELSE nodes and `.endif` a CONDITIONAL_ENDIF.
-        fn parse_bsd_conditional(&mut self, name: &str, count: usize) {
+        fn parse_block_conditional(&mut self, name: &str, count: usize) {
             self.builder.start_node(CONDITIONAL.into());
             self.builder.start_node(CONDITIONAL_IF.into());
             self.bump_n(count);
@@ -2880,13 +2992,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             loop {
                 if self.is_at_eof() {
-                    self.record_error(
-                        ParseErrorKind::MissingEndif,
-                        "unterminated .if (missing .endif)".to_string(),
+                    let message = format!(
+                        "unterminated {} (missing {})",
+                        self.directive_display("if"),
+                        self.directive_display("endif")
                     );
+                    self.record_error(ParseErrorKind::MissingEndif, message);
                     break;
                 }
-                let Some((name, count)) = self.bsd_directive() else {
+                let Some((name, count)) = self.directive() else {
                     self.parse_block_item();
                     continue;
                 };
@@ -2973,7 +3087,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     );
                     break;
                 }
-                match self.bsd_directive() {
+                match self.directive() {
                     Some((name, count)) if name == "endfor" => {
                         self.builder.start_node(FOR_END.into());
                         self.bump_n(count);
@@ -3163,13 +3277,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_token(&mut self) -> bool {
+            if let Some((name, count)) = self.directive() {
+                self.parse_directive(name, count);
+                return true;
+            }
             match self.current() {
                 None => false,
                 Some(IDENTIFIER) => {
-                    if let Some((name, count)) = self.bsd_directive() {
-                        self.parse_bsd_directive(name, count);
-                        return true;
-                    }
                     let token = &self.tokens.last().unwrap().1;
                     if self.is_conditional_directive(token)
                         && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
@@ -13960,5 +14074,250 @@ mod test_crlf {
         let makefile = parse_crlf("X = 1\r\n");
         makefile.items().next().unwrap().add_comment("hi").unwrap();
         assert_eq!(makefile.to_string(), "# hi\r\nX = 1\r\n");
+    }
+}
+
+#[cfg(test)]
+mod test_nmake {
+    use super::*;
+    use crate::MakefileItem;
+
+    fn parse_nmake(text: &str) -> Makefile {
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::NMake);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile
+    }
+
+    fn branches(cond: &Conditional) -> Vec<(Option<String>, Option<String>)> {
+        cond.branches()
+            .map(|b| (b.conditional_type(), b.condition()))
+            .collect()
+    }
+
+    #[test]
+    fn test_conditional() {
+        let makefile = parse_nmake(
+            "!IF \"$(CFG)\" == \"Debug\" # comment\nX=1\n!ELSEIF $(A) > 2\nX=2\n!ELSE IF 3\nX=3\n!else\nX=4\n!endif\n",
+        );
+        let items: Vec<_> = makefile.items().collect();
+        assert_eq!(items.len(), 1);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.conditional_type(), Some("!IF".to_string()));
+        assert_eq!(
+            cond.condition(),
+            Some("\"$(CFG)\" == \"Debug\"".to_string())
+        );
+        assert_eq!(
+            branches(&cond),
+            vec![
+                (
+                    Some("!IF".to_string()),
+                    Some("\"$(CFG)\" == \"Debug\"".to_string())
+                ),
+                (Some("!IF".to_string()), Some("$(A) > 2".to_string())),
+                (Some("!IF".to_string()), Some("3".to_string())),
+                (None, None),
+            ]
+        );
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| v.raw_value().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4"]
+        );
+    }
+
+    #[test]
+    fn test_ifdef() {
+        let makefile = parse_nmake(
+            "!  IFDEF DEBUG\nX=1\n!ELSEIFNDEF NODEBUG\nX=2\n! else ifdef OTHER\nX=3\n!ENDIF\n",
+        );
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            branches(&cond),
+            vec![
+                (Some("!IFDEF".to_string()), Some("DEBUG".to_string())),
+                (Some("!IFNDEF".to_string()), Some("NODEBUG".to_string())),
+                (Some("!IFDEF".to_string()), Some("OTHER".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested() {
+        let makefile = parse_nmake("!IFDEF A\n!IFNDEF B\nX=1\n!ENDIF\n!ENDIF\n");
+        let outer = makefile.conditionals().next().unwrap();
+        let Some(MakefileItem::Conditional(inner)) = outer.if_items().next() else {
+            panic!("expected nested conditional");
+        };
+        assert_eq!(inner.conditional_type(), Some("!IFNDEF".to_string()));
+        assert_eq!(inner.condition(), Some("B".to_string()));
+    }
+
+    #[test]
+    fn test_conditional_in_rule() {
+        let text = "all:\n!IF 1\n\techo one\n!ELSE\n\techo two\n!ENDIF\n\techo done\n";
+        let makefile = parse_nmake(text);
+        assert_eq!(
+            node_kinds(makefile.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\n  RECIPE\n"
+        );
+    }
+
+    #[test]
+    fn test_conditional_after_rule() {
+        // A conditional without recipe lines ends the rule, also when it
+        // is indented after the `!`.
+        let makefile = parse_nmake("all:\n\techo a\n\n!  IFDEF X\nY=1\n!  ENDIF\n");
+        assert_eq!(
+            node_kinds(makefile.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\n"
+        );
+        let makefile = parse_nmake("all:\n\techo a\n\n!  IFDEF X\n\techo b\n!  ENDIF\n");
+        assert_eq!(
+            node_kinds(makefile.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ENDIF\n"
+        );
+    }
+
+    #[test]
+    fn test_include() {
+        let makefile = parse_nmake("!INCLUDE <win32.mak>\n!include config.mak\n");
+        let includes: Vec<_> = makefile.includes().collect();
+        assert_eq!(
+            includes.iter().map(|i| i.path()).collect::<Vec<_>>(),
+            vec![
+                Some("win32.mak".to_string()),
+                Some("config.mak".to_string())
+            ]
+        );
+        assert!(!includes[0].is_optional());
+        includes[0].clone().set_path("other.mak").unwrap();
+        assert_eq!(includes[0].path(), Some("other.mak".to_string()));
+        // TODO: nmake escapes `#` as `^#`, which set_path doesn't write yet.
+        assert!(includes[1].clone().set_path("a#b.mak").is_err());
+        assert_eq!(
+            makefile.to_string(),
+            "!INCLUDE <other.mak>\n!include config.mak\n"
+        );
+    }
+
+    #[test]
+    fn test_include_set_optional() {
+        let makefile = parse_nmake("!INCLUDE config.mak\n");
+        let mut include = makefile.includes().next().unwrap();
+        let Err(Error::Parse(err)) = include.set_optional(true) else {
+            panic!("expected an error");
+        };
+        assert_eq!(
+            err.errors[0].message,
+            "nmake has no optional include directive"
+        );
+        include.set_optional(false).unwrap();
+        assert_eq!(makefile.to_string(), "!INCLUDE config.mak\n");
+    }
+
+    #[test]
+    fn test_directives() {
+        let makefile = parse_nmake(
+            "!UNDEF FOO\n!MESSAGE Building $(PROJ)\n!ERROR unsupported\n!CMDSWITCHES +D -N\n",
+        );
+        let directives: Vec<_> = makefile
+            .items()
+            .map(|item| match item {
+                MakefileItem::Directive(d) => (d.keyword().unwrap(), d.argument()),
+                _ => panic!("expected directive"),
+            })
+            .collect();
+        assert_eq!(
+            directives,
+            vec![
+                ("!UNDEF".to_string(), Some("FOO".to_string())),
+                ("!MESSAGE".to_string(), Some("Building $(PROJ)".to_string())),
+                ("!ERROR".to_string(), Some("unsupported".to_string())),
+                ("!CMDSWITCHES".to_string(), Some("+D -N".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_add_else_and_endif() {
+        let parsed = Makefile::parse_with_variant("!IFDEF A\nX=1\n", MakefileVariant::NMake);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| (e.kind(), e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                ParseErrorKind::MissingEndif,
+                "unterminated !IF (missing !ENDIF)"
+            )]
+        );
+        let makefile = parsed.tree();
+        let mut cond = makefile.conditionals().next().unwrap();
+        assert!(cond.add_endif().unwrap());
+        let temp = parse_nmake("X=2\n");
+        let var = temp.variable_definitions().next().unwrap();
+        cond.add_else_item(MakefileItem::Variable(var));
+        assert_eq!(makefile.code(), "!IFDEF A\nX=1\n!ELSE\nX=2\n!ENDIF\n");
+    }
+
+    #[test]
+    fn test_errors() {
+        let parsed =
+            Makefile::parse_with_variant("!ENDIF\n!ELSE\n!IF\n!ENDIF\n", MakefileVariant::NMake);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| (e.kind(), e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ParseErrorKind::ExtraneousEndif,
+                    "!ENDIF without matching !IF"
+                ),
+                (ParseErrorKind::ElseWithoutIf, "!ELSE without matching !IF"),
+                (
+                    ParseErrorKind::InvalidConditional,
+                    "expected condition after !IF"
+                ),
+            ]
+        );
+        assert_eq!(parsed.tree().to_string(), "!ENDIF\n!ELSE\n!IF\n!ENDIF\n");
+    }
+
+    #[test]
+    fn test_other_variants_unaffected() {
+        // Outside of nmake, `!IF` is not a directive.
+        for variant in [MakefileVariant::GNUMake, MakefileVariant::BSDMake] {
+            let parsed = Makefile::parse_with_variant("!IF 1\nX=1\n!ENDIF\n", variant);
+            assert_eq!(parsed.tree().conditionals().count(), 0);
+            assert_eq!(parsed.tree().to_string(), "!IF 1\nX=1\n!ENDIF\n");
+        }
+    }
+
+    #[test]
+    fn test_not_in_first_column() {
+        // nmake only recognizes directives starting in the first column.
+        let parsed = Makefile::parse_with_variant("all: ; !IF 1\n", MakefileVariant::NMake);
+        assert_eq!(parsed.errors(), &[]);
+        assert_eq!(parsed.tree().conditionals().count(), 0);
+    }
+
+    fn node_kinds(node: &SyntaxNode) -> String {
+        fn walk(node: &SyntaxNode, depth: usize, out: &mut String) {
+            for child in node.children() {
+                out.push_str(&format!("{}{:?}\n", "  ".repeat(depth), child.kind()));
+                walk(&child, depth + 1, out);
+            }
+        }
+        let mut out = String::new();
+        walk(node, 0, &mut out);
+        out
     }
 }
