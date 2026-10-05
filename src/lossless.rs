@@ -3192,10 +3192,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.bump();
             // Optional whitespace then the variable name.
             self.skip_ws_and_continuations();
-            self.bump_define_name();
-            // TODO: GNU make joins words on either side of a continuation
-            // into the name, as in `define A \<newline>B`; here B ends up in
-            // the body instead.
+            self.parse_define_name();
             self.skip_ws_and_continuations();
             // Optional assignment operator (e.g. `:=`, `+=`, `?=`).
             if self.current() == Some(OPERATOR) {
@@ -3246,23 +3243,68 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        /// Consume the name in a `define` header as a single IDENTIFIER token.
+        /// Parse the name in a `define` header.
         ///
         /// GNU make takes everything up to the assignment operator (or the end
-        /// of the line), minus surrounding whitespace, as the name. That may
-        /// span several tokens, e.g. `\n` lexes as BACKSLASH + IDENTIFIER and
-        /// `foo bar` contains whitespace.
-        fn bump_define_name(&mut self) {
+        /// of the line), minus surrounding whitespace, as the name. An
+        /// operator only counts after a single word, so `define A B =` names
+        /// the variable "A B =". Each part of the name between line
+        /// continuations becomes a single IDENTIFIER token.
+        fn parse_define_name(&mut self) {
+            let mut depth = 0;
+            let mut multiword = false;
+            if !self.bump_define_name_part(&mut depth, &mut multiword) {
+                self.error(
+                    ParseErrorKind::ExpectedVariableName,
+                    "empty variable name in `define`".to_string(),
+                );
+                return;
+            }
+            loop {
+                self.skip_ws();
+                if !self.consume_line_continuation() {
+                    return;
+                }
+                self.skip_ws_and_continuations();
+                match self.current() {
+                    None | Some(NEWLINE | COMMENT) => return,
+                    Some(OPERATOR) if depth == 0 && !multiword => return,
+                    _ => {}
+                }
+                multiword |= depth == 0;
+                let bumped = self.bump_define_name_part(&mut depth, &mut multiword);
+                debug_assert!(bumped, "name part after a continuation is empty");
+            }
+        }
+
+        /// Consume the part of a `define` name up to the next line
+        /// continuation, operator or end of line as a single IDENTIFIER
+        /// token, leaving trailing whitespace. That may span several tokens,
+        /// e.g. `\n` lexes as BACKSLASH + IDENTIFIER and `foo bar` contains
+        /// whitespace. Returns false if the part is empty.
+        fn bump_define_name_part(&mut self, depth: &mut usize, multiword: &mut bool) -> bool {
             let mut tokens = self.tokens.iter().rev().peekable();
             let mut len = 0;
             // Whether the previous token is an unescaped backslash.
             let mut escaped = false;
+            let mut after_ws = false;
             while let Some((kind, _)) = tokens.peek() {
                 let at_continuation = *kind == BACKSLASH
                     && !escaped
                     && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
-                if at_continuation || matches!(*kind, OPERATOR | NEWLINE | COMMENT) {
+                let at_operator = *kind == OPERATOR && *depth == 0 && !*multiword;
+                if at_continuation || at_operator || matches!(*kind, NEWLINE | COMMENT) {
                     break;
+                }
+                match *kind {
+                    LPAREN | LBRACE => *depth += 1,
+                    RPAREN | RBRACE => *depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                if *depth == 0 && *kind == WHITESPACE {
+                    after_ws = true;
+                } else if after_ws {
+                    *multiword = true;
                 }
                 escaped = *kind == BACKSLASH && !escaped;
                 tokens.next();
@@ -3278,14 +3320,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 name.push_str(&text);
             }
             if name.is_empty() {
-                self.error(
-                    ParseErrorKind::ExpectedVariableName,
-                    "empty variable name in `define`".to_string(),
-                );
-                return;
+                return false;
             }
             self.pending_backslash_escape = false;
             self.builder.token(IDENTIFIER.into(), &name);
+            true
         }
 
         fn is_define_modifier(token: &str) -> bool {
@@ -6183,6 +6222,107 @@ mod tests {
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(Some("foo bar".to_string()), var.name());
         assert_eq!(Some("body\n".to_string()), var.raw_value());
+    }
+
+    #[test]
+    fn test_define_name_with_continuation() {
+        // GNU make reads the whole header, so a continuation and the
+        // whitespace around it become a single space in the name.
+        for (code, name, op) in [
+            ("define A \\\nB\nbody\nendef\n", "A B", None),
+            ("define A\\\nB\nbody\nendef\n", "A B", None),
+            ("define A \\\n  B  \\\n  C\nbody\nendef\n", "A B C", None),
+            ("define $(x) \\\n B\nbody\nendef\n", "$(x) B", None),
+            ("define A \\\nB :=\nbody\nendef\n", "A B :=", None),
+            ("define A \\\nB # c\nbody\nendef\n", "A B", None),
+            ("define A \\\n=\nbody\nendef\n", "A", Some("=")),
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let makefile = parsed.root();
+            assert_eq!(code, makefile.to_string());
+            let vars = makefile
+                .variable_definitions()
+                .map(|v| {
+                    (
+                        v.name(),
+                        v.names().collect::<Vec<_>>(),
+                        v.assignment_operator(),
+                        v.raw_value(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vars,
+                vec![(
+                    Some(name.to_string()),
+                    vec![name.to_string()],
+                    op.map(str::to_string),
+                    Some("body\n".to_string())
+                )],
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_define_multiword_name_with_operator() {
+        // GNU make only recognises an operator after a single word; in
+        // `define A B =` the variable is "A B =".
+        for (code, name, op) in [
+            ("define A B =\nbody\nendef\n", "A B =", None),
+            ("define A B := x\nbody\nendef\n", "A B := x", None),
+            ("define A =\nbody\nendef\n", "A", Some("=")),
+            (
+                "define $(subst _, ,A_B) =\nbody\nendef\n",
+                "$(subst _, ,A_B)",
+                Some("="),
+            ),
+        ] {
+            let parsed = parse(code, None);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let makefile = parsed.root();
+            assert_eq!(code, makefile.to_string());
+            let vars = makefile
+                .variable_definitions()
+                .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vars,
+                vec![(
+                    Some(name.to_string()),
+                    op.map(str::to_string),
+                    Some("body\n".to_string())
+                )],
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_define_name_with_continuation_modifiers() {
+        // Words after `define` are part of the name, not modifiers.
+        let code = "override define override \\\n X\nbody\nendef\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_define());
+        assert!(var.is_override());
+        assert_eq!(var.name(), Some("override X".to_string()));
+    }
+
+    #[test]
+    fn test_define_rename_name_with_continuation() {
+        let code = "define A \\\nB\nbody\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(&code[range], "A \\\nB");
+        var.set_name("C");
+        assert_eq!(var.name(), Some("C".to_string()));
+        assert_eq!(makefile.code(), "define C\nbody\nendef\n");
     }
 
     #[test]
