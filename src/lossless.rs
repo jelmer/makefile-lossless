@@ -39,6 +39,62 @@ pub struct ParseError {
     pub errors: Vec<ErrorInfo>,
 }
 
+/// The class of a parse error.
+///
+/// Use this rather than matching on error messages, which are meant for
+/// humans and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    /// A line that is not a rule, variable assignment or directive, such as
+    /// a rule without a `:` (GNU make: "missing separator").
+    MissingSeparator,
+    /// An indented line outside of a rule (GNU make: "recipe commences
+    /// before first target").
+    RecipeBeforeFirstTarget,
+    /// A rule without a target.
+    MissingTarget,
+    /// An archive member reference such as `lib(member` without a closing
+    /// parenthesis.
+    UnclosedArchiveMember,
+    /// A variable reference such as `$(FOO` without a closing delimiter.
+    UnclosedReference,
+    /// A parenthesized conditional argument without a closing parenthesis.
+    UnclosedParenthesis,
+    /// A missing or empty variable name, e.g. in `export` or `define`.
+    ExpectedVariableName,
+    /// A variable name not followed by a valid assignment operator.
+    ExpectedAssignmentOperator,
+    /// A malformed conditional directive, such as `ifeq` without arguments
+    /// (GNU make: "invalid syntax in conditional").
+    InvalidConditional,
+    /// A conditional that is not closed before the end of the input
+    /// (GNU make: "missing 'endif'").
+    MissingEndif,
+    /// An `endif` without a matching conditional (GNU make: "extraneous
+    /// 'endif'").
+    ExtraneousEndif,
+    /// An `else` (or BSD `.elif`) without a matching conditional.
+    ElseWithoutIf,
+    /// A malformed BSD `.for` loop header.
+    InvalidForLoop,
+    /// A BSD `.for` loop that is not closed before the end of the input.
+    MissingEndfor,
+    /// A BSD `.endfor` without a matching `.for`.
+    ExtraneousEndfor,
+    /// A `define` that is not closed before the end of the input
+    /// (GNU make: "missing 'endef', unterminated 'define'").
+    MissingEndef,
+    /// An `include` directive without a file name.
+    MissingIncludePath,
+    /// Unexpected text where the end of the line was expected.
+    ExtraneousText,
+    /// A token that cannot start any construct.
+    UnexpectedToken,
+    /// Any other error.
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Information about a specific parsing error
 pub struct ErrorInfo {
@@ -48,6 +104,14 @@ pub struct ErrorInfo {
     pub line: usize,
     /// The context around the error
     pub context: String,
+    pub(crate) kind: ParseErrorKind,
+}
+
+impl ErrorInfo {
+    /// The class of this error.
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
 }
 
 impl std::fmt::Display for ParseError {
@@ -77,6 +141,14 @@ pub struct PositionedParseError {
     pub range: rowan::TextRange,
     /// Optional error code for categorization
     pub code: Option<String>,
+    pub(crate) kind: ParseErrorKind,
+}
+
+impl PositionedParseError {
+    /// The class of this error.
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
 }
 
 impl std::fmt::Display for PositionedParseError {
@@ -253,9 +325,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     }
 
     impl Parser {
-        fn error(&mut self, msg: String) {
+        fn error(&mut self, kind: ParseErrorKind, msg: String) {
             self.builder.start_node(ERROR.into());
-            self.record_error(msg);
+            self.record_error(kind, msg);
             if self.current().is_some() {
                 self.bump();
             }
@@ -263,7 +335,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Record an error without consuming the current token.
-        fn record_error(&mut self, msg: String) {
+        fn record_error(&mut self, kind: ParseErrorKind, msg: String) {
             let range = self.current_range();
             let line = self.original_text[..usize::from(range.start())]
                 .matches('\n')
@@ -271,26 +343,33 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 + 1;
             let context = self.get_context_for_line(line);
 
-            let message = if self.current() == Some(INDENT) && !msg.contains("indented") {
+            let (kind, message) = if self.current() == Some(INDENT)
+                && kind != ParseErrorKind::RecipeBeforeFirstTarget
+            {
                 if !self.tokens.is_empty() && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
-                    "expected ':'".to_string()
+                    (ParseErrorKind::MissingSeparator, "expected ':'".to_string())
                 } else {
-                    "indented line not part of a rule".to_string()
+                    (
+                        ParseErrorKind::RecipeBeforeFirstTarget,
+                        "indented line not part of a rule".to_string(),
+                    )
                 }
             } else {
-                msg
+                (kind, msg)
             };
 
             self.errors.push(ErrorInfo {
                 message: message.clone(),
                 line,
                 context,
+                kind,
             });
 
             self.positioned_errors.push(PositionedParseError {
                 message,
                 range,
                 code: None,
+                kind,
             });
         }
 
@@ -319,7 +398,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Check for and consume the indent
             if self.current() != Some(INDENT) {
-                self.error("recipe line must start with a tab".to_string());
+                self.error(
+                    ParseErrorKind::Other,
+                    "recipe line must start with a tab".to_string(),
+                );
                 self.builder.finish_node();
                 return;
             }
@@ -484,7 +566,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 _ => {
-                    self.error("expected rule target".to_string());
+                    self.error(
+                        ParseErrorKind::MissingTarget,
+                        "expected rule target".to_string(),
+                    );
                     false
                 }
             }
@@ -554,7 +639,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.current() == Some(RPAREN) {
                     self.bump();
                 } else {
-                    self.error("expected ')' to close archive member".to_string());
+                    self.error(
+                        ParseErrorKind::UnclosedArchiveMember,
+                        "expected ')' to close archive member".to_string(),
+                    );
                 }
             }
         }
@@ -884,7 +972,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .is_some_and(|(kind, _)| *kind == INDENT)
         }
 
-        fn find_and_consume_colon(&mut self) -> bool {
+        /// Whether the current token is at the start of a line that begins
+        /// with a tab, ignoring any whitespace already consumed.
+        fn at_tab_indented_line_start(&self) -> bool {
+            let start = usize::from(self.current_range().start());
+            let line_start = self.original_text[..start].rfind('\n').map_or(0, |i| i + 1);
+            self.original_text[line_start..].starts_with('\t')
+                && self.original_text[line_start..start]
+                    .chars()
+                    .all(|c| c == ' ' || c == '\t')
+        }
+
+        /// `tab_indented` is whether the rule line starts with a tab, which
+        /// GNU make reports as "recipe commences before first target"
+        /// rather than "missing separator".
+        fn find_and_consume_colon(&mut self, tab_indented: bool) -> bool {
             // Skip whitespace before colon
             self.skip_ws();
 
@@ -906,7 +1008,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             let at_eol = self.current() == Some(NEWLINE);
-            self.error("expected ':'".to_string());
+            let kind = if tab_indented {
+                ParseErrorKind::RecipeBeforeFirstTarget
+            } else {
+                ParseErrorKind::MissingSeparator
+            };
+            self.error(kind, "expected ':'".to_string());
             if !at_eol {
                 self.skip_logical_line();
             }
@@ -916,6 +1023,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_rule(&mut self) {
             self.in_rule = false;
             self.builder.start_node(RULE.into());
+            let tab_indented = self.at_tab_indented_line_start();
 
             // Parse targets in a TARGETS node
             self.skip_ws();
@@ -927,7 +1035,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Find and consume the colon
             let has_colon = if has_target {
-                self.find_and_consume_colon()
+                self.find_and_consume_colon(tab_indented)
             } else {
                 false
             };
@@ -1243,7 +1351,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 // If we're at EOF after a comment, that's fine
             } else {
-                self.error("expected comment".to_string());
+                self.error(ParseErrorKind::Other, "expected comment".to_string());
             }
         }
 
@@ -1293,7 +1401,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let export_all =
                 is_export_directive && matches!(self.current(), Some(NEWLINE | COMMENT) | None);
             if !export_all && !self.parse_variable_name() {
-                self.error("expected variable name".to_string());
+                self.error(
+                    ParseErrorKind::ExpectedVariableName,
+                    "expected variable name".to_string(),
+                );
                 self.builder.finish_node();
                 return;
             }
@@ -1345,7 +1456,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.skip_ws();
                         self.parse_assignment_value();
                     } else {
-                        self.error(format!("invalid assignment operator: {}", op));
+                        self.error(
+                            ParseErrorKind::ExpectedAssignmentOperator,
+                            format!("invalid assignment operator: {}", op),
+                        );
                     }
                 }
                 // Bare "export VARNAME" without assignment operator is valid GNU Make
@@ -1357,7 +1471,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // EOF after export VARNAME is fine
                 }
                 _ => {
-                    self.error("expected assignment operator".to_string());
+                    self.error(
+                        ParseErrorKind::ExpectedAssignmentOperator,
+                        "expected assignment operator".to_string(),
+                    );
                     self.skip_logical_line();
                 }
             }
@@ -1458,7 +1575,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(NEWLINE) {
                 self.bump();
             } else if !self.is_at_eof() {
-                self.error("expected newline after variable value".to_string());
+                self.error(
+                    ParseErrorKind::ExtraneousText,
+                    "expected newline after variable value".to_string(),
+                );
             }
         }
 
@@ -1494,7 +1614,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             }
                             // Like `$(...)`, a reference can't span lines.
                             Some(NEWLINE) | None => {
-                                self.record_error("unclosed variable reference".to_string());
+                                self.record_error(
+                                    ParseErrorKind::UnclosedReference,
+                                    "unclosed variable reference".to_string(),
+                                );
                                 break;
                             }
                             Some(_) => self.bump(),
@@ -1552,7 +1675,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // Quoted syntax: ifeq "arg1" "arg2" or ifeq 'arg1' 'arg2'
                 self.parse_quoted_comparison();
             } else {
-                self.error("expected opening parenthesis or quote".to_string());
+                self.error(
+                    ParseErrorKind::InvalidConditional,
+                    "expected opening parenthesis or quote".to_string(),
+                );
             }
 
             self.builder.finish_node();
@@ -1598,11 +1724,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // Leave the newline for the caller, like GNU make,
                     // which does not let the reference span lines.
                     Some(NEWLINE) | None => {
-                        self.record_error(if is_variable_ref {
-                            "unclosed variable reference".to_string()
+                        if is_variable_ref {
+                            self.record_error(
+                                ParseErrorKind::UnclosedReference,
+                                "unclosed variable reference".to_string(),
+                            );
                         } else {
-                            "unclosed parenthesis".to_string()
-                        });
+                            self.record_error(
+                                ParseErrorKind::UnclosedParenthesis,
+                                "unclosed parenthesis".to_string(),
+                            );
+                        }
                         break;
                     }
                     Some(_) => self.bump(),
@@ -1626,7 +1758,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(QUOTE) {
                 self.bump(); // Consume the entire first quoted string token
             } else {
-                self.error("expected first quoted argument".to_string());
+                self.error(
+                    ParseErrorKind::InvalidConditional,
+                    "expected first quoted argument".to_string(),
+                );
             }
 
             // Skip whitespace between the two arguments
@@ -1636,7 +1771,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(QUOTE) {
                 self.bump(); // Consume the entire second quoted string token
             } else {
-                self.error("expected second quoted argument".to_string());
+                self.error(
+                    ParseErrorKind::InvalidConditional,
+                    "expected second quoted argument".to_string(),
+                );
             }
 
             // Skip trailing whitespace and expect end of line
@@ -1656,6 +1794,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_conditional_keyword(&mut self) -> Option<String> {
             if self.current() != Some(IDENTIFIER) {
                 self.error(
+                    ParseErrorKind::InvalidConditional,
                     "expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".to_string(),
                 );
                 return None;
@@ -1663,7 +1802,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             let token = self.tokens.last().unwrap().1.clone();
             if !Self::is_conditional_start(&token) {
-                self.error(format!("unknown conditional directive: {}", token));
+                // Reached for an `else` or `endif` outside of a conditional.
+                let kind = match token.as_str() {
+                    "else" => ParseErrorKind::ElseWithoutIf,
+                    "endif" => ParseErrorKind::ExtraneousEndif,
+                    _ => ParseErrorKind::InvalidConditional,
+                };
+                self.error(kind, format!("unknown conditional directive: {}", token));
                 return None;
             }
 
@@ -1701,7 +1846,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             if !found_var {
                 // Empty condition is an error in GNU Make
-                self.error("expected condition after conditional directive".to_string());
+                self.error(
+                    ParseErrorKind::InvalidConditional,
+                    "expected condition after conditional directive".to_string(),
+                );
             }
 
             self.builder.finish_node();
@@ -1747,7 +1895,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "else" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
-                        self.error("else without matching if".to_string());
+                        self.error(
+                            ParseErrorKind::ElseWithoutIf,
+                            "else without matching if".to_string(),
+                        );
                         // Always consume a token to guarantee progress
                         self.bump();
                         false
@@ -1794,7 +1945,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "endif" => {
                     // Not valid outside of a conditional
                     if *depth == 0 {
-                        self.error("endif without matching if".to_string());
+                        self.error(
+                            ParseErrorKind::ExtraneousEndif,
+                            "endif without matching if".to_string(),
+                        );
                         // Always consume a token to guarantee progress
                         self.bump();
                         false
@@ -1940,7 +2094,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if depth > 0 && self.is_at_eof() {
-                self.record_error("unterminated conditional (missing endif)".to_string());
+                self.record_error(
+                    ParseErrorKind::MissingEndif,
+                    "unterminated conditional (missing endif)".to_string(),
+                );
             }
 
             self.builder.finish_node();
@@ -2042,7 +2199,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             {
                 self.bump();
             } else {
-                self.error("expected include directive".to_string());
+                self.error(
+                    ParseErrorKind::Other,
+                    "expected include directive".to_string(),
+                );
                 self.builder.finish_node();
                 return;
             }
@@ -2079,7 +2239,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if !found_path {
-                self.error("expected file path after include".to_string());
+                self.error(
+                    ParseErrorKind::MissingIncludePath,
+                    "expected file path after include".to_string(),
+                );
             }
 
             self.builder.finish_node();
@@ -2094,7 +2257,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(NEWLINE) {
                 self.bump();
             } else if !self.is_at_eof() {
-                self.error("expected newline after include".to_string());
+                self.error(
+                    ParseErrorKind::ExtraneousText,
+                    "expected newline after include".to_string(),
+                );
                 self.skip_until_newline();
             }
 
@@ -2282,8 +2448,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "for" => self.parse_bsd_for(count),
                 "include" | "-include" | "sinclude" | "dinclude" => self.parse_include(),
                 _ if is_bsd_elif(name) || matches!(name, "else" | "endif" | "endfor") => {
-                    let opener = if name == "endfor" { "for" } else { "if" };
-                    self.record_error(format!(".{} without matching .{}", name, opener));
+                    let (kind, opener) = match name {
+                        "endfor" => (ParseErrorKind::ExtraneousEndfor, "for"),
+                        "endif" => (ParseErrorKind::ExtraneousEndif, "if"),
+                        _ => (ParseErrorKind::ElseWithoutIf, "if"),
+                    };
+                    self.record_error(kind, format!(".{} without matching .{}", name, opener));
                     self.builder.start_node(ERROR.into());
                     self.skip_until_newline();
                     self.builder.finish_node();
@@ -2322,7 +2492,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             self.builder.finish_node();
             if let (Some(name), false) = (required, found) {
-                self.record_error(format!("expected condition after .{}", name));
+                self.record_error(
+                    ParseErrorKind::InvalidConditional,
+                    format!("expected condition after .{}", name),
+                );
             }
             if self.current() == Some(COMMENT) {
                 self.bump();
@@ -2343,7 +2516,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 None => {}
                 Some(NEWLINE) => self.bump(),
                 Some(_) => {
-                    self.record_error(format!("unexpected text after .{}", name));
+                    self.record_error(
+                        ParseErrorKind::ExtraneousText,
+                        format!("unexpected text after .{}", name),
+                    );
                     self.skip_until_newline();
                 }
             }
@@ -2377,7 +2553,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             loop {
                 if self.is_at_eof() {
-                    self.record_error("unterminated .if (missing .endif)".to_string());
+                    self.record_error(
+                        ParseErrorKind::MissingEndif,
+                        "unterminated .if (missing .endif)".to_string(),
+                    );
                     break;
                 }
                 let Some((name, count)) = self.bsd_directive() else {
@@ -2412,7 +2591,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // A `.for` body is plain text to make, so `.endfor` ends
                     // the loop even if a conditional inside it is still open.
                     "endfor" if self.for_depth > 0 => {
-                        self.record_error("unterminated .if (missing .endif)".to_string());
+                        self.record_error(
+                            ParseErrorKind::MissingEndif,
+                            "unterminated .if (missing .endif)".to_string(),
+                        );
                         self.in_rule = rule_context.end(self.in_rule);
                         break;
                     }
@@ -2436,12 +2618,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.skip_ws_and_continuations();
             }
             if !found_variable {
-                self.record_error("expected variable name after .for".to_string());
+                self.record_error(
+                    ParseErrorKind::InvalidForLoop,
+                    "expected variable name after .for".to_string(),
+                );
             }
             if self.current() == Some(IDENTIFIER) {
                 self.bump();
             } else {
-                self.record_error("expected 'in' in .for".to_string());
+                self.record_error(
+                    ParseErrorKind::InvalidForLoop,
+                    "expected 'in' in .for".to_string(),
+                );
             }
             self.parse_directive_argument(None);
             self.builder.finish_node();
@@ -2452,7 +2640,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.for_depth += 1;
             loop {
                 if self.is_at_eof() {
-                    self.record_error("unterminated .for (missing .endfor)".to_string());
+                    self.record_error(
+                        ParseErrorKind::MissingEndfor,
+                        "unterminated .for (missing .endfor)".to_string(),
+                    );
                     break;
                 }
                 match self.bsd_directive() {
@@ -2542,7 +2733,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if depth == 0 {
                 self.skip_until_newline();
             } else {
-                self.error("missing `endef` for `define`".to_string());
+                self.error(
+                    ParseErrorKind::MissingEndef,
+                    "missing `endef` for `define`".to_string(),
+                );
             }
 
             self.builder.finish_node();
@@ -2571,7 +2765,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 name.push_str(&text);
             }
             if name.is_empty() {
-                self.error("empty variable name in `define`".to_string());
+                self.error(
+                    ParseErrorKind::ExpectedVariableName,
+                    "empty variable name in `define`".to_string(),
+                );
                 return;
             }
             self.pending_backslash_escape = false;
@@ -2696,7 +2893,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // `error()` already consumes the offending token; bumping
                     // again here would pop past the end of the stack when
                     // this is the last token.
-                    self.error(format!("unexpected token {:?}", kind));
+                    self.error(
+                        ParseErrorKind::UnexpectedToken,
+                        format!("unexpected token {:?}", kind),
+                    );
                     true
                 }
             }
@@ -2724,7 +2924,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         _ => false,
                     });
                 if !comment_only {
-                    self.record_error("indented line not part of a rule".to_string());
+                    self.record_error(
+                        ParseErrorKind::RecipeBeforeFirstTarget,
+                        "indented line not part of a rule".to_string(),
+                    );
                 }
                 self.parse_recipe_line();
             } else {
@@ -2958,7 +3161,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // End of file is also acceptable
                 }
                 n => {
-                    self.error(format!("expected newline, got {:?}", n));
+                    self.error(
+                        ParseErrorKind::ExtraneousText,
+                        format!("expected newline, got {:?}", n),
+                    );
                     // Try to recover by skipping to the next newline
                     self.skip_until_newline();
                 }
@@ -3016,7 +3222,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_variable_reference();
                     }
                     Some(NEWLINE) | None => {
-                        self.record_error("unclosed variable reference".to_string());
+                        self.record_error(
+                            ParseErrorKind::UnclosedReference,
+                            "unclosed variable reference".to_string(),
+                        );
                         break;
                     }
                     Some(_) => self.bump(),
@@ -5679,6 +5888,7 @@ build-indep: build
                 message: "test error".to_string(),
                 line: 42,
                 context: "some problematic code".to_string(),
+                kind: ParseErrorKind::Other,
             }],
         };
 
@@ -10757,6 +10967,148 @@ test:
                 (e.message.clone(), e.line, e.context.clone(), p.range)
             })
             .collect()
+    }
+
+    fn error_kinds(input: &str, variant: Option<MakefileVariant>) -> Vec<ParseErrorKind> {
+        let parsed = parse(input, variant);
+        let kinds: Vec<_> = parsed.errors.iter().map(ErrorInfo::kind).collect();
+        assert_eq!(
+            parsed
+                .positioned_errors
+                .iter()
+                .map(PositionedParseError::kind)
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        kinds
+    }
+
+    #[test]
+    fn test_error_kind_missing_separator() {
+        assert_eq!(
+            error_kinds("foo bar\n", None),
+            vec![ParseErrorKind::MissingSeparator]
+        );
+    }
+
+    #[test]
+    fn test_error_kind_recipe_before_first_target() {
+        assert_eq!(
+            error_kinds("\techo hi\n", None),
+            vec![ParseErrorKind::RecipeBeforeFirstTarget]
+        );
+        assert_eq!(
+            error_kinds("X = 1\n\tfoo bar\n", None),
+            vec![ParseErrorKind::RecipeBeforeFirstTarget]
+        );
+        assert_eq!(
+            error_kinds("\techo hi\n", Some(MakefileVariant::BSDMake)),
+            vec![ParseErrorKind::RecipeBeforeFirstTarget]
+        );
+    }
+
+    #[test]
+    fn test_error_kind_conditionals() {
+        assert_eq!(
+            error_kinds("ifdef FOO\nX = 1\n", None),
+            vec![ParseErrorKind::MissingEndif]
+        );
+        assert_eq!(
+            error_kinds("endif\n", None),
+            vec![ParseErrorKind::ExtraneousEndif]
+        );
+        assert_eq!(
+            error_kinds("else\n", None),
+            vec![ParseErrorKind::ElseWithoutIf]
+        );
+        assert_eq!(
+            error_kinds("ifeq foo\nendif\n", None),
+            vec![ParseErrorKind::InvalidConditional]
+        );
+        assert_eq!(
+            error_kinds("ifeq (a,b) x\nendif\n", None),
+            vec![ParseErrorKind::ExtraneousText]
+        );
+        assert_eq!(
+            error_kinds("ifeq (a,b\nendif\n", None),
+            vec![ParseErrorKind::UnclosedParenthesis]
+        );
+    }
+
+    #[test]
+    fn test_error_kind_bsd_directives() {
+        let bsd = Some(MakefileVariant::BSDMake);
+        assert_eq!(
+            error_kinds(".if 1\n", bsd),
+            vec![ParseErrorKind::MissingEndif]
+        );
+        assert_eq!(
+            error_kinds(".endif\n", bsd),
+            vec![ParseErrorKind::ExtraneousEndif]
+        );
+        assert_eq!(
+            error_kinds(".elif 1\n", bsd),
+            vec![ParseErrorKind::ElseWithoutIf]
+        );
+        assert_eq!(
+            error_kinds(".if\n.endif\n", bsd),
+            vec![ParseErrorKind::InvalidConditional]
+        );
+        assert_eq!(
+            error_kinds(".if 1\n.endif foo\n", bsd),
+            vec![ParseErrorKind::ExtraneousText]
+        );
+        assert_eq!(
+            error_kinds(".for x y\n.endfor\n", bsd),
+            vec![ParseErrorKind::InvalidForLoop]
+        );
+        assert_eq!(
+            error_kinds(".for x in a\n", bsd),
+            vec![ParseErrorKind::MissingEndfor]
+        );
+        assert_eq!(
+            error_kinds(".endfor\n", bsd),
+            vec![ParseErrorKind::ExtraneousEndfor]
+        );
+    }
+
+    #[test]
+    fn test_error_kind_references() {
+        assert_eq!(
+            error_kinds("X = $(FOO\n", None),
+            vec![ParseErrorKind::UnclosedReference]
+        );
+        assert_eq!(
+            error_kinds("X = ${FOO\n", None),
+            vec![ParseErrorKind::UnclosedReference]
+        );
+    }
+
+    #[test]
+    fn test_error_kind_variables_and_directives() {
+        assert_eq!(
+            error_kinds("override FOO bar\n", None),
+            vec![ParseErrorKind::ExpectedAssignmentOperator]
+        );
+        assert_eq!(
+            error_kinds("define\nendef\n", None),
+            vec![ParseErrorKind::ExpectedVariableName]
+        );
+        assert_eq!(
+            error_kinds("define FOO\nbar\n", None),
+            vec![ParseErrorKind::MissingEndef]
+        );
+        assert_eq!(
+            error_kinds("include\n", None),
+            vec![ParseErrorKind::MissingIncludePath]
+        );
+        assert_eq!(
+            error_kinds("lib(member: foo\n", None),
+            vec![
+                ParseErrorKind::UnclosedArchiveMember,
+                ParseErrorKind::MissingSeparator
+            ]
+        );
     }
 
     #[test]

@@ -128,6 +128,7 @@ impl Parse<Rule> {
         } else {
             Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "expected a single rule".to_string(),
                     line: 1,
                     context: "".to_string(),

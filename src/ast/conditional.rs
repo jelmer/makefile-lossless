@@ -501,6 +501,7 @@ impl Conditional {
         let Some(parent) = self.syntax().parent() else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot remove conditional: no parent node".to_string(),
                     line: 1,
                     context: "conditional_remove".to_string(),
@@ -536,6 +537,7 @@ impl Conditional {
         if self.has_else() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot unwrap conditional with else clause".to_string(),
                     line: 1,
                     context: "conditional_unwrap".to_string(),
@@ -546,6 +548,7 @@ impl Conditional {
         let Some(parent) = self.syntax().parent() else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot unwrap conditional: no parent node".to_string(),
                     line: 1,
                     context: "conditional_unwrap".to_string(),
@@ -707,6 +710,7 @@ impl Conditional {
         if self.conditional_type().is_none() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot add endif to conditional with no opener".to_string(),
                     line: 1,
                     context: "conditional_add_endif".to_string(),

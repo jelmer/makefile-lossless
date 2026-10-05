@@ -158,9 +158,8 @@ impl Parse<Makefile> {
             .count();
         for err in &reparsed.errors {
             new_errors.push(ErrorInfo {
-                message: err.message.clone(),
                 line: err.line + line_offset,
-                context: err.context.clone(),
+                ..err.clone()
             });
         }
 
@@ -175,9 +174,8 @@ impl Parse<Makefile> {
         for err in self.errors() {
             if err.line > lines_after_start {
                 new_errors.push(ErrorInfo {
-                    message: err.message.clone(),
                     line: (err.line as i64 + line_delta) as usize,
-                    context: err.context.clone(),
+                    ..err.clone()
                 });
             }
         }
@@ -192,12 +190,11 @@ impl Parse<Makefile> {
         // Positioned errors from reparsed region (shifted by reparse_start).
         for err in &reparsed.positioned_errors {
             new_positioned_errors.push(PositionedParseError {
-                message: err.message.clone(),
                 range: TextRange::new(
                     err.range.start() + reparse_start,
                     err.range.end() + reparse_start,
                 ),
-                code: err.code.clone(),
+                ..err.clone()
             });
         }
 
@@ -211,9 +208,8 @@ impl Parse<Makefile> {
                     (err.range.start() - shift, err.range.end() - shift)
                 };
                 new_positioned_errors.push(PositionedParseError {
-                    message: err.message.clone(),
                     range: TextRange::new(new_start, new_end),
-                    code: err.code.clone(),
+                    ..err.clone()
                 });
             }
         }
@@ -485,5 +481,37 @@ mod tests {
         assert_eq!(vars[0].raw_value(), Some("ONE".to_string()));
         assert_eq!(vars[1].raw_value(), Some("two".to_string()));
         assert_eq!(vars[2].raw_value(), Some("THREE".to_string()));
+    }
+
+    #[test]
+    fn test_apply_edit_keeps_error_kinds() {
+        use crate::ParseErrorKind;
+        let old_text = "A = 1\n\nfoo bar\n\nendif\n";
+        let parse = Parse::<Makefile>::parse_makefile(old_text);
+        // Edit the middle error, leaving the last one after the edit.
+        let edit = TextEdit::new(TextRange::new(7.into(), 10.into()), "baz".to_string());
+        let (new_parse, _) = parse.apply_edit(old_text, &edit);
+        assert_eq!(
+            new_parse
+                .errors()
+                .iter()
+                .map(|e| (e.line, e.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, ParseErrorKind::MissingSeparator),
+                (5, ParseErrorKind::ExtraneousEndif)
+            ]
+        );
+        assert_eq!(
+            new_parse
+                .positioned_errors()
+                .iter()
+                .map(|e| e.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                ParseErrorKind::MissingSeparator,
+                ParseErrorKind::ExtraneousEndif
+            ]
+        );
     }
 }

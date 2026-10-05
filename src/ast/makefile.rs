@@ -81,6 +81,7 @@ impl MakefileItem {
         self.syntax().parent().ok_or_else(|| {
             Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: format!("Cannot {} item without parent", action),
                     line: 1,
                     context: format!("MakefileItem::{}", method),
@@ -899,6 +900,7 @@ impl Makefile {
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+ kind: crate::ParseErrorKind::Other,
                     message: format!(
                         "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
                         conditional_type
@@ -1041,6 +1043,7 @@ impl Makefile {
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+ kind: crate::ParseErrorKind::Other,
                     message: format!(
                         "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
                         conditional_type
@@ -1161,6 +1164,7 @@ impl Makefile {
         if rules.is_empty() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot replace rule in empty makefile".to_string(),
                     line: 1,
                     context: "replace_rule".to_string(),
@@ -1171,6 +1175,7 @@ impl Makefile {
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: format!(
                         "Rule index {} out of bounds (max {})",
                         index,
@@ -1213,6 +1218,7 @@ impl Makefile {
         if rules.is_empty() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: "Cannot remove rule from empty makefile".to_string(),
                     line: 1,
                     context: "remove_rule".to_string(),
@@ -1223,6 +1229,7 @@ impl Makefile {
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: format!(
                         "Rule index {} out of bounds (max {})",
                         index,
@@ -1264,6 +1271,7 @@ impl Makefile {
         if index > rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: format!("Rule index {} out of bounds (max {})", index, rules.len()),
                     line: 1,
                     context: "insert_rule".to_string(),
@@ -1629,6 +1637,7 @@ impl Makefile {
         if index > items.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
                     message: format!("Index {} out of bounds (max {})", index, items.len()),
                     line: 1,
                     context: "insert_include".to_string(),
@@ -1722,6 +1731,7 @@ impl Makefile {
             .ok_or_else(|| {
                 Error::Parse(ParseError {
                     errors: vec![ErrorInfo {
+                        kind: crate::ParseErrorKind::Other,
                         message: "Could not find the reference item".to_string(),
                         line: 1,
                         context: "insert_include_after".to_string(),
