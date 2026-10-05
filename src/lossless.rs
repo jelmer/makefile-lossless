@@ -1434,7 +1434,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let export_all =
                 is_export_directive && matches!(self.current(), Some(NEWLINE | COMMENT) | None);
             if is_undefine && matches!(self.current(), Some(NEWLINE | COMMENT) | None) {
-                self.record_error("empty variable name".to_string());
+                self.record_error(
+                    ParseErrorKind::ExpectedVariableName,
+                    "empty variable name".to_string(),
+                );
                 self.expect_eol();
                 self.builder.finish_node();
                 return;
