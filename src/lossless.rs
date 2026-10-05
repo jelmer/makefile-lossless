@@ -4195,6 +4195,28 @@ all: $(OBJS)
     }
 
     #[test]
+    fn test_empty_assignment_at_eof() {
+        // The assignment operator is the very last token of the input
+        for (text, op) in [
+            ("exe=", "="),
+            ("exe :=", ":="),
+            ("exe +=", "+="),
+            ("exe ?=", "?="),
+            ("A = 1\nexe=", "="),
+        ] {
+            let parsed = parse(text, None);
+            assert_eq!(parsed.errors, vec![], "input: {:?}", text);
+            let makefile = parsed.root();
+            assert_eq!(makefile.rules().count(), 0, "input: {:?}", text);
+            let var = makefile.variable_definitions().last().unwrap();
+            assert_eq!(var.name(), Some("exe".to_string()));
+            assert_eq!(var.assignment_operator(), Some(op.to_string()));
+            assert_eq!(var.raw_value(), Some("".to_string()));
+            assert_eq!(makefile.to_string(), text);
+        }
+    }
+
+    #[test]
     fn test_bare_export_does_not_eat_include() {
         // Bare "export VARNAME" must not consume subsequent include directives
         let parsed = parse("VAR = value\nexport VAR\ninclude other.mk\n", None);
