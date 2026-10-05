@@ -89,6 +89,10 @@ pub enum ParseErrorKind {
     MissingEndef,
     /// An `include` directive without a file name.
     MissingIncludePath,
+    /// A BSD make `.include` path without its closing `>` or `"`.
+    UnclosedIncludePath,
+    /// A BSD make `.include` path not delimited by `<...>` or `"..."`.
+    UndelimitedIncludePath,
     /// Unexpected text where the end of the line was expected.
     ExtraneousText,
     /// A token that cannot start any construct.
@@ -2647,7 +2651,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(INCLUDE.into());
 
             // Consume include keyword variant
-            if let Some((_, count)) = self.directive() {
+            let directive = self.directive();
+            if let Some((_, count)) = directive {
                 self.bump_n(count);
             } else if self.current() == Some(IDENTIFIER)
                 && ["include", "-include", "sinclude"]
@@ -2669,8 +2674,48 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.relex_as_non_recipe_line(false);
             }
             self.skip_ws_and_continuations();
+            // nmake does not require delimiters.
+            // TODO: Check nmake's handling of an unclosed `<` or `"`.
+            if directive.is_some() && self.variant != Some(MakefileVariant::NMake) {
+                self.check_include_delimiters();
+            }
             self.parse_file_list("include", true);
             self.builder.finish_node();
+        }
+
+        /// Report a BSD make `.include` path that does not start with `<`
+        /// or `"`, or lacks the closing delimiter on the same logical line.
+        /// Like BSD make, this looks at the path before expansion, so
+        /// `${X}` is not delimited, and the closing delimiter is looked for
+        /// anywhere, even in a variable reference.
+        fn check_include_delimiters(&mut self) {
+            let close = match self.tokens.last() {
+                Some((TEXT, open)) if open == "<" => '>',
+                Some((QUOTE, open)) if open == "\"" => '"',
+                // A missing path is reported by `parse_file_list`.
+                None | Some((NEWLINE | COMMENT, _)) => return,
+                Some(_) => {
+                    self.record_error(
+                        ParseErrorKind::UndelimitedIncludePath,
+                        ".include filename must be delimited by \"\" or <>".to_string(),
+                    );
+                    return;
+                }
+            };
+            let mut prev = None;
+            for (kind, text) in self.tokens.iter().rev().skip(1) {
+                match kind {
+                    COMMENT => break,
+                    NEWLINE if prev != Some(BACKSLASH) => break,
+                    _ if text.contains(close) => return,
+                    _ => {}
+                }
+                prev = Some(*kind);
+            }
+            self.record_error(
+                ParseErrorKind::UnclosedIncludePath,
+                format!("unclosed .include filename, '{}' expected", close),
+            );
         }
 
         /// Parse a GNU make `load` or `-load` directive into a LOAD node.
@@ -13219,6 +13264,98 @@ test:
         assert_eq!(
             error_kinds("X = ${FOO\n", None),
             vec![ParseErrorKind::UnclosedReference]
+        );
+    }
+
+    #[test]
+    fn test_unclosed_bsd_include_path() {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            for (code, close) in [
+                (".include \"a\n", '"'),
+                (".include <a\n", '>'),
+                (".include \"a#b\"\n", '"'),
+                (". -include <a \\\n  b\n", '>'),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(
+                    parsed
+                        .errors
+                        .iter()
+                        .map(|e| (e.kind(), e.message.as_str(), e.line))
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        ParseErrorKind::UnclosedIncludePath,
+                        format!("unclosed .include filename, '{}' expected", close).as_str(),
+                        1
+                    )],
+                    "{code:?}"
+                );
+                assert_eq!(parsed.root().syntax().to_string(), code);
+            }
+            for code in [
+                ".include \"a\"\n",
+                ".include <a> # c\n",
+                ".include <a \\\n b>\n",
+                ".include \"${X:S/a/b/}\"\n",
+                ".include \"a\"\"\n",
+            ] {
+                assert_eq!(error_kinds(code, variant), vec![], "{code:?}");
+            }
+        }
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            assert_eq!(error_kinds("include \"a\n", variant), vec![]);
+            assert_eq!(error_kinds("include <a\n", variant), vec![]);
+        }
+    }
+
+    #[test]
+    fn test_undelimited_bsd_include_path() {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            for code in [
+                ".include a.mk\n",
+                ".include ${X}\n",
+                ". sinclude a\"b\"\n",
+                ".include \\\n  a.mk # c\n",
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(
+                    parsed
+                        .errors
+                        .iter()
+                        .map(|e| (e.kind(), e.message.as_str(), e.line))
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        ParseErrorKind::UndelimitedIncludePath,
+                        ".include filename must be delimited by \"\" or <>",
+                        if code.contains('\\') { 2 } else { 1 }
+                    )],
+                    "{code:?}"
+                );
+                assert_eq!(parsed.root().syntax().to_string(), code);
+            }
+            assert_eq!(
+                error_kinds(".include\n", variant),
+                vec![ParseErrorKind::MissingIncludePath]
+            );
+            assert_eq!(
+                error_kinds(".include # c\n", variant),
+                vec![ParseErrorKind::MissingIncludePath]
+            );
+        }
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            assert_eq!(error_kinds("include a.mk $(X)\n", variant), vec![]);
+        }
+        assert_eq!(
+            error_kinds("!INCLUDE win32.mak\n", Some(MakefileVariant::NMake)),
+            vec![]
         );
     }
 
