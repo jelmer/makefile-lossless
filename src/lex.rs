@@ -321,7 +321,7 @@ impl<'a> Lexer<'a> {
                         let kind = if len > 1 {
                             SyntaxKind::OPERATOR
                         } else {
-                            SyntaxKind::ERROR
+                            SyntaxKind::TEXT
                         };
                         Some((kind, text))
                     }
@@ -388,10 +388,11 @@ impl<'a> Lexer<'a> {
                         self.pending_backslash_escape = !escaped;
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
+                    // Any other character is plain text to make.
                     _ => {
                         self.input.next();
                         self.after_lbracket = c == '[';
-                        Some((SyntaxKind::ERROR, c.to_string()))
+                        Some((SyntaxKind::TEXT, c.to_string()))
                     }
                 },
             }
@@ -588,9 +589,9 @@ rule: prerequisite
             (LBRACE, "{".to_string()),
             (IDENTIFIER, "L".to_string()),
             (OPERATOR, ":".to_string()),
-            (ERROR, "[".to_string()),
-            (ERROR, "#".to_string()),
-            (ERROR, "]".to_string()),
+            (TEXT, "[".to_string()),
+            (TEXT, "#".to_string()),
+            (TEXT, "]".to_string()),
             (RBRACE, "}".to_string()),
             (NEWLINE, "\n".to_string()),
         ];
@@ -605,7 +606,7 @@ rule: prerequisite
                 (LBRACE, "{".to_string()),
                 (IDENTIFIER, "L".to_string()),
                 (OPERATOR, ":".to_string()),
-                (ERROR, "[".to_string()),
+                (TEXT, "[".to_string()),
                 (COMMENT, "#]}".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
@@ -681,6 +682,26 @@ rule: prerequisite
                 (IDENTIFIER, "X".to_string()),
                 (OPERATOR, "=".to_string()),
                 (IDENTIFIER, "1".to_string()),
+                (NEWLINE, "\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_punctuation_is_text() {
+        assert_eq!(
+            lex_default("X = a && b\n"),
+            vec![
+                (IDENTIFIER, "X".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (OPERATOR, "=".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "a".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (TEXT, "&".to_string()),
+                (TEXT, "&".to_string()),
+                (WHITESPACE, " ".to_string()),
+                (IDENTIFIER, "b".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
         );

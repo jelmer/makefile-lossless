@@ -469,7 +469,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     true
                 }
                 // Characters such as `*` in `*.o: *.c`
-                Some(ERROR) => {
+                Some(TEXT) => {
                     self.bump();
                     true
                 }
@@ -569,8 +569,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.bump();
                     }
                     // The rest of the line after a `;` is the first recipe line.
-                    Some(ERROR) if self.at_text(";") => break,
-                    Some(ERROR) if !seen_pipe && self.at_text("|") => {
+                    Some(TEXT) if self.at_text(";") => break,
+                    Some(TEXT) if !seen_pipe && self.at_text("|") => {
                         seen_pipe = true;
                         self.bump_as(OPERATOR);
                     }
@@ -615,7 +615,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match kind {
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
-                    ERROR if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
+                    TEXT if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
                     DOLLAR => self.parse_variable_reference(),
                     _ => self.bump(),
                 }
@@ -925,7 +925,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_static_pattern();
                     }
                     self.parse_rule_dependencies();
-                    if self.current() == Some(ERROR) && self.at_text(";") {
+                    if self.current() == Some(TEXT) && self.at_text(";") {
                         self.parse_inline_recipe();
                     } else {
                         self.expect_eol();
@@ -955,7 +955,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         escaped = false;
                         continue;
                     }
-                    (NEWLINE | COMMENT, _) | (ERROR, ";") => return false,
+                    (NEWLINE | COMMENT, _) | (TEXT, ";") => return false,
                     (DOLLAR, _) if !Self::skip_variable_reference(&mut tokens) => return false,
                     _ => {}
                 }
@@ -1135,7 +1135,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Try to parse another target
                 match self.current() {
-                    Some(IDENTIFIER | DOLLAR | ERROR) => {
+                    Some(IDENTIFIER | DOLLAR | TEXT) => {
                         if !self.parse_rule_target() {
                             break;
                         }
@@ -2633,7 +2633,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_rule();
                     true
                 }
-                Some(ERROR)
+                Some(TEXT)
                     if self.line_has_dependency_operator()
                         || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) =>
                 {
