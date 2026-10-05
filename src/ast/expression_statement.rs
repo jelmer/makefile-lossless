@@ -1,6 +1,7 @@
 //! Accessors for lines that consist only of variable references or function
 //! calls, such as `$(eval ...)` or `$(info ...)`.
 
+use super::logical_text;
 use crate::lossless::{lf_line_endings, ExpressionStatement, VariableReference};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -25,10 +26,14 @@ impl ExpressionStatement {
     /// Returns the text of the expression, without trailing whitespace,
     /// comment or newline.
     ///
+    /// This is the logical line as GNU make expands it: line continuations
+    /// are collapsed into a single space, CRLF line endings converted to LF
+    /// and `\#` outside variable references unescaped to `#`.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Makefile, MakefileItem};
-    /// let makefile: Makefile = "$(info a) $(info b) # log\n".parse().unwrap();
+    /// let makefile: Makefile = "$(info a) \\\n  $(info b) # log\n".parse().unwrap();
     /// let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
     ///     panic!("expected an expression statement");
     /// };
@@ -39,16 +44,15 @@ impl ExpressionStatement {
         let Some(first) = exprs.next() else {
             return String::new();
         };
-        let start = first.text_range().start();
-        let end = exprs.last().unwrap_or(first).text_range().end();
-        let offset = self.syntax().text_range().start();
-        lf_line_endings(
-            &self
-                .syntax()
-                .text()
-                .slice((start - offset)..(end - offset))
-                .to_string(),
-        )
+        let range = first
+            .text_range()
+            .cover(exprs.last().unwrap_or(first).text_range());
+        let tokens = self
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| range.contains_range(t.text_range()));
+        logical_text(self.syntax(), tokens, true)
     }
 
     /// Returns the text after a `;` following the references, or `None` if
@@ -160,5 +164,40 @@ mod tests {
             panic!("expected an expression statement");
         };
         assert_eq!(stmt.expression(), "$(error bad)");
+    }
+
+    fn statement_of(code: &str) -> crate::ExpressionStatement {
+        let parsed = Makefile::parse(code);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), code);
+        let items: Vec<_> = makefile.items().collect();
+        assert_eq!(items.len(), 1);
+        let MakefileItem::ExpressionStatement(stmt) = &items[0] else {
+            panic!("expected an expression statement");
+        };
+        stmt.clone()
+    }
+
+    #[test]
+    fn test_expression_continuation_inside_reference() {
+        let stmt = statement_of("$(info a \\\n   b) # c\n");
+        assert_eq!(stmt.expression(), "$(info a b)");
+    }
+
+    #[test]
+    fn test_expression_continuation_between_references() {
+        let stmt = statement_of("$(info a) \\\n  $(info b) # c\n");
+        assert_eq!(stmt.expression(), "$(info a) $(info b)");
+        assert_eq!(
+            stmt.references().map(|r| r.to_string()).collect::<Vec<_>>(),
+            vec!["$(info a)", "$(info b)"]
+        );
+    }
+
+    #[test]
+    fn test_expression_escaped_hash_in_reference() {
+        let stmt = statement_of("$(info a\\#b)\n");
+        assert_eq!(stmt.expression(), "$(info a\\#b)");
     }
 }

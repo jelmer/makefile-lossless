@@ -2383,7 +2383,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Make expands such lines for their side effects; anything else on
         /// the line (e.g. a colon) makes it a rule or assignment instead.
         fn is_expression_statement_line(&self) -> bool {
-            let mut tokens = self.tokens.iter().rev();
+            let mut tokens = self.tokens.iter().rev().peekable();
             let mut seen_reference = false;
             loop {
                 match tokens.next().map(|(kind, text)| (*kind, text.as_str())) {
@@ -2395,7 +2395,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         return seen_reference
                     }
-                    Some((WHITESPACE, _)) => {}
+                    Some((WHITESPACE | INDENT, _)) => {}
+                    Some((BACKSLASH, _)) if tokens.peek().is_some_and(|(k, _)| *k == NEWLINE) => {
+                        tokens.next();
+                    }
                     Some((DOLLAR, _)) => {
                         // Like make, only count the delimiter that opened the
                         // reference.
@@ -2430,7 +2433,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(EXPRESSION_STATEMENT.into());
             while self.current() == Some(DOLLAR) {
                 self.parse_variable_reference();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
             // When the references expand to nothing, make ignores the
             // rest of the line after a `;`.
@@ -13335,7 +13338,7 @@ mod test_crlf {
         let Some(MakefileItem::ExpressionStatement(stmt)) = makefile.items().next() else {
             panic!("expected an expression statement");
         };
-        assert_eq!(stmt.expression(), "$(info a \\\n  b)");
+        assert_eq!(stmt.expression(), "$(info a b)");
     }
 
     #[test]
