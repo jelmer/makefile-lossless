@@ -2252,9 +2252,15 @@ mod tests {
         assert_eq!(names, vec![".RECIPEPREFIX", "x", ".RECIPEPREFIX"]);
         assert_eq!(makefile.to_string(), text);
 
-        // BSD make has no `.RECIPEPREFIX`.
-        let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::BSDMake);
-        assert!(!parsed.ok());
+        // Only GNU make has `.RECIPEPREFIX`.
+        for variant in [
+            crate::MakefileVariant::BSDMake,
+            crate::MakefileVariant::POSIXMake,
+            crate::MakefileVariant::NMake,
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert!(!parsed.ok(), "{variant:?}");
+        }
     }
 
     /// Parse `text` as `variant`, check it round trips without errors and

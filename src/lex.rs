@@ -51,7 +51,7 @@ impl<'a> Lexer<'a> {
             line_type: None,
             pending_backslash_escape: false,
             bsd: matches!(variant, None | Some(MakefileVariant::BSDMake)),
-            gnu: variant != Some(MakefileVariant::BSDMake),
+            gnu: matches!(variant, None | Some(MakefileVariant::GNUMake)),
             hash_in_references: !matches!(
                 variant,
                 Some(MakefileVariant::BSDMake | MakefileVariant::NMake)
@@ -390,8 +390,8 @@ impl<'a> Lexer<'a> {
                         let text = self.input.by_ref().take(len).collect();
                         Some((SyntaxKind::OPERATOR, text))
                     }
-                    // BSD make has no grouped targets, and takes the `&` in
-                    // `a b &: c` as a target.
+                    // Only GNU make has grouped targets; other makes take
+                    // the `&` in `a b &: c` as a target.
                     '&' if self.gnu => {
                         // `&:` and `&::` separate grouped targets from their
                         // prerequisites; any other `&` is just a character.
