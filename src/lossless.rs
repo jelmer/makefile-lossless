@@ -2701,15 +2701,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.in_rule = RuleContext::Outside;
             self.builder.start_node(INCLUDE.into());
 
-            // Consume include keyword variant
             let directive = self.directive();
-            if let Some((_, count)) = directive {
+            // GNU make silently accepts an `include` without any file names,
+            // unlike POSIX make, BSD make and nmake.
+            let required = if let Some((_, count)) = directive {
                 self.bump_n(count);
+                true
             } else if self.current() == Some(IDENTIFIER)
                 && ["include", "-include", "sinclude"]
                     .contains(&self.tokens.last().unwrap().1.as_str())
             {
                 self.bump();
+                !self.gnu_directives_enabled()
             } else {
                 self.error(
                     ParseErrorKind::Other,
@@ -2717,7 +2720,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 );
                 self.builder.finish_node();
                 return;
-            }
+            };
             // Make does not group the quotes around a path: BSD make reads
             // them as delimiters and GNU make as part of the file name, so
             // what is between them is an ordinary expression.
@@ -2730,7 +2733,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if directive.is_some() && self.variant != Some(MakefileVariant::NMake) {
                 self.check_include_delimiters();
             }
-            self.parse_file_list("include", true);
+            self.parse_file_list("include", required);
             self.builder.finish_node();
         }
 
@@ -2814,7 +2817,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if required && !found_path {
-                self.error(
+                self.record_error(
                     ParseErrorKind::MissingIncludePath,
                     format!("expected file path after {}", directive),
                 );
@@ -8707,6 +8710,71 @@ all: $(OBJS)
     }
 
     #[test]
+    fn test_include_without_files() {
+        // GNU make accepts an include without any file names.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for text in [
+                "include\n",
+                "include",
+                "-include\n",
+                "sinclude\n",
+                "include \n",
+                "include # comment\n",
+                "include\nall:\n",
+            ] {
+                let parsed = parse(text, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {text:?}");
+                let root = parsed.root();
+                assert_eq!(root.to_string(), text);
+                let includes: Vec<_> = root.includes().collect();
+                assert_eq!(includes.len(), 1);
+                assert_eq!(includes[0].path(), Some(String::new()));
+                assert_eq!(
+                    root.included_files().collect::<Vec<_>>(),
+                    Vec::<String>::new()
+                );
+                assert_eq!(root.rules().count(), text.matches("all:").count());
+            }
+        }
+    }
+
+    #[test]
+    fn test_include_without_files_error() {
+        for (text, variant) in [
+            ("include\nall:\n", MakefileVariant::POSIXMake),
+            ("include\nall:\n", MakefileVariant::BSDMake),
+            ("-include\nall:\n", MakefileVariant::BSDMake),
+            (".include\nall:\n", MakefileVariant::BSDMake),
+            ("!include\nall:\n", MakefileVariant::NMake),
+        ] {
+            let parsed = parse(text, Some(variant));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(ErrorInfo::kind)
+                    .collect::<Vec<_>>(),
+                vec![ParseErrorKind::MissingIncludePath],
+                "{variant:?} {text:?}"
+            );
+            let root = parsed.root();
+            assert_eq!(root.to_string(), text);
+            assert_eq!(
+                root.rules()
+                    .map(|r| r.targets().collect())
+                    .collect::<Vec<Vec<_>>>(),
+                vec![vec!["all".to_string()]],
+                "{variant:?} {text:?}"
+            );
+        }
+        // BSD make's .include always needs a file name.
+        assert_eq!(
+            error_kinds(".include\n", None),
+            vec![ParseErrorKind::MissingIncludePath]
+        );
+    }
+
+    #[test]
     fn test_bare_function_call_semicolon_continuation() {
         for src in [
             "$(info a);echo \\\n more\nall:\n",
@@ -14047,7 +14115,7 @@ test:
             vec![ParseErrorKind::MissingEndef]
         );
         assert_eq!(
-            error_kinds("include\n", None),
+            error_kinds("include\n", Some(MakefileVariant::POSIXMake)),
             vec![ParseErrorKind::MissingIncludePath]
         );
         assert_eq!(

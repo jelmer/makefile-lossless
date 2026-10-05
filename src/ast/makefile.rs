@@ -1431,10 +1431,11 @@ impl Makefile {
         // Start collection from the root node
         let includes = collect_includes(self.syntax());
 
-        // Convert to an iterator of paths
+        // Skip includes without file names, such as a bare `include`.
         includes
             .into_iter()
-            .map(|include| include.path().unwrap_or_default())
+            .filter_map(|include| include.path())
+            .filter(|path| !path.is_empty())
     }
 
     /// Find the first rule with a specific target name
