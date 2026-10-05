@@ -24,18 +24,24 @@ impl VariableDefinition {
     /// Internal: the leading directive keywords (`export`/`override`/
     /// `private`/`define`/`undefine`). A keyword only counts as one when
     /// another word follows it, so `undefine = 1` assigns to a variable
-    /// named `undefine`.
+    /// named `undefine`. The exception is a lone keyword without an
+    /// assignment operator, such as a bare `export`.
     fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
         let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
         let mut in_word = false;
-        for it in self
-            .syntax()
-            .children_with_tokens()
-            .take_while(|it| !matches!(it.kind(), OPERATOR | NEWLINE | COMMENT))
-        {
-            if it.kind() == WHITESPACE {
-                in_word = false;
-                continue;
+        let mut has_operator = false;
+        for it in self.syntax().children_with_tokens() {
+            match it.kind() {
+                OPERATOR => {
+                    has_operator = true;
+                    break;
+                }
+                NEWLINE | COMMENT => break,
+                WHITESPACE => {
+                    in_word = false;
+                    continue;
+                }
+                _ => {}
             }
             if !in_word {
                 words.push(Vec::new());
@@ -43,22 +49,26 @@ impl VariableDefinition {
             }
             words.last_mut().unwrap().push(it);
         }
-        let count = words.len().saturating_sub(1);
+        let keyword = |word: &[crate::lossless::SyntaxElement]| match word {
+            [rowan::NodeOrToken::Token(t)]
+                if t.kind() == IDENTIFIER
+                    && matches!(
+                        t.text(),
+                        "export" | "override" | "private" | "define" | "undefine"
+                    ) =>
+            {
+                Some(t.clone())
+            }
+            _ => None,
+        };
+        let count = match words.as_slice() {
+            [word] if !has_operator && keyword(word).is_some() => 1,
+            _ => words.len().saturating_sub(1),
+        };
         words
-            .into_iter()
+            .iter()
             .take(count)
-            .map_while(|word| match word.as_slice() {
-                [rowan::NodeOrToken::Token(t)]
-                    if t.kind() == IDENTIFIER
-                        && matches!(
-                            t.text(),
-                            "export" | "override" | "private" | "define" | "undefine"
-                        ) =>
-                {
-                    Some(t.clone())
-                }
-                _ => None,
-            })
+            .map_while(|word| keyword(word))
             .collect()
     }
 
@@ -149,9 +159,9 @@ impl VariableDefinition {
 
     /// Check if this variable definition is exported
     pub fn is_export(&self) -> bool {
-        self.syntax()
-            .children_with_tokens()
-            .any(|it| it.as_token().is_some_and(|token| token.text() == "export"))
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "export")
     }
 
     /// Check if this variable definition uses the `override` directive
@@ -168,10 +178,9 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("CC".to_string()));
     /// ```
     pub fn is_override(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| {
-            it.as_token()
-                .is_some_and(|token| token.text() == "override")
-        })
+        self.directive_keywords()
+            .iter()
+            .any(|t| t.text() == "override")
     }
 
     /// Check if this variable definition uses the `private` modifier
@@ -454,7 +463,7 @@ impl VariableDefinition {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     use crate::lossless::Makefile;
 
     #[test]
@@ -735,6 +744,97 @@ mod tests {
         let var = makefile.variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("private".to_string()));
         assert!(!var.is_private());
+    }
+
+    #[test]
+    fn test_private() {
+        let makefile: Makefile = "private X = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some("=".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(var.is_private());
+        assert!(!var.is_export());
+        assert!(!var.is_override());
+    }
+
+    #[test]
+    fn test_private_export() {
+        let makefile: Makefile = "private export X := 2\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("2".to_string()));
+        assert!(var.is_private());
+        assert!(var.is_export());
+        assert!(!var.is_override());
+        assert_eq!(makefile.to_string(), "private export X := 2\n");
+    }
+
+    #[test]
+    fn test_override_as_variable_name() {
+        let makefile: Makefile = "override := 2\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("override".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("2".to_string()));
+        assert!(!var.is_override());
+    }
+
+    #[test]
+    fn test_export_as_variable_name() {
+        let makefile: Makefile = "export = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("export".to_string()));
+        assert_eq!(var.raw_value(), Some("1".to_string()));
+        assert!(!var.is_export());
+    }
+
+    /// Build a VARIABLE node directly, for directive forms the parser
+    /// does not produce yet.
+    fn variable_from_tokens(tokens: &[(crate::SyntaxKind, &str)]) -> VariableDefinition {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(VARIABLE.into());
+        for (kind, text) in tokens {
+            builder.token((*kind).into(), text);
+        }
+        builder.finish_node();
+        VariableDefinition::cast(SyntaxNode::new_root_mut(builder.finish())).unwrap()
+    }
+
+    #[test]
+    fn test_bare_keyword_directive() {
+        // A bare `export` (export all variables) does not parse cleanly yet,
+        // so check the keyword logic on the tree it would produce.
+        let var = variable_from_tokens(&[(IDENTIFIER, "export"), (NEWLINE, "\n")]);
+        assert!(var.is_export());
+        assert!(!var.is_override());
+        assert_eq!(var.name(), None);
+
+        let var = variable_from_tokens(&[
+            (IDENTIFIER, "export"),
+            (WHITESPACE, " "),
+            (COMMENT, "# all"),
+            (NEWLINE, "\n"),
+        ]);
+        assert!(var.is_export());
+        assert_eq!(var.name(), None);
+
+        let var = variable_from_tokens(&[(IDENTIFIER, "override"), (WHITESPACE, " ")]);
+        assert!(var.is_override());
+        assert!(!var.is_export());
+        assert_eq!(var.name(), None);
+    }
+
+    #[test]
+    fn test_override_keyword_named_variable() {
+        // GNU make treats this as an override of a variable named `export`.
+        let makefile: Makefile = "override export = 5\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("export".to_string()));
+        assert_eq!(var.raw_value(), Some("5".to_string()));
+        assert!(var.is_override());
+        assert!(!var.is_export());
     }
 
     #[test]

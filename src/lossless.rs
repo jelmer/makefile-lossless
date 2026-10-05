@@ -813,24 +813,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Whether the current token is an `export`/`override`/`private`
+        /// modifier. A keyword directly followed by an operator is the
+        /// variable name itself, as in `override := 1`.
+        fn at_assignment_prefix_keyword(&self) -> bool {
+            self.current() == Some(IDENTIFIER)
+                && matches!(
+                    self.tokens.last().unwrap().1.as_str(),
+                    "export" | "override" | "private"
+                )
+                && self.peek_past_ws() != Some(OPERATOR)
+        }
+
         fn parse_assignment(&mut self) {
             self.builder.start_node(VARIABLE.into());
 
-            // Handle `override` and `export` prefixes (in either order). Both
-            // are independent modifiers on a variable assignment.
+            // Handle `export`/`override`/`private` modifiers, in any order.
             self.skip_ws();
-            for _ in 0..2 {
-                if self.current() == Some(IDENTIFIER)
-                    && matches!(
-                        self.tokens.last().unwrap().1.as_str(),
-                        "export" | "override"
-                    )
-                {
-                    self.bump();
-                    self.skip_ws();
-                } else {
-                    break;
-                }
+            while self.at_assignment_prefix_keyword() {
+                self.bump();
+                self.skip_ws();
             }
 
             // `undefine NAME`, unless followed by an operator as in
@@ -2042,7 +2044,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while let Some((kind, text)) = tokens.next() {
                 match kind {
                     NEWLINE => break,
-                    IDENTIFIER if matches!(text.as_str(), "export" | "override" | "undefine") => {
+                    IDENTIFIER
+                        if matches!(
+                            text.as_str(),
+                            "export" | "override" | "private" | "undefine"
+                        ) =>
+                    {
                         seen_directive = true
                     }
                     IDENTIFIER if !name_done => seen_name = true,
