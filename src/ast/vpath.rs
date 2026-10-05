@@ -1,6 +1,7 @@
 //! Accessors for `vpath` directives.
 
-use crate::lossless::{node_text, Vpath};
+use super::{collapse_continuations, is_continuation};
+use crate::lossless::Vpath;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -25,7 +26,7 @@ impl Vpath {
                         }
                         continue;
                     }
-                    if t.kind() == WHITESPACE {
+                    if t.kind() == WHITESPACE || is_continuation(&t.clone().into()) {
                         if out.is_empty() {
                             continue;
                         } else {
@@ -51,13 +52,14 @@ impl Vpath {
         }
     }
 
-    /// Returns the raw directory-list text (everything after the pattern),
-    /// or `None` if the directive has no directories.
+    /// Returns the raw directory-list text (everything after the pattern)
+    /// with line continuations collapsed, or `None` if the directive has no
+    /// directories.
     pub fn directories_text(&self) -> Option<String> {
         self.syntax()
             .children()
             .find(|c| c.kind() == EXPR)
-            .map(|n| node_text(&n))
+            .map(|n| collapse_continuations(&n))
     }
 }
 
@@ -115,5 +117,26 @@ mod tests {
             vpath_of("vpath %.c src:lib\n").directories_text(),
             Some("src:lib".to_string())
         );
+    }
+
+    #[test]
+    fn test_line_continuation() {
+        let code = "vpath %.c src \\\n  lib\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().syntax().to_string(), code);
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("src lib".to_string()));
+    }
+
+    #[test]
+    fn test_line_continuation_after_pattern() {
+        let code = "vpath \\\n  %.c\\\n  src:lib\n";
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.syntax().to_string(), code);
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("src:lib".to_string()));
     }
 }

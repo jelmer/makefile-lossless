@@ -1,8 +1,9 @@
 use super::bsd::keyword_token;
+use super::collapse_continuations;
 use super::makefile::MakefileItem;
 use crate::lossless::{
-    lf_line_endings, line_col_at_offset, node_text, remove_with_preceding_comments, Conditional,
-    Error, ErrorInfo, Lang, ParseError, Recipe,
+    lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
+    ErrorInfo, Lang, ParseError, Recipe,
 };
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -176,7 +177,7 @@ impl ConditionalBranch {
     /// ```
     pub fn condition(&self) -> Option<String> {
         let expr = self.header.children().find(|it| it.kind() == EXPR)?;
-        Some(node_text(&expr).trim().to_string())
+        Some(collapse_continuations(&expr).trim().to_string())
     }
 
     /// For an `ifeq` / `ifneq` branch, return the two argument strings
@@ -853,7 +854,7 @@ mod tests {
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
             vec![
-                branch(Some("ifeq"), Some("($(A),\\\n  a)"), 0, &["var X=1"]),
+                branch(Some("ifeq"), Some("($(A), a)"), 0, &["var X=1"]),
                 branch(Some("ifneq"), Some("\"$(A)\" 'b'"), 3, &["var X=2"]),
                 branch(Some("ifdef"), Some("C"), 5, &[]),
                 branch(None, None, 6, &["var X=3"]),
@@ -862,13 +863,13 @@ mod tests {
         assert_eq!(
             cond.branches().map(|b| b.ifeq_args()).collect::<Vec<_>>(),
             vec![
-                Some(("$(A)".to_string(), "\\\n  a".to_string())),
+                Some(("$(A)".to_string(), "a".to_string())),
                 Some(("$(A)".to_string(), "b".to_string())),
                 None,
                 None,
             ]
         );
-        assert_eq!(cond.condition(), Some("($(A),\\\n  a)".to_string()));
+        assert_eq!(cond.condition(), Some("($(A), a)".to_string()));
     }
 
     #[test]
@@ -1085,5 +1086,40 @@ endif
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
         assert_eq!(makefile.code(), "ifeq ($(X),y)\nA = 1\nB = 2\nendif\n");
+    }
+
+    #[test]
+    fn test_ifdef_line_continuation() {
+        let code = "ifdef \\\n  X\nA = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.rules().count(), 0);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("X".to_string()));
+        assert_eq!(cond.if_items().count(), 1);
+    }
+
+    #[test]
+    fn test_ifeq_quoted_line_continuation() {
+        let code = "ifeq \"a\" \\\n  \"b\"\nA = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("\"a\" \"b\"".to_string()));
+        assert_eq!(cond.ifeq_args(), Some(("a".to_string(), "b".to_string())));
+        assert_eq!(cond.if_items().count(), 1);
+    }
+
+    #[test]
+    fn test_ifeq_parenthesized_line_continuation() {
+        let code = "ifeq ($(A),\\\n  b)\nA = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("($(A), b)".to_string()));
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("$(A)".to_string(), "b".to_string()))
+        );
     }
 }

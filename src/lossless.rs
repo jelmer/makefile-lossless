@@ -1020,7 +1020,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     "export" | "unexport"
                 );
                 self.bump();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
 
             // `undefine NAME`, unless followed by an operator as in
@@ -1030,7 +1030,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 && self.peek_past_ws() != Some(OPERATOR);
             if is_undefine {
                 self.bump();
-                self.skip_ws();
+                self.skip_ws_and_continuations();
             }
 
             // A bare "export"/"unexport" with no names applies to all
@@ -1044,6 +1044,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if is_undefine {
+                self.skip_ws_and_continuations();
                 self.expect_eol();
                 self.builder.finish_node();
                 return;
@@ -1065,7 +1066,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             // Skip whitespace and parse operator
-            self.skip_ws();
+            self.skip_ws_and_continuations();
 
             // A bare "export"/"unexport" directive may list several variables.
             // With an assignment, GNU make treats "A B" as a single name, which
@@ -1078,7 +1079,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         Some(DOLLAR) => self.parse_variable_reference(),
                         _ => break,
                     }
-                    self.skip_ws();
+                    self.skip_ws_and_continuations();
                 }
             }
             match self.current() {
@@ -1372,7 +1373,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             // Skip whitespace between the two arguments
-            self.skip_ws();
+            self.skip_ws_and_continuations();
 
             // Second quoted string - lexer already tokenized the entire string
             if self.current() == Some(QUOTE) {
@@ -1425,6 +1426,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
+                    Some(BACKSLASH) if self.is_line_continuation() => {
+                        self.consume_line_continuation();
+                    }
                     Some(DOLLAR) => {
                         found_var = true;
                         self.parse_variable_reference();
@@ -1507,12 +1511,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 match next_token.as_str() {
                                     "ifdef" | "ifndef" => {
                                         self.bump(); // Consume the directive token
-                                        self.skip_ws();
+                                        self.skip_ws_and_continuations();
                                         self.parse_simple_condition();
                                     }
                                     "ifeq" | "ifneq" => {
                                         self.bump(); // Consume the directive token
-                                        self.skip_ws();
+                                        self.skip_ws_and_continuations();
                                         self.parse_parenthesized_expr();
                                     }
                                     _ => unreachable!(),
@@ -1599,7 +1603,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             };
 
             // Skip whitespace after keyword
-            self.skip_ws();
+            self.skip_ws_and_continuations();
 
             // Parse the condition based on keyword type
             match token.as_str() {
@@ -1788,7 +1792,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.builder.finish_node();
                 return;
             }
-            self.skip_ws();
+            self.skip_ws_and_continuations();
 
             // Parse file paths
             self.builder.start_node(EXPR.into());
@@ -1797,6 +1801,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             while !self.is_at_eof() && self.current() != Some(NEWLINE) {
                 match self.current() {
                     Some(WHITESPACE) => self.skip_ws(),
+                    Some(BACKSLASH) if self.is_line_continuation() => {
+                        self.consume_line_continuation();
+                    }
                     Some(DOLLAR) => {
                         found_path = true;
                         self.parse_variable_reference();
@@ -1841,7 +1848,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(VPATH.into());
             // Consume the `vpath` keyword.
             self.bump();
-            self.skip_ws();
+            self.skip_ws_and_continuations();
 
             // Optional pattern (rest of header until whitespace).
             if self.current().is_some() && self.current() != Some(NEWLINE) {
@@ -1849,16 +1856,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 while let Some(kind) = self.current() {
                     match kind {
                         WHITESPACE | NEWLINE => break,
+                        BACKSLASH if self.is_line_continuation() => break,
                         _ => self.bump(),
                     }
                 }
-                self.skip_ws();
+                self.skip_ws_and_continuations();
 
                 // Optional directory list (everything else on the line).
                 if self.current().is_some() && self.current() != Some(NEWLINE) {
                     self.builder.start_node(EXPR.into());
                     while self.current().is_some() && self.current() != Some(NEWLINE) {
-                        self.bump();
+                        if !self.consume_line_continuation() {
+                            self.bump();
+                        }
                     }
                     self.builder.finish_node();
                 }
@@ -11231,11 +11241,48 @@ mod test_crlf {
     fn test_condition_continuation() {
         let makefile = parse_crlf("ifeq ($(X),\\\r\n  y)\r\nA = 1\r\nendif\r\n");
         let conditional = makefile.conditionals().next().unwrap();
-        assert_eq!(conditional.condition(), Some("($(X),\\\n  y)".to_string()));
+        assert_eq!(conditional.condition(), Some("($(X), y)".to_string()));
         assert_eq!(
             conditional.ifeq_args(),
-            Some(("$(X)".to_string(), "\\\n  y".to_string()))
+            Some(("$(X)".to_string(), "y".to_string()))
         );
+    }
+
+    #[test]
+    fn test_ifdef_continuation() {
+        let makefile = parse_crlf("ifdef \\\r\n  X\r\nA = 1\r\nendif\r\n");
+        assert_eq!(makefile.rules().count(), 0);
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.condition(), Some("X".to_string()));
+        assert_eq!(conditional.if_body(), Some("A = 1\n".to_string()));
+    }
+
+    #[test]
+    fn test_include_continuation() {
+        let makefile = parse_crlf("include a.mk \\\r\n  b.mk\r\nc.mk: d\r\n");
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["a.mk b.mk"]
+        );
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_vpath_continuation() {
+        let makefile = parse_crlf("vpath \\\r\n  %.c src \\\r\n  lib\r\n");
+        let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else {
+            panic!("expected a vpath directive");
+        };
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("src lib".to_string()));
+    }
+
+    #[test]
+    fn test_export_continuation() {
+        let makefile = parse_crlf("export X \\\r\n  Y\r\n");
+        assert_eq!(makefile.rules().count(), 0);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.names().collect::<Vec<_>>(), vec!["X", "Y"]);
     }
 
     #[test]
