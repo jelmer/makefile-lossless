@@ -2080,11 +2080,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
-                // before looking at what it contains. Of a run of
-                // whitespace, only the first character is the name.
-                match self.tokens.last() {
-                    Some((WHITESPACE, text)) if text.len() > 1 => self.bump_token_head(1),
-                    _ => self.bump(),
+                // before looking at what it contains. Only the first
+                // character of a token such as `XY` or a run of whitespace is
+                // the name.
+                let text = &self.tokens.last().unwrap().1;
+                let first_len = text.chars().next().unwrap().len_utf8();
+                if text.len() > first_len {
+                    self.bump_token_head(first_len);
+                } else {
+                    self.bump();
                 }
             }
             // A `$` at the end of a line is accepted by both GNU and BSD
@@ -5736,6 +5740,38 @@ mod tests {
             ),
             vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i", "$$"]
         );
+    }
+
+    #[test]
+    fn test_single_character_reference_covers_one_character() {
+        // Make reads `$XY` as the value of `X` followed by `Y`.
+        for variant in [
+            MakefileVariant::GNUMake,
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            assert_eq!(
+                reference_texts("V = $XY $i/small $$x\n", variant),
+                vec!["$X", "$i", "$$"],
+                "{variant:?}"
+            );
+            assert_eq!(
+                reference_texts("$XY: $@a\n", variant),
+                vec!["$X", "$@"],
+                "{variant:?}"
+            );
+        }
+        let makefile = Makefile::parse("V = $XY\n").tree();
+        assert_eq!(
+            makefile
+                .variable_references()
+                .map(|r| (r.name(), r.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(Some("X".to_string()), "$X".to_string())]
+        );
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.raw_value(), Some("$XY".to_string()));
     }
 
     #[test]
