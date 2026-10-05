@@ -6138,6 +6138,94 @@ mod tests {
     }
 
     #[test]
+    fn test_nmake_space_indented_commands() {
+        // In nmake a command line begins with one or more spaces or tabs.
+        let code = "all: foo.obj\n    link foo.obj\n  echo a \\\n b\n\techo c\n";
+        let parsed = parse(code, Some(MakefileVariant::NMake));
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n    PREREQUISITE\n  RECIPE\n  RECIPE\n  RECIPE\n"
+        );
+        let rule = root.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["link foo.obj", "echo a \\\n b", "echo c"]
+        );
+    }
+
+    #[test]
+    fn test_nmake_space_indented_command_after_inline_command() {
+        let code = "foo.obj: foo.c ; cl /c foo.c\n  echo done\nbar:\n";
+        let parsed = parse(code, Some(MakefileVariant::NMake));
+        assert_eq!(parsed.errors, vec![]);
+        let root = parsed.root();
+        assert_eq!(root.to_string(), code);
+        let rules = root.rules().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec!["cl /c foo.c", "echo done"]
+        );
+        assert_eq!(rules[1].targets().collect::<Vec<_>>(), vec!["bar"]);
+    }
+
+    #[test]
+    fn test_space_indented_line_after_rule_not_nmake() {
+        // Elsewhere only a tab starts a recipe line.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            let code = "all:\n  X = 1\n";
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(parsed.root().to_string(), code);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\nVARIABLE\n  EXPR\n",
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nmake_space_indented_line_outside_rule() {
+        // Outside of a rule, nmake handles a space-indented line just like a
+        // tab-indented one.
+        for (code, tab_code) in [
+            ("X = 1\n  Y = 2\nall:\n", "X = 1\n\tY = 2\nall:\n"),
+            ("X = 1\n  # c\n  \nall:\n", "X = 1\n\t# c\n\t\nall:\n"),
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::NMake));
+            let tab_parsed = parse(tab_code, Some(MakefileVariant::NMake));
+            assert_eq!(parsed.root().to_string(), code);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                node_kinds(&tab_parsed.syntax()),
+                "{code:?}"
+            );
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.line, e.kind))
+                    .collect::<Vec<_>>(),
+                tab_parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.line, e.kind))
+                    .collect::<Vec<_>>(),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rule_continuation_before_second_target() {
         let code = "foo \\\n bar: baz\n";
         let parsed = parse(code, None);

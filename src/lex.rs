@@ -24,6 +24,9 @@ pub struct Lexer<'a> {
     /// Whether `#` inside a variable reference or function call is literal,
     /// as in GNU make, rather than the start of a comment.
     hash_in_references: bool,
+    /// Whether nmake syntax is accepted, where a line starting with spaces
+    /// is a command line too.
+    nmake: bool,
     /// Whether the previous token was a `[`. BSD make does not treat `#` as
     /// a comment there, so that the `:[#]` modifier works.
     after_lbracket: bool,
@@ -56,6 +59,7 @@ impl<'a> Lexer<'a> {
                 variant,
                 Some(MakefileVariant::BSDMake | MakefileVariant::NMake)
             ),
+            nmake: variant == Some(MakefileVariant::NMake),
             after_lbracket: false,
             recipe_continuation: false,
             reference_depth: 0,
@@ -304,8 +308,9 @@ impl<'a> Lexer<'a> {
                     self.continuation = false;
                     return Some((SyntaxKind::INDENT, "\t".to_string()));
                 }
-                (' ', None) if recipe_continuation => {
-                    // Space-indented continuation of a recipe line
+                (' ', None) if recipe_continuation || (self.nmake && !self.continuation) => {
+                    // A space-indented continuation of a recipe line, or an
+                    // nmake command line, which may start with spaces.
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, self.read_while(|ch| ch == ' ')));
                 }
@@ -1264,6 +1269,24 @@ override_dh_auto_clean:
                 (TEXT, "echo a \\"),
                 (NEWLINE, "\n"),
                 (INDENT, "    "),
+                (TEXT, "b"),
+                (NEWLINE, "\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nmake_space_indented_line() {
+        assert_eq!(
+            lex("  echo a \\\n b\n", Some(MakefileVariant::NMake))
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (INDENT, "  "),
+                (TEXT, "echo a \\"),
+                (NEWLINE, "\n"),
+                (INDENT, " "),
                 (TEXT, "b"),
                 (NEWLINE, "\n"),
             ]
