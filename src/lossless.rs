@@ -1507,12 +1507,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // Try to parse another target
                 match self.current() {
-                    Some(IDENTIFIER | DOLLAR | TEXT | BACKSLASH) => {
+                    Some(INDENT | NEWLINE | COMMENT | OPERATOR) | None => break,
+                    _ => {
                         if !self.parse_rule_target() {
                             break;
                         }
                     }
-                    _ => break,
                 }
             }
 

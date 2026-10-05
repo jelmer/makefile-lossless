@@ -301,36 +301,19 @@ impl Rule {
     fn extract_targets_from_node(node: &SyntaxNode) -> Vec<String> {
         let mut result = Vec::new();
         let mut current_target = String::new();
-        let mut in_parens = 0;
 
         for child in node.children_with_tokens() {
             if let Some(token) = child.as_token() {
                 match token.kind() {
-                    IDENTIFIER => {
-                        current_target.push_str(token.text());
-                    }
                     // Whitespace and line continuations (backslash-newline
-                    // plus the continued line's indent) delimit targets,
-                    // unless we're inside parentheses. The parser keeps an
-                    // escaped space as TEXT.
+                    // plus the continued line's indent) delimit targets. The
+                    // parser keeps an escaped space as TEXT, and whitespace
+                    // inside archive member parentheses is part of the nested
+                    // ARCHIVE_MEMBERS node.
                     kind if kind == WHITESPACE || is_continuation(&child) => {
-                        if in_parens == 0 && !current_target.is_empty() {
-                            result.push(current_target.clone());
-                            current_target.clear();
-                        } else if in_parens > 0 {
-                            current_target.push_str(token.text());
+                        if !current_target.is_empty() {
+                            result.push(std::mem::take(&mut current_target));
                         }
-                    }
-                    LPAREN => {
-                        in_parens += 1;
-                        current_target.push_str(token.text());
-                    }
-                    RPAREN => {
-                        in_parens -= 1;
-                        current_target.push_str(token.text());
-                    }
-                    DOLLAR => {
-                        current_target.push_str(token.text());
                     }
                     _ => {
                         current_target.push_str(token.text());
@@ -1373,8 +1356,8 @@ mod tests {
 
     #[test]
     fn test_targets_archive_member_keeps_inner_whitespace() {
-        // Whitespace inside the parentheses must not split the target: the
-        // in_parens depth counter keeps the whole member together.
+        // Whitespace inside the parentheses must not split the target: it is
+        // part of the nested ARCHIVE_MEMBERS node.
         let rule: Rule = "lib.a(a.o b.o): dep\n\tcmd".parse().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["lib.a(a.o b.o)"]);
     }
@@ -2138,6 +2121,53 @@ mod tests {
 
     fn targets(rule: &Rule) -> Vec<String> {
         rule.targets().collect()
+    }
+
+    #[test]
+    fn test_target_literal_text_around_reference() {
+        let cases: &[(&str, &[&str])] = &[
+            ("pre${X}}: dep\n", &["pre${X}}"]),
+            ("${:Ua}}: dep\n", &["${:Ua}}"]),
+            ("pre$(X)): dep\n", &["pre$(X))"]),
+            ("${X}}x y: dep\n", &["${X}}x", "y"]),
+            ("a) b: dep\n", &["a)", "b"]),
+            ("a}b x: dep\n", &["a}b", "x"]),
+            ("a, b: dep\n", &["a,", "b"]),
+            ("a\"b: dep\n", &["a\"b"]),
+        ];
+        for (input, expected) in cases {
+            let mut parsed = vec![Makefile::parse(input)];
+            for variant in [
+                crate::MakefileVariant::GNUMake,
+                crate::MakefileVariant::BSDMake,
+                crate::MakefileVariant::POSIXMake,
+                crate::MakefileVariant::NMake,
+            ] {
+                parsed.push(Makefile::parse_with_variant(input, variant));
+            }
+            for parsed in parsed {
+                assert_eq!(parsed.errors(), &[], "{input:?}");
+                let makefile = parsed.tree();
+                let rule = makefile.rules().next().unwrap();
+                assert_eq!(targets(&rule), *expected, "{input:?}");
+                assert_eq!(prereqs(&rule), (vec!["dep".to_string()], vec![]));
+                assert_eq!(makefile.to_string(), *input);
+            }
+        }
+    }
+
+    #[test]
+    fn test_prerequisite_literal_text_around_reference() {
+        let input = "all: a${X}b ${X}} | ${Y})c\n";
+        let rule: Rule = input.parse().unwrap();
+        assert_eq!(
+            prereqs(&rule),
+            (
+                vec!["a${X}b".to_string(), "${X}}".to_string()],
+                vec!["${Y})c".to_string()]
+            )
+        );
+        assert_eq!(rule.to_string(), input);
     }
 
     #[test]
