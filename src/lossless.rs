@@ -1248,8 +1248,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             };
             let open = if close == RPAREN { LPAREN } else { LBRACE };
             let mut depth = 1;
+            let mut backslashes = 0;
             for (kind, _) in tokens {
+                if *kind == BACKSLASH {
+                    backslashes += 1;
+                    continue;
+                }
+                let continued = backslashes % 2 == 1;
+                backslashes = 0;
                 match *kind {
+                    // A line continuation inside a reference doesn't end it.
+                    NEWLINE if continued => {}
                     NEWLINE => return false,
                     k if k == open => depth += 1,
                     k if k == close => {
@@ -12972,7 +12981,7 @@ mod test_crlf {
         assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a", "b"]);
         assert_eq!(
             rule.order_only_prerequisites().collect::<Vec<_>>(),
-            vec!["c", "$(wildcard d \\\n  e)"]
+            vec!["c", "$(wildcard d e)"]
         );
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
     }
