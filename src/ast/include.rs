@@ -1,6 +1,6 @@
 use super::makefile::MakefileItem;
 use crate::lossless::{remove_with_preceding_comments, Error, ErrorInfo, Include, ParseError};
-use crate::SyntaxKind::{EXPR, IDENTIFIER};
+use crate::SyntaxKind::{EXPR, IDENTIFIER, INCLUDE};
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode};
 
@@ -133,91 +133,30 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
     pub fn set_optional(&mut self, optional: bool) {
-        use crate::SyntaxKind::INCLUDE;
+        let Some(token) = self
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == IDENTIFIER)
+        else {
+            return;
+        };
+        let new_keyword = match (optional, token.text()) {
+            (true, "include") => "-include",
+            (false, "-include" | "sinclude") => "include",
+            _ => return,
+        };
 
-        // Find the first IDENTIFIER token (which is the include keyword)
-        let keyword_token = self.syntax().children_with_tokens().find(|it| {
-            it.as_token()
-                .map(|t| t.kind() == IDENTIFIER)
-                .unwrap_or(false)
-        });
-
-        if let Some(token_element) = keyword_token {
-            let token = token_element.as_token().unwrap();
-            let current_text = token.text();
-
-            let new_keyword = if optional {
-                // Make it optional
-                if current_text == "include" {
-                    "-include"
-                } else if current_text == "sinclude" || current_text == "-include" {
-                    // Already optional, no change needed
-                    return;
-                } else {
-                    // Shouldn't happen, but handle gracefully
-                    return;
-                }
-            } else {
-                // Make it non-optional
-                if current_text == "-include" || current_text == "sinclude" {
-                    "include"
-                } else if current_text == "include" {
-                    // Already non-optional, no change needed
-                    return;
-                } else {
-                    // Shouldn't happen, but handle gracefully
-                    return;
-                }
-            };
-
-            // Rebuild the entire INCLUDE node, replacing just the keyword token
-            let mut builder = GreenNodeBuilder::new();
-            builder.start_node(INCLUDE.into());
-
-            for child in self.syntax().children_with_tokens() {
-                match child {
-                    rowan::NodeOrToken::Token(tok)
-                        if tok.kind() == IDENTIFIER && tok.text() == current_text =>
-                    {
-                        // Replace the include keyword
-                        builder.token(IDENTIFIER.into(), new_keyword);
-                    }
-                    rowan::NodeOrToken::Token(tok) => {
-                        // Copy other tokens as-is
-                        builder.token(tok.kind().into(), tok.text());
-                    }
-                    rowan::NodeOrToken::Node(node) => {
-                        // For nodes (like EXPR), rebuild them
-                        builder.start_node(node.kind().into());
-                        for node_child in node.children_with_tokens() {
-                            if let rowan::NodeOrToken::Token(tok) = node_child {
-                                builder.token(tok.kind().into(), tok.text());
-                            }
-                        }
-                        builder.finish_node();
-                    }
-                }
-            }
-
-            builder.finish_node();
-            let new_include = SyntaxNode::new_root_mut(builder.finish());
-
-            // Replace the old INCLUDE node with the new one
-            let index = self.syntax().index();
-            if let Some(parent) = self.syntax().parent() {
-                parent.splice_children(index..index + 1, vec![new_include.clone().into()]);
-
-                // Update self to point to the new node
-                *self = Include::cast(
-                    parent
-                        .children_with_tokens()
-                        .nth(index)
-                        .and_then(|it| it.into_node())
-                        .unwrap(),
-                )
-                .unwrap();
-            }
-        }
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.token(IDENTIFIER.into(), new_keyword);
+        builder.finish_node();
+        let new_token = SyntaxNode::new_root_mut(builder.finish())
+            .first_token()
+            .unwrap();
+        let index = token.index();
+        self.syntax()
+            .splice_children(index..index + 1, vec![new_token.into()]);
     }
 }
 
@@ -494,5 +433,15 @@ mod tests {
         // Comment should also be removed
         assert_eq!(makefile.includes().count(), 0);
         assert!(!makefile.to_string().contains("# Comment"));
+    }
+
+    #[test]
+    fn test_set_optional_keeps_variable_references() {
+        let makefile: Makefile = "include $(TOP)/config.mk\n".parse().unwrap();
+        let mut inc = makefile.includes().next().unwrap();
+        inc.set_optional(true);
+        assert_eq!(makefile.to_string(), "-include $(TOP)/config.mk\n");
+        inc.set_optional(false);
+        assert_eq!(makefile.to_string(), "include $(TOP)/config.mk\n");
     }
 }
