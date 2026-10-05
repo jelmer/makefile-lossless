@@ -1177,4 +1177,25 @@ mod tests {
         );
         assert_eq!(makefile.rules().count(), 0);
     }
+
+    #[test]
+    fn test_continuation_before_operator() {
+        // As in Linux's drivers/scsi/Makefile.
+        for variant in [
+            None,
+            Some(crate::MakefileVariant::GNUMake),
+            Some(crate::MakefileVariant::BSDMake),
+        ] {
+            let text = "flags-$(CONFIG_X) \\\n\t\t:= -DA \\\n\t\t-DB\nY = 1\n";
+            let parsed = match variant {
+                None => crate::Makefile::parse(text),
+                Some(v) => crate::Makefile::parse_with_variant(text, v),
+            };
+            assert!(parsed.ok(), "{variant:?}");
+            let vars: Vec<_> = parsed.tree().variable_definitions().collect();
+            assert_eq!(vars.len(), 2, "{variant:?}");
+            assert_eq!(vars[0].name(), Some("flags-$(CONFIG_X)".to_string()));
+            assert_eq!(vars[0].assignment_operator(), Some(":=".to_string()));
+        }
+    }
 }

@@ -2796,6 +2796,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_name = true;
                     }
                     RPAREN | RBRACE => level -= 1,
+                    // A line continuation counts as whitespace.
+                    BACKSLASH if matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        while tokens
+                            .next_if(|(kind, _)| matches!(kind, INDENT | WHITESPACE))
+                            .is_some()
+                        {}
+                        seen_space = seen_name;
+                    }
                     _ if level != 0 => {}
                     WHITESPACE => seen_space = seen_name,
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
@@ -2875,6 +2884,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // It's a rule if we see a colon first
                     OPERATOR if matches!(text.as_str(), ":" | "::" | "&:" | "&::") => return false,
                     WHITESPACE => name_done = seen_name,
+                    // A line continuation counts as whitespace.
+                    BACKSLASH if matches!(tokens.peek(), Some((NEWLINE, _))) => {
+                        tokens.next();
+                        while tokens
+                            .next_if(|(kind, _)| matches!(kind, INDENT | WHITESPACE))
+                            .is_some()
+                        {}
+                        name_done = seen_name;
+                    }
                     _ if seen_directive => return true, // Everything after export/override is part of the assignment
                     _ => return false,
                 }
