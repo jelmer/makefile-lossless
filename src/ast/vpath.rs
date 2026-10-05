@@ -1,6 +1,6 @@
 //! Accessors for `vpath` directives.
 
-use super::{collapse_continuations, is_continuation};
+use super::{is_continuation, logical_text, LineSyntax};
 use crate::lossless::Vpath;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -11,12 +11,14 @@ impl Vpath {
     /// `vpath` (no args) returns `None`.
     /// `vpath PATTERN`     returns `Some("PATTERN")`.
     /// `vpath PATTERN DIRS` returns `Some("PATTERN")`.
+    ///
+    /// `\#` is unescaped as GNU make does.
     pub fn pattern(&self) -> Option<String> {
         // Walk tokens: skip the leading `vpath` keyword and whitespace,
         // then collect tokens up to the next whitespace or to the EXPR
         // (directories) node.
         let mut after_keyword = false;
-        let mut out = String::new();
+        let mut tokens = Vec::new();
         for child in self.syntax().children_with_tokens() {
             match child {
                 rowan::NodeOrToken::Token(t) => {
@@ -27,7 +29,7 @@ impl Vpath {
                         continue;
                     }
                     if t.kind() == WHITESPACE || is_continuation(&t.clone().into()) {
-                        if out.is_empty() {
+                        if tokens.is_empty() {
                             continue;
                         } else {
                             break;
@@ -36,7 +38,7 @@ impl Vpath {
                     if matches!(t.kind(), NEWLINE | COMMENT) {
                         break;
                     }
-                    out.push_str(t.text());
+                    tokens.push(t);
                 }
                 rowan::NodeOrToken::Node(_) => {
                     // The EXPR (directories) node marks the end of the
@@ -45,21 +47,27 @@ impl Vpath {
                 }
             }
         }
-        if out.is_empty() {
+        if tokens.is_empty() {
             None
         } else {
-            Some(out)
+            Some(logical_text(self.syntax(), tokens, LineSyntax::Gnu, true))
         }
     }
 
-    /// Returns the raw directory-list text (everything after the pattern,
-    /// excluding any trailing comment) with line continuations collapsed,
-    /// or `None` if the directive has no directories.
+    /// Returns the directory-list text (everything after the pattern,
+    /// excluding any trailing comment) as GNU make reads it, with line
+    /// continuations collapsed and `\#` unescaped, or `None` if the
+    /// directive has no directories.
     pub fn directories_text(&self) -> Option<String> {
         self.syntax()
             .children()
             .find(|c| c.kind() == EXPR)
-            .map(|n| collapse_continuations(&n).trim_end().to_string())
+            .map(|n| {
+                let tokens = n.descendants_with_tokens().filter_map(|it| it.into_token());
+                logical_text(&n, tokens, LineSyntax::Gnu, true)
+                    .trim_end()
+                    .to_string()
+            })
     }
 }
 
@@ -171,8 +179,15 @@ mod tests {
     fn test_directories_text_escaped_hash() {
         assert_eq!(
             vpath_of("vpath %.c a\\#b # comment\n").directories_text(),
-            Some("a\\#b".to_string())
+            Some("a#b".to_string())
         );
+    }
+
+    #[test]
+    fn test_pattern_escaped_hash() {
+        let vpath = vpath_of("vpath %\\#y.h d\\\\#x\n");
+        assert_eq!(vpath.pattern(), Some("%#y.h".to_string()));
+        assert_eq!(vpath.directories_text(), Some("d\\".to_string()));
     }
 
     #[test]
