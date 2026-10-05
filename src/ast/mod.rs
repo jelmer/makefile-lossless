@@ -9,13 +9,13 @@ pub mod rule;
 pub mod variable;
 pub mod vpath;
 
-use crate::lossless::{Lang, SyntaxElement, SyntaxNode, SyntaxToken};
+use crate::lossless::{detached_elements, SyntaxElement, SyntaxNode, SyntaxToken};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
-    BACKSLASH, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, DOLLAR, FOR_END, INDENT, LBRACE, LPAREN,
-    NEWLINE, RECIPE, TEXT, WHITESPACE,
+    self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
+    DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
+    LBRACE, LOAD, LPAREN, NEWLINE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
 };
-use rowan::{GreenNode, GreenNodeData, GreenToken, Language, NodeOrToken};
 
 /// Whether `token` is the backslash of a backslash-newline line
 /// continuation. A backslash escaped by an odd run of preceding backslashes
@@ -85,29 +85,91 @@ pub(crate) fn line_ending(node: &SyntaxNode) -> String {
         .map_or_else(|| "\n".to_string(), |t| t.text().to_string())
 }
 
+/// Whether nodes of this kind hold the line break that ends them, rather
+/// than being part of a longer line.
+fn holds_line_break(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        RULE | RECIPE
+            | VARIABLE
+            | INCLUDE
+            | VPATH
+            | CONDITIONAL
+            | CONDITIONAL_IF
+            | CONDITIONAL_ENDIF
+            | FOR_LOOP
+            | FOR_HEADER
+            | FOR_END
+            | DIRECTIVE
+            | EXPRESSION_STATEMENT
+            | LOAD
+            | BLANK_LINE
+    )
+}
+
+/// The last token in `node`. Unlike `SyntaxNode::last_token`, this doesn't
+/// give up if the last child is an empty node, such as the prerequisites of
+/// `a:`.
+fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    node.descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .last()
+}
+
 /// `node`, or a copy of it with `eol` appended if it doesn't end in a line
 /// break, so that it can be inserted in front of another line.
 pub(crate) fn with_trailing_newline(node: &SyntaxNode, eol: &str) -> SyntaxNode {
-    if node.last_token().is_some_and(|t| t.kind() == NEWLINE) {
+    if last_token(node).is_none_or(|t| t.kind() == NEWLINE) {
         return node.clone();
     }
-    SyntaxNode::new_root_mut(append_newline(&node.green(), eol))
+    let copy = SyntaxNode::new_root_mut(node.green().into_owned());
+    terminate_line_before(&copy, copy.children_with_tokens().count(), eol);
+    copy
 }
 
-/// Append a NEWLINE token where the parser would have put it: inside a
-/// trailing recipe line or closing directive, otherwise as the last child.
-fn append_newline(green: &GreenNodeData, eol: &str) -> GreenNode {
-    let children = green.children();
-    let len = children.len();
-    if let Some(NodeOrToken::Node(last)) = children.last() {
-        if matches!(
-            Lang::kind_from_raw(last.kind()),
-            RECIPE | CONDITIONAL | CONDITIONAL_ENDIF | FOR_END
-        ) {
-            return green.replace_child(len - 1, append_newline(last, eol).into());
+/// Make sure the text before child `index` of `parent` ends in a line
+/// break, so that a new line can be inserted there. If it doesn't, `eol` is
+/// added where the parser would have put it. Returns the index to insert at,
+/// which shifts if the line break was added to `parent` itself.
+pub(crate) fn terminate_line_before(parent: &SyntaxNode, index: usize, eol: &str) -> usize {
+    let Some((prev, last)) = parent
+        .children_with_tokens()
+        .take(index)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find_map(|it| {
+            let last = match &it {
+                SyntaxElement::Node(n) => last_token(n)?,
+                SyntaxElement::Token(t) => t.clone(),
+            };
+            Some((it, last))
+        })
+    else {
+        return index;
+    };
+    if last.kind() == NEWLINE {
+        return index;
+    }
+    let newline = detached_elements(&[(NEWLINE, eol)], None);
+    match prev {
+        SyntaxElement::Node(mut node) if holds_line_break(node.kind()) => {
+            while let Some(child) = node
+                .last_child_or_token()
+                .and_then(|it| it.into_node())
+                .filter(|n| holds_line_break(n.kind()))
+            {
+                node = child;
+            }
+            let len = node.children_with_tokens().count();
+            node.splice_children(len..len, newline);
+            index
+        }
+        _ => {
+            parent.splice_children(index..index, newline);
+            index + 1
         }
     }
-    green.insert_child(len, GreenToken::new(NEWLINE.into(), eol).into())
 }
 
 /// How a make implementation forms a logical line from physical lines.

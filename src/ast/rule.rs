@@ -1,6 +1,8 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, is_continuation, line_ending, LineSyntax};
+use super::{
+    collapse_continuations, is_continuation, line_ending, terminate_line_before, LineSyntax,
+};
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
     ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
@@ -860,6 +862,7 @@ impl Rule {
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
+        let index = terminate_line_before(self.syntax(), index, &eol);
         self.syntax()
             .splice_children(index..index, vec![syntax.into()]);
     }
@@ -931,6 +934,7 @@ impl Rule {
         builder.finish_node();
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
+        let target_index = terminate_line_before(self.syntax(), target_index, &eol);
         self.syntax()
             .splice_children(target_index..target_index, vec![syntax.into()]);
         true

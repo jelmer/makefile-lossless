@@ -1,4 +1,4 @@
-use crate::ast::line_ending;
+use crate::ast::{line_ending, terminate_line_before};
 use crate::lex::{lex, lex_non_recipe_line};
 use crate::MakefileVariant;
 use crate::SyntaxKind;
@@ -5081,19 +5081,20 @@ impl Recipe {
     pub fn insert_after(&self, text: &str) {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
-        let node_index = node.index();
+        let eol = line_ending(node);
 
         // Build a new RECIPE node
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
         builder.token(INDENT.into(), "\t");
         builder.token(TEXT.into(), text);
-        builder.token(NEWLINE.into(), &line_ending(node));
+        builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
         let new_syntax = SyntaxNode::new_root_mut(builder.finish());
 
         // Insert after this recipe
-        parent.splice_children(node_index + 1..node_index + 1, vec![new_syntax.into()]);
+        let index = terminate_line_before(&parent, node.index() + 1, &eol);
+        parent.splice_children(index..index, vec![new_syntax.into()]);
     }
 
     /// Remove this recipe line from its parent
@@ -5377,7 +5378,7 @@ pub(crate) fn node_text(node: &SyntaxNode) -> String {
 /// extra blank lines at the end of a file when the last rule is removed.
 /// Build detached tree elements for splicing into a mutable tree: the given
 /// tokens, followed by a RECIPE node holding `recipe` if given.
-fn detached_elements(
+pub(crate) fn detached_elements(
     tokens: &[(SyntaxKind, &str)],
     recipe: Option<&[(SyntaxKind, &str)]>,
 ) -> Vec<SyntaxElement> {
@@ -12091,6 +12092,160 @@ endif
     }
 
     #[test]
+    fn test_push_command_after_unterminated_recipe() {
+        let makefile: Makefile = "a:\n\tcmd".parse().unwrap();
+        makefile.rules().next().unwrap().push_command("x");
+        assert_eq!(makefile.to_string(), "a:\n\tcmd\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_push_command_after_unterminated_rule_line() {
+        let makefile: Makefile = "a: b".parse().unwrap();
+        makefile.rules().next().unwrap().push_command("x");
+        assert_eq!(makefile.to_string(), "a: b\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_command_after_unterminated_recipe() {
+        let makefile: Makefile = "a:\n\tcmd".parse().unwrap();
+        assert!(makefile.rules().next().unwrap().insert_command(1, "x"));
+        assert_eq!(makefile.to_string(), "a:\n\tcmd\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_recipe_insert_after_unterminated() {
+        let makefile: Makefile = "a:\n\tcmd".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().next().unwrap().insert_after("x");
+        assert_eq!(makefile.to_string(), "a:\n\tcmd\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "X = 1\nb:\n");
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_define() {
+        let mut makefile: Makefile = "define V\nx\nendef".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "define V\nx\nendef\nb:\n");
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_conditional() {
+        let mut makefile: Makefile = "ifdef X\nY = 1\nendif".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\nb:\n");
+    }
+
+    #[test]
+    fn test_add_conditional_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile
+            .add_conditional("ifdef", "D", "Y = 1\n", None)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nifdef D\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        let items: Makefile = "Y = 1\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items("ifdef", "D", items.items(), None::<Vec<MakefileItem>>)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nifdef D\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_insert_rule_after_unterminated_line() {
+        let mut makefile: Makefile = "a:".parse().unwrap();
+        makefile.insert_rule(1, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\nb:\n");
+
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.insert_rule(0, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nb:\n");
+    }
+
+    #[test]
+    fn test_item_insert_after_unterminated() {
+        let makefile: Makefile = "X = 1".parse().unwrap();
+        let new_item = "Y = 1\n"
+            .parse::<Makefile>()
+            .unwrap()
+            .items()
+            .next()
+            .unwrap();
+        makefile
+            .items()
+            .next()
+            .unwrap()
+            .insert_after(new_item)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\nY = 1\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_after_unterminated() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.insert_include(1, "a.mk").unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\ninclude a.mk\n");
+        assert_matches_reparse(&makefile);
+
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        let first = makefile.items().next().unwrap();
+        let include = makefile.insert_include_after(&first, "a.mk").unwrap();
+        assert_eq!(include.path(), Some("a.mk".to_string()));
+        assert_eq!(makefile.to_string(), "X = 1\ninclude a.mk\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_phony_target_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.add_phony_target("clean").unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n.PHONY: clean\n");
+    }
+
+    #[test]
+    fn test_add_else_item_to_unterminated_conditional() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\nY = 1");
+        let item = "Y = 2\n"
+            .parse::<Makefile>()
+            .unwrap()
+            .items()
+            .next()
+            .unwrap();
+        makefile.conditionals().next().unwrap().add_else_item(item);
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nelse\nY = 2\n");
+    }
+
+    #[test]
+    fn test_add_endif_after_unterminated_line() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\nY = 1");
+        assert!(makefile.conditionals().next().unwrap().add_endif().unwrap());
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_endif_after_unterminated_rule() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\na:");
+        assert!(makefile.conditionals().next().unwrap().add_endif().unwrap());
+        assert_eq!(makefile.to_string(), "ifdef X\na:\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
     fn test_add_conditional_invalid_type() {
         let mut makefile = Makefile::new();
         let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
@@ -16232,6 +16387,76 @@ mod test_crlf {
             .unwrap();
         makefile.insert_rule(2, "d:".parse().unwrap()).unwrap();
         assert_eq!(makefile.to_string(), "c:\r\n\tcmd\r\nb:\r\n\r\nd:\r\n");
+    }
+
+    #[test]
+    fn test_push_command_after_unterminated_recipe() {
+        let makefile = parse_crlf("a:\r\n\tcmd");
+        makefile.rules().next().unwrap().push_command("x");
+        assert_eq!(makefile.to_string(), "a:\r\n\tcmd\r\n\tx\r\n");
+    }
+
+    #[test]
+    fn test_insert_command_after_unterminated_rule_line() {
+        let makefile = parse_crlf("X = 1\r\na: b");
+        assert!(makefile.rules().next().unwrap().insert_command(0, "x"));
+        assert_eq!(makefile.to_string(), "X = 1\r\na: b\r\n\tx\r\n");
+    }
+
+    #[test]
+    fn test_recipe_insert_after_unterminated() {
+        let makefile = parse_crlf("a:\r\n\tcmd");
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes().next().unwrap().insert_after("x");
+        assert_eq!(makefile.to_string(), "a:\r\n\tcmd\r\n\tx\r\n");
+    }
+
+    #[test]
+    fn test_add_after_unterminated_line() {
+        let mut makefile = parse_crlf("X = 1\r\nY = 1");
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "X = 1\r\nY = 1\r\nb:\r\n");
+
+        let mut makefile = parse_crlf("X = 1\r\nY = 1");
+        makefile
+            .add_conditional("ifdef", "D", "Z = 1\n", None)
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "X = 1\r\nY = 1\r\n\r\nifdef D\r\nZ = 1\r\nendif\r\n"
+        );
+
+        let mut makefile = parse_crlf("X = 1\r\na:");
+        makefile.insert_rule(1, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\r\na:\r\n\r\nb:\n");
+
+        let mut makefile = parse_crlf("X = 1\r\nY = 1");
+        makefile.insert_include(2, "a.mk").unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\r\nY = 1\r\ninclude a.mk\r\n");
+    }
+
+    #[test]
+    fn test_item_insert_after_unterminated() {
+        let makefile = parse_crlf("X = 1\r\nY = 1");
+        let new_item = parse_crlf("Z = 1\r\n").items().next().unwrap();
+        makefile
+            .items()
+            .nth(1)
+            .unwrap()
+            .insert_after(new_item)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\r\nY = 1\r\nZ = 1\r\n");
+    }
+
+    #[test]
+    fn test_add_else_item_to_unterminated_conditional() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\r\nY = 1");
+        let item = parse_crlf("Y = 2\r\n").items().next().unwrap();
+        makefile.conditionals().next().unwrap().add_else_item(item);
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\r\nY = 1\r\nelse\r\nY = 2\r\n"
+        );
     }
 
     #[test]
