@@ -1457,8 +1457,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn at_assignment_prefix_keyword(&self) -> bool {
             self.current() == Some(IDENTIFIER)
                 && match self.tokens.last().unwrap().1.as_str() {
-                    "export" => true,
-                    "unexport" | "override" | "private" => !self.is_bsd_make(),
+                    "export" => self.gnu_directives_enabled() || self.is_bsd_make(),
+                    "unexport" | "override" | "private" => self.gnu_directives_enabled(),
                     _ => false,
                 }
                 && self.peek_past_ws() != Some(OPERATOR)
@@ -3455,16 +3455,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn is_assignment_line(&mut self) -> bool {
-            let bsd_make = self.is_bsd_make();
-            if bsd_make && self.at_gmake_export() {
+            if self.is_bsd_make() && self.at_gmake_export() {
                 return true;
             }
             if self.is_undefine_line() {
                 return true;
             }
-            let is_directive = |text: &str| {
-                !bsd_make && matches!(text, "export" | "unexport" | "override" | "private")
-            };
+            let gnu = self.gnu_directives_enabled();
+            let is_directive =
+                |text: &str| gnu && matches!(text, "export" | "unexport" | "override" | "private");
             let mut tokens = self.tokens.iter().rev().peekable();
             let mut seen_name = false;
             // Whitespace after the name: anything but an operator now means
@@ -7202,6 +7201,90 @@ all: $(OBJS)
             assert_eq!(
                 top_level_kinds(parsed.root().syntax()),
                 vec![VPATH, VPATH],
+                "{variant:?}"
+            );
+            assert_eq!(parsed.root().code(), text);
+        }
+    }
+
+    #[test]
+    fn test_assignment_modifiers_gnu_only() {
+        let text = "override X = 1\nunexport X\nprivate X = 1\nexport X\nexport\n";
+        for variant in [
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+            MakefileVariant::BSDMake,
+        ] {
+            let parsed = parse(text, Some(variant));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"; 5],
+                "{variant:?}"
+            );
+            assert_eq!(parsed.root().variable_definitions().count(), 0);
+            assert_eq!(parsed.root().code(), text);
+        }
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(parsed.root().variable_definitions().count(), 5);
+            assert_eq!(parsed.root().code(), text);
+        }
+    }
+
+    #[test]
+    fn test_export_assignment_gnu_and_bsd_only() {
+        let text = "export X = 1\n";
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
+            let parsed = parse(text, Some(variant));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["expected ':'"],
+                "{variant:?}"
+            );
+            assert_eq!(parsed.root().variable_definitions().count(), 0);
+            assert_eq!(parsed.root().code(), text);
+        }
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+        ] {
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let var = parsed.root().variable_definitions().next().unwrap();
+            assert!(var.is_export(), "{variant:?}");
+            assert_eq!(var.name(), Some("X".to_string()), "{variant:?}");
+            assert_eq!(parsed.root().code(), text);
+        }
+    }
+
+    #[test]
+    fn test_modifier_keyword_as_variable_name_any_variant() {
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            let text = "override = 1\nexport = 2\n";
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(
+                parsed
+                    .root()
+                    .variable_definitions()
+                    .map(|v| v.name())
+                    .collect::<Vec<_>>(),
+                vec![Some("override".to_string()), Some("export".to_string())],
                 "{variant:?}"
             );
             assert_eq!(parsed.root().code(), text);
