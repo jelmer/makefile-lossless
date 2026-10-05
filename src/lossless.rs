@@ -332,6 +332,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     /// The rest of a logical line, from [`Parser::bsd_logical_line`].
     struct BsdLine {
         text: String,
+        /// `text` as make sees it, with `\#` replaced by `#`.
+        unescaped: crate::reference::UnescapedHash,
         /// The source position of each token and its offset in `text`.
         starts: Vec<(rowan::TextSize, usize)>,
         /// The source position of the end of the line.
@@ -1723,6 +1725,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let consumed = self.token_positions.len() - self.tokens.len();
             let mut line = BsdLine {
                 text: String::new(),
+                unescaped: Default::default(),
                 starts: vec![],
                 end: self.current_range().start(),
                 token_edits: self.token_edits,
@@ -1764,6 +1767,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 escaped = *kind == BACKSLASH && !escaped;
                 line.text.push_str(token);
             }
+            line.unescaped = crate::reference::UnescapedHash::new(&line.text);
             line
         }
 
@@ -1828,10 +1832,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_bsd_variable_reference(&mut self) -> bool {
             let offset = self.bsd_line_offset();
             let line = self.bsd_line.take().expect("set by bsd_line_offset");
-            let text = &line.text[offset..];
-            let found = crate::reference::bsd_expr_extent(text);
+            let found = crate::reference::bsd_expr_extent_at(&line.unescaped, offset);
             if let Some((end, nested)) = &found {
-                self.emit_bsd_expr(&text[..*end], nested);
+                self.emit_bsd_expr(&line.text[offset..offset + end], nested);
             }
             self.bsd_line = Some(line);
             found.is_some()
@@ -5267,6 +5270,29 @@ mod tests {
                 MakefileVariant::BSDMake
             ),
             vec!["${\"${A:Uno}\"!=\"no\":?${B}:c}", "${A:Uno}", "${B}"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_reference_escaped_hash() {
+        // From heimdal's Makefile.rules.inc in NetBSD.
+        let text = ".if ${ASN1_FILES.${src}:[\\#]} == 1\n.endif\n";
+        assert_eq!(
+            reference_texts(text, MakefileVariant::BSDMake),
+            vec!["${ASN1_FILES.${src}:[\\#]}", "${src}"]
+        );
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let reference = makefile.variable_references().next().unwrap();
+        assert_eq!(
+            reference.parse(MakefileVariant::BSDMake),
+            Ok(crate::ParsedReference {
+                name: "ASN1_FILES.${src}".to_string(),
+                modifiers: vec![crate::Modifier::Words(crate::WordSelector::Count)],
+            })
+        );
+        assert_eq!(
+            reference_texts("X = ${X:[\\#]:S/}/x/}\n", MakefileVariant::BSDMake),
+            vec!["${X:[\\#]:S/}/x/}"]
         );
     }
 
