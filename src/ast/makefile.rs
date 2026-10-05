@@ -1,5 +1,5 @@
 use crate::lossless::{
-    parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include,
+    parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
     Makefile, ParseError, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
@@ -38,6 +38,8 @@ pub enum MakefileItem {
     Directive(Directive),
     /// A line of only references or function calls (e.g., `$(eval $(call f,x))`)
     ExpressionStatement(ExpressionStatement),
+    /// A GNU make `load` directive (e.g., `load foo.so`)
+    Load(Load),
 }
 
 impl MakefileItem {
@@ -57,6 +59,8 @@ impl MakefileItem {
             Some(MakefileItem::Directive(d))
         } else if let Some(stmt) = ExpressionStatement::cast(node.clone()) {
             Some(MakefileItem::ExpressionStatement(stmt))
+        } else if let Some(load) = Load::cast(node.clone()) {
+            Some(MakefileItem::Load(load))
         } else {
             Conditional::cast(node).map(MakefileItem::Conditional)
         }
@@ -73,6 +77,7 @@ impl MakefileItem {
             MakefileItem::ForLoop(f) => f.syntax(),
             MakefileItem::Directive(d) => d.syntax(),
             MakefileItem::ExpressionStatement(e) => e.syntax(),
+            MakefileItem::Load(l) => l.syntax(),
         }
     }
 
