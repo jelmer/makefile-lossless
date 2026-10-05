@@ -20,22 +20,33 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
     builder.finish_node();
 }
 
+/// Whether `token` is a directive keyword (`export`/`override`/`private`/
+/// `define`) prefixing the variable name. A keyword directly followed by the
+/// assignment operator is the name itself, as in `private = 1`.
+fn is_prefix_keyword(token: &crate::lossless::SyntaxToken) -> bool {
+    if token.kind() != IDENTIFIER
+        || !matches!(token.text(), "export" | "override" | "private" | "define")
+    {
+        return false;
+    }
+    let mut next = token.next_sibling_or_token();
+    while next.as_ref().is_some_and(|n| n.kind() == WHITESPACE) {
+        next = next.and_then(|n| n.next_sibling_or_token());
+    }
+    next.is_none_or(|n| n.kind() != OPERATOR)
+}
+
 impl VariableDefinition {
     /// Internal: the elements making up the variable's name, i.e. the
     /// IDENTIFIER tokens and variable references that follow any directive
-    /// keywords (`export`/`override`/`define`). A name usually is a single
-    /// IDENTIFIER, but may contain references as in `CFLAGS.${PROG}`.
-    /// Single source of truth for [`Self::name`], [`Self::name_range`] and
-    /// [`Self::set_name`].
+    /// keyword prefixes. A name usually is a single IDENTIFIER, but may
+    /// contain references as in `CFLAGS.${PROG}`. Single source of truth for
+    /// [`Self::name`], [`Self::name_range`] and [`Self::set_name`].
     fn name_elements(&self) -> Vec<crate::lossless::SyntaxElement> {
         self.syntax()
             .children_with_tokens()
             .skip_while(|it| {
-                it.kind() == WHITESPACE
-                    || it.as_token().is_some_and(|t| {
-                        t.kind() == IDENTIFIER
-                            && matches!(t.text(), "export" | "override" | "define")
-                    })
+                it.kind() == WHITESPACE || it.as_token().is_some_and(is_prefix_keyword)
             })
             .take_while(|it| matches!(it.kind(), IDENTIFIER | EXPR))
             .collect()
@@ -114,6 +125,26 @@ impl VariableDefinition {
         self.syntax().children_with_tokens().any(|it| {
             it.as_token()
                 .is_some_and(|token| token.text() == "override")
+        })
+    }
+
+    /// Check if this variable definition uses the `private` modifier
+    ///
+    /// A private target-specific variable is not inherited by the target's
+    /// prerequisites.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let rule: Rule = "all: private CFLAGS = -O2\n".parse().unwrap();
+    /// let var = rule.scoped_assignment().unwrap();
+    /// assert!(var.is_private());
+    /// assert_eq!(var.name(), Some("CFLAGS".to_string()));
+    /// ```
+    pub fn is_private(&self) -> bool {
+        self.syntax().children_with_tokens().any(|it| {
+            it.as_token()
+                .is_some_and(|t| t.text() == "private" && is_prefix_keyword(t))
         })
     }
 
@@ -651,6 +682,14 @@ mod tests {
         assert!(var.is_override());
         assert!(var.is_export());
         assert_eq!(var.name(), Some("FOO".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_as_variable_name() {
+        let makefile: Makefile = "private = 1\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("private".to_string()));
+        assert!(!var.is_private());
     }
 
     #[test]
