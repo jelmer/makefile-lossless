@@ -1312,6 +1312,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.in_rule = RuleContext::Inside;
                     self.parse_rule_recipes();
                 }
+            } else if has_target && self.is_bsd_make() {
+                // BSD make starts a new, empty list of targets before parsing
+                // a dependency line, so the commands after an invalid one
+                // belong to no target, which is not an error.
+                self.in_rule = RuleContext::Inside;
+                self.parse_rule_recipes();
             }
 
             self.builder.finish_node();
@@ -3126,7 +3132,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             } else {
                 (text.strip_prefix('.')?, 1)
             };
-            let name = *BSD_DIRECTIVES.iter().find(|d| **d == name)?;
+            let name = match BSD_DIRECTIVES.iter().find(|d| **d == name) {
+                Some(name) => *name,
+                // BSD make only compares the start of the word for includes,
+                // so `.includes: foo` is an include with a bad path.
+                None if self.is_bsd_make() => ["include", "-include", "sinclude", "dinclude"]
+                    .into_iter()
+                    .find(|d| name.starts_with(d))?,
+                None => return None,
+            };
             // Like BSD make, require whitespace or the end of the line after
             // the name, so that `.info: foo` is a dependency line. The
             // conditional and loop directives are more lenient, as in `.if!0`.
@@ -3268,6 +3282,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             match name {
                 _ if is_bsd_if(name) => self.parse_block_conditional(name, count),
                 "for" => self.parse_bsd_for(count),
+                "include" | "-include" | "sinclude" | "dinclude"
+                    if self.is_bsd_make()
+                        && self.tokens[self.tokens.len() - count]
+                            .1
+                            .trim_start_matches('.')
+                            != name =>
+                {
+                    self.record_error(
+                        ParseErrorKind::UndelimitedIncludePath,
+                        ".include filename must be delimited by \"\" or <>".to_string(),
+                    );
+                    self.builder.start_node(ERROR.into());
+                    self.skip_logical_line();
+                    self.builder.finish_node();
+                }
                 "include" | "-include" | "sinclude" | "dinclude" => self.parse_include(),
                 _ if is_bsd_elif(name) || matches!(name, "else" | "endif" | "endfor") => {
                     let (kind, opener) = match name {
@@ -3288,7 +3317,29 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 _ => {
                     self.builder.start_node(DIRECTIVE.into());
                     self.bump_n(count);
-                    self.parse_directive_argument(None);
+                    let found = self.parse_directive_expr();
+                    let error = match (name, found) {
+                        // TODO: Check nmake's handling of `!UNDEF` without a
+                        // name.
+                        _ if self.variant == Some(MakefileVariant::NMake) => None,
+                        ("break", true) => Some((
+                            ParseErrorKind::ExtraneousText,
+                            "The .break directive does not take arguments",
+                        )),
+                        ("unexport-env", true) => Some((
+                            ParseErrorKind::ExtraneousText,
+                            "The directive .unexport-env does not take arguments",
+                        )),
+                        ("undef", false) => Some((
+                            ParseErrorKind::ExpectedVariableName,
+                            "The .undef directive requires an argument",
+                        )),
+                        _ => None,
+                    };
+                    if let Some((kind, message)) = error {
+                        self.record_error(kind, message.to_string());
+                    }
+                    self.finish_directive_line();
                     self.builder.finish_node();
                 }
             }
@@ -3298,6 +3349,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// an optional comment and the newline. If `required` names the
         /// directive, an empty argument is reported as an error.
         fn parse_directive_argument(&mut self, required: Option<&str>) {
+            let found = self.parse_directive_expr();
+            if let (Some(name), false) = (required, found) {
+                self.record_error(
+                    ParseErrorKind::InvalidConditional,
+                    format!("expected condition after {}", self.directive_display(name)),
+                );
+            }
+            self.finish_directive_line();
+        }
+
+        /// Parse the rest of a directive line up to any comment into an EXPR
+        /// node, returning whether it is non-empty.
+        fn parse_directive_expr(&mut self) -> bool {
             self.skip_ws_and_continuations();
             self.builder.start_node(EXPR.into());
             let mut found = false;
@@ -3318,12 +3382,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
             self.builder.finish_node();
-            if let (Some(name), false) = (required, found) {
-                self.record_error(
-                    ParseErrorKind::InvalidConditional,
-                    format!("expected condition after {}", self.directive_display(name)),
-                );
-            }
+            found
+        }
+
+        /// Consume the optional comment and the newline ending a directive.
+        fn finish_directive_line(&mut self) {
             if self.current() == Some(COMMENT) {
                 self.bump();
             }
@@ -3333,7 +3396,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Consume the remainder of a directive that takes no arguments, such
-        /// as `.else` or `.endif`, allowing a trailing comment.
+        /// as `.else` or `.endif`, allowing a trailing comment. BSD make
+        /// ignores anything after `.endfor`.
         fn parse_bare_directive_end(&mut self, name: &str) {
             self.skip_ws();
             if self.current() == Some(COMMENT) {
@@ -3342,10 +3406,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             match self.current() {
                 None => {}
                 Some(NEWLINE) => self.bump(),
+                Some(_) if name == "endfor" => self.skip_logical_line(),
                 Some(_) => {
                     self.record_error(
                         ParseErrorKind::ExtraneousText,
-                        format!("unexpected text after {}", self.directive_display(name)),
+                        format!(
+                            "The {} directive does not take arguments",
+                            self.directive_display(name)
+                        ),
                     );
                     self.skip_until_newline();
                 }
@@ -14601,6 +14669,206 @@ test:
             error_kinds("!INCLUDE win32.mak\n", Some(MakefileVariant::NMake)),
             vec![]
         );
+    }
+
+    #[test]
+    fn test_bsd_include_keyword_with_junk() {
+        // BSD make checks for an include directive before looking for a
+        // dependency operator or assignment, and only compares the start of
+        // the name, so these are includes with a bad path.
+        for code in [
+            ".includes: foo\n",
+            ".includex = 1\n",
+            ".include.mk: foo\n",
+            ".sincludes: foo\n",
+            ".-includes: foo\n",
+            ".dincludex = 1\n",
+            ". includes: foo\n",
+            ".includes \\\n  foo: bar\n",
+            ".includes \"foo\"\n",
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.kind(), e.message.as_str(), e.line))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    ParseErrorKind::UndelimitedIncludePath,
+                    ".include filename must be delimited by \"\" or <>",
+                    1
+                )],
+                "{code:?}"
+            );
+            assert_eq!(node_kinds(&parsed.syntax()), "ERROR\n", "{code:?}");
+            assert_eq!(parsed.root().syntax().to_string(), code);
+        }
+        // Like other directives, it doesn't end a rule's commands.
+        let code = "all:\n.includes: foo\n\techo\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.line))
+                .collect::<Vec<_>>(),
+            vec![(ParseErrorKind::UndelimitedIncludePath, 2)]
+        );
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  ERROR\n  RECIPE\n"
+        );
+        assert_eq!(parsed.root().syntax().to_string(), code);
+        // Other makes read these as rules and assignments.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            for code in [".includes: foo\n", ".include.mk: foo\n", ".includex = 1\n"] {
+                assert_eq!(error_kinds(code, variant), vec![], "{code:?} {variant:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bsd_directive_arguments() {
+        // From NetBSD make's unit-tests/directive-unexport-env.mk,
+        // directive-for-break.mk, directive-undef.mk, directive-else.mk and
+        // directive-endif.mk.
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            for (code, kind, message, line) in [
+                (
+                    ".unexport-env UT_EXPORTED UT_UNEXPORTED\n",
+                    ParseErrorKind::ExtraneousText,
+                    "The directive .unexport-env does not take arguments",
+                    1,
+                ),
+                (
+                    ".for i in a\n.  break 1\n.endfor\n",
+                    ParseErrorKind::ExtraneousText,
+                    "The .break directive does not take arguments",
+                    2,
+                ),
+                (
+                    ".undef\n",
+                    ParseErrorKind::ExpectedVariableName,
+                    "The .undef directive requires an argument",
+                    1,
+                ),
+                (
+                    ".undef # comment\n",
+                    ParseErrorKind::ExpectedVariableName,
+                    "The .undef directive requires an argument",
+                    1,
+                ),
+                (
+                    ".if 1\n.else 1\n.endif\n",
+                    ParseErrorKind::ExtraneousText,
+                    "The .else directive does not take arguments",
+                    2,
+                ),
+                (
+                    ".if 1\n.endif 1\n",
+                    ParseErrorKind::ExtraneousText,
+                    "The .endif directive does not take arguments",
+                    2,
+                ),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(
+                    parsed
+                        .errors
+                        .iter()
+                        .map(|e| (e.kind(), e.message.as_str(), e.line))
+                        .collect::<Vec<_>>(),
+                    vec![(kind, message, line)],
+                    "{code:?} {variant:?}"
+                );
+                assert_eq!(parsed.root().syntax().to_string(), code);
+            }
+            for code in [
+                ".unexport-env\n",
+                ".unexport-env # comment\n",
+                ".for i in a\n.break\n.endfor\n",
+                ".undef X\n",
+                ".export-env X\n",
+                // BSD make ignores anything after `.endfor`.
+                ".for i in a\n.endfor i\n",
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{code:?} {variant:?}");
+                assert_eq!(parsed.root().syntax().to_string(), code);
+            }
+        }
+        assert_eq!(
+            parse("!IF 1\n!ELSE 1\n!ENDIF\n", Some(MakefileVariant::NMake))
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                ParseErrorKind::ExtraneousText,
+                "The !ELSE directive does not take arguments"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_bsd_commands_after_invalid_dependency_line() {
+        // BSD make starts a new, empty list of targets before parsing a
+        // dependency line, so the commands after an invalid one belong to
+        // no target, which is not an error.
+        let code = "all:\nfoo bar\n\techo\n";
+        let parsed = parse(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.line))
+                .collect::<Vec<_>>(),
+            vec![(ParseErrorKind::MissingSeparator, 2)]
+        );
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\nRULE\n  TARGETS\n  ERROR\n  RECIPE\n"
+        );
+        assert_eq!(parsed.root().syntax().to_string(), code);
+        for (code, line) in [
+            ("foo\n\techo\n", 1),
+            ("all:\n.elsif 1\n\techo\n\techo\n", 2),
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            assert_eq!(
+                parsed.errors.iter().map(|e| e.line).collect::<Vec<_>>(),
+                vec![line],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+        }
+        // An assignment ends the empty list of targets.
+        assert_eq!(
+            error_kinds("foo\nX = 1\n\techo\n", Some(MakefileVariant::BSDMake)),
+            vec![
+                ParseErrorKind::MissingSeparator,
+                ParseErrorKind::RecipeBeforeFirstTarget
+            ]
+        );
+        for variant in [
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            assert_eq!(
+                error_kinds("foo\n\techo\n", variant),
+                vec![
+                    ParseErrorKind::MissingSeparator,
+                    ParseErrorKind::RecipeBeforeFirstTarget
+                ],
+                "{variant:?}"
+            );
+        }
     }
 
     #[test]
