@@ -452,3 +452,30 @@ fn test_recipe_with_variables_line_tracking() {
     assert_eq!(recipes[0].line(), 1);
     assert_eq!(recipes[1].line(), 2);
 }
+
+#[test]
+fn test_text_range() {
+    let text = "VAR = 1\r\ninclude a.mk\nifdef X\nall: b\n\techo hi\nendif\nvpath %.c src\n";
+    let makefile: Makefile = text.parse().unwrap();
+    let range = |start: u32, end: u32| crate::TextRange::new(start.into(), end.into());
+
+    assert_eq!(makefile.text_range(), range(0, 66));
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(var.text_range(), range(0, 9));
+    let include = makefile.includes().next().unwrap();
+    assert_eq!(include.text_range(), range(9, 22));
+    let conditional = makefile.conditionals().next().unwrap();
+    assert_eq!(conditional.text_range(), range(22, 52));
+    let rule = makefile.rules().next().unwrap();
+    assert_eq!(rule.text_range(), range(30, 46));
+    let recipe = rule.recipe_nodes().next().unwrap();
+    assert_eq!(recipe.text_range(), range(37, 46));
+    let vpath = makefile
+        .items()
+        .find_map(|item| match item {
+            MakefileItem::Vpath(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(vpath.text_range(), range(52, 66));
+}

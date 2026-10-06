@@ -258,11 +258,6 @@ impl Recipe {
         self.syntax().ancestors().find_map(Rule::cast)
     }
 
-    /// Get the source range of this recipe node.
-    pub fn text_range(&self) -> rowan::TextRange {
-        self.syntax().text_range()
-    }
-
     /// Check if this recipe has the silent prefix (@)
     ///
     /// # Example
