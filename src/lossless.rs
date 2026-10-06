@@ -300,23 +300,33 @@ pub(crate) fn lf_line_endings(text: &str) -> String {
 /// Where references are parsed in comments, in recipe lines and `define`
 /// bodies, a comment is split into COMMENT tokens around the EXPR nodes of
 /// the references, which all belong to the comment started by the first
-/// token.
+/// token. In a recipe line, a comment also takes in the lines it is
+/// continued onto, up to the end of the line.
 pub(crate) fn comment_elements(token: &SyntaxToken) -> Option<Vec<SyntaxElement>> {
-    let continues = std::iter::successors(token.prev_sibling_or_token(), |it| {
+    let in_recipe = token.parent().is_some_and(|p| p.kind() == RECIPE);
+    let mut before = std::iter::successors(token.prev_sibling_or_token(), |it| {
         it.prev_sibling_or_token()
-    })
-    .find(|it| it.kind() != EXPR)
-    .is_some_and(|it| it.kind() == COMMENT);
+    });
+    let continues = if in_recipe {
+        before.any(|it| it.kind() == COMMENT)
+    } else {
+        before
+            .find(|it| it.kind() != EXPR)
+            .is_some_and(|it| it.kind() == COMMENT)
+    };
     if continues {
         return None;
     }
-    Some(
+    let mut elements: Vec<_> =
         std::iter::successors(Some(SyntaxElement::Token(token.clone())), |it| {
             it.next_sibling_or_token()
         })
-        .take_while(|it| matches!(it.kind(), COMMENT | EXPR))
-        .collect(),
-    )
+        .take_while(|it| in_recipe || matches!(it.kind(), COMMENT | EXPR))
+        .collect();
+    if elements.last().is_some_and(|it| it.kind() == NEWLINE) {
+        elements.pop();
+    }
+    Some(elements)
 }
 
 /// The text of `node`, with CRLF line endings converted to LF.
