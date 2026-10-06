@@ -12,8 +12,8 @@ impl VariableReference {
     /// Returns `Some` if the node is an EXPR whose first token is `$` followed by
     /// `(`, `{`, or an identifier (for single-character variables like `$X`).
     /// An escaped dollar sign (`$$`) is not a reference, and neither is the
-    /// body of a `define` block, which is kept as raw text; see
-    /// [`VariableDefinition::define_variable_references`].
+    /// EXPR holding the body of a `define` block, which may start with a
+    /// `$`.
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         if syntax.kind() != EXPR {
             return None;
@@ -54,9 +54,6 @@ impl VariableReference {
     ///
     /// Returns `None` for expressions without a variable name, such as BSD
     /// make's `${:Uvalue}`.
-    ///
-    /// Note: Variable references inside `define` bodies are not parsed into
-    /// the syntax tree (they are stored as raw text).
     ///
     /// # Example
     /// ```

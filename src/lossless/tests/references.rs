@@ -530,7 +530,7 @@ fn test_recipe_variable_references() {
 }
 
 #[test]
-fn test_variable_references_skip_define_body() {
+fn test_variable_references_in_define_body() {
     let text = "define E\n$(FOO) $(FOO:a=b)\nendef\nX = $(BAR)\n";
     let makefile: Makefile = text.parse().unwrap();
     assert_eq!(
@@ -538,7 +538,11 @@ fn test_variable_references_skip_define_body() {
             .variable_references()
             .map(|r| (r.syntax().text().to_string(), r.name()))
             .collect::<Vec<_>>(),
-        vec![("$(BAR)".to_string(), Some("BAR".to_string()))]
+        vec![
+            ("$(FOO)".to_string(), Some("FOO".to_string())),
+            ("$(FOO:a=b)".to_string(), Some("FOO".to_string())),
+            ("$(BAR)".to_string(), Some("BAR".to_string()))
+        ]
     );
 }
 

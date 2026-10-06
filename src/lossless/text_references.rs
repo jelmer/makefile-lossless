@@ -1,5 +1,5 @@
 //! Variable references in text that make keeps as is when reading the
-//! makefile, such as recipe lines.
+//! makefile: recipe lines and the bodies of `define` blocks.
 //!
 //! The lexer reads such text without looking for references. Here the
 //! references are found the way make finds them when it expands the text,
@@ -16,6 +16,21 @@ use crate::SyntaxKind::{self, *};
 use rowan::Language;
 use rowan::{GreenNode, GreenNodeBuilder, GreenNodeData, NodeOrToken};
 use std::ops::Range;
+
+/// Where text with references comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextContext {
+    /// A recipe line. A reference can only continue on the next line after
+    /// a line continuation, as GNU make joins those inside references. The
+    /// indentation or `;` before the command and comment lines are not
+    /// searched.
+    // TODO: make expands the text of a recipe line starting with `#` too,
+    // before passing it to the shell; those are kept as COMMENT tokens.
+    Recipe,
+    /// The body of a `define` block. Make expands it as a whole, so a
+    /// reference may span lines.
+    DefineBody,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Shape {
@@ -41,11 +56,13 @@ struct Reference {
 /// Add `tokens` to `builder`, with each variable reference in them wrapped
 /// in an EXPR node.
 ///
-/// `tokens` are the children of a RECIPE node. An unterminated reference is
-/// left as text, like make, which only reports it when expanding the text.
+/// `tokens` are the children of a RECIPE node or of the EXPR holding a
+/// `define` body. An unterminated reference is left as text, like make,
+/// which only reports it when expanding the text.
 pub(crate) fn emit_with_references(
     builder: &mut GreenNodeBuilder<'_>,
     tokens: &[(SyntaxKind, &str)],
+    context: TextContext,
     variant: Option<MakefileVariant>,
 ) {
     let mut text = String::new();
@@ -61,7 +78,7 @@ pub(crate) fn emit_with_references(
         }
         return;
     }
-    let references: Vec<_> = searched_regions(tokens, &starts, &text)
+    let references: Vec<_> = searched_regions(tokens, &starts, &text, context)
         .into_iter()
         .flat_map(|region| {
             Finder::new(&text, region.clone(), variant).find(region.start, region.end, 0)
@@ -83,6 +100,7 @@ pub(crate) fn emit_with_references(
 pub(crate) fn emit_node_with_references(
     builder: &mut GreenNodeBuilder<'_>,
     node: &GreenNodeData,
+    context: TextContext,
     variant: Option<MakefileVariant>,
 ) {
     builder.start_node(node.kind());
@@ -94,7 +112,7 @@ pub(crate) fn emit_node_with_references(
         })
         .collect();
     match tokens {
-        Some(tokens) => emit_with_references(builder, &tokens, variant),
+        Some(tokens) => emit_with_references(builder, &tokens, context, variant),
         None => {
             for child in node.children() {
                 replay(builder, child);
@@ -126,7 +144,7 @@ fn replay(
 pub(crate) fn recipe_green(tokens: &[(SyntaxKind, &str)]) -> GreenNode {
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(RECIPE.into());
-    emit_with_references(&mut builder, tokens, None);
+    emit_with_references(&mut builder, tokens, TextContext::Recipe, None);
     builder.finish_node();
     builder.finish()
 }
@@ -140,19 +158,19 @@ fn is_continued(text: &str, newline: usize) -> bool {
     (before.len() - before.trim_end_matches('\\').len()) % 2 == 1
 }
 
-/// The byte ranges of `text`, the text of a recipe line, to search for
-/// references. A reference lies within one of them: it can only continue on
-/// the next line after a line continuation, as GNU make joins those inside
-/// references.
+/// The byte ranges of `text` to search for references. A reference lies
+/// within one of them.
 fn searched_regions(
     tokens: &[(SyntaxKind, &str)],
     starts: &[usize],
     text: &str,
+    context: TextContext,
 ) -> Vec<Range<usize>> {
+    if context == TextContext::DefineBody {
+        return std::iter::once(0..text.len()).collect();
+    }
     // Only text is searched: not comment lines, nor the `;` before a recipe
     // on the rule line.
-    // TODO: make expands the text of a recipe line starting with `#` too,
-    // before passing it to the shell; those are kept as COMMENT tokens.
     let mut regions: Vec<Range<usize>> = vec![];
     for ((kind, _), bounds) in tokens.iter().zip(starts.windows(2)) {
         if !matches!(kind, TEXT | NEWLINE | INDENT) {

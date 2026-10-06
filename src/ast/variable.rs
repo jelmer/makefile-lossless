@@ -302,12 +302,15 @@ impl VariableDefinition {
     /// Iterate `$(VAR)` and `${VAR}` variable references in the body of a
     /// `define` block.
     ///
-    /// Like recipes, `define` bodies are stored as raw text, so
-    /// [`Makefile::variable_references`](crate::Makefile::variable_references)
-    /// does not find references in them. The references are found the same
+    /// The references are found by scanning each line of the body the same
     /// way as by [`Recipe::variable_references`](crate::Recipe::variable_references),
     /// with ranges in the original source. Returns an empty list if this is
     /// not a `define` block.
+    ///
+    /// The references in a `define` body are also in the syntax tree, where
+    /// [`Makefile::variable_references`](crate::Makefile::variable_references)
+    /// finds them along with function calls, automatic variables and
+    /// references spanning lines.
     ///
     /// # Example
     /// ```
@@ -1934,10 +1937,9 @@ mod tests {
             name_references("define $(A) \\\n $(B)\nbody\nendef\n"),
             vec![r("$(A)", "A", 7..11), r("$(B)", "B", 15..19)]
         );
-        // References in the body are left to define_variable_references.
         assert_eq!(
             name_references("define $(A)\n$(B)\nendef\n"),
-            vec![r("$(A)", "A", 7..11)]
+            vec![r("$(A)", "A", 7..11), r("$(B)", "B", 12..16)]
         );
         // Consistent with an ordinary assignment.
         assert_eq!(name_references("$(A)_X = 1\n"), vec![r("$(A)", "A", 0..4)]);

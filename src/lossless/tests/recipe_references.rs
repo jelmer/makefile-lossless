@@ -363,3 +363,72 @@ fn test_recipe_on_rule_line_moved() {
     assert_eq!(makefile.to_string(), "all:\n\techo $(Y)\n\techo $(X)\n");
     assert_eq!(recipe_tree(&rule), vec!["$(Y)", "$(X)"]);
 }
+
+#[test]
+fn test_define_body_references() {
+    let code = "define RULE\n$(1): $$($(1)_OBJS)\n\t$$(CC) -o $$@ $(LDFLAGS)\n$(foreach v,$(VARS),\n  $(info $(v)))\nendef\n";
+    assert_eq!(
+        references(code, None),
+        vec![
+            r("$(1)", "1"),
+            r("$(1)", "1"),
+            r("$(LDFLAGS)", "LDFLAGS"),
+            r("$(foreach v,$(VARS),\n  $(info $(v)))", "foreach"),
+            r("$(VARS)", "VARS"),
+            r("$(info $(v))", "info"),
+            r("$(v)", "v"),
+        ]
+    );
+    let makefile = parse(code, None).root();
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(
+        var.raw_value(),
+        Some("$(1): $$($(1)_OBJS)\n\t$$(CC) -o $$@ $(LDFLAGS)\n$(foreach v,$(VARS),\n  $(info $(v)))\n".to_string())
+    );
+    assert_eq!(
+        var.value(MakefileVariant::GNUMake),
+        Some("$(1): $$($(1)_OBJS)\n\t$$(CC) -o $$@ $(LDFLAGS)\n$(foreach v,$(VARS),\n  $(info $(v)))".to_string())
+    );
+}
+
+#[test]
+fn test_define_body_hash_and_continuation() {
+    // A define body has no comments, and its line continuations are kept.
+    let code = "define X\na # $(A)\n$(B \\\n  c) \\\n$(D)\nendef\n";
+    assert_eq!(
+        references(code, None),
+        vec![r("$(A)", "A"), r("$(B \\\n  c)", "B"), r("$(D)", "D")]
+    );
+    let var = parse(code, None)
+        .root()
+        .variable_definitions()
+        .next()
+        .unwrap();
+    assert_eq!(
+        var.value(MakefileVariant::GNUMake),
+        Some("a # $(A)\n$(B c) $(D)".to_string())
+    );
+}
+
+#[test]
+fn test_define_body_unterminated_reference() {
+    let code = "define X\n$(A\nendef\nY = $(B)\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    assert_eq!(references(code, None), vec![r("$(B)", "B")]);
+}
+
+#[test]
+fn test_nested_define_body_references() {
+    let code = "define OUTER\ndefine $(1)_INNER\n$$(X) $(Y)\nendef\nendef\n";
+    assert_eq!(references(code, None), vec![r("$(1)", "1"), r("$(Y)", "Y")]);
+    let var = parse(code, None)
+        .root()
+        .variable_definitions()
+        .next()
+        .unwrap();
+    assert_eq!(
+        var.raw_value(),
+        Some("define $(1)_INNER\n$$(X) $(Y)\nendef\n".to_string())
+    );
+}
