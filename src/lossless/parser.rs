@@ -3861,8 +3861,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         Some("define") => depth += 1,
                         _ => {}
                     }
-                    // Consume one line into the EXPR body.
-                    p.skip_until_newline();
+                    // Consume one line into the EXPR body. Like make, join
+                    // continued lines, so a continued line hides an `endef`.
+                    p.skip_logical_line();
                 }
             });
 
