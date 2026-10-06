@@ -1089,9 +1089,13 @@ impl Conditional {
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
 
-    /// Add an item to the else branch of the conditional
+    /// Add an item to the start of the final plain `else` branch of the
+    /// conditional
     ///
-    /// If the conditional doesn't have an else branch, this will create one.
+    /// If the conditional has no plain `else`, one is created before the
+    /// `endif`; this includes an `else ifdef ...` chain that ends without
+    /// one, since the items of an `else if` branch are conditional on that
+    /// branch's condition.
     ///
     /// # Example
     /// ```
@@ -1105,20 +1109,18 @@ impl Conditional {
     /// assert!(makefile.to_string().contains("CFLAGS = -O2"));
     /// ```
     pub fn add_else_item(&mut self, item: MakefileItem) {
-        // Ensure there's an else clause
-        if !self.has_else() {
-            self.add_else_clause();
-        }
-
+        let else_node = self.plain_else().unwrap_or_else(|| self.add_else_clause());
         let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
-
-        // Find position after CONDITIONAL_ELSE
-        let insert_pos = self
-            .syntax()
-            .children_with_tokens()
-            .position(|n| n.kind() == CONDITIONAL_ELSE)
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let mut insert_pos = else_node.index() + 1;
+        // The parser leaves the newline after a plain GNU `else` outside the
+        // CONDITIONAL_ELSE node.
+        if !else_node.last_token().is_some_and(|t| t.kind() == NEWLINE)
+            && else_node
+                .next_sibling_or_token()
+                .is_some_and(|it| it.kind() == NEWLINE)
+        {
+            insert_pos += 1;
+        }
 
         let insert_pos =
             terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
@@ -1179,12 +1181,24 @@ impl Conditional {
         Ok(true)
     }
 
-    /// Add an else clause to the conditional if it doesn't already have one
-    fn add_else_clause(&mut self) {
-        if self.has_else() {
-            return;
+    /// The header of the final plain `else` branch, if the conditional has
+    /// one.
+    fn plain_else(&self) -> Option<SyntaxNode<Lang>> {
+        let last = self
+            .syntax()
+            .children()
+            .filter(|it| it.kind() == CONDITIONAL_ELSE)
+            .last()?;
+        ConditionalBranch {
+            header: last.clone(),
         }
+        .conditional_type()
+        .is_none()
+        .then_some(last)
+    }
 
+    /// Add a plain `else` before the `endif` and return its header.
+    fn add_else_clause(&mut self) -> SyntaxNode<Lang> {
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(CONDITIONAL_ELSE.into());
@@ -1204,6 +1218,11 @@ impl Conditional {
         let insert_pos = terminate_line_before(self.syntax(), insert_pos, &eol);
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![syntax.into()]);
+        self.syntax()
+            .children_with_tokens()
+            .nth(insert_pos)
+            .and_then(|it| it.into_node())
+            .expect("else clause was just inserted")
     }
 }
 
@@ -2308,6 +2327,78 @@ endif
         let mut cond = makefile.conditionals().next().unwrap();
         cond.add_else_item(item_without_newline("Y = 2"));
         assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nelse\nY = 2\nendif\n");
+    }
+
+    #[test]
+    fn test_add_else_item_to_plain_else() {
+        let makefile: Makefile = "ifdef X\nA = 1\nelse\nA = 3\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("B = 4"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nA = 1\nelse\nB = 4\nA = 3\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_else_item_to_else_if_chain() {
+        let makefile: Makefile = "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nelse\nA = 3\nendif\n"
+            .parse()
+            .unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("B = 4"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nelse\nB = 4\nA = 3\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_else_item_to_else_if_chain_without_else() {
+        let makefile: Makefile = "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nendif\n"
+            .parse()
+            .unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("B = 4"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nelse\nB = 4\nendif\n"
+        );
+        let branches: Vec<_> = cond
+            .branches()
+            .map(|b| {
+                (
+                    b.conditional_type(),
+                    b.items()
+                        .map(|i| i.syntax().to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            branches,
+            vec![
+                (Some("ifdef".to_string()), vec!["A = 1\n".to_string()]),
+                (Some("ifdef".to_string()), vec!["A = 2\n".to_string()]),
+                (None, vec!["B = 4\n".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_add_else_item_to_bsd_elif_chain_without_else() {
+        let makefile: Makefile = ".if ${X}\nA = 1\n.elifdef Y\nA = 2\n.endif\n"
+            .parse()
+            .unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("B = 4"));
+        assert_eq!(
+            makefile.to_string(),
+            ".if ${X}\nA = 1\n.elifdef Y\nA = 2\n.else\nB = 4\n.endif\n"
+        );
+        assert_matches_reparse(&makefile);
     }
 
     #[test]
