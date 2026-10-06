@@ -35,6 +35,23 @@ fn needs_blank_line_at_end(root: &SyntaxNode) -> bool {
     !last_line.trim().is_empty()
 }
 
+/// Append `node` to the end of `root`, terminating any unterminated last
+/// line and separating it from preceding content by a blank line as
+/// described by [`needs_blank_line_at_end`].
+fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
+    let pos = terminate_line_before(root, root.children_with_tokens().count(), eol);
+    let mut nodes = Vec::new();
+    if needs_blank_line_at_end(root) {
+        let mut bl_builder = GreenNodeBuilder::new();
+        bl_builder.start_node(BLANK_LINE.into());
+        bl_builder.token(NEWLINE.into(), eol);
+        bl_builder.finish_node();
+        nodes.push(SyntaxNode::new_root_mut(bl_builder.finish()).into());
+    }
+    nodes.push(node.into());
+    root.splice_children(pos..pos, nodes);
+}
+
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
 #[non_exhaustive]
@@ -957,25 +974,7 @@ impl Makefile {
                 rowan::GreenToken::new(NEWLINE.into(), &eol).into(),
             ],
         ));
-        let pos = terminate_line_before(
-            self.syntax(),
-            self.syntax().children_with_tokens().count(),
-            &eol,
-        );
-
-        if needs_blank_line_at_end(self.syntax()) {
-            // Create a BLANK_LINE node
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-
-            self.syntax()
-                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
-        } else {
-            self.syntax().splice_children(pos..pos, vec![syntax.into()]);
-        }
+        append_with_blank_line(self.syntax(), syntax, &eol);
 
         // Use children().count() - 1 to get the last added child node
         // (not children_with_tokens().count() which includes tokens)
@@ -983,6 +982,9 @@ impl Makefile {
     }
 
     /// Add a new conditional to the makefile
+    ///
+    /// The conditional is separated from any preceding content by a blank
+    /// line, unless the makefile already ends in one.
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1068,31 +1070,7 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        let pos = terminate_line_before(
-            self.syntax(),
-            self.syntax().children_with_tokens().count(),
-            &eol,
-        );
-
-        // Add a blank line before the new conditional if there are existing elements
-        let needs_blank_line = self
-            .syntax()
-            .children()
-            .any(|c| c.kind() == RULE || c.kind() == VARIABLE || c.kind() == CONDITIONAL);
-
-        if needs_blank_line {
-            // Create a BLANK_LINE node
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-
-            self.syntax()
-                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
-        } else {
-            self.syntax().splice_children(pos..pos, vec![syntax.into()]);
-        }
+        append_with_blank_line(self.syntax(), syntax, &eol);
 
         // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
@@ -1101,7 +1079,8 @@ impl Makefile {
     /// Add a new conditional to the makefile with typed items
     ///
     /// This is a more type-safe alternative to `add_conditional` that accepts iterators of
-    /// `MakefileItem` instead of raw strings.
+    /// `MakefileItem` instead of raw strings. Blank lines are handled as by
+    /// [`Makefile::add_conditional`].
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1204,31 +1183,7 @@ impl Makefile {
         builder.finish_node();
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
-        let pos = terminate_line_before(
-            self.syntax(),
-            self.syntax().children_with_tokens().count(),
-            &eol,
-        );
-
-        // Add a blank line before the new conditional if there are existing elements
-        let needs_blank_line = self
-            .syntax()
-            .children()
-            .any(|c| c.kind() == RULE || c.kind() == VARIABLE || c.kind() == CONDITIONAL);
-
-        if needs_blank_line {
-            // Create a BLANK_LINE node
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-
-            self.syntax()
-                .splice_children(pos..pos, vec![blank_line.into(), syntax.into()]);
-        } else {
-            self.syntax().splice_children(pos..pos, vec![syntax.into()]);
-        }
+        append_with_blank_line(self.syntax(), syntax, &eol);
 
         // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
@@ -3367,6 +3322,45 @@ VAR3 = value3
         let mut makefile: Makefile = "ifdef X\nY = 1\nendif".parse().unwrap();
         makefile.add_rule("b");
         assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\n\nb:\n");
+    }
+
+    #[test]
+    fn test_add_conditional_blank_line() {
+        let cases = [
+            ("", "ifdef D\nY = 1\nendif\n"),
+            ("all: a\n", "all: a\n\nifdef D\nY = 1\nendif\n"),
+            ("all: a\n\n", "all: a\n\nifdef D\nY = 1\nendif\n"),
+            ("all: a\n\n\n", "all: a\n\n\nifdef D\nY = 1\nendif\n"),
+            ("X = 1\n", "X = 1\n\nifdef D\nY = 1\nendif\n"),
+            ("X = 1\n\n", "X = 1\n\nifdef D\nY = 1\nendif\n"),
+            ("# comment\n", "# comment\n\nifdef D\nY = 1\nendif\n"),
+            ("include a.mk\n", "include a.mk\n\nifdef D\nY = 1\nendif\n"),
+            ("\n", "\nifdef D\nY = 1\nendif\n"),
+            ("all:\r\n\r\n", "all:\r\n\r\nifdef D\r\nY = 1\r\nendif\r\n"),
+        ];
+        for (text, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .add_conditional("ifdef", "D", "Y = 1\n", None)
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+
+            let mut makefile: Makefile = text.parse().unwrap();
+            let items: Makefile = "Y = 1\n".parse().unwrap();
+            makefile
+                .add_conditional_with_items("ifdef", "D", items.items(), None::<Vec<MakefileItem>>)
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(reparsed.to_string(), expected);
+            let conditional = reparsed.conditionals().last().unwrap();
+            assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+            assert_eq!(
+                reparsed.variable_definitions().last().unwrap().raw_value(),
+                Some("1".to_string())
+            );
+        }
     }
 
     #[test]
