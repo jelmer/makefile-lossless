@@ -1,8 +1,8 @@
 use super::makefile::MakefileItem;
 use super::{is_continuation, logical_text, LineSyntax};
 use crate::lossless::{
-    is_sunsh_operator, node_text, remove_with_preceding_comments, VariableDefinition,
-    ASSIGNMENT_OPERATORS,
+    is_sunsh_operator, node_text, remove_with_preceding_comments, scan_recipe_variable_refs,
+    RecipeVariableReference, VariableDefinition, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -297,6 +297,43 @@ impl VariableDefinition {
         self.directive_keywords()
             .iter()
             .any(|t| t.text() == "define")
+    }
+
+    /// Iterate `$(VAR)` and `${VAR}` variable references in the body of a
+    /// `define` block.
+    ///
+    /// Like recipes, `define` bodies are stored as raw text, so
+    /// [`Makefile::variable_references`](crate::Makefile::variable_references)
+    /// does not find references in them. The references are found the same
+    /// way as by [`Recipe::variable_references`](crate::Recipe::variable_references),
+    /// with ranges in the original source. Returns an empty list if this is
+    /// not a `define` block.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "define E\n$(FOO) $$(BAR) ${BAZ:a=b}\nendef\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// let names: Vec<_> = var
+    ///     .define_variable_references()
+    ///     .iter()
+    ///     .map(|r| r.name().to_string())
+    ///     .collect();
+    /// assert_eq!(names, vec!["FOO", "BAZ"]);
+    /// ```
+    pub fn define_variable_references(&self) -> Vec<RecipeVariableReference> {
+        let mut out = Vec::new();
+        if !self.is_define() {
+            return out;
+        }
+        if let Some(body) = self.value_expr() {
+            scan_recipe_variable_refs(
+                &body.text().to_string(),
+                body.text_range().start().into(),
+                &mut out,
+            );
+        }
+        out
     }
 
     /// Check if this is an `undefine` directive, e.g. `undefine FOO`
@@ -1806,5 +1843,43 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("y");
         assert_eq!(makefile.code(), "y = 1\n");
+    }
+
+    fn define_references(text: &str) -> Vec<(String, std::ops::Range<usize>)> {
+        let makefile: Makefile = text.parse().unwrap();
+        makefile
+            .variable_definitions()
+            .flat_map(|v| v.define_variable_references())
+            .map(|r| (r.name().to_string(), r.text_range().into()))
+            .collect()
+    }
+
+    #[test]
+    fn test_define_variable_references() {
+        assert_eq!(
+            define_references(
+                "define E\n$(FOO) $(FOO:a=b) $$(X) $$$(Y)\n\t$(shell echo ${A.${B}})\nendef\n"
+            ),
+            vec![
+                ("FOO".to_string(), 11..14),
+                ("FOO".to_string(), 18..21),
+                ("Y".to_string(), 37..38),
+                ("A.${B}".to_string(), 56..62),
+                ("B".to_string(), 60..61),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_define_variable_references_in_conditional() {
+        assert_eq!(
+            define_references("ifdef X\ndefine E :=\n$(FOO)\nendef\nendif\n"),
+            vec![("FOO".to_string(), 22..25)]
+        );
+    }
+
+    #[test]
+    fn test_define_variable_references_not_define() {
+        assert_eq!(define_references("E = $(FOO)\n"), vec![]);
     }
 }
