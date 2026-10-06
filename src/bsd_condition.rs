@@ -81,7 +81,8 @@ pub enum BsdCondition {
     /// in which case only `==` and `!=` are allowed.
     Compare {
         /// The left-hand side. As in make, unquoted text is rejected here
-        /// unless the operand starts with a variable reference or digit.
+        /// unless the operand starts with a variable reference or digit,
+        /// except by [`parse_bsd_if_else_condition`].
         lhs: BsdOperand,
         /// The comparison operator.
         op: BsdComparisonOp,
@@ -263,7 +264,11 @@ impl std::error::Error for BsdConditionError {}
 /// assert!(parse_bsd_condition("${A} == ").is_err());
 /// ```
 pub fn parse_bsd_condition(text: &str) -> Result<BsdCondition, BsdConditionError> {
-    let mut parser = Parser::new(text);
+    parse(text, false)
+}
+
+fn parse(text: &str, left_unquoted_ok: bool) -> Result<BsdCondition, BsdConditionError> {
+    let mut parser = Parser::new(text, left_unquoted_ok);
     let condition = parser.parse_or()?;
     parser.skip_whitespace();
     match parser.peek() {
@@ -271,6 +276,37 @@ pub fn parse_bsd_condition(text: &str) -> Result<BsdCondition, BsdConditionError
         Some(b')') => Err(parser.error("unbalanced \")\"")),
         Some(_) => Err(parser.error("expected \"&&\", \"||\" or end of condition")),
     }
+}
+
+/// Parse the condition of a `${cond:?then:else}` expression, as make does
+/// for the `:?` modifier.
+///
+/// make expands the condition (the variable name of the expression) before
+/// parsing it, so the caller should pass the expanded text. In this context
+/// make accepts unquoted text on the left-hand side of a comparison, since
+/// it cannot tell anymore whether that text came from a variable reference.
+/// Otherwise the syntax is the same as for [`parse_bsd_condition`] and a
+/// [`BsdCondition`] evaluates as for `.if`.
+///
+/// # Example
+/// ```
+/// use makefile_lossless::{
+///     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
+///     BsdOperand,
+/// };
+/// // `${${ACTIVE_CC} == "clang":?a:b}` with ACTIVE_CC set to gcc.
+/// assert_eq!(
+///     parse_bsd_if_else_condition(r#"gcc == "clang""#).unwrap(),
+///     BsdCondition::Compare {
+///         lhs: BsdOperand::Word("gcc".to_string()),
+///         op: BsdComparisonOp::Equal,
+///         rhs: BsdOperand::String("clang".to_string()),
+///     }
+/// );
+/// assert!(parse_bsd_condition(r#"gcc == "clang""#).is_err());
+/// ```
+pub fn parse_bsd_if_else_condition(text: &str) -> Result<BsdCondition, BsdConditionError> {
+    parse(text, true)
 }
 
 impl FromStr for BsdCondition {
@@ -308,10 +344,12 @@ struct Parser {
     /// The offset in the original text of each byte of `text`, plus the end.
     offsets: Vec<usize>,
     pos: usize,
+    /// Whether plain characters are allowed in an unquoted left-hand side.
+    left_unquoted_ok: bool,
 }
 
 impl Parser {
-    fn new(original: &str) -> Self {
+    fn new(original: &str, left_unquoted_ok: bool) -> Self {
         let bytes = original.as_bytes();
         let mut text = Vec::with_capacity(bytes.len());
         let mut offsets = Vec::with_capacity(bytes.len() + 1);
@@ -336,6 +374,7 @@ impl Parser {
             text,
             offsets,
             pos: 0,
+            left_unquoted_ok,
         }
     }
 
@@ -597,14 +636,18 @@ impl Parser {
     /// `<`, `>` or `)`.
     ///
     /// As in make, plain characters in an unquoted left-hand side are only
-    /// allowed if it starts with a variable reference or a digit.
+    /// allowed if it starts with a variable reference or a digit, unless
+    /// `left_unquoted_ok` is set.
     fn parse_leaf(&mut self, is_lhs: bool) -> Result<BsdOperand, BsdConditionError> {
         let start = self.pos;
         let quoted = self.peek() == Some(b'"');
         if quoted {
             self.pos += 1;
         }
-        let unquoted_text_ok = quoted || !is_lhs || matches!(self.peek(), Some(b'$' | b'0'..=b'9'));
+        let unquoted_text_ok = quoted
+            || !is_lhs
+            || self.left_unquoted_ok
+            || matches!(self.peek(), Some(b'$' | b'0'..=b'9'));
         let mut value = Vec::new();
         // The end of the first variable reference, if the leaf starts with one.
         let mut first_reference_end = None;
@@ -1174,6 +1217,89 @@ mod tests {
         assert_eq!(error("-1"), (message.clone(), 0));
         assert_eq!(error("!+1"), (message.clone(), 1));
         assert_eq!(error("x${:Uvalue} == \"\""), (message, 0));
+    }
+
+    fn parse_if_else(text: &str) -> BsdCondition {
+        parse_bsd_if_else_condition(text).unwrap()
+    }
+
+    fn if_else_error(text: &str) -> (String, usize) {
+        let err = parse_bsd_if_else_condition(text).unwrap_err();
+        (err.message, err.offset)
+    }
+
+    #[test]
+    fn test_if_else_unquoted_left_hand_side() {
+        assert_eq!(
+            parse_if_else("gcc == \"clang\""),
+            compare(word("gcc"), Equal, string("clang"))
+        );
+        assert_eq!(
+            parse_if_else("a || left != right"),
+            Or(vec![
+                bare("a"),
+                compare(word("left"), NotEqual, word("right"))
+            ])
+        );
+        assert_eq!(
+            parse_if_else("x${:Uvalue} == \"\""),
+            compare(word("x${:Uvalue}"), Equal, string(""))
+        );
+        // From varmod-ifelse.mk; "no >= 10" is only an error when evaluated.
+        assert_eq!(
+            parse_if_else("string == \"literal\" || no >= 10"),
+            Or(vec![
+                compare(word("string"), Equal, string("literal")),
+                compare(word("no"), GreaterOrEqual, number("10")),
+            ])
+        );
+        assert_eq!(parse_if_else("-1"), Value(number("-1")));
+        assert_eq!(parse_if_else("!+1"), not(Value(number("+1"))));
+        assert_eq!(parse_if_else("+\t\t"), Value(word("+")));
+    }
+
+    #[test]
+    fn test_if_else_same_as_if() {
+        // Bare words that are not compared are still passed to defined().
+        assert_eq!(parse_if_else("*\t"), bare("*"));
+        assert_eq!(parse_if_else("A"), bare("A"));
+        assert_eq!(
+            parse_if_else(" ${VAR} == value"),
+            compare(var("${VAR}"), Equal, word("value"))
+        );
+        assert_eq!(
+            parse_if_else(" (\"\" != \"\") "),
+            compare(string(""), NotEqual, string(""))
+        );
+    }
+
+    #[test]
+    fn test_if_else_errors() {
+        // All of these are a "Bad condition" in varmod-ifelse.mk.
+        assert_eq!(
+            if_else_error("bare words == \"literal\""),
+            ("expected \"&&\", \"||\" or end of condition".to_string(), 5)
+        );
+        assert_eq!(
+            if_else_error(" == \"\""),
+            ("expected \"&&\", \"||\" or end of condition".to_string(), 4)
+        );
+        assert_eq!(
+            if_else_error("1 == == 2"),
+            ("expected \"&&\", \"||\" or end of condition".to_string(), 5)
+        );
+        assert_eq!(
+            if_else_error("string == \"literal\" &&  >= 10"),
+            (
+                "expected \"&&\", \"||\" or end of condition".to_string(),
+                27
+            )
+        );
+        assert_eq!(if_else_error("\t"), ("missing operand".to_string(), 1));
+        assert_eq!(
+            if_else_error(" < 0 "),
+            ("expected \"&&\", \"||\" or end of condition".to_string(), 3)
+        );
     }
 
     #[test]
