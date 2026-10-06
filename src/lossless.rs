@@ -724,6 +724,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     true
                 }
+                Some(OPERATOR) if self.at_literal_bang() => {
+                    self.bump();
+                    true
+                }
                 Some(WHITESPACE | INDENT | NEWLINE | COMMENT | OPERATOR | BACKSLASH) | None => {
                     self.error(
                         ParseErrorKind::MissingTarget,
@@ -745,9 +749,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn at_escapable_target_separator(&self) -> bool {
             match self.tokens.last() {
                 Some((WHITESPACE, _)) => true,
-                Some((OPERATOR, op)) => {
-                    op.starts_with(':') || (op == "!" && self.is_dependency_operator(op))
-                }
+                Some((OPERATOR, op)) => op.starts_with(':') || self.at_bang_dependency_operator(),
                 _ => false,
             }
         }
@@ -1081,15 +1083,44 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
         }
 
-        /// Whether `op` separates targets from prerequisites. `&:` and `&::`
-        /// mark grouped targets; BSD make also has `!`, which always
+        /// Whether `op` can separate targets from prerequisites. `&:` and
+        /// `&::` mark grouped targets; BSD make also has `!`, which always
         /// rebuilds the target.
         fn is_dependency_operator(&self, op: &str) -> bool {
-            matches!(op, ":" | "::" | "&:" | "&::") || (op == "!" && self.bsd_directives_enabled())
+            Self::is_colon_dependency_operator(op) || (op == "!" && self.bsd_directives_enabled())
+        }
+
+        fn is_colon_dependency_operator(op: &str) -> bool {
+            matches!(op, ":" | "::" | "&:" | "&::")
         }
 
         fn at_dependency_operator(&self) -> bool {
-            matches!(self.tokens.last(), Some((OPERATOR, op)) if self.is_dependency_operator(op))
+            match self.tokens.last() {
+                Some((OPERATOR, op)) => {
+                    Self::is_colon_dependency_operator(op) || self.at_bang_dependency_operator()
+                }
+                _ => false,
+            }
+        }
+
+        /// Whether the current token is a `!` dependency operator. Without
+        /// a known variant, a `!` followed by a `:` on the same line is
+        /// instead part of a target name, as in GNU make's `a!b:`.
+        fn at_bang_dependency_operator(&self) -> bool {
+            if !matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!") {
+                return false;
+            }
+            match self.variant {
+                Some(MakefileVariant::BSDMake) => true,
+                None => !self.line_has_operator(Self::is_colon_dependency_operator),
+                _ => false,
+            }
+        }
+
+        /// Whether the current token is a `!` that is part of a name.
+        fn at_literal_bang(&self) -> bool {
+            matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!")
+                && !self.at_bang_dependency_operator()
         }
 
         /// Look ahead (without consuming) from the current token, which
@@ -1267,13 +1298,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// A backslash escapes the first character of an operator, so `\:`
         /// is not one.
         fn line_has_dependency_operator(&self) -> bool {
+            self.line_has_operator(|op| self.is_dependency_operator(op))
+        }
+
+        /// Whether the rest of the physical line has an operator matching
+        /// `matches`, after removing any escaped first character.
+        fn line_has_operator(&self, matches: impl Fn(&str) -> bool) -> bool {
             let mut escaped = self.pending_backslash_escape;
             for (kind, text) in self.tokens.iter().rev() {
                 match kind {
                     NEWLINE => break,
                     OPERATOR => {
                         let op = if escaped { &text[1..] } else { text.as_str() };
-                        if self.is_dependency_operator(op) {
+                        if matches(op) {
                             return true;
                         }
                     }
@@ -1829,6 +1866,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
 
                 match self.current() {
+                    Some(OPERATOR) if self.at_literal_bang() => self.bump(),
                     Some(INDENT | NEWLINE | COMMENT | OPERATOR) | None => break,
                     Some(LPAREN) if archive_allowed && !seen_archive => {
                         self.parse_archive_member_list();
@@ -4168,6 +4206,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 Some(OPERATOR) if self.at_dependency_operator() => {
                     self.parse_rule();
+                    true
+                }
+                Some(OPERATOR)
+                    if self.at_literal_bang()
+                        && (self.line_has_dependency_operator() || self.is_assignment_line()) =>
+                {
+                    self.parse_normal_content();
                     true
                 }
                 // Lines may also start with characters such as `*` in
@@ -8161,6 +8206,95 @@ rule: dependency
                 assert_eq!(rule.static_pattern(), None);
                 assert!(!rule.is_grouped());
             }
+        }
+    }
+
+    #[test]
+    fn test_bang_in_target_names() {
+        // Only BSD make has the `!` dependency operator. Without a known
+        // variant, a later `:` means `!` is part of a target name.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            for (code, targets, prerequisites) in [
+                ("a!b:\n\techo $@\n", vec!["a!b"], vec![]),
+                ("!x:\n\techo $@\n", vec!["!x"], vec![]),
+                ("a! b!c: d!e\n", vec!["a!", "b!c"], vec!["d!e"]),
+                ("x ! y: z\n", vec!["x", "!", "y"], vec!["z"]),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rules: Vec<_> = root.rules().collect();
+                assert_eq!(rules.len(), 1, "{variant:?} {code:?}");
+                assert_eq!(
+                    targets,
+                    rules[0].targets().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(
+                    prerequisites,
+                    rules[0].prerequisites().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bang_in_variable_names() {
+        for variant in [MakefileVariant::GNUMake, MakefileVariant::POSIXMake] {
+            for (code, name) in [("!x = 1\n", "!x"), ("a!b = 2\n", "a!b")] {
+                let parsed = parse(code, Some(variant));
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                assert_eq!(root.rules().count(), 0, "{variant:?} {code:?}");
+                let names: Vec<_> = root.variable_definitions().map(|v| v.name()).collect();
+                assert_eq!(names, vec![Some(name.to_string())], "{variant:?} {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bsd_bang_dependency_operator() {
+        for (variant, code, targets, prerequisites) in [
+            (
+                Some(MakefileVariant::BSDMake),
+                "a!b:\n",
+                vec!["a"],
+                vec!["b:"],
+            ),
+            (Some(MakefileVariant::BSDMake), "!x:\n", vec![], vec!["x:"]),
+            (
+                Some(MakefileVariant::BSDMake),
+                "a ! b\n",
+                vec!["a"],
+                vec!["b"],
+            ),
+            (None, "a ! b\n", vec!["a"], vec!["b"]),
+            (None, "a b! c\n", vec!["a", "b"], vec!["c"]),
+        ] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            let rules: Vec<_> = root.rules().collect();
+            assert_eq!(rules.len(), 1, "{variant:?} {code:?}");
+            let syntax = variant.unwrap_or(MakefileVariant::BSDMake);
+            assert_eq!(
+                targets,
+                rules[0].targets_for(syntax).collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
+            assert_eq!(
+                prerequisites,
+                rules[0].prerequisites_for(syntax).collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
         }
     }
 
