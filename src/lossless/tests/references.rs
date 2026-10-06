@@ -599,6 +599,7 @@ fn reference_locations(makefile: &Makefile) -> Vec<(String, String)> {
                 ReferenceLocation::Prerequisite(rule) => {
                     format!("prerequisite of line {}", rule.line())
                 }
+                ReferenceLocation::Recipe(recipe) => format!("recipe {:?}", recipe.text()),
                 ReferenceLocation::Condition(branch) => format!(
                     "condition {:?} of line {}",
                     branch.conditional_type(),
@@ -772,6 +773,81 @@ fn test_reference_location_nmake() {
             ("$(X)", "condition Some(\"!IF\") of line 0"),
             ("$(Y)", "condition Some(\"!IF\") of line 1"),
             ("$(I)", "include of Some(\"$(I)\")"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_recipes() {
+    let text = concat!(
+        "all: $(P) ; echo $(INLINE)\n",
+        "\t$(CC) -o $@ \\\n",
+        "\t  $(OBJS:.o=$(EXT))\n",
+        "ifdef X\n",
+        "\t@$(COND)\n",
+        "endif\n",
+    );
+    let makefile: Makefile = text.parse().unwrap();
+    let continued = "recipe \"$(CC) -o $@ \\\\\\n  $(OBJS:.o=$(EXT))\"";
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(P)", "prerequisite of line 0"),
+            ("$(INLINE)", "recipe \"echo $(INLINE)\""),
+            ("$(CC)", continued),
+            ("$@", continued),
+            ("$(OBJS:.o=$(EXT))", continued),
+            ("$(EXT)", "modifier of $(OBJS:.o=$(EXT))"),
+            ("$(COND)", "recipe \"@$(COND)\""),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_recipe_outside_rule() {
+    // The recipe line after the conditional belongs to whichever rule ends
+    // the branch make takes.
+    let makefile: Makefile = "ifdef X\na:\nelse\nb:\nendif\n\techo $(ORPHAN)\n"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[("$(ORPHAN)", "recipe \"echo $(ORPHAN)\"")])
+    );
+}
+
+#[test]
+fn test_reference_location_recipes_bsd_nmake() {
+    let makefile =
+        Makefile::parse_with_variant("all:\n\t${CC} ${.TARGET}\n", MakefileVariant::BSDMake).tree();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("${CC}", "recipe \"${CC} ${.TARGET}\""),
+            ("${.TARGET}", "recipe \"${CC} ${.TARGET}\""),
+        ])
+    );
+    let makefile =
+        Makefile::parse_with_variant("all:\n\t$(CC) $@\n", MakefileVariant::NMake).tree();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(CC)", "recipe \"$(CC) $@\""),
+            ("$@", "recipe \"$(CC) $@\""),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_define_body() {
+    // A tab-indented line in a define body is not a recipe line until the
+    // variable is expanded.
+    let makefile: Makefile = "define F\n\t$(CC) $(1)\nendef\n".parse().unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(CC)", "value of Some(\"F\")"),
+            ("$(1)", "value of Some(\"F\")"),
         ])
     );
 }
