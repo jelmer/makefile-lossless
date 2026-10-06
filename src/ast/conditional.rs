@@ -1554,6 +1554,72 @@ endif
     }
 
     #[test]
+    fn test_ifeq_line_continuation_in_quotes() {
+        let code = "ifeq \"a \\\n   b\" \"a b\"\nA = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("\"a b\" \"a b\"".to_string()));
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("a b".to_string(), "a b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_ifeq_quoted_reference() {
+        let code = "ifeq \"$(A)\" '${B}'\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("$(A)".to_string(), "${B}".to_string()))
+        );
+        let names: Vec<_> = makefile
+            .variable_references()
+            .filter_map(|r| r.name())
+            .collect();
+        assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn test_ifeq_quoted_other_quote_and_backslash() {
+        // A backslash does not escape the closing quote.
+        for (code, args) in [
+            ("ifeq 'a\"b' \"a'b\"\nendif\n", ("a\"b", "a'b")),
+            ("ifeq \"a\\\" \"a\\\"\nendif\n", ("a\\", "a\\")),
+        ] {
+            assert_eq!(error_summary(code), vec![], "{code:?}");
+            let makefile = Makefile::parse(code).tree();
+            let cond = makefile.conditionals().next().unwrap();
+            assert_eq!(
+                cond.ifeq_args(),
+                Some((args.0.to_string(), args.1.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_ifeq_quoted_comment() {
+        // GNU make strips the comment before looking at the quotes, so the
+        // first argument is not closed.
+        let code = "ifeq \"a#b\" \"a\"\nendif\n";
+        assert_eq!(
+            error_summary(code),
+            vec![(
+                ParseErrorKind::InvalidConditional,
+                1,
+                "invalid syntax in conditional: unterminated quoted argument".to_string()
+            )]
+        );
+        let makefile = Makefile::parse(code).tree();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("\"a".to_string()));
+        assert_eq!(cond.ifeq_args(), None);
+    }
+
+    #[test]
     fn test_ifeq_parenthesized_line_continuation() {
         let code = "ifeq ($(A),\\\n  b)\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();

@@ -1572,6 +1572,59 @@ mod tests {
     }
 
     #[test]
+    fn test_value_quotes_ignored() {
+        // Neither GNU make nor BSD make treats quotes specially when
+        // reading a line.
+        let cases = [
+            ("A?= @echo '\\#  '\n", "@echo '#  '", "@echo '#  '"),
+            ("X = '\\#x' \"\\#y\"\n", "'#x' \"#y\"", "'#x' \"#y\""),
+            ("X = 'a\\\\\\#b'\n", "'a\\#b'", "'a\\\\#b'"),
+            ("X = 'a\\\\#b'\n", "'a\\", "'a\\\\"),
+            ("X = \"a#b\"\n", "\"a", "\"a"),
+            ("X = 'a \\\n    b'\n", "'a b'", "'a  b'"),
+            (
+                "X = $(subst '\\#',z,'\\#')\n",
+                "$(subst '\\#',z,'\\#')",
+                "$(subst '#',z,'#')",
+            ),
+        ];
+        for (code, gnu, bsd) in cases {
+            assert_eq!(value_of(code), Some(gnu.to_string()), "{code:?}");
+            assert_eq!(bsd_value(code), Some(bsd.to_string()), "{code:?}");
+            let makefile: Makefile = code.parse().unwrap();
+            assert_eq!(makefile.to_string(), code);
+            let var = makefile.variable_definitions().next().unwrap();
+            assert_eq!(var.value(MakefileVariant::GNUMake), Some(gnu.to_string()));
+            assert_eq!(var.value(MakefileVariant::BSDMake), Some(bsd.to_string()));
+        }
+        assert_eq!(
+            posix_value("X = 'a \\\n    b' '\\#'\n"),
+            Some("'a  b' '#'".to_string())
+        );
+        assert_eq!(
+            value_in(MakefileVariant::NMake, "X = 'a\\#b'\n"),
+            Some("'a\\".to_string())
+        );
+    }
+
+    #[test]
+    fn test_raw_value_comment_in_quotes() {
+        let makefile: Makefile = "A = \"a#b\" # c\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.raw_value(), Some("\"a".to_string()));
+    }
+
+    #[test]
+    fn test_reference_in_quotes() {
+        let makefile: Makefile = "A = \"$(B)\" '${C}'\n".parse().unwrap();
+        let names: Vec<_> = makefile
+            .variable_references()
+            .filter_map(|r| r.name())
+            .collect();
+        assert_eq!(names, vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
     fn test_value_bsd_continuation() {
         assert_eq!(bsd_value("X = a \\\n   b\n"), Some("a  b".to_string()));
         assert_eq!(bsd_value("X = a\t\\\n\t b\n"), Some("a\t b".to_string()));

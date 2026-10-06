@@ -34,7 +34,7 @@ pub struct Lexer<'a> {
     /// that this line continues the recipe.
     recipe_continuation: bool,
     /// Number of parentheses and braces open inside `$(...)` and `${...}`
-    /// references on the current logical line, outside quoted strings.
+    /// references on the current logical line.
     reference_depth: usize,
     /// Number of `$` tokens directly before the current one.
     dollars: usize,
@@ -44,8 +44,6 @@ pub struct Lexer<'a> {
     recipe_prefix: char,
     /// Text of the current logical line, if it is not a recipe line.
     line: Option<String>,
-    /// Whether a quoted string becomes a single QUOTE token.
-    group_quotes: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -68,7 +66,6 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             line: Some(String::new()),
-            group_quotes: true,
         }
     }
 
@@ -146,99 +143,6 @@ impl<'a> Lexer<'a> {
             || c == '.'
             || c == '-'
             || c == '%'
-    }
-
-    /// Check whether a matching close-quote appears on the current line.
-    /// Make doesn't treat quotes as syntactic; we only group them so that
-    /// embedded parens don't confuse $(...) parsing. If the quote is
-    /// unterminated (or asymmetric, like `it's`), grouping would do more
-    /// harm than good — so we only group when there's a partner on the
-    /// same line. A backslash escapes the next character.
-    fn has_matching_close_quote(&self, quote: char) -> bool {
-        let mut probe = self.input.clone();
-        probe.next(); // Skip the opening quote we already peeked.
-        while let Some(c) = probe.next() {
-            if c == '\n' {
-                return false;
-            }
-            if c == '\\' {
-                probe.next();
-                continue;
-            }
-            if c == quote {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Whether the quote at the current position should start a quoted
-    /// string. Make doesn't treat quotes as syntactic; grouping only serves
-    /// to keep e.g. the `)` in `$(if a,')')` from closing the reference.
-    /// Inside a reference, don't group if that would hide the delimiter
-    /// closing it, as in `${:U'}=x'`.
-    fn should_group_quote(&self, quote: char) -> bool {
-        if !self.has_matching_close_quote(quote) {
-            return false;
-        }
-        if self.reference_depth == 0 {
-            return true;
-        }
-        let mut probe = self.input.clone();
-        probe.next();
-        let mut quoted = Vec::new();
-        while let Some(c) = probe.next() {
-            if c == quote {
-                break;
-            }
-            quoted.push(c);
-            if c == '\\' {
-                quoted.extend(probe.next());
-            }
-        }
-        let rest: Vec<char> = probe.take_while(|&c| c != '\n').collect();
-        // Whether the open references are closed on this line.
-        let closes = |chars: &mut dyn Iterator<Item = &char>| {
-            let mut depth = self.reference_depth;
-            for c in chars {
-                match c {
-                    '(' | '{' => depth += 1,
-                    ')' | '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            false
-        };
-        closes(&mut rest.iter()) || !closes(&mut quoted.iter().chain(rest.iter()))
-    }
-
-    fn read_quoted_string(&mut self) -> String {
-        let mut result = String::new();
-        let quote = self.input.next().unwrap(); // Consume opening quote
-        result.push(quote);
-
-        while let Some(&c) = self.input.peek() {
-            if c == quote {
-                result.push(c);
-                self.input.next();
-                break;
-            } else if c == '\\' {
-                result.push(c);
-                self.input.next(); // Consume backslash
-                if let Some(next) = self.input.next() {
-                    result.push(next);
-                }
-            } else {
-                result.push(c);
-                self.input.next();
-            }
-        }
-        result
     }
 
     /// Read a comment up to the end of the line. Outside recipes, a comment
@@ -371,15 +275,11 @@ impl<'a> Lexer<'a> {
                         SyntaxKind::IDENTIFIER,
                         self.read_while(Self::is_valid_identifier_char),
                     )),
+                    // Make does not treat quotes specially when reading a
+                    // line, so each quote is a token of its own.
                     '"' | '\'' => {
-                        if self.group_quotes && self.should_group_quote(c) {
-                            Some((SyntaxKind::QUOTE, self.read_quoted_string()))
-                        } else {
-                            // Lone quote — emit as a single-character QUOTE
-                            // token so paren counting in $(...) still works.
-                            self.input.next();
-                            Some((SyntaxKind::QUOTE, c.to_string()))
-                        }
+                        self.input.next();
+                        Some((SyntaxKind::QUOTE, c.to_string()))
                     }
                     ':' => {
                         // Only take as many characters as form a valid
@@ -544,17 +444,12 @@ pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxK
 /// Lex `input`, treating its first line as an ordinary makefile line even if
 /// it starts with a tab. Also returns whether the input ends in a line
 /// continuation.
-///
-/// Unless `group_quotes` is set, each quote is a QUOTE token of its own, so
-/// that what is between quotes is lexed as usual.
 pub(crate) fn lex_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
-    group_quotes: bool,
 ) -> (Vec<(SyntaxKind, String)>, bool) {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
-    lexer.group_quotes = group_quotes;
     let tokens: Vec<_> = lexer.by_ref().collect();
     // A continued comment takes in the newline and the next line, so if
     // the input ends in a newline that is part of a comment, the comment
@@ -833,7 +728,7 @@ rule: prerequisite
 
     #[test]
     fn test_quote_hiding_reference_close() {
-        // Grouping `'}=a'` would hide the `}` that closes the reference.
+        // The quote does not hide the `}` that closes the reference.
         assert_eq!(
             lex_default("${:U'}=a'\n"),
             vec![
@@ -852,8 +747,9 @@ rule: prerequisite
     }
 
     #[test]
-    fn test_quote_hiding_paren_in_reference() {
-        // The reference is still closed after the quoted `)`.
+    fn test_quoted_paren_in_reference() {
+        // Make does not look at quotes, so the quoted `)` closes the
+        // reference.
         assert_eq!(
             lex_default("$(if a,')')\n"),
             vec![
@@ -863,7 +759,9 @@ rule: prerequisite
                 (WHITESPACE, " ".to_string()),
                 (IDENTIFIER, "a".to_string()),
                 (COMMA, ",".to_string()),
-                (QUOTE, "')'".to_string()),
+                (QUOTE, "'".to_string()),
+                (RPAREN, ")".to_string()),
+                (QUOTE, "'".to_string()),
                 (RPAREN, ")".to_string()),
                 (NEWLINE, "\n".to_string()),
             ]
@@ -871,21 +769,43 @@ rule: prerequisite
     }
 
     #[test]
-    fn test_quote_outside_reference() {
-        // Braces outside references don't matter to make.
-        assert_eq!(
-            lex_default("X = '{' '}'\n"),
-            vec![
-                (IDENTIFIER, "X".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (OPERATOR, "=".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (QUOTE, "'{'".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (QUOTE, "'}'".to_string()),
-                (NEWLINE, "\n".to_string()),
-            ]
-        );
+    fn test_quotes_not_grouped() {
+        // Neither GNU make nor BSD make treats quotes specially when
+        // reading a line.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            assert_eq!(
+                lex("X = '$(Y) \\\n b' \"a#b\"\n", variant),
+                vec![
+                    (IDENTIFIER, "X".to_string()),
+                    (WHITESPACE, " ".to_string()),
+                    (OPERATOR, "=".to_string()),
+                    (WHITESPACE, " ".to_string()),
+                    (QUOTE, "'".to_string()),
+                    (DOLLAR, "$".to_string()),
+                    (LPAREN, "(".to_string()),
+                    (IDENTIFIER, "Y".to_string()),
+                    (RPAREN, ")".to_string()),
+                    (WHITESPACE, " ".to_string()),
+                    (BACKSLASH, "\\".to_string()),
+                    (NEWLINE, "\n".to_string()),
+                    (INDENT, " ".to_string()),
+                    (IDENTIFIER, "b".to_string()),
+                    (QUOTE, "'".to_string()),
+                    (WHITESPACE, " ".to_string()),
+                    (QUOTE, "\"".to_string()),
+                    (IDENTIFIER, "a".to_string()),
+                    (COMMENT, "#b\"".to_string()),
+                    (NEWLINE, "\n".to_string()),
+                ],
+                "{variant:?}"
+            );
+        }
     }
 
     #[test]
