@@ -102,6 +102,69 @@ impl RuleItem {
     }
 }
 
+/// The dependency operator separating a rule's targets from its
+/// prerequisites, as returned by [`Rule::operator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RuleOperator {
+    /// `:`
+    Colon,
+    /// `::`, a double-colon rule.
+    DoubleColon,
+    /// `&:`, GNU make grouped targets.
+    GroupedColon,
+    /// `&::`, GNU make grouped targets of a double-colon rule.
+    GroupedDoubleColon,
+    /// `!`, a BSD make rule whose targets are always remade.
+    Bang,
+}
+
+impl RuleOperator {
+    fn from_text(text: &str) -> Option<Self> {
+        match text {
+            ":" => Some(RuleOperator::Colon),
+            "::" => Some(RuleOperator::DoubleColon),
+            "&:" => Some(RuleOperator::GroupedColon),
+            "&::" => Some(RuleOperator::GroupedDoubleColon),
+            "!" => Some(RuleOperator::Bang),
+            _ => None,
+        }
+    }
+
+    /// The operator as written in a makefile, e.g. `"&::"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RuleOperator::Colon => ":",
+            RuleOperator::DoubleColon => "::",
+            RuleOperator::GroupedColon => "&:",
+            RuleOperator::GroupedDoubleColon => "&::",
+            RuleOperator::Bang => "!",
+        }
+    }
+
+    /// Whether this is a double-colon operator (`::` or `&::`).
+    pub fn is_double_colon(&self) -> bool {
+        matches!(
+            self,
+            RuleOperator::DoubleColon | RuleOperator::GroupedDoubleColon
+        )
+    }
+
+    /// Whether this is a grouped targets operator (`&:` or `&::`).
+    pub fn is_grouped(&self) -> bool {
+        matches!(
+            self,
+            RuleOperator::GroupedColon | RuleOperator::GroupedDoubleColon
+        )
+    }
+}
+
+impl std::fmt::Display for RuleOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Rule {
     /// Parse rule text, returning a Parse result
     pub fn parse(text: &str) -> crate::Parse<Rule> {
@@ -212,10 +275,7 @@ impl Rule {
     /// assert!(!rule.is_grouped());
     /// ```
     pub fn is_grouped(&self) -> bool {
-        self.syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .any(|t| t.kind() == OPERATOR && matches!(t.text(), "&:" | "&::"))
+        self.operator().is_some_and(|op| op.is_grouped())
     }
 
     /// Check if this is a double-colon rule (`target:: prereqs`).
@@ -232,10 +292,33 @@ impl Rule {
     /// assert!(rule.is_double_colon());
     /// ```
     pub fn is_double_colon(&self) -> bool {
-        self.syntax()
+        self.operator().is_some_and(|op| op.is_double_colon())
+    }
+
+    /// Get the dependency operator that separates the targets from the
+    /// prerequisites.
+    ///
+    /// For a static pattern rule such as `a.o: %.o: %.c` this is the
+    /// operator after the targets, not the colon after the target pattern.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant, RuleOperator};
+    /// let makefile: Makefile = "a b &:: c\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// assert_eq!(rule.operator(), Some(RuleOperator::GroupedDoubleColon));
+    ///
+    /// let makefile = Makefile::parse_with_variant("a ! b\n", MakefileVariant::BSDMake).tree();
+    /// let rule = makefile.rules().next().unwrap();
+    /// assert_eq!(rule.operator(), Some(RuleOperator::Bang));
+    /// ```
+    pub fn operator(&self) -> Option<RuleOperator> {
+        let token = self
+            .syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
-            .any(|t| t.kind() == OPERATOR && matches!(t.text(), "::" | "&::"))
+            .find(|t| t.kind() == OPERATOR)?;
+        RuleOperator::from_text(token.text())
     }
 
     // Helper method to collect variable references from tokens
@@ -1415,7 +1498,9 @@ impl Default for Makefile {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem};
+    use crate::{
+        ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem, RuleOperator,
+    };
 
     #[test]
     fn test_rules_with_pipe_in_shell_continuation() {
@@ -1481,6 +1566,113 @@ mod tests {
     fn test_is_double_colon_false() {
         let rule: Rule = "all: dep\n\tcmd".parse().unwrap();
         assert!(!rule.is_double_colon());
+    }
+
+    fn operators(text: &str, variant: Option<MakefileVariant>) -> Vec<Option<RuleOperator>> {
+        let parsed = match variant {
+            Some(variant) => Makefile::parse_with_variant(text, variant),
+            None => Makefile::parse(text),
+        };
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile.rules().map(|r| r.operator()).collect()
+    }
+
+    #[test]
+    fn test_operator_gnu() {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            assert_eq!(
+                operators("a: b\nc:: d\ne f &: g\nh i &:: j\n:\n", variant),
+                vec![
+                    Some(RuleOperator::Colon),
+                    Some(RuleOperator::DoubleColon),
+                    Some(RuleOperator::GroupedColon),
+                    Some(RuleOperator::GroupedDoubleColon),
+                    Some(RuleOperator::Colon),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_bsd() {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            assert_eq!(
+                operators("a: b\nc:: d\ne ! f\ng!h\n", variant),
+                vec![
+                    Some(RuleOperator::Colon),
+                    Some(RuleOperator::DoubleColon),
+                    Some(RuleOperator::Bang),
+                    Some(RuleOperator::Bang),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_posix_and_nmake() {
+        for variant in [MakefileVariant::POSIXMake, MakefileVariant::NMake] {
+            assert_eq!(
+                operators("a: b\nc:: d\n", Some(variant)),
+                vec![Some(RuleOperator::Colon), Some(RuleOperator::DoubleColon)]
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_static_pattern_rule() {
+        assert_eq!(
+            operators(
+                "a.o: %.o: %.c\nb.o:: %.o: %.c\nc.x c.y &: %.x: %.c\n",
+                Some(MakefileVariant::GNUMake)
+            ),
+            vec![
+                Some(RuleOperator::Colon),
+                Some(RuleOperator::DoubleColon),
+                Some(RuleOperator::GroupedColon),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_operator_ignores_later_operators() {
+        assert_eq!(
+            operators(
+                "a: VAR ::= x\nb: c | d\ne: ; echo\n",
+                Some(MakefileVariant::GNUMake)
+            ),
+            vec![
+                Some(RuleOperator::Colon),
+                Some(RuleOperator::Colon),
+                Some(RuleOperator::Colon),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_operator_bsd_split_assignment() {
+        // BSD make reads `a b:::=c` as `::` followed by a target-local `:=`
+        // assignment, and `d e!=f` as `!` followed by `=`.
+        assert_eq!(
+            operators("a b:::=c\nd e!=f\n", Some(MakefileVariant::BSDMake)),
+            vec![Some(RuleOperator::DoubleColon), Some(RuleOperator::Bang)]
+        );
+    }
+
+    #[test]
+    fn test_rule_operator_as_str() {
+        assert_eq!(
+            [
+                RuleOperator::Colon,
+                RuleOperator::DoubleColon,
+                RuleOperator::GroupedColon,
+                RuleOperator::GroupedDoubleColon,
+                RuleOperator::Bang,
+            ]
+            .map(|op| op.as_str()),
+            [":", "::", "&:", "&::", "!"]
+        );
     }
 
     #[test]
