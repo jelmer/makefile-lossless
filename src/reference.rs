@@ -323,8 +323,12 @@ pub enum Modifier {
 ///   (unescaped) text to match. Other backslashes, such as those in regular
 ///   expressions for `:C`, are kept.
 /// - `:U` and `:D`: `\` followed by `:`, the closing brace, `$` or `\`.
-/// - `:M` and `:N`: `\` followed by `:` or the closing brace. A backslash
-///   before the opening brace is kept, as it is in make.
+/// - `:M` and `:N`: `\` followed by `:` or the closing brace, but only if
+///   an escaped `:`, closing brace or opening brace comes before the first
+///   `$`. These escapes are then removed from the whole pattern, including
+///   from nested expressions, so `${X:M\:${:U\:}}` gives `:${:U:}` while
+///   `${X:M${:U\:}}` gives `${:U\:}`. A backslash before the opening brace
+///   is kept, as it is in make.
 /// - `:@`: in the variable name and body, `\@`, `\\` and `\$`.
 ///
 /// In parts that are parsed into a [`ModifierArg`], `$$` is returned as a
@@ -1316,8 +1320,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the pattern of `:M` or `:N`.
+    ///
+    /// As in make, escaped delimiters are only unescaped if an escape comes
+    /// before the first `$`, and then throughout the pattern, including in
+    /// nested expressions.
     fn parse_match_pattern(&mut self, delims: Delims) -> String {
-        let mut pattern = String::new();
+        let start = self.pos;
+        let mut unescape = false;
+        let mut has_expr = false;
         let mut nest = 0;
         while let Some(c) = self.peek() {
             if c == ':' && nest == 0 {
@@ -1325,16 +1335,15 @@ impl<'a> Parser<'a> {
             }
             if c == '\\' {
                 if let Some(next) = self.peek_nth(1) {
-                    let escapes_delimiter = delims.is_delimiter(Some(next));
-                    if escapes_delimiter || Some(next) == delims.startc {
-                        if !escapes_delimiter {
-                            pattern.push('\\');
-                        }
-                        pattern.push(next);
+                    if delims.is_delimiter(Some(next)) || Some(next) == delims.startc {
+                        unescape |= !has_expr;
                         self.bump_n(2);
                         continue;
                     }
                 }
+            }
+            if c == '$' {
+                has_expr = true;
             }
             if c == '(' || c == '{' {
                 nest += 1;
@@ -1345,8 +1354,23 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            pattern.push(c);
             self.bump();
+        }
+        let raw = &self.text[start..self.pos];
+        if !unescape {
+            return raw.to_string();
+        }
+        let mut pattern = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if delims.is_delimiter(Some(next)) {
+                        continue;
+                    }
+                }
+            }
+            pattern.push(c);
         }
         pattern
     }
@@ -1964,6 +1988,40 @@ mod tests {
         assert_eq!(one("${X:M}"), Modifier::Match("".to_string()));
         // `=` does not make this a SysV substitution.
         assert_eq!(one("${X:Ma=b}"), Modifier::Match("a=b".to_string()));
+    }
+
+    #[test]
+    fn test_match_escapes_and_expressions() {
+        // Escapes are only removed if one comes before the first `$`, and
+        // then also from the nested expressions.
+        assert_eq!(
+            one("${W:M${:U\\:}}"),
+            Modifier::Match("${:U\\:}".to_string())
+        );
+        assert_eq!(
+            one("${X:M${:U}\\:}"),
+            Modifier::Match("${:U}\\:".to_string())
+        );
+        assert_eq!(one("${X:M\\:${:U}}"), Modifier::Match(":${:U}".to_string()));
+        assert_eq!(
+            one("${X:M\\:${:U\\:}}"),
+            Modifier::Match(":${:U:}".to_string())
+        );
+        assert_eq!(
+            one("${X:M${:U\\:}\\:}"),
+            Modifier::Match("${:U\\:}\\:".to_string())
+        );
+        assert_eq!(one("${X:N$$\\:}"), Modifier::NoMatch("$$\\:".to_string()));
+        // An escaped opening brace keeps its backslash but still enables
+        // unescaping.
+        assert_eq!(
+            one("${X:M\\{${:U\\}}}"),
+            Modifier::Match("\\{${:U}}".to_string())
+        );
+        assert_eq!(
+            mods("${X:M${:U\\:}:Q}"),
+            vec![Modifier::Match("${:U\\:}".to_string()), Modifier::Quote]
+        );
     }
 
     #[test]
