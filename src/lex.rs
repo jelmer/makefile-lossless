@@ -169,6 +169,15 @@ impl<'a> Lexer<'a> {
             && probe.next() == Some('\n')
     }
 
+    /// Read the rest of a recipe line as text, noting whether it continues
+    /// on the next line.
+    fn read_recipe_text(&mut self) -> (SyntaxKind, String) {
+        let text = self.read_line();
+        let trailing_backslashes = text.chars().rev().take_while(|&c| c == '\\').count();
+        self.recipe_continuation = trailing_backslashes % 2 == 1;
+        (SyntaxKind::TEXT, text)
+    }
+
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
@@ -271,6 +280,12 @@ impl<'a> Lexer<'a> {
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, self.read_while(|ch| ch == ' ')));
                 }
+                (_, None) if recipe_continuation && !self.at_newline() => {
+                    // An unindented continuation of a recipe line, which
+                    // make passes on to the shell as is, `#` included.
+                    self.line_type = Some(LineType::Recipe);
+                    return Some(self.read_recipe_text());
+                }
                 (' ', None) if !self.continuation => {
                     // Only a tab introduces a recipe line; leading spaces are
                     // allowed before ordinary makefile lines.
@@ -310,13 +325,7 @@ impl<'a> Lexer<'a> {
             }
 
             match self.line_type.unwrap() {
-                LineType::Recipe => {
-                    let text = self.read_line();
-                    let trailing_backslashes =
-                        text.chars().rev().take_while(|&c| c == '\\').count();
-                    self.recipe_continuation = trailing_backslashes % 2 == 1;
-                    Some((SyntaxKind::TEXT, text))
-                }
+                LineType::Recipe => Some(self.read_recipe_text()),
                 LineType::Other => match c {
                     c if self.is_word_separator(c) => {
                         Some((SyntaxKind::WHITESPACE, self.read_word_separators()))

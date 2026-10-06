@@ -560,14 +560,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     .unwrap_or(false);
 
                 if is_continuation {
-                    // This is a continuation line - consume the indent of the next line and continue
-                    if self.current() == Some(INDENT) {
-                        self.bump();
-                        // Continue parsing the next line
-                        continue;
-                    } else {
-                        // If there's no indent after a backslash, that's unusual but we'll stop here
-                        break;
+                    // This is a continuation line - consume the indent of the next line, if
+                    // any, and continue
+                    match self.current() {
+                        Some(INDENT) => {
+                            self.bump();
+                            continue;
+                        }
+                        Some(TEXT) => continue,
+                        _ => break,
                     }
                 } else {
                     // No continuation - we're done

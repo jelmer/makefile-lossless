@@ -3014,4 +3014,27 @@ mod tests {
         assert!(rule.set_prerequisites(vec!["c;d"]).is_err());
         assert_eq!(makefile.to_string(), "a: b\n");
     }
+
+    #[test]
+    fn test_recipe_continuation_lines_without_indent() {
+        // As in intel-ipsec-mb's LibTestApp/Makefile. Both makes run
+        // `echo a b,c,# d` (GNU make) as one command.
+        let text = "style:\n\techo a \\\nb,\\\nc,\\\n# d\nall:\n";
+        for variant in [
+            crate::MakefileVariant::GNUMake,
+            crate::MakefileVariant::BSDMake,
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert_eq!(parsed.errors(), &[], "{variant:?}");
+            let makefile = parsed.tree();
+            let rules: Vec<_> = makefile.rules().collect();
+            assert_eq!(rules.len(), 2, "{variant:?}");
+            assert_eq!(
+                rules[0].recipes().collect::<Vec<_>>(),
+                vec!["echo a \\\nb,\\\nc,\\\n# d"],
+                "{variant:?}"
+            );
+            assert_eq!(makefile.to_string(), text);
+        }
+    }
 }
