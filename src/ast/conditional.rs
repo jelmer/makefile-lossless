@@ -1111,19 +1111,11 @@ impl Conditional {
     pub fn add_else_item(&mut self, item: MakefileItem) {
         let else_node = self.plain_else().unwrap_or_else(|| self.add_else_clause());
         let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
-        let mut insert_pos = else_node.index() + 1;
-        // The parser leaves the newline after a plain GNU `else` outside the
-        // CONDITIONAL_ELSE node.
-        if !else_node.last_token().is_some_and(|t| t.kind() == NEWLINE)
-            && else_node
-                .next_sibling_or_token()
-                .is_some_and(|it| it.kind() == NEWLINE)
-        {
-            insert_pos += 1;
-        }
-
-        let insert_pos =
-            terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
+        let insert_pos = terminate_line_before(
+            self.syntax(),
+            else_node.index() + 1,
+            &line_ending(self.syntax()),
+        );
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
@@ -3001,5 +2993,54 @@ endif
                 "ConditionalBranch { index: 1, range: 14..19 }",
             ]
         );
+    }
+
+    fn parsed_item(src: &str) -> MakefileItem {
+        let temp: Makefile = src.parse().unwrap();
+        let item = temp.items().next().unwrap();
+        item
+    }
+
+    #[test]
+    fn test_add_else_item_to_existing_else() {
+        let makefile: Makefile = "ifdef X\nelse\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(parsed_item("b:\n"));
+        assert_eq!(makefile.to_string(), "ifdef X\nelse\nb:\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_else_item_after_else_comment() {
+        let makefile: Makefile = "ifdef X\nelse # c\nA = 1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(parsed_item("b:\n"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nelse # c\nb:\nA = 1\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_else_item_to_else_if() {
+        let makefile: Makefile = "ifdef X\nelse ifdef Y\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(parsed_item("b:\n"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nelse ifdef Y\nelse\nb:\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_if_item_to_existing_conditional() {
+        let makefile: Makefile = "ifeq (a,b)\nelse\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(parsed_item("b:\n"));
+        cond.add_else_item(parsed_item("c:\n"));
+        assert_eq!(makefile.to_string(), "ifeq (a,b)\nb:\nelse\nc:\nendif\n");
+        assert_matches_reparse(&makefile);
     }
 }
