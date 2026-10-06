@@ -295,7 +295,19 @@ pub enum Modifier {
     Remember(String),
     /// A nested expression such as `${MODS}` in `${VAR:${MODS}}`, whose
     /// value is a list of modifiers to apply.
+    ///
+    /// The value is parsed as a list of modifiers on its own, as by
+    /// [`ParsedReference::parse_body`] with a leading `:`. It may end in a
+    /// `:`, so `tl:` has the same effect as `tl`.
     Indirect(String),
+    /// A nested expression used as a list of modifiers like
+    /// [`Modifier::Indirect`], that is directly followed by the next
+    /// modifier instead of by `:` or the closing brace, such as `${M}` in
+    /// `${VAR:${M}S,a,b,}`.
+    ///
+    /// make only accepts this if the expression expands to an empty string.
+    /// Otherwise it reports an unknown modifier `:${`.
+    UnseparatedIndirect(String),
 }
 
 /// A variable reference, split into the variable name and its modifiers.
@@ -803,12 +815,14 @@ impl<'a> Parser<'a> {
                 Some(_) => {}
             }
             let start = self.pos;
-            modifiers.push(self.parse_modifier(delims)?);
+            let modifier = self.parse_modifier(delims)?;
+            let unseparated = matches!(modifier, Modifier::UnseparatedIndirect(_));
+            modifiers.push(modifier);
             match self.peek() {
                 Some(':') => {
                     self.bump();
                 }
-                c if delims.is_delimiter(c) => {}
+                c if unseparated || delims.is_delimiter(c) => {}
                 _ => {
                     return Err(syntax_error(
                         self.pos,
@@ -947,6 +961,15 @@ impl<'a> Parser<'a> {
         self.spans.truncate(spans);
         if let Some(modifier) = self.parse_sysv(delims)? {
             return Ok(modifier);
+        }
+        // An indirect modifier that expands to an empty string may be
+        // followed directly by the next modifier.
+        if first == '$' {
+            let mut arg = ModifierArg::default();
+            self.parse_nested_expr(&mut arg)?;
+            return Ok(Modifier::UnseparatedIndirect(
+                self.text[start..self.pos].to_string(),
+            ));
         }
         // Guess the end of the modifier, like make does.
         self.bump();
@@ -2390,6 +2413,48 @@ mod tests {
                 from: ModifierArg::new([expr("${A}"), text("x")]),
                 to: lit("y"),
             }
+        );
+    }
+
+    #[test]
+    fn test_unseparated_indirect() {
+        // From NetBSD's unit-tests/varmod-indirect.mk.
+        assert_eq!(
+            mods("${value:L:${:Dempty}S,value,replaced,}"),
+            vec![
+                Modifier::Literal,
+                Modifier::UnseparatedIndirect("${:Dempty}".to_string()),
+                subst("value", "replaced", Default::default()),
+            ]
+        );
+        assert_eq!(
+            mods("${X:${A}${B}}"),
+            vec![
+                Modifier::UnseparatedIndirect("${A}".to_string()),
+                Modifier::Indirect("${B}".to_string()),
+            ]
+        );
+        // From NetBSD's share/mk/bsd.man.mk.
+        assert_eq!(
+            mods("${MLINKS:${_FLATTEN}M${_dst:${_FLATTEN}Q}:[\\#]}"),
+            vec![
+                Modifier::UnseparatedIndirect("${_FLATTEN}".to_string()),
+                Modifier::Match("${_dst:${_FLATTEN}Q}".to_string()),
+                Modifier::Words(WordSelector::Count),
+            ]
+        );
+        assert_eq!(
+            ParsedReference::parse("${X:${A}Z}", BSDMake),
+            Err(ReferenceError::UnknownModifier {
+                offset: 8,
+                modifier: "Z".to_string()
+            })
+        );
+        // The value of an indirect modifier is parsed as modifiers on its
+        // own, which may end in a colon.
+        assert_eq!(
+            ParsedReference::parse_body(":tl:", BSDMake),
+            Ok(reference("", vec![Modifier::ToLower]))
         );
     }
 
