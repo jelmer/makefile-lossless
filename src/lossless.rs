@@ -182,6 +182,77 @@ impl Makefile {
         let b_ref: &rowan::GreenNodeData = &b;
         std::ptr::eq(a_ref as *const _, b_ref as *const _) || a_ref == b_ref
     }
+
+    /// The source ranges of the line continuations in this makefile: each
+    /// backslash-newline that joins two lines, from the backslash up to
+    /// and including the line ending.
+    ///
+    /// A backslash escaped by another one (`\\`) does not continue the
+    /// line, nor does an nmake `^\`. Continuations are found in any
+    /// context: in rule lines, assignments and directives, in recipes and
+    /// comments, and in `define` bodies, where make keeps them in the
+    /// value.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    ///
+    /// let makefile: Makefile = "A = a \\\n  b\nall:\n\techo \\\\\n".parse().unwrap();
+    /// assert_eq!(
+    ///     makefile.line_continuations().collect::<Vec<_>>(),
+    ///     vec![TextRange::new(6.into(), 8.into())]
+    /// );
+    /// ```
+    pub fn line_continuations(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.0
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .flat_map(|token| token_continuations(&token))
+    }
+}
+
+/// The line continuations within or starting in `token`.
+fn token_continuations(token: &SyntaxToken) -> Vec<rowan::TextRange> {
+    let start = token.text_range().start();
+    if token.kind() == BACKSLASH {
+        if !crate::ast::is_continuation(&token.clone().into()) {
+            return vec![];
+        }
+        let end = token
+            .next_token()
+            .expect("a continuation backslash is followed by a newline")
+            .text_range()
+            .end();
+        return vec![rowan::TextRange::new(start, end)];
+    }
+    // An nmake `^\` escapes the backslash.
+    if token.kind() == NEWLINE || token.text() == "^\\" {
+        return vec![];
+    }
+    // Recipe text and comments hold the backslash, and comments also the
+    // newline.
+    let text = token.text();
+    let odd_backslashes = |before: &str| {
+        let before = before.strip_suffix('\r').unwrap_or(before);
+        let n = before.len() - before.trim_end_matches('\\').len();
+        (n % 2 == 1).then(|| before.len() - 1)
+    };
+    let offset = |i: usize| start + rowan::TextSize::from(i as u32);
+    let mut ranges: Vec<_> = text
+        .match_indices('\n')
+        .filter_map(|(i, _)| {
+            odd_backslashes(&text[..i])
+                .map(|backslash| rowan::TextRange::new(offset(backslash), offset(i + 1)))
+        })
+        .collect();
+    let newline = token.next_token().filter(|t| t.kind() == NEWLINE);
+    if let (Some(newline), Some(backslash)) = (newline, odd_backslashes(text)) {
+        ranges.push(rowan::TextRange::new(
+            offset(backslash),
+            newline.text_range().end(),
+        ));
+    }
+    ranges
 }
 
 ast_node!(Rule, RULE);
