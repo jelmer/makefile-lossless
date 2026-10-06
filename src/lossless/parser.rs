@@ -677,7 +677,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// whitespace/newline/comment, descending into variable references
         /// (`$(...)`, `${...}`, `$X`, `$$`) and archive-member parentheses
         /// without treating them as word boundaries. If `stop_at_pipe` is
-        /// set, a `|` also ends the word.
+        /// set, a `|` that is not escaped with a backslash also ends the
+        /// word.
         fn parse_prerequisite_word(&mut self, stop_at_pipe: bool) {
             self.builder.start_node(PREREQUISITE.into());
 
@@ -708,7 +709,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
-                    TEXT if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
+                    // GNU make takes `\|` as part of the name, but not `\;`.
+                    TEXT if self.at_text(";")
+                        || (stop_at_pipe
+                            && self.at_text("|")
+                            && !self.pending_backslash_escape) =>
+                    {
+                        break
+                    }
                     DOLLAR => {
                         let escape = self.at_dollar_escape();
                         self.parse_variable_reference();
