@@ -8239,6 +8239,46 @@ rule: dependency
     }
 
     #[test]
+    fn test_try_add_rule() {
+        let mut makefile: Makefile = "all: $(OBJS) a#b\n".parse().unwrap();
+        for target in ["$(OBJS)", "a#b", "$(call f,x y)", "lib(a.o)", "a\\ b"] {
+            let rule = makefile.try_add_rule(target).unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec![target]);
+        }
+        assert_eq!(
+            makefile.to_string(),
+            "all: $(OBJS) a#b\n\n$(OBJS):\n\na\\#b:\n\n$(call f,x y):\n\nlib(a.o):\n\na\\ b:\n"
+        );
+    }
+
+    #[test]
+    fn test_try_add_rule_invalid() {
+        let mut makefile: Makefile = "all: x\n".parse().unwrap();
+        for target in ["", "a b", "a:b", "a\nb", "a=b", "$(X", "a\\"] {
+            let Err(Error::Parse(e)) = makefile.try_add_rule(target) else {
+                panic!("expected an error for {target:?}");
+            };
+            assert_eq!(
+                e.errors
+                    .iter()
+                    .map(|e| (e.message.clone(), e.context.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    format!("Cannot write {:?} as targets", [target]),
+                    "add_rule"
+                )]
+            );
+        }
+        assert_eq!(makefile.to_string(), "all: x\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid target")]
+    fn test_add_rule_invalid_panics() {
+        Makefile::new().add_rule("a b");
+    }
+
+    #[test]
     fn test_add_rule_with_shebang() {
         // Regression test for bug where add_rule() panics on makefiles with shebangs
         let content = r#"#!/usr/bin/make -f
