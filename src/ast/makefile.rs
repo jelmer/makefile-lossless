@@ -1,4 +1,3 @@
-use super::build_copy;
 use super::rule::build_targets_node;
 use super::{
     detach_tokens, index_before_doc_comment, line_ending, lines_above, terminate_line_before,
@@ -164,6 +163,50 @@ fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
     }
     nodes.push(node.into());
     insert_items(root, pos, nodes);
+}
+
+/// Build a conditional by parsing its text, so that the tree is the same
+/// as when the makefile is parsed again. Each body line is ended with
+/// `eol`. Returns an error if the text does not parse as a single
+/// conditional, such as when a body contains an unmatched `endif`.
+fn build_conditional(
+    if_line: &str,
+    if_body: &str,
+    else_branch: Option<(&str, &str)>,
+    endif_keyword: &str,
+    eol: &str,
+    context: &str,
+) -> Result<SyntaxNode, Error> {
+    let mut lines = vec![if_line];
+    lines.extend(if_body.lines());
+    if let Some((else_keyword, else_body)) = else_branch {
+        lines.push(else_keyword);
+        lines.extend(else_body.lines());
+    }
+    lines.push(endif_keyword);
+    let text: String = lines.iter().flat_map(|line| [*line, eol]).collect();
+
+    let parsed = parse(&text, None);
+    if !parsed.errors.is_empty() {
+        return Err(Error::Parse(ParseError {
+            errors: parsed.errors,
+        }));
+    }
+    let root = parsed.root();
+    let mut children = root.syntax().children_with_tokens();
+    match (children.next(), children.next()) {
+        (Some(rowan::NodeOrToken::Node(node)), None) if node.kind() == CONDITIONAL => {
+            Ok(SyntaxNode::new_root_mut(node.green().into_owned()))
+        }
+        _ => Err(Error::Parse(ParseError {
+            errors: vec![ErrorInfo {
+                kind: crate::ParseErrorKind::Other,
+                message: format!("{text:?} does not parse as a single conditional"),
+                line: 1,
+                context: context.to_string(),
+            }],
+        })),
+    }
 }
 
 /// Represents different types of items that can appear in a Makefile
@@ -1267,7 +1310,8 @@ impl Makefile {
     /// Add a new conditional to the makefile
     ///
     /// The conditional is separated from any preceding content by a blank
-    /// line, unless the makefile already ends in one.
+    /// line, unless the makefile already ends in one. The bodies are parsed
+    /// as makefile text.
     ///
     /// Returns an error if the condition is empty or invalid, as in
     /// `ifeq ()`, or if a body does not read back as part of its branch,
@@ -1317,64 +1361,24 @@ impl Makefile {
         )?;
 
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(CONDITIONAL.into());
-
-        // Build CONDITIONAL_IF
-        builder.start_node(CONDITIONAL_IF.into());
-        builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap condition in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        for line in if_body.lines() {
-            if !line.is_empty() {
-                builder.token(IDENTIFIER.into(), line);
-            }
-            builder.token(NEWLINE.into(), &eol);
-        }
-
-        // Add else clause if provided
-        if let Some(else_content) = else_body {
-            builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), &eol);
-            builder.finish_node();
-
-            for line in else_content.lines() {
-                if !line.is_empty() {
-                    builder.token(IDENTIFIER.into(), line);
-                }
-                builder.token(NEWLINE.into(), &eol);
-            }
-        }
-
-        // Build CONDITIONAL_ENDIF
-        builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = build_conditional(
+            &format!("{conditional_type} {condition}"),
+            if_body,
+            else_body.map(|body| (else_keyword, body)),
+            endif_keyword,
+            &eol,
+            "add_conditional",
+        )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
-        // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
     /// Add a new conditional to the makefile with typed items
     ///
     /// This is a more type-safe alternative to `add_conditional` that accepts iterators of
-    /// `MakefileItem` instead of raw strings. Blank lines are handled as by
-    /// [`Makefile::add_conditional`].
+    /// `MakefileItem` instead of raw strings. Blank lines and errors are
+    /// handled as by [`Makefile::add_conditional`].
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1437,50 +1441,21 @@ impl Makefile {
         )?;
 
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(CONDITIONAL.into());
-
-        // Build CONDITIONAL_IF
-        builder.start_node(CONDITIONAL_IF.into());
-        builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap condition in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        for item in if_items {
-            build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
-        }
-
-        // Add else clause if provided
-        if let Some(else_iter) = else_items {
-            builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), &eol);
-            builder.finish_node();
-
-            for item in else_iter {
-                build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
-            }
-        }
-
-        // Build CONDITIONAL_ENDIF
-        builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        // Each item on its own lines, even one without a final newline
+        let item_text = |item: MakefileItem| with_trailing_newline(item.syntax(), "\n").to_string();
+        let if_text: String = if_items.into_iter().map(item_text).collect();
+        let else_text: Option<String> =
+            else_items.map(|items| items.into_iter().map(item_text).collect());
+        let syntax = build_conditional(
+            &format!("{conditional_type} {condition}"),
+            &if_text,
+            else_text.as_deref().map(|text| (else_keyword, text)),
+            endif_keyword,
+            &eol,
+            "add_conditional_with_items",
+        )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
-        // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
@@ -4349,6 +4324,95 @@ VAR3 = value3
                 Some("1".to_string())
             );
         }
+    }
+
+    #[test]
+    fn test_add_conditional_matches_reparse() {
+        let bodies = [
+            "VAR = debug\n",
+            "a: b\n\techo $@\n\nX := $(Y)\n",
+            "ifdef Y\nZ = 1\nelse\nZ = 2\nendif\n",
+            "include a.mk\n# comment\n\n",
+            "export X\n",
+        ];
+        for prefix in ["", "X = 1\n", "X = 1\r\n"] {
+            for body in bodies {
+                let mut makefile: Makefile = prefix.parse().unwrap();
+                makefile
+                    .add_conditional("ifeq", "($(A),b)", body, Some(body))
+                    .unwrap();
+                assert_matches_reparse(&makefile);
+
+                let mut makefile: Makefile = prefix.parse().unwrap();
+                let items: Makefile = body.parse().unwrap();
+                makefile
+                    .add_conditional_with_items("ifdef", "D", items.items(), Some(items.items()))
+                    .unwrap();
+                assert_matches_reparse(&makefile);
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_conditional_items_accessible() {
+        let mut makefile = Makefile::new();
+        let cond = makefile
+            .add_conditional("ifdef", "D", "a: b\n\techo\nX = 1\n", Some("Y = 2\n"))
+            .unwrap();
+        assert_eq!(cond.condition(), Some("D".to_string()));
+        assert_eq!(cond.if_items().count(), 2);
+        assert_eq!(cond.else_items().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| v.name().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["X", "Y"]
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_without_newline() {
+        let mut makefile = Makefile::new();
+        let first: Makefile = "X = 1".parse().unwrap();
+        let second: Makefile = "Y = 2\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items(
+                "ifdef",
+                "D",
+                first.items().chain(second.items()),
+                Some(first.items()),
+            )
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef D\nX = 1\nY = 2\nelse\nX = 1\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_crlf_item() {
+        let mut makefile = Makefile::new();
+        let items: Makefile = "a:\r\n\techo\r\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items("ifdef", "D", items.items(), None::<Vec<MakefileItem>>)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "ifdef D\na:\n\techo\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_conditional_rejects_invalid_body() {
+        let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+        for body in ["endif\n", "ifdef Y\n", "define V\n"] {
+            assert!(
+                makefile.add_conditional("ifdef", "D", body, None).is_err(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(makefile.to_string(), "X = 1\n");
     }
 
     #[test]

@@ -2205,8 +2205,8 @@ rule1:
         assert_eq!(conditional.condition(), Some("DEBUG".to_string()));
         assert!(conditional.has_else());
 
-        // Verify the original content is preserved
-        assert_eq!(makefile.variable_definitions().count(), 1);
+        // The original variable and the two in the conditional
+        assert_eq!(makefile.variable_definitions().count(), 3);
         assert_eq!(makefile.rules().count(), 1);
     }
 
