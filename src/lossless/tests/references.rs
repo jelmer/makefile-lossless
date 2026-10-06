@@ -24,6 +24,7 @@ fn test_variable_reference_names() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_reference_names() {
     let text = "all:\n\t${.ALLSRC:M*.o} ${VAR.${M}} $(shell echo $(X)) ${X:S/a/${Y}/} $1\n";
     let makefile: Makefile = text.parse().unwrap();
@@ -513,6 +514,7 @@ fn test_complex_variable_references_minimal() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references() {
     let makefile: Makefile = "all:\n\techo $(FOO) ${BAR}\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();
@@ -547,6 +549,7 @@ fn test_variable_references_in_define_body() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references_skips_functions_and_automatic() {
     let makefile: Makefile = "all:\n\t$(shell ls) $@ $1 $(REAL)\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();
@@ -560,6 +563,7 @@ fn test_recipe_variable_references_skips_functions_and_automatic() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references_across_continuation() {
     let makefile: Makefile = "all:\n\techo $(FOO) \\\n\t  $(BAR)\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();

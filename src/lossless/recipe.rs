@@ -593,6 +593,9 @@ impl Recipe {
     ///     .collect();
     /// assert_eq!(names, vec!["FOO", "BAR"]);
     /// ```
+    #[deprecated(
+        note = "use Recipe::references, which also finds function calls, automatic variables and references continued on the next line"
+    )]
     pub fn variable_references(&self) -> Vec<RecipeVariableReference> {
         let mut out = Vec::new();
         for (start, text) in self.text_lines() {

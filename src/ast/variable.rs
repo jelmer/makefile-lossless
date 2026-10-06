@@ -324,6 +324,9 @@ impl VariableDefinition {
     ///     .collect();
     /// assert_eq!(names, vec!["FOO", "BAZ"]);
     /// ```
+    #[deprecated(
+        note = "use the references in the syntax tree, from Makefile::variable_references, which also finds function calls, automatic variables and references spanning lines"
+    )]
     pub fn define_variable_references(&self) -> Vec<RecipeVariableReference> {
         let mut out = Vec::new();
         if !self.is_define() {
@@ -1848,6 +1851,7 @@ mod tests {
         assert_eq!(makefile.code(), "y = 1\n");
     }
 
+    #[allow(deprecated)]
     fn define_references(text: &str) -> Vec<(String, std::ops::Range<usize>)> {
         let makefile: Makefile = text.parse().unwrap();
         makefile
