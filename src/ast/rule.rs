@@ -841,7 +841,7 @@ impl Rule {
     }
 
     /// If this rule is actually a target-specific variable assignment
-    /// (`target: VAR [op] value`), return the embedded [`VariableDefinition`].
+    /// (`target: VAR [op] value`), return the embedded [`VariableDefinition`](crate::VariableDefinition).
     ///
     /// In BSD make, such a target-local assignment may follow other sources,
     /// as in `prog: .USE VAR=value`, and the rule may have commands. BSD make
