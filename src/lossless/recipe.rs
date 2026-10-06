@@ -115,8 +115,12 @@ impl Recipe {
 
     fn logical_text(&self, include_comments: bool) -> String {
         let mut after_newline = false;
+        let comment = self.comment_start();
         self.body_tokens()
             .filter_map(|t| {
+                if !include_comments && comment.is_some_and(|c| t.text_range().start() >= c) {
+                    return None;
+                }
                 // Tokens in a reference are all text.
                 let nested = t.parent().as_ref() != Some(self.syntax());
                 match t.kind() {
@@ -146,6 +150,16 @@ impl Recipe {
             .collect()
     }
 
+    /// The start of the comment that this line consists of, if it starts
+    /// with `#`. The references in it are parsed, as GNU make expands it,
+    /// but [`Recipe::text`] leaves it out.
+    fn comment_start(&self) -> Option<rowan::TextSize> {
+        self.syntax()
+            .children_with_tokens()
+            .find(|it| it.kind() == COMMENT)
+            .map(|it| it.text_range().start())
+    }
+
     /// The tokens of this recipe without the leading indentation and the
     /// trailing newline.
     fn body_tokens(&self) -> impl Iterator<Item = SyntaxToken> {
@@ -170,14 +184,16 @@ impl Recipe {
     fn text_lines(&self) -> Vec<(rowan::TextSize, String)> {
         let mut lines: Vec<(rowan::TextSize, String)> = vec![];
         let mut in_line = false;
+        let comment = self.comment_start();
         for token in self
             .syntax()
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
         {
             let nested = token.parent().as_ref() != Some(self.syntax());
-            let is_text =
-                !matches!(token.kind(), NEWLINE | INDENT) && (nested || token.kind() == TEXT);
+            let is_text = !matches!(token.kind(), NEWLINE | INDENT)
+                && (nested || token.kind() == TEXT)
+                && comment.is_none_or(|c| token.text_range().start() < c);
             match lines.last_mut() {
                 Some((_, line)) if is_text && in_line => line.push_str(token.text()),
                 _ if is_text => lines.push((token.text_range().start(), token.text().to_string())),
@@ -201,7 +217,8 @@ impl Recipe {
     /// References are found as make finds them when it expands the recipe,
     /// so a reference may continue on the next line after a line
     /// continuation. An unterminated reference is left as text. Lines
-    /// starting with `#` are not searched.
+    /// starting with `#` are searched too, as GNU make expands them, except
+    /// for BSD make and nmake, which skip them.
     ///
     /// # Example
     /// ```
@@ -263,17 +280,13 @@ impl Recipe {
     /// assert_eq!(recipes[1].comment(), None);
     /// ```
     pub fn comment(&self) -> Option<String> {
-        self.syntax()
+        let token = self
+            .syntax()
             .children_with_tokens()
-            .filter_map(|it| {
-                if let Some(token) = it.as_token() {
-                    if token.kind() == COMMENT {
-                        return Some(token.text().to_string());
-                    }
-                }
-                None
-            })
-            .next()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == COMMENT)?;
+        let elements = comment_elements(&token)?;
+        Some(elements.iter().map(|it| it.to_string()).collect())
     }
 
     /// Get the full content of this recipe line
@@ -825,6 +838,77 @@ fn find_reference_end(bytes: &[u8], start: usize, close: u8) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_comment_line_references() {
+        // GNU make expands a recipe line starting with `#` before passing it
+        // to the shell.
+        let text = "all:\n\t# $(info a) $(X:.c=$(Y)) b\n\t@# $(Z)\nb: ; # ${W}\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let recipes: Vec<_> = makefile.rules().flat_map(|r| r.recipe_nodes()).collect();
+        let refs: Vec<Vec<_>> = recipes
+            .iter()
+            .map(|r| r.references().map(|x| x.to_string()).collect())
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                vec!["$(info a)", "$(X:.c=$(Y))", "$(Y)"],
+                vec!["$(Z)"],
+                vec!["${W}"]
+            ]
+        );
+        let accessors: Vec<_> = recipes
+            .iter()
+            .map(|r| (r.text(), r.comment(), r.full(), r.shell_text()))
+            .collect();
+        assert_eq!(
+            accessors,
+            vec![
+                (
+                    String::new(),
+                    Some("# $(info a) $(X:.c=$(Y)) b".to_string()),
+                    "# $(info a) $(X:.c=$(Y)) b".to_string(),
+                    "# $(info a) $(X:.c=$(Y)) b".to_string()
+                ),
+                (
+                    "@# $(Z)".to_string(),
+                    None,
+                    "@# $(Z)".to_string(),
+                    "@# $(Z)".to_string()
+                ),
+                (
+                    String::new(),
+                    Some("# ${W}".to_string()),
+                    "# ${W}".to_string(),
+                    "# ${W}".to_string()
+                ),
+            ]
+        );
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["", "@# $(Z)"]);
+        assert_eq!(makefile.to_string(), text);
+    }
+
+    #[test]
+    fn test_comment_line_references_bsd_nmake() {
+        // BSD make and nmake skip such lines.
+        for variant in [
+            crate::MakefileVariant::BSDMake,
+            crate::MakefileVariant::NMake,
+        ] {
+            let makefile = Makefile::parse_with_variant("all:\n\t# $(X)\n", variant).tree();
+            let recipe = makefile
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            assert_eq!(recipe.references().count(), 0, "{variant:?}");
+            assert_eq!(recipe.comment(), Some("# $(X)".to_string()));
+        }
+    }
 
     #[test]
     fn test_recipe_is_silent_various_prefixes() {

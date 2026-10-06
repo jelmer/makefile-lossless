@@ -22,10 +22,9 @@ use std::ops::Range;
 pub(crate) enum TextContext {
     /// A recipe line. A reference can only continue on the next line after
     /// a line continuation, as GNU make joins those inside references. The
-    /// indentation or `;` before the command and comment lines are not
-    /// searched.
-    // TODO: make expands the text of a recipe line starting with `#` too,
-    // before passing it to the shell; those are kept as COMMENT tokens.
+    /// indentation or `;` before the command is not searched, and neither
+    /// is a line starting with `#` for BSD make and nmake, which skip those.
+    /// GNU make expands those too before passing them to the shell.
     Recipe,
     /// The body of a `define` block. Make expands it as a whole, so a
     /// reference may span lines.
@@ -78,7 +77,7 @@ pub(crate) fn emit_with_references(
         }
         return;
     }
-    let references: Vec<_> = searched_regions(tokens, &starts, &text, context)
+    let references: Vec<_> = searched_regions(tokens, &starts, &text, context, variant)
         .into_iter()
         .flat_map(|region| {
             Finder::new(&text, region.clone(), variant).find(region.start, region.end, 0)
@@ -165,15 +164,19 @@ fn searched_regions(
     starts: &[usize],
     text: &str,
     context: TextContext,
+    variant: Option<MakefileVariant>,
 ) -> Vec<Range<usize>> {
     if context == TextContext::DefineBody {
         return std::iter::once(0..text.len()).collect();
     }
-    // Only text is searched: not comment lines, nor the `;` before a recipe
-    // on the rule line.
+    let comments = !matches!(
+        variant,
+        Some(MakefileVariant::BSDMake | MakefileVariant::NMake)
+    );
+    // Only text is searched, not the `;` before a recipe on the rule line.
     let mut regions: Vec<Range<usize>> = vec![];
     for ((kind, _), bounds) in tokens.iter().zip(starts.windows(2)) {
-        if !matches!(kind, TEXT | NEWLINE | INDENT) {
+        if !(matches!(kind, TEXT | NEWLINE | INDENT) || (comments && *kind == COMMENT)) {
             continue;
         }
         match regions.last_mut() {

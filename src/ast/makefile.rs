@@ -1228,8 +1228,9 @@ impl Makefile {
     /// This includes whole-line comments, trailing comments such as the one
     /// in `FOO = 1 # x`, comments in conditional directive lines and a
     /// shebang line. It also includes recipe lines and lines in `define`
-    /// bodies that start with `#`, although make passes those on unchanged
-    /// rather than treating them as comments. A `#` elsewhere in a recipe
+    /// bodies that start with `#`, although GNU make expands those and
+    /// passes them on rather than treating them as comments; a range covers
+    /// the references in such a line. A `#` elsewhere in a recipe
     /// line, as in `echo # x`, is not included. Each range starts at the
     /// `#` and ends before the line ending, after any lines the comment is
     /// continued onto with a backslash.
@@ -1249,7 +1250,11 @@ impl Makefile {
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .filter(|t| t.kind() == COMMENT)
-            .map(|t| t.text_range())
+            .filter_map(|t| crate::lossless::comment_elements(&t))
+            .filter_map(|elements| {
+                let first = elements.first()?.text_range();
+                Some(first.cover(elements.last()?.text_range()))
+            })
     }
 
     /// Add a new rule to the makefile
@@ -3251,6 +3256,19 @@ override_dh_auto_configure:
                 "# i \\\n  j"
             ]
         );
+    }
+
+    #[test]
+    fn test_comment_ranges_with_references() {
+        // References in recipe comment lines and define bodies are parsed,
+        // but the comment is still a single range.
+        let text = "all:\n\t# a $(X) b\n\t# $(Y)\ndefine F\n# c $(Z) d\nendef\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let comments: Vec<_> = makefile
+            .comment_ranges()
+            .map(|r| &text[r.start().into()..r.end().into()])
+            .collect();
+        assert_eq!(comments, vec!["# a $(X) b", "# $(Y)", "# c $(Z) d"]);
     }
 
     #[test]
