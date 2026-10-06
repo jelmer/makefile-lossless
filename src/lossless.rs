@@ -523,7 +523,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // Check if the last TEXT token ended with a backslash (continuation)
                 let is_continuation = last_text_content
                     .as_ref()
-                    .map(|text| text.trim_end().ends_with('\\'))
+                    .map(|text| text.trim_end_matches([' ', '\t']).ends_with('\\'))
                     .unwrap_or(false);
 
                 if is_continuation {
@@ -16458,7 +16458,9 @@ mod test_crlf {
 
     #[test]
     fn test_bsd_for_and_directive() {
-        let src = ".for i in a \\\r\n  b\r\nX+= ${i}\r\n.endfor\r\n.error bad \\\r\n  thing\r\n";
+        // BSD make does not continue a line ending in a backslash and CRLF,
+        // so continue these with LF.
+        let src = ".for i in a \\\n  b\r\nX+= ${i}\r\n.endfor\r\n.error bad \\\n  thing\r\n";
         let makefile = Makefile::parse_with_variant(src, crate::MakefileVariant::BSDMake).tree();
         assert_eq!(makefile.to_string(), src);
         let items: Vec<_> = makefile.items().collect();
@@ -16878,6 +16880,60 @@ mod test_crlf {
         let rule = makefile.rules().next().unwrap();
         rule.recipe_nodes().next().unwrap().insert_after("echo b");
         assert_eq!(makefile.to_string(), "X = a\rb\nall:\n\techo a\n\techo b\n");
+    }
+
+    #[test]
+    fn test_bsd_backslash_before_crlf() {
+        // BSD make takes the backslash as escaping the CR, so the line is
+        // not continued.
+        let bsd = Some(crate::MakefileVariant::BSDMake);
+        let makefile = parse_lone_cr("X = a \\\r\nY = b\r\n", bsd);
+        assert_eq!(
+            variables(&makefile),
+            vec![
+                ("X".to_string(), "a \\\r".to_string()),
+                ("Y".to_string(), "b".to_string()),
+            ]
+        );
+        let makefile = parse_lone_cr("all: a \\\r\nb:\r\n", bsd);
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["all", "b"]);
+        let makefile = parse_lone_cr("# c \\\r\nX = 1\r\n", bsd);
+        assert_eq!(
+            variables(&makefile),
+            vec![("X".to_string(), "1".to_string())]
+        );
+        let makefile = parse_lone_cr("all:\r\n\techo a \\\r\n\techo b\r\n", bsd);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a \\\r", "echo b"]
+        );
+    }
+
+    #[test]
+    fn test_backslash_before_crlf_continues() {
+        for variant in VARIANTS {
+            if variant == Some(crate::MakefileVariant::BSDMake) {
+                continue;
+            }
+            let makefile = parse_lone_cr("X = a \\\r\nY = b\r\n", variant);
+            assert_eq!(
+                variables(&makefile),
+                vec![("X".to_string(), "a \\\nY = b".to_string())],
+                "{variant:?}"
+            );
+            let makefile = parse_lone_cr("all:\r\n\techo a \\\r\n\techo b\r\n", variant);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(
+                rule.recipes().collect::<Vec<_>>(),
+                vec!["echo a \\\necho b"],
+                "{variant:?}"
+            );
+        }
     }
 }
 

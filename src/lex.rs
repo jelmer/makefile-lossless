@@ -126,10 +126,26 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Whether the input is at a CRLF whose CR BSD make takes as escaped
+    /// by an unescaped backslash before it, so that the line ends at the LF
+    /// and is not continued.
+    fn at_escaped_cr(&self, after_backslash: bool) -> bool {
+        let mut probe = self.input.clone();
+        self.bsd
+            && !self.gnu
+            && after_backslash
+            && probe.next() == Some('\r')
+            && probe.next() == Some('\n')
+    }
+
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
-        while !self.at_newline() {
+        loop {
+            let after_backslash = result.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+            if self.at_newline() && !self.at_escaped_cr(after_backslash) {
+                break;
+            }
             let Some(c) = self.input.next() else {
                 break;
             };
@@ -476,6 +492,10 @@ impl<'a> Lexer<'a> {
                         if !escaped && self.input.peek() == Some(&'#') {
                             self.input.next();
                             return Some((SyntaxKind::TEXT, "\\#".to_string()));
+                        }
+                        if self.at_escaped_cr(!escaped) {
+                            self.input.next();
+                            return Some((SyntaxKind::TEXT, "\\\r".to_string()));
                         }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
