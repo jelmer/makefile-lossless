@@ -962,8 +962,8 @@ mod tests {
     use super::{ConditionalBranch, ConditionalItem};
     use crate::lossless::Makefile;
     use crate::{
-        BsdComparisonOp, BsdCondition, BsdConditionError, BsdFunction, BsdOperand, MakefileItem,
-        MakefileVariant, ParseErrorKind, RuleItem,
+        BsdComparisonOp, BsdCondition, BsdConditionError, BsdConditionErrorKind, BsdFunction,
+        BsdOperand, MakefileItem, MakefileVariant, ParseErrorKind, RuleItem,
     };
 
     #[test]
@@ -1383,6 +1383,7 @@ mod tests {
                 Some(Err(BsdConditionError {
                     message: "missing right-hand side of operator \"==\"".to_string(),
                     offset: 7,
+                    kind: BsdConditionErrorKind::MissingRightHandSide,
                 })),
                 None,
             ]
@@ -1417,6 +1418,7 @@ mod tests {
             Some(Err(BsdConditionError {
                 message: "missing operand".to_string(),
                 offset: 0,
+                kind: BsdConditionErrorKind::MissingOperand,
             }))
         );
     }

@@ -10,7 +10,7 @@
 //!          | Leaf | Leaf CompareOp Leaf | BareWord
 //! ```
 
-use crate::reference::{ParsedReference, ReferenceError};
+use crate::reference::{ParsedReference, ReferenceError, ReferenceSyntaxErrorKind};
 use crate::MakefileVariant;
 use std::fmt;
 use std::str::FromStr;
@@ -220,6 +220,50 @@ impl BsdOperand {
     }
 }
 
+/// The class of a [`BsdConditionError`].
+///
+/// Use this rather than matching on error messages, which are meant for
+/// humans and may change. Unless noted otherwise, make reports these errors
+/// as "Malformed conditional".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BsdConditionErrorKind {
+    /// The condition or an operand of `!`, `&&` or `||` is missing.
+    MissingOperand,
+    /// A `)` where an operand was expected, as in `()`.
+    UnexpectedParenthesis,
+    /// A `)` without a matching `(`.
+    UnbalancedParenthesis,
+    /// A `(` without a matching `)`.
+    UnclosedParenthesis,
+    /// `&&` or `||` where an operand was expected.
+    UnexpectedOperator,
+    /// Text after a complete condition that is not `&&` or `||`.
+    UnexpectedText,
+    /// A single `&` or `|` (make: "Unknown operator").
+    UnknownOperator,
+    /// A comparison operator at the end of the condition (make: "Missing
+    /// right-hand side of operator").
+    MissingRightHandSide,
+    /// The argument of a function such as `defined` is not followed by `)`
+    /// (make: "Missing ')' after argument").
+    UnclosedFunctionCall,
+    /// A quoted string without its closing `"` (make: "Unfinished string
+    /// literal").
+    UnfinishedStringLiteral,
+    /// A backslash at the end of an operand (make: "Unfinished backslash
+    /// escape sequence").
+    UnfinishedEscape,
+    /// An unquoted left-hand side of a comparison that does not start with
+    /// a variable reference or a digit.
+    UnquotedLeftHandSide,
+    /// A variable reference with a modifier that make does not know (make:
+    /// "Unknown modifier").
+    UnknownModifier,
+    /// A malformed variable reference.
+    Reference(ReferenceSyntaxErrorKind),
+}
+
 /// A syntax error in a BSD make conditional expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BsdConditionError {
@@ -227,6 +271,14 @@ pub struct BsdConditionError {
     pub message: String,
     /// The byte offset in the condition text at which the problem was found.
     pub offset: usize,
+    pub(crate) kind: BsdConditionErrorKind,
+}
+
+impl BsdConditionError {
+    /// The class of this error.
+    pub fn kind(&self) -> BsdConditionErrorKind {
+        self.kind
+    }
 }
 
 impl fmt::Display for BsdConditionError {
@@ -273,8 +325,14 @@ fn parse(text: &str, left_unquoted_ok: bool) -> Result<BsdCondition, BsdConditio
     parser.skip_whitespace();
     match parser.peek() {
         None | Some(b'#') => Ok(condition),
-        Some(b')') => Err(parser.error("unbalanced \")\"")),
-        Some(_) => Err(parser.error("expected \"&&\", \"||\" or end of condition")),
+        Some(b')') => Err(parser.error(
+            BsdConditionErrorKind::UnbalancedParenthesis,
+            "unbalanced \")\"",
+        )),
+        Some(_) => Err(parser.error(
+            BsdConditionErrorKind::UnexpectedText,
+            "expected \"&&\", \"||\" or end of condition",
+        )),
     }
 }
 
@@ -378,14 +436,20 @@ impl Parser {
         }
     }
 
-    fn error(&self, message: impl Into<String>) -> BsdConditionError {
-        self.error_at(self.pos, message)
+    fn error(&self, kind: BsdConditionErrorKind, message: impl Into<String>) -> BsdConditionError {
+        self.error_at(self.pos, kind, message)
     }
 
-    fn error_at(&self, pos: usize, message: impl Into<String>) -> BsdConditionError {
+    fn error_at(
+        &self,
+        pos: usize,
+        kind: BsdConditionErrorKind,
+        message: impl Into<String>,
+    ) -> BsdConditionError {
         BsdConditionError {
             message: message.into(),
             offset: self.offsets[pos],
+            kind,
         }
     }
 
@@ -441,7 +505,10 @@ impl Parser {
             return Ok(false);
         }
         if self.peek_at(self.pos + 1) != Some(c) {
-            return Err(self.error(format!("unknown operator \"{}\"", c as char)));
+            return Err(self.error(
+                BsdConditionErrorKind::UnknownOperator,
+                format!("unknown operator \"{}\"", c as char),
+            ));
         }
         self.pos += 2;
         Ok(true)
@@ -450,7 +517,9 @@ impl Parser {
     fn parse_term(&mut self) -> Result<BsdCondition, BsdConditionError> {
         self.skip_whitespace();
         match self.peek() {
-            None | Some(b'#') => Err(self.error("missing operand")),
+            None | Some(b'#') => {
+                Err(self.error(BsdConditionErrorKind::MissingOperand, "missing operand"))
+            }
             Some(b'!') => {
                 self.pos += 1;
                 Ok(BsdCondition::Not(Box::new(self.parse_term()?)))
@@ -461,15 +530,23 @@ impl Parser {
                 let inner = self.parse_or()?;
                 self.skip_whitespace();
                 if self.peek() != Some(b')') {
-                    return Err(self.error_at(open, "unclosed \"(\""));
+                    return Err(self.error_at(
+                        open,
+                        BsdConditionErrorKind::UnclosedParenthesis,
+                        "unclosed \"(\"",
+                    ));
                 }
                 self.pos += 1;
                 Ok(inner)
             }
-            Some(b')') => Err(self.error("unexpected \")\"")),
-            Some(c @ (b'&' | b'|')) => {
-                Err(self.error(format!("unexpected operator \"{}\"", c as char)))
-            }
+            Some(b')') => Err(self.error(
+                BsdConditionErrorKind::UnexpectedParenthesis,
+                "unexpected \")\"",
+            )),
+            Some(c @ (b'&' | b'|')) => Err(self.error(
+                BsdConditionErrorKind::UnexpectedOperator,
+                format!("unexpected operator \"{}\"", c as char),
+            )),
             Some(b'"' | b'$' | b'0'..=b'9' | b'-' | b'+') => self.parse_comparison(),
             Some(_) => match self.parse_call()? {
                 Some(call) => Ok(call),
@@ -512,6 +589,7 @@ impl Parser {
             if self.peek() != Some(b')') {
                 return Err(self.error_at(
                     start,
+                    BsdConditionErrorKind::UnclosedFunctionCall,
                     format!("missing \")\" after argument of \"{}\"", function),
                 ));
             }
@@ -575,7 +653,13 @@ impl Parser {
                     .map_or(1, char::len_utf8);
                 return Ok(start + 1 + len);
             }
-            None => return Err(self.error_at(start, "incomplete variable reference")),
+            None => {
+                return Err(self.error_at(
+                    start,
+                    BsdConditionErrorKind::Reference(ReferenceSyntaxErrorKind::MissingVariableName),
+                    "incomplete variable reference",
+                ))
+            }
         }
         let text =
             std::str::from_utf8(&self.text[start..]).expect("split at a non-character boundary");
@@ -588,12 +672,20 @@ impl Parser {
     fn scan_expression(&self, start: usize, text: &str) -> Result<usize, BsdConditionError> {
         match ParsedReference::parse_prefix(text, MakefileVariant::BSDMake) {
             Ok((_, len)) => Ok(start + len),
-            Err(ReferenceError::Syntax { offset, message }) => {
-                Err(self.error_at(start + offset, message))
-            }
-            Err(ReferenceError::UnknownModifier { offset, modifier }) => {
-                Err(self.error_at(start + offset, format!("unknown modifier ':{}'", modifier)))
-            }
+            Err(ReferenceError::Syntax {
+                offset,
+                kind,
+                message,
+            }) => Err(self.error_at(
+                start + offset,
+                BsdConditionErrorKind::Reference(kind),
+                message,
+            )),
+            Err(ReferenceError::UnknownModifier { offset, modifier }) => Err(self.error_at(
+                start + offset,
+                BsdConditionErrorKind::UnknownModifier,
+                format!("unknown modifier ':{}'", modifier),
+            )),
             Err(e @ ReferenceError::FunctionCall { .. }) => {
                 unreachable!("function call in BSD make expression: {}", e)
             }
@@ -612,7 +704,10 @@ impl Parser {
         // Only the end of the condition is an error; an empty leaf before
         // `)` or another operator compares against the empty string.
         if self.peek().is_none() {
-            return Err(self.error(format!("missing right-hand side of operator \"{}\"", op)));
+            return Err(self.error(
+                BsdConditionErrorKind::MissingRightHandSide,
+                format!("missing right-hand side of operator \"{}\"", op),
+            ));
         }
         let rhs = self.parse_leaf(false)?;
         Ok(BsdCondition::Compare { lhs, op, rhs })
@@ -654,7 +749,11 @@ impl Parser {
         loop {
             match self.peek() {
                 None if quoted => {
-                    return Err(self.error_at(start, "unterminated string literal"));
+                    return Err(self.error_at(
+                        start,
+                        BsdConditionErrorKind::UnfinishedStringLiteral,
+                        "unterminated string literal",
+                    ));
                 }
                 None => break,
                 Some(b'"') if quoted => {
@@ -663,7 +762,10 @@ impl Parser {
                 }
                 Some(b'\\') => {
                     let Some(escaped) = self.peek_at(self.pos + 1) else {
-                        return Err(self.error("unfinished backslash escape sequence"));
+                        return Err(self.error(
+                            BsdConditionErrorKind::UnfinishedEscape,
+                            "unfinished backslash escape sequence",
+                        ));
                     };
                     if escaped == b'$' {
                         value.push(b'$');
@@ -689,6 +791,7 @@ impl Parser {
                 Some(_) if !unquoted_text_ok => {
                     return Err(self.error_at(
                         start,
+                        BsdConditionErrorKind::UnquotedLeftHandSide,
                         "left-hand side of comparison must be a quoted string, number or \
                          variable reference",
                     ));
@@ -1205,6 +1308,47 @@ mod tests {
             error("${A} == $"),
             ("incomplete variable reference".to_string(), 8)
         );
+    }
+
+    #[test]
+    fn test_error_kinds() {
+        use BsdConditionErrorKind::*;
+        let cases = [
+            ("", MissingOperand),
+            ("a &&", MissingOperand),
+            ("()", UnexpectedParenthesis),
+            ("a)", UnbalancedParenthesis),
+            ("(a", UnclosedParenthesis),
+            ("|| a", UnexpectedOperator),
+            ("a b", UnexpectedText),
+            ("a & b", UnknownOperator),
+            ("${A} == ", MissingRightHandSide),
+            ("defined(A B)", UnclosedFunctionCall),
+            ("${A} == \"b", UnfinishedStringLiteral),
+            ("${A} == b\\", UnfinishedEscape),
+            ("left == right", UnquotedLeftHandSide),
+            ("${A:Z} == x", UnknownModifier),
+            (
+                "${A",
+                Reference(ReferenceSyntaxErrorKind::UnclosedExpression),
+            ),
+            (
+                "${A} == $",
+                Reference(ReferenceSyntaxErrorKind::MissingVariableName),
+            ),
+            (
+                "empty(A:S/a/b)",
+                Reference(ReferenceSyntaxErrorKind::UnfinishedModifier),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                parse_bsd_condition(text).unwrap_err().kind(),
+                expected,
+                "{}",
+                text
+            );
+        }
     }
 
     #[test]
