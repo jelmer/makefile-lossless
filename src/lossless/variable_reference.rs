@@ -1,4 +1,5 @@
 use super::*;
+use crate::ConditionalBranch;
 
 /// A reference to a variable in the makefile, e.g. `$(FOO)` or `${BAR}`.
 ///
@@ -63,23 +64,204 @@ impl VariableReference {
     /// assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
     /// ```
     pub fn name(&self) -> Option<String> {
-        let mut children = self.0.children_with_tokens().skip(1);
-        let open = children.next()?;
-        if !matches!(open.kind(), LPAREN | LBRACE) {
+        let elements = self.name_elements();
+        if !self.is_delimited() {
             // A single-character reference such as `$@` or `$X`
-            return open.into_token()?.text().chars().next().map(String::from);
+            let token = elements.first()?.as_token()?.clone();
+            return token.text().chars().next().map(String::from);
         }
-        let mut name = String::new();
-        for child in children {
-            match child.kind() {
-                RPAREN | RBRACE | WHITESPACE | COMMA | OPERATOR | NEWLINE => break,
-                _ => name.push_str(&child.to_string()),
-            }
-        }
+        let name: String = elements.iter().map(|it| it.to_string()).collect();
         if name.is_empty() {
             None
         } else {
             Some(name)
+        }
+    }
+
+    /// Internal: whether this is delimited by parentheses or braces, rather
+    /// than a single-character reference.
+    fn is_delimited(&self) -> bool {
+        self.0
+            .children_with_tokens()
+            .nth(1)
+            .is_some_and(|it| matches!(it.kind(), LPAREN | LBRACE))
+    }
+
+    /// Internal: the elements making up the name, which ends at the closing
+    /// delimiter, whitespace, a comma or an operator such as the `:` before
+    /// modifiers. For a single-character reference this is the token after
+    /// the `$`.
+    fn name_elements(&self) -> Vec<SyntaxElement> {
+        let mut children = self.0.children_with_tokens().skip(1);
+        if !self.is_delimited() {
+            return children.next().into_iter().collect();
+        }
+        children
+            .skip(1)
+            .take_while(|child| {
+                !matches!(
+                    child.kind(),
+                    RPAREN | RBRACE | WHITESPACE | COMMA | OPERATOR | NEWLINE
+                )
+            })
+            .collect()
+    }
+
+    /// The source range of the name, covering the same text as
+    /// [`Self::name`].
+    ///
+    /// For a function call this is the function name, and for a
+    /// single-character reference such as `$@` the character after the `$`.
+    /// Returns `None` if [`Self::name`] does.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "X = ${SRCS:.c=.o} $(FOO.$(BAR)) $@\n".parse().unwrap();
+    /// let ranges: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| r.name_range())
+    ///     .collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![
+    ///         Some(TextRange::new(6.into(), 10.into())),
+    ///         Some(TextRange::new(20.into(), 30.into())),
+    ///         Some(TextRange::new(26.into(), 29.into())),
+    ///         Some(TextRange::new(33.into(), 34.into())),
+    ///     ]
+    /// );
+    /// ```
+    pub fn name_range(&self) -> Option<rowan::TextRange> {
+        let elements = self.name_elements();
+        if !self.is_delimited() {
+            let token = elements.first()?.as_token()?.clone();
+            let first = token.text().chars().next()?;
+            return Some(rowan::TextRange::at(
+                token.text_range().start(),
+                rowan::TextSize::of(first),
+            ));
+        }
+        let first = elements.first()?.text_range();
+        let last = elements.last()?.text_range();
+        Some(first.cover(last))
+    }
+
+    /// The innermost reference this one is nested in, as the function call
+    /// `$(dir $(FILE))` is for `$(FILE)` or `$(FOO.$(BAR))` for `$(BAR)`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X = $(dir $(FILE)) $(Y)\n".parse().unwrap();
+    /// let parents: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| r.parent_reference().map(|p| p.to_string()))
+    ///     .collect();
+    /// assert_eq!(parents, vec![None, Some("$(dir $(FILE))".to_string()), None]);
+    /// ```
+    pub fn parent_reference(&self) -> Option<VariableReference> {
+        self.0.ancestors().skip(1).find_map(VariableReference::cast)
+    }
+
+    /// Where this reference is: in which part of the enclosing reference, if
+    /// it is nested in one, or otherwise in which part of which makefile
+    /// item.
+    ///
+    /// For a nested reference, call `location()` on the enclosing reference
+    /// in turn to find out where that one is.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, ReferenceLocation};
+    /// let makefile: Makefile = "$(OBJS): $(SRCS)\nX := $(dir $(FILE))\n".parse().unwrap();
+    /// let locations: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| match r.location() {
+    ///         ReferenceLocation::Target(_) => "target",
+    ///         ReferenceLocation::Prerequisite(_) => "prerequisite",
+    ///         ReferenceLocation::VariableValue(_) => "value",
+    ///         ReferenceLocation::FunctionArgument(_) => "argument",
+    ///         _ => "other",
+    ///     })
+    ///     .collect();
+    /// assert_eq!(locations, vec!["target", "prerequisite", "value", "argument"]);
+    /// ```
+    pub fn location(&self) -> ReferenceLocation {
+        let mut child = self.0.clone();
+        for ancestor in self.0.ancestors().skip(1) {
+            if let Some(outer) = VariableReference::cast(ancestor.clone()) {
+                return outer.location_of_child(&child);
+            }
+            let location = match ancestor.kind() {
+                EXPR | PREREQUISITE | ARCHIVE_MEMBERS | ARCHIVE_MEMBER => {
+                    child = ancestor;
+                    continue;
+                }
+                TARGETS => ancestor
+                    .parent()
+                    .and_then(Rule::cast)
+                    .map(ReferenceLocation::Target),
+                TARGET_PATTERN => ancestor
+                    .parent()
+                    .and_then(Rule::cast)
+                    .map(ReferenceLocation::TargetPattern),
+                PREREQUISITES => ancestor
+                    .parent()
+                    .and_then(Rule::cast)
+                    .map(ReferenceLocation::Prerequisite),
+                VARIABLE => VariableDefinition::cast(ancestor.clone()).map(|var| {
+                    if var.value_expr().as_ref() != Some(&child) {
+                        ReferenceLocation::VariableName(var)
+                    } else if ancestor.parent().is_some_and(|p| p.kind() == RULE) {
+                        ReferenceLocation::TargetSpecificValue(var)
+                    } else {
+                        ReferenceLocation::VariableValue(var)
+                    }
+                }),
+                CONDITIONAL_IF | CONDITIONAL_ELSE => ancestor
+                    .parent()
+                    .and_then(Conditional::cast)
+                    .and_then(|cond| {
+                        let index = cond
+                            .syntax()
+                            .children()
+                            .filter(|it| matches!(it.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE))
+                            .position(|it| it == ancestor)?;
+                        cond.branches().nth(index)
+                    })
+                    .map(ReferenceLocation::Condition),
+                INCLUDE => Include::cast(ancestor).map(ReferenceLocation::Include),
+                VPATH => Vpath::cast(ancestor).map(ReferenceLocation::Vpath),
+                LOAD => Load::cast(ancestor).map(ReferenceLocation::Load),
+                EXPRESSION_STATEMENT => {
+                    ExpressionStatement::cast(ancestor).map(ReferenceLocation::ExpressionStatement)
+                }
+                FOR_HEADER => ancestor
+                    .parent()
+                    .and_then(ForLoop::cast)
+                    .map(ReferenceLocation::ForLoop),
+                DIRECTIVE => Directive::cast(ancestor).map(ReferenceLocation::Directive),
+                _ => None,
+            };
+            return location.unwrap_or(ReferenceLocation::Other);
+        }
+        ReferenceLocation::Other
+    }
+
+    /// Internal: the location of `child`, a child node of this reference
+    /// containing a nested reference.
+    fn location_of_child(&self, child: &SyntaxNode) -> ReferenceLocation {
+        let in_name = self
+            .name_elements()
+            .iter()
+            .any(|it| it.as_node() == Some(child));
+        if in_name {
+            ReferenceLocation::ReferenceName(self.clone())
+        } else if self.is_function_call() {
+            ReferenceLocation::FunctionArgument(self.clone())
+        } else {
+            ReferenceLocation::Modifier(self.clone())
         }
     }
 
@@ -291,6 +473,61 @@ impl VariableReference {
     pub fn text_range(&self) -> rowan::TextRange {
         self.0.text_range()
     }
+}
+
+/// Where a [`VariableReference`] is, as returned by
+/// [`VariableReference::location`].
+///
+/// A reference nested in another one gives the part of that reference it is
+/// in. Otherwise it gives the part of the makefile item that contains it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReferenceLocation {
+    /// In an argument of a function call, as `$(SRCS)` in
+    /// `$(patsubst %.c,%.o,$(SRCS))`. Like
+    /// [`VariableReference::is_function_call`], this goes by the syntax, so
+    /// it also covers `$(FOO $(BAR))` if `FOO` is not a function.
+    FunctionArgument(VariableReference),
+    /// In the name of another reference, which is computed: `$(BAR)` in
+    /// `$(FOO.$(BAR))`.
+    ReferenceName(VariableReference),
+    /// In the modifiers of another reference, as in the substitution
+    /// reference `$(SRCS:.c=$(EXT))` or BSD make's `${SRCS:M${PATTERN}}`.
+    Modifier(VariableReference),
+    /// In the name of a variable assignment, `define`, `undefine` or
+    /// `export` directive, including a target-specific one.
+    VariableName(VariableDefinition),
+    /// In the value of a variable assignment on its own line, including the
+    /// body of a `define` block.
+    VariableValue(VariableDefinition),
+    /// In the value of a target-specific variable assignment on a rule line,
+    /// as in `all: CFLAGS = $(OPT)`; see
+    /// [`Rule::scoped_assignment`](crate::Rule::scoped_assignment).
+    TargetSpecificValue(VariableDefinition),
+    /// In the targets of a rule.
+    Target(Rule),
+    /// In the target pattern of a static pattern rule, between the two
+    /// colons.
+    TargetPattern(Rule),
+    /// In the prerequisites of a rule, including order-only ones.
+    Prerequisite(Rule),
+    /// In the condition of a conditional branch, such as `ifeq ($(A),b)`,
+    /// `else ifdef $(B)`, `.if ${C}` or `!IF "$(D)" == "1"`.
+    Condition(ConditionalBranch),
+    /// In the file names of an include directive.
+    Include(Include),
+    /// In the pattern or directories of a `vpath` directive.
+    Vpath(Vpath),
+    /// In the objects of a `load` directive.
+    Load(Load),
+    /// In a line consisting of references only, such as `$(eval $(RULES))`.
+    ExpressionStatement(ExpressionStatement),
+    /// In the header of a BSD make `.for` loop.
+    ForLoop(ForLoop),
+    /// In the argument of a BSD make directive such as `.error` or `.undef`.
+    Directive(Directive),
+    /// Anywhere else, such as text the parser could not make sense of.
+    Other,
 }
 
 impl core::fmt::Display for VariableReference {

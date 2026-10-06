@@ -577,3 +577,248 @@ fn test_recipe_variable_references_across_continuation() {
         assert_eq!(&src[r.text_range()], r.name());
     }
 }
+
+/// Each reference in `makefile` with a description of its location.
+fn reference_locations(makefile: &Makefile) -> Vec<(String, String)> {
+    makefile
+        .variable_references()
+        .map(|r| {
+            let location = match r.location() {
+                ReferenceLocation::FunctionArgument(p) => format!("argument of {p}"),
+                ReferenceLocation::ReferenceName(p) => format!("name of {p}"),
+                ReferenceLocation::Modifier(p) => format!("modifier of {p}"),
+                ReferenceLocation::VariableName(v) => format!("name of {:?}", v.name()),
+                ReferenceLocation::VariableValue(v) => format!("value of {:?}", v.name()),
+                ReferenceLocation::TargetSpecificValue(v) => {
+                    format!("target-specific value of {:?}", v.name())
+                }
+                ReferenceLocation::Target(rule) => format!("target of line {}", rule.line()),
+                ReferenceLocation::TargetPattern(rule) => {
+                    format!("target pattern of line {}", rule.line())
+                }
+                ReferenceLocation::Prerequisite(rule) => {
+                    format!("prerequisite of line {}", rule.line())
+                }
+                ReferenceLocation::Condition(branch) => format!(
+                    "condition {:?} of line {}",
+                    branch.conditional_type(),
+                    branch.line()
+                ),
+                ReferenceLocation::Include(include) => format!("include of {:?}", include.path()),
+                ReferenceLocation::Vpath(vpath) => format!("vpath {:?}", vpath.pattern()),
+                ReferenceLocation::Load(load) => format!("load {:?}", load.objects()),
+                ReferenceLocation::ExpressionStatement(stmt) => {
+                    format!("statement {:?}", stmt.expression())
+                }
+                ReferenceLocation::ForLoop(for_loop) => format!("for {:?}", for_loop.variables()),
+                ReferenceLocation::Directive(directive) => {
+                    format!("directive {:?}", directive.keyword())
+                }
+                ReferenceLocation::Other => "other".to_string(),
+            };
+            (r.to_string(), location)
+        })
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+#[test]
+fn test_reference_location_rules() {
+    let makefile: Makefile =
+        "$(T) a: $(P) | $(O)\n$(OBJS): $(D)%.o: %.c\n$(U): $(N) = $(V)\nlib.a($(M)): x\n"
+            .parse()
+            .unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(T)", "target of line 0"),
+            ("$(P)", "prerequisite of line 0"),
+            ("$(O)", "prerequisite of line 0"),
+            ("$(OBJS)", "target of line 1"),
+            ("$(D)", "target pattern of line 1"),
+            ("$(U)", "target of line 2"),
+            ("$(N)", "name of Some(\"$(N)\")"),
+            ("$(V)", "target-specific value of Some(\"$(N)\")"),
+            ("$(M)", "target of line 3"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_variables() {
+    let makefile: Makefile =
+        "X.$(A) := $(B)\nexport $(XS)\ndefine $(D)\n$(BODY)\nendef\nundefine $(U)\n"
+            .parse()
+            .unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(A)", "name of Some(\"X.$(A)\")"),
+            ("$(B)", "value of Some(\"X.$(A)\")"),
+            ("$(XS)", "name of Some(\"$(XS)\")"),
+            ("$(D)", "name of Some(\"$(D)\")"),
+            ("$(U)", "name of Some(\"$(U)\")"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_assignment_in_rule_body() {
+    // Not target-specific: GNU make assigns Y globally.
+    let makefile: Makefile = "all:\nifdef X\n\techo\nY = $(Z)\nendif\n".parse().unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[("$(Z)", "value of Some(\"Y\")")])
+    );
+}
+
+#[test]
+fn test_reference_location_nested() {
+    let makefile: Makefile =
+        "X = $(patsubst %.c,%.o,$(SRCS)) $(FOO.$(BAR)) $($(F) x) $(Y:$(A)=$(B)) $(if $(C),${D})\n"
+            .parse()
+            .unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(patsubst %.c,%.o,$(SRCS))", "value of Some(\"X\")"),
+            ("$(SRCS)", "argument of $(patsubst %.c,%.o,$(SRCS))"),
+            ("$(FOO.$(BAR))", "value of Some(\"X\")"),
+            ("$(BAR)", "name of $(FOO.$(BAR))"),
+            ("$($(F) x)", "value of Some(\"X\")"),
+            ("$(F)", "name of $($(F) x)"),
+            ("$(Y:$(A)=$(B))", "value of Some(\"X\")"),
+            ("$(A)", "modifier of $(Y:$(A)=$(B))"),
+            ("$(B)", "modifier of $(Y:$(A)=$(B))"),
+            ("$(if $(C),${D})", "value of Some(\"X\")"),
+            ("$(C)", "argument of $(if $(C),${D})"),
+            ("${D}", "argument of $(if $(C),${D})"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_nested_continuation() {
+    let text = "X = $(foreach v,\\\n  $(L),$($(v)_x))\r\n";
+    let makefile: Makefile = text.parse().unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(foreach v,\\\n  $(L),$($(v)_x))", "value of Some(\"X\")"),
+            ("$(L)", "argument of $(foreach v,\\\n  $(L),$($(v)_x))"),
+            ("$($(v)_x)", "argument of $(foreach v,\\\n  $(L),$($(v)_x))"),
+            ("$(v)", "name of $($(v)_x)"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_directives() {
+    let makefile: Makefile = "ifeq ($(A),b)\nelse ifdef $(C)\nendif\ninclude $(I)\nvpath $(VP) $(VD)\n$(eval $(E))\nload $(L)\n"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(A)", "condition Some(\"ifeq\") of line 0"),
+            ("$(C)", "condition Some(\"ifdef\") of line 1"),
+            ("$(I)", "include of Some(\"$(I)\")"),
+            ("$(VP)", "vpath Some(\"$(VP)\")"),
+            ("$(VD)", "vpath Some(\"$(VP)\")"),
+            ("$(eval $(E))", "statement \"$(eval $(E))\""),
+            ("$(E)", "argument of $(eval $(E))"),
+            ("$(L)", "load [\"$(L)\"]"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_bsd() {
+    let makefile = Makefile::parse_with_variant(
+        ".if ${X} == 1\n.elif defined(${Y})\n.endif\n.for i in ${L:M${P}}\n.endfor\n.error ${E}\n.include \"${I}\"\n",
+        MakefileVariant::BSDMake,
+    )
+    .tree();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("${X}", "condition Some(\".if\") of line 0"),
+            ("${Y}", "condition Some(\".if\") of line 1"),
+            ("${L:M${P}}", "for [\"i\"]"),
+            ("${P}", "modifier of ${L:M${P}}"),
+            ("${E}", "directive Some(\".error\")"),
+            ("${I}", "include of Some(\"${I}\")"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_location_nmake() {
+    let makefile = Makefile::parse_with_variant(
+        "!IF \"$(X)\" == \"1\"\n!ELSEIF $(Y)\n!ENDIF\n!INCLUDE $(I)\n",
+        MakefileVariant::NMake,
+    )
+    .tree();
+    assert_eq!(
+        reference_locations(&makefile),
+        pairs(&[
+            ("$(X)", "condition Some(\"!IF\") of line 0"),
+            ("$(Y)", "condition Some(\"!IF\") of line 1"),
+            ("$(I)", "include of Some(\"$(I)\")"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_name_range() {
+    let text = "A = ${SRCS:M*.c} $(OBJS:.o=.c) ${VAR.${M}} ${:Ufoo} $@ $(wildcard *.c) $(X\\\n Y)\r\n";
+    let makefile: Makefile = text.parse().unwrap();
+    let names: Vec<_> = makefile
+        .variable_references()
+        .map(|r| r.name_range().map(|range| &text[range]))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            Some("SRCS"),
+            Some("OBJS"),
+            Some("VAR.${M}"),
+            Some("M"),
+            None,
+            Some("@"),
+            Some("wildcard"),
+            Some("X\\"),
+        ]
+    );
+    for r in makefile.variable_references() {
+        assert_eq!(
+            r.name_range().map(|range| text[range].to_string()),
+            r.name()
+        );
+    }
+}
+
+#[test]
+fn test_parent_reference() {
+    let makefile: Makefile = "X = $(a $(b $(c))) $(d)\nall: $(e)\n".parse().unwrap();
+    let parents: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.parent_reference().map(|p| p.to_string())))
+        .collect();
+    assert_eq!(
+        parents,
+        vec![
+            ("$(a $(b $(c)))".to_string(), None),
+            ("$(b $(c))".to_string(), Some("$(a $(b $(c)))".to_string())),
+            ("$(c)".to_string(), Some("$(b $(c))".to_string())),
+            ("$(d)".to_string(), None),
+            ("$(e)".to_string(), None),
+        ]
+    );
+}

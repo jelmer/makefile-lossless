@@ -49,8 +49,8 @@ pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Identifier, Include, Lang, Load, Makefile, ParseError, ParseErrorKind,
-    PositionedParseError, Recipe, RecipeVariableReference, Rule, VariableDefinition,
-    VariableReference, Vpath,
+    PositionedParseError, Recipe, RecipeVariableReference, ReferenceLocation, Rule,
+    VariableDefinition, VariableReference, Vpath,
 };
 pub use parse::Parse;
 pub use reference::{
