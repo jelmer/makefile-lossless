@@ -2245,12 +2245,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
                 && !self.is_line_continuation()
+                && !(self.variant == Some(MakefileVariant::BSDMake)
+                    && self
+                        .tokens
+                        .last()
+                        .is_some_and(|(_, text)| text.starts_with(':')))
             {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
-                // before looking at what it contains. Only the first
-                // character of a token such as `XY` or a run of whitespace is
-                // the name.
+                // before looking at what it contains. BSD make does not take
+                // `:` as a name either, so `$:` is a lone `$` and a `:`. Only
+                // the first character of a token such as `XY` or a run of
+                // whitespace is the name.
                 let text = &self.tokens.last().unwrap().1;
                 let first_len = text.chars().next().unwrap().len_utf8();
                 if text.len() > first_len {
@@ -2779,6 +2785,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             Some((WHITESPACE, _)) => {
                                 seen_reference = true;
                                 continue;
+                            }
+                            // BSD make does not take `:` as a name.
+                            Some((OPERATOR, text))
+                                if text == ":"
+                                    && self.variant == Some(MakefileVariant::BSDMake) =>
+                            {
+                                return false
                             }
                             Some((kind, text))
                                 if text.chars().count() == 1
@@ -6035,6 +6048,53 @@ mod tests {
             ),
             vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i", "$$"]
         );
+    }
+
+    #[test]
+    fn test_bsd_dollar_colon_is_not_a_reference() {
+        // BSD make does not take `:` as a variable name, so `$:` expands to
+        // `:` and the line is a dependency line without targets.
+        let parsed = parse("$:\n", Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..3
+  RULE@0..3
+    TARGETS@0..1
+      EXPR@0..1
+        DOLLAR@0..1 "$"
+    OPERATOR@1..2 ":"
+    PREREQUISITES@2..2
+    NEWLINE@2..3 "\n"
+"#
+        );
+        let makefile = Makefile::parse_with_variant("a$: b\n", MakefileVariant::BSDMake).tree();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a$"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            reference_texts("X = $: $:: ${:U$:}\n", MakefileVariant::BSDMake),
+            vec!["${:U$:}"]
+        );
+    }
+
+    #[test]
+    fn test_gnu_dollar_colon_is_a_reference() {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse("$:\n", variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(
+                format!("{:#?}", parsed.syntax()),
+                r#"ROOT@0..3
+  EXPRESSION_STATEMENT@0..3
+    EXPR@0..2
+      DOLLAR@0..1 "$"
+      OPERATOR@1..2 ":"
+    NEWLINE@2..3 "\n"
+"#,
+                "{variant:?}"
+            );
+        }
     }
 
     #[test]
