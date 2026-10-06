@@ -365,92 +365,36 @@ pub(crate) fn trim_trailing_newlines(node: &SyntaxNode) {
     }
 }
 
-/// Helper function to remove a node along with its preceding comments and up to 1 empty line.
+/// Remove `node` from `parent` along with the comment lines directly above
+/// it, as found by [`crate::ast::lines_above`].
 ///
-/// This walks backward from the node, removing:
-/// - The node itself
-/// - All preceding comments (COMMENT tokens)
-/// - Up to 1 empty line (consecutive NEWLINE tokens)
-/// - Any WHITESPACE tokens between these elements
+/// If the removed lines are preceded by a blank line and followed by
+/// another blank line or nothing at all, the blank line above is removed
+/// too.
 pub(crate) fn remove_with_preceding_comments(node: &SyntaxNode, parent: &SyntaxNode) {
-    let mut collected_elements = vec![];
-    let mut found_comment = false;
+    debug_assert_eq!(node.parent().as_ref(), Some(parent));
+    use crate::ast::next_token;
+    let lines = crate::ast::lines_above(node);
+    let doc_lines = lines.iter().take_while(|l| l.comment.is_some()).count();
+    let mut tokens: Vec<SyntaxToken> = lines[..doc_lines]
+        .iter()
+        .flat_map(|l| l.tokens.iter().cloned())
+        .collect();
+    tokens.extend(crate::ast::line_indent(node));
 
-    // Walk backward to collect preceding comments, newlines, and whitespace
-    let mut current = node.prev_sibling_or_token();
-    while let Some(element) = current {
-        match &element {
-            rowan::NodeOrToken::Token(token) => match token.kind() {
-                COMMENT => {
-                    if token.text().starts_with("#!") {
-                        break; // Don't remove shebang lines
-                    }
-                    found_comment = true;
-                    collected_elements.push(element.clone());
-                }
-                NEWLINE | WHITESPACE => {
-                    collected_elements.push(element.clone());
-                }
-                _ => break, // Hit something else, stop
-            },
-            rowan::NodeOrToken::Node(n) => {
-                // Handle BLANK_LINE nodes which wrap newlines
-                if n.kind() == BLANK_LINE {
-                    collected_elements.push(element.clone());
-                } else {
-                    break; // Hit another node type, stop
-                }
-            }
-        }
-        current = element.prev_sibling_or_token();
-    }
-
-    // Determine which preceding elements to remove
-    // If we found comments, remove them along with up to 1 blank line
-    let mut elements_to_remove = vec![];
-    let mut consecutive_newlines = 0;
-    for element in collected_elements.iter().rev() {
-        let should_remove = match element {
-            rowan::NodeOrToken::Token(token) => match token.kind() {
-                COMMENT => {
-                    consecutive_newlines = 0;
-                    found_comment
-                }
-                NEWLINE => {
-                    consecutive_newlines += 1;
-                    found_comment && consecutive_newlines <= 1
-                }
-                WHITESPACE => found_comment,
-                _ => false,
-            },
-            rowan::NodeOrToken::Node(n) => {
-                // Handle BLANK_LINE nodes (count as newlines)
-                if n.kind() == BLANK_LINE {
-                    consecutive_newlines += 1;
-                    found_comment && consecutive_newlines <= 1
-                } else {
-                    false
-                }
-            }
-        };
-
-        if should_remove {
-            elements_to_remove.push(element.clone());
+    let next = node.last_token().and_then(|t| next_token(&t));
+    let next = match next {
+        Some(t) if t.kind() == WHITESPACE => next_token(&t).map(|t| t.kind()),
+        next => next.map(|t| t.kind()),
+    };
+    if matches!(next, None | Some(NEWLINE)) {
+        if let Some(blank) = lines.get(doc_lines).filter(|l| l.comment.is_none()) {
+            tokens.extend(blank.tokens.iter().cloned());
         }
     }
 
-    // Remove elements in reverse order (from highest index to lowest) to avoid index shifts
-    // Start with the node itself, then preceding elements
-    let mut all_to_remove = vec![rowan::NodeOrToken::Node(node.clone())];
-    all_to_remove.extend(elements_to_remove.into_iter().rev());
-
-    // Sort by index in descending order
-    all_to_remove.sort_by_key(|el| std::cmp::Reverse(el.index()));
-
-    for element in all_to_remove {
-        let idx = element.index();
-        parent.splice_children(idx..idx + 1, vec![]);
-    }
+    node.detach();
+    crate::ast::detach_tokens(tokens);
 }
 
 impl FromStr for Rule {

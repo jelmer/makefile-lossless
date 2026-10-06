@@ -143,6 +143,52 @@ fn test_rule_parent() {
     assert!(parent.is_none());
 }
 
+#[test]
+fn test_rule_remove_doc_comment() {
+    let cases = [
+        ("a:\n\techo\n# doc\nc:\n", "a:\n\techo\n"),
+        ("a:\n# doc\n# more\nc:\n", "a:\n"),
+        ("a:\n\techo\n# doc\nc:\nd:\n", "a:\n\techo\nd:\n"),
+        (
+            "a:\r\n\techo\r\n# doc\r\nc:\r\nd:\r\n",
+            "a:\r\n\techo\r\nd:\r\n",
+        ),
+        ("x = 1\n\n# doc\nc:\n", "x = 1\n"),
+        ("x = 1\n\n# doc\nc:\n\nd:\n", "x = 1\n\nd:\n"),
+        ("x = 1\n\n# doc\nc:\nd:\n", "x = 1\n\nd:\n"),
+        ("x = 1\n# x\n\n# doc\nc:\nd:\n", "x = 1\n# x\n\nd:\n"),
+        ("# header\n\nc:\nd:\n", "# header\n\nd:\n"),
+        ("#!/bin/make\n# doc\nc:\n", "#!/bin/make\n"),
+        ("X = 1 # x\nc:\n", "X = 1 # x\n"),
+        ("FOO = a \\\n# continued\nc:\n", "FOO = a \\\n# continued\n"),
+        ("ifdef X\n  # doc\n  c:\nendif\n", "ifdef X\nendif\n"),
+    ];
+    for (text, expected) in cases {
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile
+            .rules()
+            .find(|r| r.targets().collect::<Vec<_>>() == ["c"])
+            .unwrap();
+        rule.remove().unwrap();
+        assert_eq!(makefile.code(), expected, "{text:?}");
+        assert_matches_reparse(&makefile);
+    }
+}
+
+#[test]
+fn test_include_and_conditional_remove_doc_comment() {
+    let makefile: Makefile = "a:\n\techo\n# doc\ninclude x.mk\n# far\n\n# doc\nifdef X\nendif\n"
+        .parse()
+        .unwrap();
+    makefile.includes().next().unwrap().remove().unwrap();
+    assert_eq!(
+        makefile.code(),
+        "a:\n\techo\n# far\n\n# doc\nifdef X\nendif\n"
+    );
+    makefile.conditionals().next().unwrap().remove().unwrap();
+    assert_eq!(makefile.code(), "a:\n\techo\n# far\n");
+}
+
 /// Lines that can not be written as a single recipe line, comment or
 /// variable value.
 const LINE_BREAKING: [&str; 4] = ["a\nb", "a\r\nb", "a \\", "a \\\\\\"];

@@ -3,7 +3,7 @@ use super::{is_continuation, line_ending, logical_text, LineSyntax};
 use crate::lossless::{
     detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
     scan_recipe_variable_refs, Error, ErrorInfo, ParseError, RecipeVariableReference,
-    VariableDefinition, ASSIGNMENT_OPERATORS,
+    VariableDefinition, VariableReference, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -68,6 +68,38 @@ fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossles
         .value_expr()
         .filter(|_| var.raw_value().as_deref() == Some(value))?;
     Some(SyntaxNode::new_root_mut(expr.green().into_owned()))
+}
+
+/// The number of `define` blocks opened in the body of a `define` block
+/// and not closed again, counted the way the parser does: by the first word
+/// of each logical line.
+fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
+    let tokens: Vec<_> = body
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .collect();
+    let lines = tokens.split(|t| t.kind() == NEWLINE && !is_continuation(&t.clone().into()));
+    let mut depth = 0usize;
+    for line in lines {
+        let mut words = line
+            .iter()
+            .skip_while(|t| matches!(t.kind(), WHITESPACE | INDENT));
+        let Some(first) = words.next().filter(|t| t.kind() == IDENTIFIER) else {
+            continue;
+        };
+        let ends_word = match words.next().map(|t| t.kind()) {
+            None | Some(WHITESPACE) => true,
+            // A line continuation right after the word.
+            Some(BACKSLASH) => words.next().is_some_and(|t| t.kind() == NEWLINE),
+            _ => false,
+        };
+        match first.text() {
+            "define" if ends_word => depth += 1,
+            "endef" if ends_word => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// Whether `text` is an assignment operator token.
@@ -392,6 +424,131 @@ impl VariableDefinition {
             .any(|t| t.text() == "define")
     }
 
+    /// Internal: the EXPR node holding the body of a `define` block.
+    fn define_body(&self) -> Option<crate::lossless::SyntaxNode> {
+        if !self.is_define() {
+            return None;
+        }
+        self.syntax()
+            .children()
+            .filter(|it| it.kind() == EXPR)
+            .last()
+    }
+
+    /// Returns true if this is a `define` block that is closed by an
+    /// `endef` line.
+    ///
+    /// Returns false for a `define` block that runs to the end of the file,
+    /// which the parser reports as
+    /// [`ParseErrorKind::MissingEndef`](crate::ParseErrorKind::MissingEndef),
+    /// and for any other kind of assignment.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "define A\nx\nendef\n".parse().unwrap();
+    /// assert!(makefile.variable_definitions().next().unwrap().has_endef());
+    /// let (makefile, _) = Makefile::from_str_relaxed("define A\nx\n");
+    /// assert!(!makefile.variable_definitions().next().unwrap().has_endef());
+    /// ```
+    pub fn has_endef(&self) -> bool {
+        let Some(body) = self.define_body() else {
+            return false;
+        };
+        std::iter::successors(body.next_sibling_or_token(), |it| {
+            it.next_sibling_or_token()
+        })
+        .any(|it| {
+            it.as_token()
+                .is_some_and(|t| t.kind() == IDENTIFIER && t.text() == "endef")
+        })
+    }
+
+    /// Close a `define` block that has no `endef`, as one running to the end
+    /// of the file does.
+    ///
+    /// Nested `define` lines in the body that are not closed get an `endef`
+    /// too, since the parser counts them when looking for the end of the
+    /// block. If the body does not end with a newline, one is added before
+    /// the first `endef`.
+    ///
+    /// Returns `Ok(true)` if `endef` lines were added and `Ok(false)` if
+    /// the block already had one. Returns an error if this is not a
+    /// `define` block.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let (makefile, _) = Makefile::from_str_relaxed("define A\ndefine B\nx");
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.add_endef().unwrap());
+    /// assert_eq!(makefile.code(), "define A\ndefine B\nx\nendef\nendef\n");
+    /// assert!(var.has_endef());
+    /// ```
+    pub fn add_endef(&mut self) -> Result<bool, Error> {
+        let Some(body) = self.define_body() else {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
+                    message: "Cannot add endef to a variable that is not a define block"
+                        .to_string(),
+                    line: self.line() + 1,
+                    context: "variable_add_endef".to_string(),
+                }],
+            }));
+        };
+        if self.has_endef() {
+            return Ok(false);
+        }
+        let eol = super::line_ending(self.syntax());
+
+        // The parser marks the missing endef with an empty ERROR node.
+        let errors: Vec<_> = self
+            .syntax()
+            .children()
+            .filter(|n| n.index() > body.index() && n.kind() == ERROR && n.text().is_empty())
+            .collect();
+        for error in errors {
+            error.detach();
+        }
+
+        let mut inner = Vec::new();
+        let last = body
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .last();
+        match last {
+            // A continued last line would continue onto `endef`, so end it
+            // with a blank line.
+            Some(t) if t.kind() == NEWLINE => {
+                if is_continuation(&t.into()) {
+                    inner.push((NEWLINE, eol.as_str()));
+                }
+            }
+            Some(_) => {
+                let len = body.children_with_tokens().count();
+                super::terminate_line_before(&body, len, &eol);
+            }
+            // An empty body: end the `define` line instead.
+            None => {
+                super::terminate_line_before(self.syntax(), body.index(), &eol);
+            }
+        }
+        for _ in 0..open_nested_defines(&body) {
+            inner.push((IDENTIFIER, "endef"));
+            inner.push((NEWLINE, eol.as_str()));
+        }
+        let len = body.children_with_tokens().count();
+        body.splice_children(len..len, detached_elements(&inner, None));
+
+        let body_index = body.index();
+        self.syntax().splice_children(
+            body_index + 1..body_index + 1,
+            detached_elements(&[(IDENTIFIER, "endef"), (NEWLINE, &eol)], None),
+        );
+        Ok(true)
+    }
+
     /// Iterate `$(VAR)` and `${VAR}` variable references in the body of a
     /// `define` block.
     ///
@@ -516,6 +673,32 @@ impl VariableDefinition {
             .any(|t| t.text() == "private")
     }
 
+    /// Returns true if this is a target-specific assignment on a rule line,
+    /// as in `all: CFLAGS = -O2`, i.e. one returned by
+    /// [`Rule::scoped_assignment`](crate::Rule::scoped_assignment).
+    ///
+    /// An assignment on its own line in a rule's body, such as inside a
+    /// conditional between recipe lines, is not target-specific: GNU make
+    /// treats it as an ordinary assignment, even though
+    /// [`Makefile::rules`](crate::Makefile::rules) sees the conditional as
+    /// part of the rule.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "all: X = 1\nall:\nifdef D\n\techo\nY = 1\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let vars: Vec<_> = makefile
+    ///     .variable_definitions()
+    ///     .map(|v| (v.name().unwrap(), v.is_target_specific()))
+    ///     .collect();
+    /// assert_eq!(vars, vec![("X".to_string(), true), ("Y".to_string(), false)]);
+    /// ```
+    pub fn is_target_specific(&self) -> bool {
+        self.syntax().parent().is_some_and(|p| p.kind() == RULE)
+    }
+
     /// Get the assignment operator/flavor used in this variable definition
     ///
     /// Returns the operator as a string: "=", ":=", "::=", ":::=", "+=", "?=", or "!=",
@@ -556,6 +739,46 @@ impl VariableDefinition {
     /// See [`Self::value`] for the value as GNU make stores it.
     pub fn raw_value(&self) -> Option<String> {
         self.value_expr().map(|it| node_text(&it))
+    }
+
+    /// The source range of the value, covering the same text as
+    /// [`Self::raw_value`].
+    ///
+    /// For a `define` block this is the body, including the line break
+    /// before `endef`. Returns `None` if there is no value, as for an
+    /// `undefine` directive; an empty value gives an empty range.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "X := a $(B) # c\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert_eq!(var.value_range(), Some(TextRange::new(5.into(), 12.into())));
+    /// ```
+    pub fn value_range(&self) -> Option<rowan::TextRange> {
+        self.value_expr().map(|it| it.text_range())
+    }
+
+    /// The variable references in the value, in source order, including
+    /// those nested in other references, as in the function call
+    /// `$(patsubst %.c,%.o,$(SRCS))` and its argument `$(SRCS)`.
+    ///
+    /// References in the variable's name are not included. For a `define`
+    /// block, those in the body are.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X.$(A) = $(B) $(addprefix -I,$(C))\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// let names: Vec<_> = var.value_references().filter_map(|r| r.name()).collect();
+    /// assert_eq!(names, vec!["B", "addprefix", "C"]);
+    /// ```
+    pub fn value_references(&self) -> impl Iterator<Item = VariableReference> {
+        self.value_expr()
+            .into_iter()
+            .flat_map(|expr| expr.descendants())
+            .filter_map(VariableReference::cast)
     }
 
     /// Get the value of the variable as `variant` stores it, before
@@ -637,7 +860,10 @@ impl VariableDefinition {
 
     /// Remove this variable definition from its parent makefile
     ///
-    /// This will also remove any preceding comments and up to 1 empty line before the variable.
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     ///
     /// # Example
     /// ```
@@ -829,30 +1055,45 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = value\n");
     /// ```
     pub fn trim_trailing_value_whitespace(&mut self) -> bool {
-        let Some(expr) = self.value_expr() else {
+        let Some(token) = self.trailing_value_whitespace() else {
             return false;
         };
+        token.detach();
+        true
+    }
 
-        // Find the last non-comment child. Comments are part of the EXPR but
-        // the whitespace we care about precedes them (Make includes that
-        // whitespace in the value).
-        let last_non_comment = expr
+    /// Internal: the whitespace token at the end of the value, before any
+    /// comment, that [`Self::trim_trailing_value_whitespace`] removes.
+    fn trailing_value_whitespace(&self) -> Option<crate::lossless::SyntaxToken> {
+        // Comments are part of the EXPR but the whitespace we care about
+        // precedes them (Make includes that whitespace in the value).
+        self.value_expr()?
             .children_with_tokens()
             .filter(|c| c.kind() != COMMENT)
-            .last();
-        let Some(elem) = last_non_comment else {
-            return false;
-        };
-        let Some(token) = elem.into_token() else {
-            return false;
-        };
-        if token.kind() != WHITESPACE {
-            return false;
-        }
+            .last()?
+            .into_token()
+            .filter(|t| t.kind() == WHITESPACE)
+    }
 
-        let idx = token.index();
-        expr.splice_children(idx..idx + 1, vec![]);
-        true
+    /// The source range of whitespace at the end of the value, before any
+    /// comment, which GNU make includes in the value.
+    ///
+    /// This is the whitespace that [`Self::trim_trailing_value_whitespace`]
+    /// removes. Whitespace inside a nested variable reference does not
+    /// count.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "X = a  # c\nY = b\n".parse().unwrap();
+    /// let ranges: Vec<_> = makefile
+    ///     .variable_definitions()
+    ///     .map(|v| v.trailing_value_whitespace_range())
+    ///     .collect();
+    /// assert_eq!(ranges, vec![Some(TextRange::new(5.into(), 7.into())), None]);
+    /// ```
+    pub fn trailing_value_whitespace_range(&self) -> Option<rowan::TextRange> {
+        self.trailing_value_whitespace().map(|t| t.text_range())
     }
 
     /// Update the value of this variable definition while preserving the rest
@@ -2305,5 +2546,353 @@ mod tests {
                 rowan::TextRange::new(0.into(), 6.into())
             )]
         );
+    }
+
+    fn range_text(text: &str, range: Option<rowan::TextRange>) -> Option<&str> {
+        range.map(|r| &text[r])
+    }
+
+    #[test]
+    fn test_is_target_specific() {
+        let text = "a b: export X += 1\nc:: Y = 2\nZ = 3\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let vars: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| (v.name().unwrap(), v.is_target_specific()))
+            .collect();
+        assert_eq!(
+            vars,
+            vec![
+                ("X".to_string(), true),
+                ("Y".to_string(), true),
+                ("Z".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_target_specific_conditional_in_rule_body() {
+        // GNU make assigns Y globally here, although the conditional is part
+        // of the rule.
+        let makefile: Makefile = "all:\nifdef X\n\techo\nY = 1\nendif\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.body_items().count(), 1);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("Y".to_string()));
+        assert!(!var.is_target_specific());
+    }
+
+    #[test]
+    fn test_is_target_specific_bsd_after_sources() {
+        let parsed =
+            Makefile::parse_with_variant("prog: .USE VAR=value\n", MakefileVariant::BSDMake);
+        let var = parsed.tree().variable_definitions().next().unwrap();
+        assert!(var.is_target_specific());
+    }
+
+    #[test]
+    fn test_value_range() {
+        let text = "export X := a $(B) # c\nY =\nZ = \\\n  z\nundefine W\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| range_text(text, v.value_range()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![Some("a $(B) "), Some(""), Some("\\\n  z"), None]
+        );
+        for var in makefile.variable_definitions() {
+            assert_eq!(
+                range_text(text, var.value_range()).map(str::to_string),
+                var.raw_value()
+            );
+        }
+    }
+
+    #[test]
+    fn test_value_range_target_specific() {
+        let text = "all: CFLAGS = -O2 # c\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(range_text(text, var.value_range()), Some("-O2 "));
+    }
+
+    #[test]
+    fn test_value_range_define() {
+        let text = "define A =\nx\ny\nendef\ndefine B\nendef\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.value_range())
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Some(rowan::TextRange::new(11.into(), 15.into())),
+                Some(rowan::TextRange::new(30.into(), 30.into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_value_range_crlf() {
+        let text = "X = a \\\r\n b\r\nY = c\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| range_text(text, v.value_range()))
+            .collect();
+        assert_eq!(ranges, vec![Some("a \\\r\n b"), Some("c")]);
+    }
+
+    #[test]
+    fn test_value_references() {
+        let text = "X.$(A) := $(B) $(patsubst %.c,%.o,$(SRCS:.c=.o)) ${C} $$(D) $E\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let refs: Vec<_> = var
+            .value_references()
+            .map(|r| &text[r.text_range()])
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                "$(B)",
+                "$(patsubst %.c,%.o,$(SRCS:.c=.o))",
+                "$(SRCS:.c=.o)",
+                "${C}",
+                "$E"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_value_references_target_specific() {
+        let text = "$(T): X = $(Y)\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let refs: Vec<_> = var
+            .value_references()
+            .map(|r| &text[r.text_range()])
+            .collect();
+        assert_eq!(refs, vec!["$(Y)"]);
+    }
+
+    #[test]
+    fn test_value_references_define_and_undefine() {
+        let makefile: Makefile = "define $(A)\n$(B)\nendef\nundefine $(C)\n".parse().unwrap();
+        let names: Vec<Vec<_>> = makefile
+            .variable_definitions()
+            .map(|v| v.value_references().filter_map(|r| r.name()).collect())
+            .collect();
+        assert_eq!(names, vec![vec!["B".to_string()], vec![]]);
+    }
+
+    #[test]
+    fn test_trailing_value_whitespace_range() {
+        let text = "A = a \t\nB = b\nC = c  # x\nD = $(d )\nE = \\\n\te \nF = \nall: G = g \n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| range_text(text, v.trailing_value_whitespace_range()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Some(" \t"),
+                None,
+                Some("  "),
+                None,
+                Some(" "),
+                None,
+                Some(" ")
+            ]
+        );
+        let offsets: Vec<_> = makefile
+            .variable_definitions()
+            .filter_map(|v| v.trailing_value_whitespace_range())
+            .map(|r| usize::from(r.start()))
+            .collect();
+        assert_eq!(offsets, vec![5, 19, 43, 60]);
+    }
+
+    #[test]
+    fn test_trailing_value_whitespace_range_crlf() {
+        let text = "A = a \r\nB = b\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| range_text(text, v.trailing_value_whitespace_range()))
+            .collect();
+        assert_eq!(ranges, vec![Some(" "), None]);
+    }
+
+    #[test]
+    fn test_has_endef() {
+        let makefile: Makefile = "define A\nx\nendef\noverride define B\n  endef # c\nC = endef\n"
+            .parse()
+            .unwrap();
+        let has: Vec<_> = makefile
+            .variable_definitions()
+            .map(|v| v.has_endef())
+            .collect();
+        assert_eq!(has, vec![true, true, false]);
+    }
+
+    #[test]
+    fn test_has_endef_nested() {
+        let (makefile, _) = Makefile::from_str_relaxed("define A\ndefine B\nx\nendef\n");
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(!var.has_endef());
+        let makefile: Makefile = "define A\ndefine B\nx\nendef\nendef\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.has_endef());
+    }
+
+    fn add_endef(text: &str) -> (Result<bool, String>, String) {
+        let (makefile, _) = Makefile::from_str_relaxed(text);
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let result = var.add_endef().map_err(|e| e.to_string());
+        if result == Ok(true) {
+            assert!(var.has_endef());
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+        (result, makefile.code())
+    }
+
+    #[test]
+    fn test_add_endef() {
+        assert_eq!(
+            add_endef("define A\nx\n"),
+            (Ok(true), "define A\nx\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_endef_no_trailing_newline() {
+        assert_eq!(
+            add_endef("define A\nx"),
+            (Ok(true), "define A\nx\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_endef_empty_body() {
+        assert_eq!(
+            add_endef("define A\n"),
+            (Ok(true), "define A\nendef\n".to_string())
+        );
+        assert_eq!(
+            add_endef("define A # c"),
+            (Ok(true), "define A # c\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_endef_nested() {
+        assert_eq!(
+            add_endef("define A\n define B\ndefine C\nendef\nx\n"),
+            (
+                Ok(true),
+                "define A\n define B\ndefine C\nendef\nx\nendef\nendef\n".to_string()
+            )
+        );
+        // A line starting with a tab, or a word merely starting with
+        // "define", does not open a nested define.
+        assert_eq!(
+            add_endef("define A\n\tdefine B\ndefined\ndefine=1\n"),
+            (
+                Ok(true),
+                "define A\n\tdefine B\ndefined\ndefine=1\nendef\n".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_add_endef_crlf() {
+        assert_eq!(
+            add_endef("define A\r\ndefine B\r\nx"),
+            (
+                Ok(true),
+                "define A\r\ndefine B\r\nx\r\nendef\r\nendef\r\n".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_add_endef_already_closed() {
+        assert_eq!(
+            add_endef("define A\nx\nendef\n"),
+            (Ok(false), "define A\nx\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_endef_not_define() {
+        let (result, code) = add_endef("A = 1\n");
+        assert_eq!(code, "A = 1\n");
+        assert_eq!(
+            result,
+            Err(
+                "Parse error: Error at line 1: Cannot add endef to a variable that is not a \
+                 define block\n1| variable_add_endef\n"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_add_endef_in_conditional() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\ndefine A\nx\nendif\n");
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.add_endef().unwrap());
+        assert_eq!(makefile.code(), "ifdef X\ndefine A\nx\nendif\nendef\n");
+    }
+
+    #[test]
+    fn test_add_endef_after_continuation() {
+        // A newline after the backslash would continue the last line onto
+        // `endef`, so a blank line ends it first.
+        for (text, expected) in [
+            ("define A\nx \\\n", "define A\nx \\\n\nendef\n"),
+            ("define A\nx \\", "define A\nx \\\n\nendef\n"),
+            ("define A\nx \\\\\\", "define A\nx \\\\\\\n\nendef\n"),
+            ("define A\nx \\\\", "define A\nx \\\\\nendef\n"),
+            ("define A\nx \\\n  ", "define A\nx \\\n  \nendef\n"),
+            ("define A\n# c \\", "define A\n# c \\\n\nendef\n"),
+            ("define A\r\nx \\\r\n", "define A\r\nx \\\r\n\r\nendef\r\n"),
+        ] {
+            assert_eq!(
+                add_endef(text),
+                (Ok(true), expected.to_string()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_endef_nested_continuation() {
+        // Like make, nested defines are found at the start of logical lines.
+        for (text, expected) in [
+            (
+                "define A\nx \\\ndefine B\n",
+                "define A\nx \\\ndefine B\nendef\n",
+            ),
+            (
+                "define A\ndefine B \\\nendef\n",
+                "define A\ndefine B \\\nendef\nendef\nendef\n",
+            ),
+            (
+                "define A\ndefine\\\n  B\n",
+                "define A\ndefine\\\n  B\nendef\nendef\n",
+            ),
+        ] {
+            assert_eq!(
+                add_endef(text),
+                (Ok(true), expected.to_string()),
+                "{text:?}"
+            );
+        }
     }
 }

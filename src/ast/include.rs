@@ -370,7 +370,10 @@ impl Include {
 
     /// Remove this include directive from the makefile
     ///
-    /// This will also remove any preceding comments.
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     ///
     /// # Example
     /// ```

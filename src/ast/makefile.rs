@@ -1,6 +1,8 @@
-use super::build_copy;
 use super::rule::build_targets_node;
-use super::{index_before_doc_comment, line_ending, terminate_line_before, with_trailing_newline};
+use super::{
+    detach_tokens, index_before_doc_comment, line_ending, lines_above, terminate_line_before,
+    with_trailing_newline,
+};
 use crate::lossless::{
     line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Include, Load, Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition,
@@ -163,6 +165,50 @@ fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
     insert_items(root, pos, nodes);
 }
 
+/// Build a conditional by parsing its text, so that the tree is the same
+/// as when the makefile is parsed again. Each body line is ended with
+/// `eol`. Returns an error if the text does not parse as a single
+/// conditional, such as when a body contains an unmatched `endif`.
+fn build_conditional(
+    if_line: &str,
+    if_body: &str,
+    else_branch: Option<(&str, &str)>,
+    endif_keyword: &str,
+    eol: &str,
+    context: &str,
+) -> Result<SyntaxNode, Error> {
+    let mut lines = vec![if_line];
+    lines.extend(if_body.lines());
+    if let Some((else_keyword, else_body)) = else_branch {
+        lines.push(else_keyword);
+        lines.extend(else_body.lines());
+    }
+    lines.push(endif_keyword);
+    let text: String = lines.iter().flat_map(|line| [*line, eol]).collect();
+
+    let parsed = parse(&text, None);
+    if !parsed.errors.is_empty() {
+        return Err(Error::Parse(ParseError {
+            errors: parsed.errors,
+        }));
+    }
+    let root = parsed.root();
+    let mut children = root.syntax().children_with_tokens();
+    match (children.next(), children.next()) {
+        (Some(rowan::NodeOrToken::Node(node)), None) if node.kind() == CONDITIONAL => {
+            Ok(SyntaxNode::new_root_mut(node.green().into_owned()))
+        }
+        _ => Err(Error::Parse(ParseError {
+            errors: vec![ErrorInfo {
+                kind: crate::ParseErrorKind::Other,
+                message: format!("{text:?} does not parse as a single conditional"),
+                line: 1,
+                context: context.to_string(),
+            }],
+        })),
+    }
+}
+
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
 #[non_exhaustive]
@@ -315,11 +361,6 @@ impl MakefileItem {
         })
     }
 
-    /// Check if a token is a regular comment (not a shebang)
-    fn is_regular_comment(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> bool {
-        token.kind() == COMMENT && !token.text().starts_with("#!")
-    }
-
     /// Extract comment text from a comment token, removing '#' prefix
     fn extract_comment_text(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> String {
         let text = token.text();
@@ -329,38 +370,13 @@ impl MakefileItem {
             .to_string()
     }
 
-    /// Helper to find all preceding comment-related elements up to the first non-comment element
-    ///
-    /// Returns elements in reverse order (from closest to furthest from the item)
-    fn collect_preceding_comment_elements(
-        &self,
-    ) -> Vec<rowan::NodeOrToken<SyntaxNode, rowan::SyntaxToken<crate::lossless::Lang>>> {
-        let mut elements = Vec::new();
-        let mut current = self.syntax().prev_sibling_or_token();
-
-        while let Some(element) = current {
-            match &element {
-                rowan::NodeOrToken::Token(token) if Self::is_regular_comment(token) => {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Token(token)
-                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
-                {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    // Hit a shebang, stop here
-                    break;
-                }
-                _ => break,
-            }
-            current = element.prev_sibling_or_token();
-        }
-
-        elements
+    /// The comment tokens above this item, nearest first, going past blank
+    /// lines.
+    fn preceding_comment_tokens(&self) -> Vec<rowan::SyntaxToken<crate::lossless::Lang>> {
+        lines_above(self.syntax())
+            .into_iter()
+            .filter_map(|line| line.comment)
+            .collect()
     }
 
     /// Helper to parse comment text and extract properly formatted comment tokens
@@ -475,6 +491,9 @@ impl MakefileItem {
     ///
     /// Returns an iterator of comment strings (without the leading '#' and whitespace).
     ///
+    /// These are the whole-line comments above the item, going past blank
+    /// lines, up to a line with anything else on it or a shebang line.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -486,18 +505,12 @@ impl MakefileItem {
     /// assert_eq!(comments[1], "Comment 2");
     /// ```
     pub fn preceding_comments(&self) -> impl Iterator<Item = String> {
-        let elements = self.collect_preceding_comment_elements();
-        let mut comments = Vec::new();
-
-        // Process elements in reverse order (furthest to closest)
-        for element in elements.iter().rev() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    comments.push(Self::extract_comment_text(token));
-                }
-            }
-        }
-
+        let mut comments: Vec<_> = self
+            .preceding_comment_tokens()
+            .iter()
+            .map(Self::extract_comment_text)
+            .collect();
+        comments.reverse();
         comments.into_iter()
     }
 
@@ -526,48 +539,26 @@ impl MakefileItem {
     /// );
     /// ```
     pub fn doc_comments(&self) -> impl Iterator<Item = String> {
-        type Token = rowan::SyntaxToken<crate::lossless::Lang>;
-        fn prev_skipping_indent(token: &Token) -> Option<Token> {
-            match token.prev_token() {
-                Some(t) if t.kind() == WHITESPACE => t.prev_token(),
-                prev => prev,
-            }
-        }
-        // `None` is the start of the file.
-        fn at_line_start(prev: &Option<Token>) -> bool {
-            prev.as_ref()
-                .is_none_or(|t| t.kind() == NEWLINE && !super::is_continuation(&t.clone().into()))
-        }
-
-        let mut lines = Vec::new();
-        let mut before = self
-            .syntax()
-            .first_token()
-            .and_then(|t| prev_skipping_indent(&t));
-        while let Some(newline) = before.as_ref().filter(|_| at_line_start(&before)) {
-            let Some(comment) = newline.prev_token().filter(Self::is_regular_comment) else {
-                break;
-            };
-            let prev = prev_skipping_indent(&comment);
-            if !at_line_start(&prev) {
-                break;
-            }
-            let text = comment.text().trim_start_matches('#');
-            lines.push(
+        let mut lines: Vec<_> = lines_above(self.syntax())
+            .into_iter()
+            .map_while(|line| line.comment)
+            .map(|comment| {
+                let text = comment.text().trim_start_matches('#');
                 text.strip_prefix(' ')
                     .unwrap_or(text)
                     .trim_end()
-                    .to_string(),
-            );
-            before = prev;
-        }
+                    .to_string()
+            })
+            .collect();
         lines.reverse();
         lines.into_iter()
     }
 
     /// Remove all preceding comments for this MakefileItem
     ///
-    /// Returns the number of comments removed.
+    /// The comment lines found by [`Self::preceding_comments`] are removed;
+    /// blank lines between them are kept. Returns the number of comments
+    /// removed.
     ///
     /// # Example
     /// ```
@@ -579,54 +570,14 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Comment"));
     /// ```
     pub fn remove_comments(&mut self) -> Result<usize, Error> {
-        let parent = self.get_parent_or_error("remove comments from", "remove_comments")?;
-        let collected_elements = self.collect_preceding_comment_elements();
-
-        // Count the comments
-        let mut comment_count = 0;
-        for element in collected_elements.iter() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    comment_count += 1;
-                }
-            }
-        }
-
-        // Determine which elements to remove - similar to remove_with_preceding_comments
-        // We remove comments and up to 1 blank line worth of newlines
-        let mut elements_to_remove = Vec::new();
-        let mut consecutive_newlines = 0;
-        for element in collected_elements.iter().rev() {
-            let should_remove = match element {
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    consecutive_newlines = 0;
-                    true // Remove comments
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == NEWLINE => {
-                    consecutive_newlines += 1;
-                    comment_count > 0 && consecutive_newlines <= 1
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == WHITESPACE => comment_count > 0,
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
-                    consecutive_newlines += 1;
-                    comment_count > 0 && consecutive_newlines <= 1
-                }
-                _ => false,
-            };
-
-            if should_remove {
-                elements_to_remove.push(element.clone());
-            }
-        }
-
-        // Remove elements in reverse order (from highest index to lowest)
-        elements_to_remove.sort_by_key(|el| std::cmp::Reverse(el.index()));
-        for element in elements_to_remove {
-            let idx = element.index();
-            parent.splice_children(idx..idx + 1, vec![]);
-        }
-
-        Ok(comment_count)
+        self.get_parent_or_error("remove comments from", "remove_comments")?;
+        let lines: Vec<_> = lines_above(self.syntax())
+            .into_iter()
+            .filter(|line| line.comment.is_some())
+            .collect();
+        let count = lines.len();
+        detach_tokens(lines.into_iter().flat_map(|line| line.tokens));
+        Ok(count)
     }
 
     /// Modify the first preceding comment for this MakefileItem
@@ -647,33 +598,24 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Old comment"));
     /// ```
     pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
-        let parent = self.get_parent_or_error("modify comment for", "modify_comment")?;
+        self.get_parent_or_error("modify comment for", "modify_comment")?;
         let (new_comment_token, _) = Self::parse_comment_tokens(
             new_comment_text,
             &line_ending(self.syntax()),
             "modify_comment",
         )?;
 
-        // Find the first preceding comment (closest to the item)
-        let collected_elements = self.collect_preceding_comment_elements();
-        let comment_element = collected_elements.iter().find(|element| {
-            if let rowan::NodeOrToken::Token(token) = element {
-                token.kind() == COMMENT
-            } else {
-                false
-            }
-        });
-
-        if let Some(element) = comment_element {
-            let idx = element.index();
-            parent.splice_children(
-                idx..idx + 1,
-                vec![rowan::NodeOrToken::Token(new_comment_token)],
-            );
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        // The comment closest to the item
+        let Some(comment) = self.preceding_comment_tokens().into_iter().next() else {
+            return Ok(false);
+        };
+        let parent = comment.parent().expect("comment has a parent");
+        let idx = comment.index();
+        parent.splice_children(
+            idx..idx + 1,
+            vec![rowan::NodeOrToken::Token(new_comment_token)],
+        );
+        Ok(true)
     }
 
     /// Insert a new MakefileItem before this item
@@ -772,6 +714,42 @@ impl ExtractFromItem for Include {
     fn extract(item: MakefileItem) -> Option<Self> {
         match item {
             MakefileItem::Include(i) => Some(i),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for Conditional {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Conditional(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for Recipe {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Recipe(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for Vpath {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Vpath(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for ExpressionStatement {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::ExpressionStatement(e) => Some(e),
             _ => None,
         }
     }
@@ -1018,11 +996,94 @@ impl Makefile {
     }
 
     /// Get all conditionals in the makefile (top-level only)
+    ///
+    /// Use [`Makefile::all_conditionals`] to also get nested conditionals
+    /// and conditionals in rule bodies.
     pub fn conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
         self.items().filter_map(|item| match item {
             MakefileItem::Conditional(c) => Some(c),
             _ => None,
         })
+    }
+
+    /// Get all conditionals in the makefile at any depth, in source order.
+    ///
+    /// Unlike [`Makefile::conditionals`], this includes conditionals nested
+    /// in other conditionals or BSD make `.for` loops, and conditionals in
+    /// rule bodies. An outer conditional comes before the conditionals
+    /// nested in it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile =
+    ///     "ifdef A\nifdef B\nX = 1\nendif\nendif\nall:\nifdef C\n\techo c\nendif\n"
+    ///         .parse()
+    ///         .unwrap();
+    /// assert_eq!(makefile.conditionals().count(), 1);
+    /// let conditions: Vec<_> = makefile
+    ///     .all_conditionals()
+    ///     .map(|c| c.condition().unwrap())
+    ///     .collect();
+    /// assert_eq!(conditions, vec!["A", "B", "C"]);
+    /// ```
+    pub fn all_conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all recipe lines in the makefile, in source order.
+    ///
+    /// Like [`Rule::recipe_nodes`], this includes recipe lines in
+    /// conditionals and BSD make `.for` loops in rule bodies. It also
+    /// includes recipe lines that are not part of any rule: indented lines
+    /// before the first rule (a parse error) and lines returned as
+    /// [`MakefileItem::Recipe`], such as a recipe line after a conditional
+    /// whose branches all end in rule context.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "a:\n\techo a\nifdef X\nb:\n\techo b\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let texts: Vec<_> = makefile.recipe_nodes().map(|r| r.text()).collect();
+    /// assert_eq!(texts, vec!["echo a", "echo b"]);
+    /// ```
+    pub fn recipe_nodes(&self) -> impl Iterator<Item = Recipe> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all `vpath` directives in the makefile, including those in
+    /// conditionals, in source order.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "vpath %.c src\nifdef X\nvpath %.h include\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let patterns: Vec<_> = makefile.vpaths().map(|v| v.pattern()).collect();
+    /// assert_eq!(patterns, vec![Some("%.c".to_string()), Some("%.h".to_string())]);
+    /// ```
+    pub fn vpaths(&self) -> impl Iterator<Item = Vpath> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all expression statements (lines of only references or function
+    /// calls, such as `$(eval ...)`) in the makefile, including those in
+    /// conditionals, in source order.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "$(info a)\nifdef X\n$(eval $(call f,x))\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let exprs: Vec<_> = makefile.expression_statements().map(|e| e.expression()).collect();
+    /// assert_eq!(exprs, vec!["$(info a)", "$(eval $(call f,x))"]);
+    /// ```
+    pub fn expression_statements(&self) -> impl Iterator<Item = ExpressionStatement> + '_ {
+        RecursiveItemsIter::new(self.items())
     }
 
     /// Get all top-level items (rules, variables, includes, conditionals) in the makefile
@@ -1236,6 +1297,7 @@ impl Makefile {
             [
                 targets.green().into_owned().into(),
                 rowan::GreenToken::new(OPERATOR.into(), ":").into(),
+                rowan::GreenNode::new(PREREQUISITES.into(), []).into(),
                 rowan::GreenToken::new(NEWLINE.into(), &eol).into(),
             ],
         ));
@@ -1249,7 +1311,8 @@ impl Makefile {
     /// Add a new conditional to the makefile
     ///
     /// The conditional is separated from any preceding content by a blank
-    /// line, unless the makefile already ends in one.
+    /// line, unless the makefile already ends in one. The bodies are parsed
+    /// as makefile text.
     ///
     /// Returns an error if the condition is empty or invalid, as in
     /// `ifeq ()`, or if a body does not read back as part of its branch,
@@ -1299,64 +1362,24 @@ impl Makefile {
         )?;
 
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(CONDITIONAL.into());
-
-        // Build CONDITIONAL_IF
-        builder.start_node(CONDITIONAL_IF.into());
-        builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap condition in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        for line in if_body.lines() {
-            if !line.is_empty() {
-                builder.token(IDENTIFIER.into(), line);
-            }
-            builder.token(NEWLINE.into(), &eol);
-        }
-
-        // Add else clause if provided
-        if let Some(else_content) = else_body {
-            builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), &eol);
-            builder.finish_node();
-
-            for line in else_content.lines() {
-                if !line.is_empty() {
-                    builder.token(IDENTIFIER.into(), line);
-                }
-                builder.token(NEWLINE.into(), &eol);
-            }
-        }
-
-        // Build CONDITIONAL_ENDIF
-        builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = build_conditional(
+            &format!("{conditional_type} {condition}"),
+            if_body,
+            else_body.map(|body| (else_keyword, body)),
+            endif_keyword,
+            &eol,
+            "add_conditional",
+        )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
-        // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
     /// Add a new conditional to the makefile with typed items
     ///
     /// This is a more type-safe alternative to `add_conditional` that accepts iterators of
-    /// `MakefileItem` instead of raw strings. Blank lines are handled as by
-    /// [`Makefile::add_conditional`].
+    /// `MakefileItem` instead of raw strings. Blank lines and errors are
+    /// handled as by [`Makefile::add_conditional`].
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1419,50 +1442,21 @@ impl Makefile {
         )?;
 
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(CONDITIONAL.into());
-
-        // Build CONDITIONAL_IF
-        builder.start_node(CONDITIONAL_IF.into());
-        builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
-
-        // Wrap condition in EXPR node
-        builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
-        builder.finish_node();
-
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        for item in if_items {
-            build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
-        }
-
-        // Add else clause if provided
-        if let Some(else_iter) = else_items {
-            builder.start_node(CONDITIONAL_ELSE.into());
-            builder.token(IDENTIFIER.into(), else_keyword);
-            builder.token(NEWLINE.into(), &eol);
-            builder.finish_node();
-
-            for item in else_iter {
-                build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
-            }
-        }
-
-        // Build CONDITIONAL_ENDIF
-        builder.start_node(CONDITIONAL_ENDIF.into());
-        builder.token(IDENTIFIER.into(), endif_keyword);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        // Each item on its own lines, even one without a final newline
+        let item_text = |item: MakefileItem| with_trailing_newline(item.syntax(), "\n").to_string();
+        let if_text: String = if_items.into_iter().map(item_text).collect();
+        let else_text: Option<String> =
+            else_items.map(|items| items.into_iter().map(item_text).collect());
+        let syntax = build_conditional(
+            &format!("{conditional_type} {condition}"),
+            &if_text,
+            else_text.as_deref().map(|text| (else_keyword, text)),
+            endif_keyword,
+            &eol,
+            "add_conditional_with_items",
+        )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
-        // Return the newly added conditional
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
@@ -1485,6 +1479,8 @@ impl Makefile {
     ///
     /// `index` is a position in [`Makefile::rules`], so it can refer to a
     /// rule inside a conditional or loop.
+    ///
+    /// Comments above the rule are kept.
     ///
     /// # Example
     /// ```
@@ -1539,6 +1535,8 @@ impl Makefile {
     ///
     /// `index` is a position in [`Makefile::rules`], so it can refer to a
     /// rule inside a conditional or loop.
+    ///
+    /// Comments above the rule are kept; [`Rule::remove`] removes them too.
     ///
     /// # Example
     /// ```
@@ -1596,6 +1594,10 @@ impl Makefile {
     /// conditions. If `index` is `rules().count()`, the new rule is
     /// appended to the end of the makefile.
     ///
+    /// If the rule at `index` has comment lines directly above it, with no
+    /// blank line in between, the new rule is inserted before them, since
+    /// they document the existing rule.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1620,7 +1622,9 @@ impl Makefile {
         }
 
         let (parent, target_index) = match rules.get(index) {
-            Some(rule) => (rule.parent().unwrap(), rule.index()),
+            // Insert before the rule at the given index, and any comment
+            // documenting it
+            Some(rule) => (rule.parent().unwrap(), index_before_doc_comment(rule)),
             None => (
                 self.syntax().clone(),
                 self.syntax().children_with_tokens().count(),
@@ -2253,7 +2257,42 @@ mod tests {
         let count = item.remove_comments().unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(makefile.to_string(), "VAR0 = x\nVAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR0 = x\n\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_comments_after_rule() {
+        // The parser puts the comment into the RULE node of `a`.
+        let text = "a:\n\techo\n# far\n\n# doc of b\nb:\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let item = makefile.items().nth(1).unwrap();
+        assert_eq!(
+            item.preceding_comments().collect::<Vec<_>>(),
+            vec!["far", "doc of b"]
+        );
+
+        let mut item = makefile.items().nth(1).unwrap();
+        assert!(item.modify_comment("new").unwrap());
+        assert_eq!(makefile.to_string(), "a:\n\techo\n# far\n\n# new\nb:\n");
+
+        let mut item = makefile.items().nth(1).unwrap();
+        assert_eq!(item.remove_comments().unwrap(), 2);
+        assert_eq!(makefile.to_string(), "a:\n\techo\n\nb:\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_makefile_item_preceding_comments_stop_at_content() {
+        for text in [
+            "X = 1 # x\nb:\n",
+            "X = a \\\n# continued\nb:\n",
+            "ifdef X # c\nb:\nendif\n",
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let rule = makefile.rules().next().unwrap();
+            let item = MakefileItem::Rule(rule);
+            assert_eq!(item.preceding_comments().count(), 0, "{text:?}");
+        }
     }
 
     #[test]
@@ -3232,6 +3271,171 @@ override_dh_auto_configure:
     }
 
     #[test]
+    fn test_all_conditionals() {
+        let makefile: Makefile = "ifdef A\nifdef B\nX = 1\nendif\nelse ifdef C\nifeq ($(D),1)\nY = 2\nendif\nelse\nifndef E\nendif\nendif\nall:\nifdef F\n\techo f\nifdef G\n\techo g\nendif\nendif\nifdef H\nendif\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "H"]
+        );
+        assert_eq!(
+            makefile
+                .all_conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "($(D),1)", "E", "F", "G", "H"]
+        );
+    }
+
+    #[test]
+    fn test_all_conditionals_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            ".if ${A}\n.if ${B}\n.endif\n.elif ${C}\n.for x in a b\n.ifdef D\n.endif\n.endfor\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            makefile
+                .all_conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["${A}", "${B}", "D"]
+        );
+    }
+
+    #[test]
+    fn test_all_conditionals_empty() {
+        let makefile: Makefile = "all:\n\techo\n".parse().unwrap();
+        assert_eq!(makefile.all_conditionals().count(), 0);
+    }
+
+    #[test]
+    fn test_recipe_nodes() {
+        let makefile: Makefile = "a:\n\techo a1\n\techo a2\nifdef X\nb:\n\techo b\nelse\nc:\nifdef Y\n\techo c1\nelse\n\techo c2\nendif\n\techo c3\nendif\nd:\n\techo d\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo a1", "echo a2", "echo b", "echo c1", "echo c2", "echo c3", "echo d"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_nodes_outside_rules() {
+        let (makefile, errors) = Makefile::from_str_relaxed(
+            "\techo orphan\nifdef X\na:\nelse\nb:\nendif\n\techo after\nc:\n\techo c\n",
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo orphan", "echo after", "echo c"]
+        );
+        let lines: Vec<_> = makefile.recipe_nodes().map(|r| r.line()).collect();
+        assert_eq!(lines, vec![0, 6, 8]);
+    }
+
+    #[test]
+    fn test_recipe_nodes_matches_descendants() {
+        let texts = [
+            "a:\n\techo a\nifdef X\n\techo x\nendif\n",
+            "ifdef X\na:\n\techo a\nelse ifdef Y\nb:\n\techo b\nendif\n\techo after\n",
+            "a: ; inline\n\techo a \\\n\t  continued\n",
+            "a:\r\n\techo a\r\nifdef X\r\n\techo x\r\nendif\r\n",
+            "define F\n\techo not a recipe\nendef\na:\n\t$(F)\n",
+        ];
+        for text in texts {
+            let makefile = Makefile::from_str_relaxed(text).0;
+            let expected: Vec<_> = makefile
+                .syntax()
+                .descendants()
+                .filter_map(Recipe::cast)
+                .map(|r| r.syntax().text_range())
+                .collect();
+            let actual: Vec<_> = makefile
+                .recipe_nodes()
+                .map(|r| r.syntax().text_range())
+                .collect();
+            assert_eq!(actual, expected, "{:?}", text);
+        }
+    }
+
+    #[test]
+    fn test_recipe_nodes_continuation_and_crlf() {
+        let makefile: Makefile = "a:\r\n\techo a \\\r\n\t  b\r\nifdef X\r\n\techo x\r\nendif\r\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo a \\\n  b", "echo x"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_nodes_bsd_for_loop() {
+        let makefile = Makefile::parse_with_variant(
+            "all:\n.for f in a b\n\techo ${f}\n.endfor\n.if ${X}\n\techo x\n.elif ${Y}\n\techo y\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo ${f}", "echo x", "echo y"]
+        );
+    }
+
+    #[test]
+    fn test_vpaths() {
+        let makefile: Makefile =
+            "vpath %.c src\nifdef X\nvpath %.h include\nelse\nifdef Y\nvpath %.o obj\nendif\nendif\nVPATH = dir\nvpath\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            makefile.vpaths().map(|v| v.pattern()).collect::<Vec<_>>(),
+            vec![
+                Some("%.c".to_string()),
+                Some("%.h".to_string()),
+                Some("%.o".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expression_statements() {
+        let makefile: Makefile = "$(info a)\nifdef X\n$(eval $(call f,x))\nelse\nifdef Y\n$(warning w)\nendif\nendif\nall:\nifdef Z\n$(error e)\nendif\n\techo $(info not a statement)\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .expression_statements()
+                .map(|e| e.expression())
+                .collect::<Vec<_>>(),
+            vec![
+                "$(info a)",
+                "$(eval $(call f,x))",
+                "$(warning w)",
+                "$(error e)"
+            ]
+        );
+    }
+
+    #[test]
     fn test_remove_include_in_conditional() {
         let makefile: Makefile = "ifdef X\ninclude b.mk\nendif\n".parse().unwrap();
         makefile.includes().next().unwrap().remove().unwrap();
@@ -3284,6 +3488,25 @@ override_dh_auto_configure:
                 vec!["b"],
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_add_rule_matches_reparse() {
+        for text in [
+            "",
+            "X = 1\n",
+            "X = 1\r\n",
+            "X = 1",
+            "ifdef X\nall:\nendif\n",
+        ] {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.add_rule("b");
+            assert_matches_reparse(&makefile);
+
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.try_add_rule("$(OBJS)").unwrap();
+            assert_matches_reparse(&makefile);
         }
     }
 
@@ -3686,6 +3909,87 @@ VAR3 = value3
     }
 
     #[test]
+    fn test_insert_rule_before_doc_comment() {
+        let cases = [
+            ("a:\n# doc\nc:\n", 1, "a:\n\nb:\n\n# doc\nc:\n"),
+            (
+                "a:\n# doc\n# more\nc:\n",
+                1,
+                "a:\n\nb:\n\n# doc\n# more\nc:\n",
+            ),
+            ("# doc\nc:\n", 0, "b:\n\n# doc\nc:\n"),
+            (
+                "a:\n\techo\n# doc\nc:\n",
+                1,
+                "a:\n\techo\n\nb:\n\n# doc\nc:\n",
+            ),
+            (
+                "X = 1\n# x\n\n# doc\nc:\n",
+                0,
+                "X = 1\n# x\n\nb:\n\n# doc\nc:\n",
+            ),
+            ("X = 1\n# x\n\nc:\n", 0, "X = 1\n# x\n\nb:\n\nc:\n"),
+            ("a:\n  # x\nc:\n", 1, "a:\n  # x\n\nb:\n\nc:\n"),
+            (
+                "ifdef X\n# doc\nc:\nendif\n",
+                0,
+                "ifdef X\nb:\n\n# doc\nc:\nendif\n",
+            ),
+            (
+                "a:\nifdef X\nc:\n\techo\n# doc\nd:\nendif\n",
+                2,
+                "a:\nifdef X\nc:\n\techo\n\nb:\n\n# doc\nd:\nendif\n",
+            ),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .insert_rule(index, "b:\n".parse().unwrap())
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(
+                reparsed
+                    .rules()
+                    .nth(index)
+                    .unwrap()
+                    .targets()
+                    .collect::<Vec<_>>(),
+                vec!["b"],
+                "{text:?} at {index}"
+            );
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_insert_rule_after_non_doc_comment() {
+        // A trailing comment or a shebang does not document the next rule.
+        for text in ["X = 1 # x\nc:\n", "#!/usr/bin/make -f\nc:\n"] {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.insert_rule(0, "b:\n".parse().unwrap()).unwrap();
+            let result = makefile.to_string();
+            let (before, after) = result.split_once("b:\n").unwrap();
+            assert_eq!(before.trim_end(), text.strip_suffix("\nc:\n").unwrap());
+            assert_eq!(after, "\nc:\n");
+        }
+    }
+
+    #[test]
+    fn test_replace_rule_keeps_doc_comment() {
+        let mut makefile: Makefile = "a:\n\techo\n# doc\nc:\n".parse().unwrap();
+        makefile.replace_rule(1, "z:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\techo\n# doc\nz:\n");
+    }
+
+    #[test]
+    fn test_remove_rule_keeps_doc_comment() {
+        let mut makefile: Makefile = "a:\n# doc\nc:\n".parse().unwrap();
+        makefile.remove_rule(1).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n# doc\n");
+    }
+
+    #[test]
     fn test_makefile_find_rule_by_target() {
         let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
         let rule = makefile.find_rule_by_target("rule2");
@@ -4040,6 +4344,95 @@ VAR3 = value3
                 Some("1".to_string())
             );
         }
+    }
+
+    #[test]
+    fn test_add_conditional_matches_reparse() {
+        let bodies = [
+            "VAR = debug\n",
+            "a: b\n\techo $@\n\nX := $(Y)\n",
+            "ifdef Y\nZ = 1\nelse\nZ = 2\nendif\n",
+            "include a.mk\n# comment\n\n",
+            "export X\n",
+        ];
+        for prefix in ["", "X = 1\n", "X = 1\r\n"] {
+            for body in bodies {
+                let mut makefile: Makefile = prefix.parse().unwrap();
+                makefile
+                    .add_conditional("ifeq", "($(A),b)", body, Some(body))
+                    .unwrap();
+                assert_matches_reparse(&makefile);
+
+                let mut makefile: Makefile = prefix.parse().unwrap();
+                let items: Makefile = body.parse().unwrap();
+                makefile
+                    .add_conditional_with_items("ifdef", "D", items.items(), Some(items.items()))
+                    .unwrap();
+                assert_matches_reparse(&makefile);
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_conditional_items_accessible() {
+        let mut makefile = Makefile::new();
+        let cond = makefile
+            .add_conditional("ifdef", "D", "a: b\n\techo\nX = 1\n", Some("Y = 2\n"))
+            .unwrap();
+        assert_eq!(cond.condition(), Some("D".to_string()));
+        assert_eq!(cond.if_items().count(), 2);
+        assert_eq!(cond.else_items().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+        assert_eq!(
+            makefile
+                .variable_definitions()
+                .map(|v| v.name().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["X", "Y"]
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_without_newline() {
+        let mut makefile = Makefile::new();
+        let first: Makefile = "X = 1".parse().unwrap();
+        let second: Makefile = "Y = 2\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items(
+                "ifdef",
+                "D",
+                first.items().chain(second.items()),
+                Some(first.items()),
+            )
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef D\nX = 1\nY = 2\nelse\nX = 1\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_crlf_item() {
+        let mut makefile = Makefile::new();
+        let items: Makefile = "a:\r\n\techo\r\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items("ifdef", "D", items.items(), None::<Vec<MakefileItem>>)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "ifdef D\na:\n\techo\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_conditional_rejects_invalid_body() {
+        let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+        for body in ["endif\n", "ifdef Y\n", "define V\n"] {
+            assert!(
+                makefile.add_conditional("ifdef", "D", body, None).is_err(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(makefile.to_string(), "X = 1\n");
     }
 
     #[test]
