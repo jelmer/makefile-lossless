@@ -5007,9 +5007,18 @@ impl VariableReference {
     ///
     /// Returns `Some` if the node is an EXPR whose first token is `$` followed by
     /// `(`, `{`, or an identifier (for single-character variables like `$X`).
-    /// An escaped dollar sign (`$$`) is not a reference.
+    /// An escaped dollar sign (`$$`) is not a reference, and neither is the
+    /// body of a `define` block, which is kept as raw text; see
+    /// [`VariableDefinition::define_variable_references`].
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         if syntax.kind() != EXPR {
+            return None;
+        }
+        if syntax
+            .parent()
+            .and_then(VariableDefinition::cast)
+            .is_some_and(|v| v.is_define())
+        {
             return None;
         }
         let mut tokens = syntax
@@ -5042,9 +5051,9 @@ impl VariableReference {
     /// Returns `None` for expressions without a variable name, such as BSD
     /// make's `${:Uvalue}`.
     ///
-    /// Note: Variable references inside recipes are not parsed into the syntax tree
-    /// (recipes are stored as raw text). This only finds references in variable values,
-    /// prerequisites, and targets.
+    /// Note: Variable references inside recipes and `define` bodies are not
+    /// parsed into the syntax tree (they are stored as raw text). This only
+    /// finds references in variable values, prerequisites, and targets.
     ///
     /// # Example
     /// ```
@@ -5838,10 +5847,11 @@ impl Recipe {
     }
 }
 
-/// A `$(VAR)` or `${VAR}` reference found inside a recipe body.
+/// A `$(VAR)` or `${VAR}` reference found inside a recipe or `define` body.
 ///
-/// Recipes are stored as raw text, so these references have no backing syntax
-/// node; this type carries just the variable name and its absolute source range.
+/// Recipes and `define` bodies are stored as raw text, so these references
+/// have no backing syntax node; this type carries just the variable name and
+/// its absolute source range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeVariableReference {
     name: String,
@@ -5867,7 +5877,11 @@ impl RecipeVariableReference {
 /// in `${SRCS:M*.c}`, and may contain nested references, as in `${VAR.${M}}`.
 /// References inside other references, such as in modifiers or function
 /// arguments, are reported too.
-fn scan_recipe_variable_refs(text: &str, base: u32, out: &mut Vec<RecipeVariableReference>) {
+pub(crate) fn scan_recipe_variable_refs(
+    text: &str,
+    base: u32,
+    out: &mut Vec<RecipeVariableReference>,
+) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -16301,6 +16315,19 @@ test:
             let range = r.text_range();
             assert_eq!(&src[range], r.name());
         }
+    }
+
+    #[test]
+    fn test_variable_references_skip_define_body() {
+        let text = "define E\n$(FOO) $(FOO:a=b)\nendef\nX = $(BAR)\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(
+            makefile
+                .variable_references()
+                .map(|r| (r.syntax().text().to_string(), r.name()))
+                .collect::<Vec<_>>(),
+            vec![("$(BAR)".to_string(), Some("BAR".to_string()))]
+        );
     }
 
     #[test]
