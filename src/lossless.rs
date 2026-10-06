@@ -1197,7 +1197,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     (IDENTIFIER, "else") if self.conditional_keyword_at(end) => {
                         match stack.last_mut() {
                             Some(context) => {
-                                let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
+                                let is_final = !self.is_else_if_at(end);
                                 in_rule = context.next_branch(in_rule, is_final);
                             }
                             None => return false,
@@ -2814,11 +2814,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             matches!(token, "ifdef" | "ifndef" | "ifeq" | "ifneq")
         }
 
-        /// Given tokens in forward order starting at an `else`, check whether
-        /// it is an `else ifdef` etc. rather than a final `else`.
-        fn is_else_if<'a>(tokens: impl Iterator<Item = &'a (SyntaxKind, String)>) -> bool {
-            let mut rest = tokens.skip(1).skip_while(|(kind, _)| *kind == WHITESPACE);
-            matches!(rest.next(), Some((IDENTIFIER, t)) if Self::is_conditional_start(t))
+        /// Whether the `else` at `end - 1` in the token stack is an
+        /// `else ifdef` etc. rather than a final `else`. As for other
+        /// conditional keywords, whitespace must follow, so GNU make takes
+        /// `else ifdef:` as an `else` with extraneous text.
+        fn is_else_if_at(&self, end: usize) -> bool {
+            let mut next = end - 1;
+            while next > 0 && self.tokens[next - 1].0 == WHITESPACE {
+                next -= 1;
+            }
+            self.keyword_at(next, &["ifdef", "ifndef", "ifeq", "ifneq"])
         }
 
         // Helper method to handle conditional token
@@ -2852,22 +2857,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                         // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
                         // The newline will be consumed by the conditional body loop.
-                        match self.tokens.last() {
-                            Some((IDENTIFIER, t)) if matches!(t.as_str(), "ifdef" | "ifndef") => {
+                        if self.at_keyword(&["ifdef", "ifndef"]) {
+                            self.bump();
+                            self.skip_ws_and_continuations();
+                            self.parse_simple_condition();
+                        } else if self.at_keyword(&["ifeq", "ifneq"]) {
+                            self.bump();
+                            self.skip_ws_and_continuations();
+                            self.parse_parenthesized_expr();
+                        } else {
+                            self.parse_extraneous_text("else", false);
+                            if self.current() == Some(COMMENT) {
                                 self.bump();
-                                self.skip_ws_and_continuations();
-                                self.parse_simple_condition();
-                            }
-                            Some((IDENTIFIER, t)) if matches!(t.as_str(), "ifeq" | "ifneq") => {
-                                self.bump();
-                                self.skip_ws_and_continuations();
-                                self.parse_parenthesized_expr();
-                            }
-                            _ => {
-                                self.parse_extraneous_text("else", false);
-                                if self.current() == Some(COMMENT) {
-                                    self.bump();
-                                }
                             }
                         }
 
@@ -2980,7 +2981,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         let token = self.tokens.last().unwrap().1.clone();
                         match token.as_str() {
                             "else" => {
-                                let is_final = !Self::is_else_if(self.tokens.iter().rev());
+                                let is_final = !self.is_else_if_at(self.tokens.len());
                                 self.in_rule = rule_context.next_branch(self.in_rule, is_final);
                             }
                             "endif" => self.in_rule = rule_context.end(self.in_rule),
@@ -6786,6 +6787,9 @@ mod tests {
                 ("ifdef X\nA = 1\nelse junk # c\nA = 2\nendif\n", 3),
                 ("ifdef X\nA = 1\nelse $(Y)\nA = 2\nendif\n", 3),
                 ("ifdef X\nA = 1\nelse endif\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse ifdef:\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse ifndef: x\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse ifeq(a,a)\nA = 2\nendif\n", 3),
                 ("ifdef X\nA = 1\nelse \\\njunk\nA = 2\nendif\n", 4),
                 ("ifdef X\nA = 1\nelse\nA = 2\nendif junk\n", 5),
                 ("ifdef X\nA = 1\nelse\nA = 2\nendif junk # c\n", 5),
@@ -6853,6 +6857,8 @@ mod tests {
             "ifdef X\nA = 1\nelse  \nA = 2\nendif  \n",
             "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nendif\n",
             "ifdef X\nA = 1\nelse ifeq (a,b)\nA = 2\nendif\n",
+            "ifdef X\nA = 1\nelse ifdef#c\nA = 2\nendif\n",
+            "ifdef X\nA = 1\nelse ifdef\\\n Y\nA = 2\nendif\n",
             "ifdef X\nA = 1\nelse\nA = 2\nendif",
         ] {
             let (errors, if_body, _) = parse_single_conditional(code, None);
@@ -6862,6 +6868,33 @@ mod tests {
                 "{code:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_else_if_without_whitespace() {
+        let code = "ifdef X\nelse ifdef:\nendif\n";
+        let parsed = parse(code, None);
+        assert_eq!(
+            parsed.errors,
+            vec![ErrorInfo {
+                message: "extraneous text after `else` directive".to_string(),
+                line: 2,
+                context: "else ifdef:".to_string(),
+                kind: ParseErrorKind::ExtraneousText,
+            }]
+        );
+        assert_eq!(
+            parsed
+                .positioned_errors
+                .iter()
+                .map(|e| e.range)
+                .collect::<Vec<_>>(),
+            vec![rowan::TextRange::new(13.into(), 18.into())]
+        );
+        assert_eq!(code, parsed.root().to_string());
+        let conditionals: Vec<_> = parsed.root().conditionals().collect();
+        assert_eq!(conditionals.len(), 1);
+        assert_eq!(conditionals[0].else_body(), Some("\n".to_string()));
     }
 
     #[test]
