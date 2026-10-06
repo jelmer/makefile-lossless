@@ -106,11 +106,11 @@ fn test_conditional_header_comment_tree() {
       WHITESPACE@31..32 " "
       COMMENT@32..35 "# c"
       NEWLINE@35..36 "\n"
-    CONDITIONAL_ELSE@36..44
+    CONDITIONAL_ELSE@36..45
       IDENTIFIER@36..40 "else"
       WHITESPACE@40..41 " "
       COMMENT@41..44 "# c"
-    NEWLINE@44..45 "\n"
+      NEWLINE@44..45 "\n"
     CONDITIONAL_ENDIF@45..55
       IDENTIFIER@45..50 "endif"
       WHITESPACE@50..51 " "
@@ -161,7 +161,7 @@ fn test_conditional_extraneous_text() {
                 (
                     vec![(ParseErrorKind::ExtraneousText, line)],
                     Some("A = 1\n".to_string()),
-                    Some("\nA = 2\n".to_string())
+                    Some("A = 2\n".to_string())
                 ),
                 "{code:?}"
             );
@@ -194,12 +194,12 @@ fn test_conditional_extraneous_text_tree() {
       EXPR@6..7
         IDENTIFIER@6..7 "X"
       NEWLINE@7..8 "\n"
-    CONDITIONAL_ELSE@8..17
+    CONDITIONAL_ELSE@8..18
       IDENTIFIER@8..12 "else"
       WHITESPACE@12..13 " "
       ERROR@13..17
         IDENTIFIER@13..17 "junk"
-    NEWLINE@17..18 "\n"
+      NEWLINE@17..18 "\n"
     CONDITIONAL_ENDIF@18..29
       IDENTIFIER@18..23 "endif"
       WHITESPACE@23..24 " "
@@ -255,7 +255,7 @@ fn test_else_if_without_whitespace() {
     assert_eq!(code, parsed.root().to_string());
     let conditionals: Vec<_> = parsed.root().conditionals().collect();
     assert_eq!(conditionals.len(), 1);
-    assert_eq!(conditionals[0].else_body(), Some("\n".to_string()));
+    assert_eq!(conditionals[0].else_body(), None);
 }
 
 #[test]
@@ -796,4 +796,57 @@ endif
     assert_eq!(conditionals.len(), 1);
     assert_eq!(conditionals[0].line(), 0);
     assert_eq!(conditionals[0].column(), 0);
+}
+
+#[test]
+fn test_conditional_headers_include_newline() {
+    // Each branch header owns the newline that ends its line, so that the
+    // branch body starts on the next line.
+    for (code, variant) in [
+        ("ifdef X\nelse\nendif\n", None),
+        ("ifdef X\nelse # c\nendif\n", None),
+        ("ifdef X\nelse junk\nendif\n", None),
+        ("ifdef X\nelse ifdef Y\nendif\n", None),
+        ("ifdef X\nelse ifeq (a,b)\nelse\nendif\n", None),
+        (
+            "ifeq (a,b)\nelse ifneq (c,d)\nendif\n",
+            Some(MakefileVariant::GNUMake),
+        ),
+        (
+            ".if 1\n.elif 2\n.else\n.endif\n",
+            Some(MakefileVariant::BSDMake),
+        ),
+        (
+            ".ifdef X\n.elifndef Y\n.else # c\n.endif\n",
+            Some(MakefileVariant::BSDMake),
+        ),
+        (
+            "!IF 1\n!ELSEIF 2\n!ELSE\n!ENDIF\n",
+            Some(MakefileVariant::NMake),
+        ),
+    ] {
+        let parsed = parse(code, variant);
+        assert_eq!(
+            parsed.errors.len(),
+            usize::from(code.contains("junk")),
+            "{code:?}"
+        );
+        let conditional = parsed.root().conditionals().next().unwrap();
+        let headers: Vec<String> = conditional
+            .syntax()
+            .children()
+            .filter(|n| {
+                matches!(
+                    n.kind(),
+                    CONDITIONAL_IF | CONDITIONAL_ELSE | CONDITIONAL_ENDIF
+                )
+            })
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(
+            headers,
+            code.split_inclusive('\n').collect::<Vec<_>>(),
+            "{code:?}"
+        );
+    }
 }

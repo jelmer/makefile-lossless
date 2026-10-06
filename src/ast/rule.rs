@@ -259,11 +259,12 @@ impl Rule {
             GreenToken::new(OPERATOR.into(), ":").into(),
         ];
         if !prerequisites.is_empty() {
-            let prerequisites = build_prerequisites_node(&owned(prerequisites), None, false)
-                .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
             children.push(GreenToken::new(WHITESPACE.into(), " ").into());
-            children.push(prerequisites.green().into_owned().into());
         }
+        // The parser creates a PREREQUISITES node even when it is empty.
+        let prerequisites = build_prerequisites_node(&owned(prerequisites), None, false)
+            .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
+        children.push(prerequisites.green().into_owned().into());
         children.push(GreenToken::new(NEWLINE.into(), "\n").into());
         for recipe in recipes {
             let recipe = recipe_green(&[(INDENT, "\t"), (TEXT, recipe), (NEWLINE, "\n")]);
@@ -1715,7 +1716,10 @@ impl Rule {
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
     ///
-    /// This will also remove any preceding comments and up to 1 empty line before the rule.
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     /// When removing the last rule in a makefile, this will also trim any trailing blank lines
     /// from the previous rule to avoid leaving extra whitespace at the end of the file.
     pub fn remove(self) -> Result<(), Error> {
@@ -1767,6 +1771,7 @@ mod tests {
     use crate::{
         ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem, RuleOperator,
     };
+    use rowan::ast::AstNode;
 
     #[test]
     fn test_rules_with_pipe_in_shell_continuation() {
@@ -3526,6 +3531,28 @@ mod tests {
         rule.set_prerequisites(vec!["x\\"]).unwrap();
         assert_eq!(makefile.to_string(), "a: x\\\\# c\n");
         assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["x\\"]);
+    }
+
+    #[test]
+    fn test_new_rule_matches_parse() {
+        let cases: [(&[&str], &[&str], &[&str]); 4] = [
+            (&["a"], &[], &[]),
+            (&["a", "b"], &["c"], &[]),
+            (&["a"], &[], &["echo"]),
+            (&["a"], &["b", "c"], &["echo", "true"]),
+        ];
+        for (targets, prerequisites, recipes) in cases {
+            let rule = Rule::new(targets, prerequisites, recipes);
+            let parsed: Rule = rule.to_string().parse().unwrap();
+            assert_eq!(
+                format!("{:#?}", rule.syntax()),
+                format!("{:#?}", parsed.syntax())
+            );
+
+            let mut makefile = Makefile::new();
+            makefile.insert_rule(0, rule).unwrap();
+            assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]

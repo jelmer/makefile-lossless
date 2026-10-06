@@ -2779,7 +2779,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.skip_ws();
 
                         // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
-                        // The newline will be consumed by the conditional body loop.
+                        // Like CONDITIONAL_IF, the node includes the newline.
                         if self.at_keyword(&["ifdef", "ifndef"]) {
                             self.bump();
                             self.skip_ws_and_continuations();
@@ -2789,10 +2789,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             self.skip_ws_and_continuations();
                             self.parse_parenthesized_expr();
                         } else {
-                            self.parse_extraneous_text("else", false);
-                            if self.current() == Some(COMMENT) {
-                                self.bump();
-                            }
+                            self.parse_directive_line_end("else", false);
                         }
 
                         self.builder.finish_node(); // finish CONDITIONAL_ELSE

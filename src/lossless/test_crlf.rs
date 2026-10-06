@@ -101,7 +101,7 @@ fn test_conditional() {
     assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
     assert_eq!(conditional.condition(), Some("X".to_string()));
     assert_eq!(conditional.if_body(), Some("A = 1\n".to_string()));
-    assert_eq!(conditional.else_body(), Some("\nA = 2\n".to_string()));
+    assert_eq!(conditional.else_body(), Some("A = 2\n".to_string()));
 }
 
 #[test]
