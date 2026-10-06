@@ -618,6 +618,42 @@ impl ExtractFromItem for Include {
     }
 }
 
+impl ExtractFromItem for Conditional {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Conditional(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for Recipe {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Recipe(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for Vpath {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Vpath(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl ExtractFromItem for ExpressionStatement {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::ExpressionStatement(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 // Internal stack-based iterator for recursively collecting items from conditionals
 struct RecursiveItemsIter<T> {
     stack: VecDeque<MakefileItem>,
@@ -859,11 +895,94 @@ impl Makefile {
     }
 
     /// Get all conditionals in the makefile (top-level only)
+    ///
+    /// Use [`Makefile::all_conditionals`] to also get nested conditionals
+    /// and conditionals in rule bodies.
     pub fn conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
         self.items().filter_map(|item| match item {
             MakefileItem::Conditional(c) => Some(c),
             _ => None,
         })
+    }
+
+    /// Get all conditionals in the makefile at any depth, in source order.
+    ///
+    /// Unlike [`Makefile::conditionals`], this includes conditionals nested
+    /// in other conditionals or BSD make `.for` loops, and conditionals in
+    /// rule bodies. An outer conditional comes before the conditionals
+    /// nested in it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile =
+    ///     "ifdef A\nifdef B\nX = 1\nendif\nendif\nall:\nifdef C\n\techo c\nendif\n"
+    ///         .parse()
+    ///         .unwrap();
+    /// assert_eq!(makefile.conditionals().count(), 1);
+    /// let conditions: Vec<_> = makefile
+    ///     .all_conditionals()
+    ///     .map(|c| c.condition().unwrap())
+    ///     .collect();
+    /// assert_eq!(conditions, vec!["A", "B", "C"]);
+    /// ```
+    pub fn all_conditionals(&self) -> impl Iterator<Item = Conditional> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all recipe lines in the makefile, in source order.
+    ///
+    /// Like [`Rule::recipe_nodes`], this includes recipe lines in
+    /// conditionals and BSD make `.for` loops in rule bodies. It also
+    /// includes recipe lines that are not part of any rule: indented lines
+    /// before the first rule (a parse error) and lines returned as
+    /// [`MakefileItem::Recipe`], such as a recipe line after a conditional
+    /// whose branches all end in rule context.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "a:\n\techo a\nifdef X\nb:\n\techo b\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let texts: Vec<_> = makefile.recipe_nodes().map(|r| r.text()).collect();
+    /// assert_eq!(texts, vec!["echo a", "echo b"]);
+    /// ```
+    pub fn recipe_nodes(&self) -> impl Iterator<Item = Recipe> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all `vpath` directives in the makefile, including those in
+    /// conditionals, in source order.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "vpath %.c src\nifdef X\nvpath %.h include\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let patterns: Vec<_> = makefile.vpaths().map(|v| v.pattern()).collect();
+    /// assert_eq!(patterns, vec![Some("%.c".to_string()), Some("%.h".to_string())]);
+    /// ```
+    pub fn vpaths(&self) -> impl Iterator<Item = Vpath> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all expression statements (lines of only references or function
+    /// calls, such as `$(eval ...)`) in the makefile, including those in
+    /// conditionals, in source order.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "$(info a)\nifdef X\n$(eval $(call f,x))\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let exprs: Vec<_> = makefile.expression_statements().map(|e| e.expression()).collect();
+    /// assert_eq!(exprs, vec!["$(info a)", "$(eval $(call f,x))"]);
+    /// ```
+    pub fn expression_statements(&self) -> impl Iterator<Item = ExpressionStatement> + '_ {
+        RecursiveItemsIter::new(self.items())
     }
 
     /// Get all top-level items (rules, variables, includes, conditionals) in the makefile
@@ -3065,6 +3184,171 @@ override_dh_auto_configure:
     fn test_comment_ranges_none() {
         let makefile: Makefile = "all:\n\techo '#'\n".parse().unwrap();
         assert_eq!(makefile.comment_ranges().count(), 0);
+    }
+
+    #[test]
+    fn test_all_conditionals() {
+        let makefile: Makefile = "ifdef A\nifdef B\nX = 1\nendif\nelse ifdef C\nifeq ($(D),1)\nY = 2\nendif\nelse\nifndef E\nendif\nendif\nall:\nifdef F\n\techo f\nifdef G\n\techo g\nendif\nendif\nifdef H\nendif\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "H"]
+        );
+        assert_eq!(
+            makefile
+                .all_conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "($(D),1)", "E", "F", "G", "H"]
+        );
+    }
+
+    #[test]
+    fn test_all_conditionals_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            ".if ${A}\n.if ${B}\n.endif\n.elif ${C}\n.for x in a b\n.ifdef D\n.endif\n.endfor\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            makefile
+                .all_conditionals()
+                .map(|c| c.condition().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["${A}", "${B}", "D"]
+        );
+    }
+
+    #[test]
+    fn test_all_conditionals_empty() {
+        let makefile: Makefile = "all:\n\techo\n".parse().unwrap();
+        assert_eq!(makefile.all_conditionals().count(), 0);
+    }
+
+    #[test]
+    fn test_recipe_nodes() {
+        let makefile: Makefile = "a:\n\techo a1\n\techo a2\nifdef X\nb:\n\techo b\nelse\nc:\nifdef Y\n\techo c1\nelse\n\techo c2\nendif\n\techo c3\nendif\nd:\n\techo d\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo a1", "echo a2", "echo b", "echo c1", "echo c2", "echo c3", "echo d"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_nodes_outside_rules() {
+        let (makefile, errors) = Makefile::from_str_relaxed(
+            "\techo orphan\nifdef X\na:\nelse\nb:\nendif\n\techo after\nc:\n\techo c\n",
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo orphan", "echo after", "echo c"]
+        );
+        let lines: Vec<_> = makefile.recipe_nodes().map(|r| r.line()).collect();
+        assert_eq!(lines, vec![0, 6, 8]);
+    }
+
+    #[test]
+    fn test_recipe_nodes_matches_descendants() {
+        let texts = [
+            "a:\n\techo a\nifdef X\n\techo x\nendif\n",
+            "ifdef X\na:\n\techo a\nelse ifdef Y\nb:\n\techo b\nendif\n\techo after\n",
+            "a: ; inline\n\techo a \\\n\t  continued\n",
+            "a:\r\n\techo a\r\nifdef X\r\n\techo x\r\nendif\r\n",
+            "define F\n\techo not a recipe\nendef\na:\n\t$(F)\n",
+        ];
+        for text in texts {
+            let makefile = Makefile::from_str_relaxed(text).0;
+            let expected: Vec<_> = makefile
+                .syntax()
+                .descendants()
+                .filter_map(Recipe::cast)
+                .map(|r| r.syntax().text_range())
+                .collect();
+            let actual: Vec<_> = makefile
+                .recipe_nodes()
+                .map(|r| r.syntax().text_range())
+                .collect();
+            assert_eq!(actual, expected, "{:?}", text);
+        }
+    }
+
+    #[test]
+    fn test_recipe_nodes_continuation_and_crlf() {
+        let makefile: Makefile = "a:\r\n\techo a \\\r\n\t  b\r\nifdef X\r\n\techo x\r\nendif\r\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo a \\\n  b", "echo x"]
+        );
+    }
+
+    #[test]
+    fn test_recipe_nodes_bsd_for_loop() {
+        let makefile = Makefile::parse_with_variant(
+            "all:\n.for f in a b\n\techo ${f}\n.endfor\n.if ${X}\n\techo x\n.elif ${Y}\n\techo y\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            makefile
+                .recipe_nodes()
+                .map(|r| r.text())
+                .collect::<Vec<_>>(),
+            vec!["echo ${f}", "echo x", "echo y"]
+        );
+    }
+
+    #[test]
+    fn test_vpaths() {
+        let makefile: Makefile =
+            "vpath %.c src\nifdef X\nvpath %.h include\nelse\nifdef Y\nvpath %.o obj\nendif\nendif\nVPATH = dir\nvpath\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            makefile.vpaths().map(|v| v.pattern()).collect::<Vec<_>>(),
+            vec![
+                Some("%.c".to_string()),
+                Some("%.h".to_string()),
+                Some("%.o".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expression_statements() {
+        let makefile: Makefile = "$(info a)\nifdef X\n$(eval $(call f,x))\nelse\nifdef Y\n$(warning w)\nendif\nendif\nall:\nifdef Z\n$(error e)\nendif\n\techo $(info not a statement)\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile
+                .expression_statements()
+                .map(|e| e.expression())
+                .collect::<Vec<_>>(),
+            vec![
+                "$(info a)",
+                "$(eval $(call f,x))",
+                "$(warning w)",
+                "$(error e)"
+            ]
+        );
     }
 
     #[test]
