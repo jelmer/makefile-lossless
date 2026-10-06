@@ -708,15 +708,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         fn parse_rule_target(&mut self) -> bool {
             match self.current() {
-                Some(IDENTIFIER) => {
-                    // Check if this is an archive member (e.g., libfoo.a(bar.o))
-                    if self.is_archive_member() {
-                        self.parse_archive_member();
-                    } else {
-                        self.bump();
-                    }
-                    true
-                }
                 Some(DOLLAR) => {
                     self.parse_variable_reference();
                     true
@@ -774,79 +765,50 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        fn is_archive_member(&self) -> bool {
-            // Check if the current identifier is followed by a parenthesis
-            // Pattern: archive.a(member.o)
-            if self.tokens.len() < 2 {
-                return false;
-            }
-
-            // Look for pattern: IDENTIFIER LPAREN
-            let current_is_identifier = self.current() == Some(IDENTIFIER);
-            let next_is_lparen =
-                self.tokens.len() > 1 && self.tokens[self.tokens.len() - 2].0 == LPAREN;
-
-            current_is_identifier && next_is_lparen
+        /// Whether the current token is a `$$` escape, after which a `(` is
+        /// literal rather than the start of an archive member list.
+        fn at_dollar_escape(&self) -> bool {
+            self.current() == Some(DOLLAR)
+                && self.tokens.len() >= 2
+                && self.tokens[self.tokens.len() - 2].0 == DOLLAR
         }
 
-        fn parse_archive_member(&mut self) {
-            // We're parsing something like: libfoo.a(bar.o baz.o)
-            // Structure will be:
-            // - IDENTIFIER: libfoo.a
-            // - LPAREN
-            // - ARCHIVE_MEMBERS
-            //   - ARCHIVE_MEMBER: bar.o
-            //   - ARCHIVE_MEMBER: baz.o
-            // - RPAREN
-
-            // Parse archive name
-            if self.current() == Some(IDENTIFIER) {
-                self.bump();
+        /// Parse the parenthesized member list of an archive member
+        /// reference such as `libfoo.a(bar.o baz.o)`, starting at the `(`.
+        /// The archive name before it is left to the caller, as it may
+        /// contain variable references.
+        fn parse_archive_member_list(&mut self) {
+            self.bump(); // (
+            self.builder.start_node(ARCHIVE_MEMBERS.into());
+            while self.current().is_some() && self.current() != Some(RPAREN) {
+                // The member list may continue on the next physical line.
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.current() {
+                    Some(IDENTIFIER) | Some(TEXT) => {
+                        self.builder.start_node(ARCHIVE_MEMBER.into());
+                        self.bump();
+                        self.builder.finish_node();
+                    }
+                    Some(WHITESPACE) => self.bump(),
+                    Some(DOLLAR) => {
+                        self.builder.start_node(ARCHIVE_MEMBER.into());
+                        self.parse_variable_reference();
+                        self.builder.finish_node();
+                    }
+                    _ => break,
+                }
             }
+            self.builder.finish_node();
 
-            // Parse opening parenthesis
-            if self.current() == Some(LPAREN) {
+            if self.current() == Some(RPAREN) {
                 self.bump();
-
-                // Start the ARCHIVE_MEMBERS container for just the members
-                self.builder.start_node(ARCHIVE_MEMBERS.into());
-
-                // Parse member name(s) - each as an ARCHIVE_MEMBER node
-                while self.current().is_some() && self.current() != Some(RPAREN) {
-                    // The member list may continue on the next physical line.
-                    if self.consume_line_continuation() {
-                        continue;
-                    }
-                    match self.current() {
-                        Some(IDENTIFIER) | Some(TEXT) => {
-                            // Start an individual member node
-                            self.builder.start_node(ARCHIVE_MEMBER.into());
-                            self.bump();
-                            self.builder.finish_node();
-                        }
-                        Some(WHITESPACE) => self.bump(),
-                        Some(DOLLAR) => {
-                            // Variable reference can also be a member
-                            self.builder.start_node(ARCHIVE_MEMBER.into());
-                            self.parse_variable_reference();
-                            self.builder.finish_node();
-                        }
-                        _ => break,
-                    }
-                }
-
-                // Finish the ARCHIVE_MEMBERS container
-                self.builder.finish_node();
-
-                // Parse closing parenthesis
-                if self.current() == Some(RPAREN) {
-                    self.bump();
-                } else {
-                    self.error(
-                        ParseErrorKind::UnclosedArchiveMember,
-                        "expected ')' to close archive member".to_string(),
-                    );
-                }
+            } else {
+                self.error(
+                    ParseErrorKind::UnclosedArchiveMember,
+                    "expected ')' to close archive member".to_string(),
+                );
             }
         }
 
@@ -907,18 +869,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_prerequisite_word(&mut self, stop_at_pipe: bool) {
             self.builder.start_node(PREREQUISITE.into());
 
-            // Archive member syntax: `lib(member.o)` — keep as a unit.
-            if self.current() == Some(IDENTIFIER) && self.is_archive_member() {
-                self.parse_archive_member();
-                self.builder.finish_node();
-                return;
-            }
+            // Whether a `(` here starts the member list of an archive member
+            // reference such as `lib.a(m.o)` or `$(LIB)(m.o)`. It can't start
+            // the word or follow a `$$`, and a word has only one. A word that
+            // starts with `(` has none.
+            let mut archive_allowed = false;
+            let mut seen_archive = false;
 
-            // Otherwise, consume tokens until a separator. A line continuation
-            // ends the word; the outer loop consumes it and resumes on the
-            // next physical line.
+            // Consume tokens until a separator. A line continuation ends the
+            // word; the outer loop consumes it and resumes on the next
+            // physical line.
             while let Some(kind) = self.current() {
                 match kind {
+                    LPAREN if archive_allowed && !seen_archive => {
+                        self.parse_archive_member_list();
+                        seen_archive = true;
+                        // BSD make ends the word at the `)`.
+                        if self.is_bsd_make() {
+                            break;
+                        }
+                    }
                     // GNU make takes a backslash-escaped space as part of
                     // the name; BSD make splits sources at any whitespace.
                     WHITESPACE if self.pending_backslash_escape && !self.is_bsd_make() => {
@@ -927,9 +897,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     WHITESPACE | NEWLINE | COMMENT => break,
                     BACKSLASH if self.is_line_continuation() => break,
                     TEXT if self.at_text(";") || (stop_at_pipe && self.at_text("|")) => break,
-                    DOLLAR => self.parse_variable_reference(),
+                    DOLLAR => {
+                        let escape = self.at_dollar_escape();
+                        self.parse_variable_reference();
+                        archive_allowed = !escape;
+                        continue;
+                    }
+                    LPAREN => {
+                        seen_archive |= !archive_allowed;
+                        self.bump();
+                    }
                     _ => self.bump(),
                 }
+                archive_allowed = true;
             }
 
             self.builder.finish_node(); // End PREREQUISITE
@@ -1809,16 +1789,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_rule_targets(&mut self) -> bool {
-            // Parse first target
-            let has_first_target = self.parse_rule_target();
+            // As in parse_prerequisite_word, whether a `(` here starts the
+            // member list of an archive member target.
+            let mut archive_allowed = !self.at_dollar_escape();
+            let mut seen_archive = self.current() == Some(LPAREN);
 
-            if !has_first_target {
+            if !self.parse_rule_target() {
                 return false;
             }
 
             // Parse additional targets until we hit the colon
             loop {
-                self.skip_ws();
+                if self.current() == Some(WHITESPACE) {
+                    self.skip_ws();
+                    archive_allowed = false;
+                    seen_archive = false;
+                }
 
                 // Check if we're at a colon
                 if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
@@ -1827,13 +1813,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
                 // The target list may continue on the next physical line.
                 if self.consume_line_continuation() {
+                    archive_allowed = false;
+                    seen_archive = false;
                     continue;
                 }
 
-                // Try to parse another target
                 match self.current() {
                     Some(INDENT | NEWLINE | COMMENT | OPERATOR) | None => break,
+                    Some(LPAREN) if archive_allowed && !seen_archive => {
+                        self.parse_archive_member_list();
+                        seen_archive = true;
+                    }
                     _ => {
+                        // GNU make takes no archive name from a word that
+                        // starts with `(`, and BSD make rejects one.
+                        seen_archive |= self.current() == Some(LPAREN);
+                        archive_allowed = !self.at_dollar_escape();
                         if !self.parse_rule_target() {
                             break;
                         }

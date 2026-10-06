@@ -1,22 +1,27 @@
 use crate::lossless::{node_text, ArchiveMember, ArchiveMembers};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
+use rowan::Direction;
 
 impl ArchiveMembers {
     /// Get the archive name (e.g., "libfoo.a" from "libfoo.a(bar.o)")
+    ///
+    /// The name is returned as written, so variable references in it are
+    /// not expanded: for `$(LIB)(bar.o)` this is `$(LIB)`.
     pub fn archive_name(&self) -> Option<String> {
-        // Get the first identifier before the opening parenthesis
-        for element in self.syntax().children_with_tokens() {
-            if let Some(token) = element.as_token() {
-                if token.kind() == IDENTIFIER {
-                    return Some(token.text().to_string());
-                } else if token.kind() == LPAREN {
-                    // Reached the opening parenthesis without finding an identifier
-                    break;
-                }
-            }
+        let mut before = self.syntax().siblings_with_tokens(Direction::Prev).skip(1);
+        if before.next()?.kind() != LPAREN {
+            return None;
         }
-        None
+        let mut parts: Vec<_> = before
+            .take_while(|e| !matches!(e.kind(), WHITESPACE | NEWLINE | INDENT))
+            .map(|e| e.to_string())
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        parts.reverse();
+        Some(parts.concat())
     }
 
     /// Get all member nodes
@@ -41,6 +46,7 @@ impl ArchiveMember {
 mod tests {
     use super::*;
     use crate::lossless::parse;
+    use crate::MakefileVariant;
     use crate::SyntaxKind::ARCHIVE_MEMBERS;
 
     #[test]
@@ -160,6 +166,121 @@ mod tests {
         assert_eq!(
             rules[0].prerequisites().collect::<Vec<_>>(),
             vec!["lib(a.o b.o)", "c"]
+        );
+    }
+
+    #[test]
+    fn test_archive_name() {
+        let parsed = parse("lib.a(m.o): x\nall: $(LIB)(a.o b.o) c\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        let archives: Vec<_> = parsed
+            .root()
+            .syntax()
+            .descendants()
+            .filter_map(ArchiveMembers::cast)
+            .map(|m| (m.archive_name(), m.member_names()))
+            .collect();
+        assert_eq!(
+            archives,
+            vec![
+                (Some("lib.a".to_string()), vec!["m.o".to_string()]),
+                (
+                    Some("$(LIB)".to_string()),
+                    vec!["a.o".to_string(), "b.o".to_string()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_archive_name_with_variable_reference() {
+        // Both GNU make and BSD make expand the archive name, so it may
+        // contain or consist of variable references.
+        let input =
+            "$(LIB)(m.o n.o) lib$(V).a(p.o q.o): y\nall: ${LIB}(a.o b.o) lib$(V).a(c.o d.o) e\n";
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            let parsed = parse(input, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(parsed.root().syntax().to_string(), input);
+            assert_eq!(
+                member_lists(&parsed),
+                vec![
+                    vec!["m.o", "n.o"],
+                    vec!["p.o", "q.o"],
+                    vec!["a.o", "b.o"],
+                    vec!["c.o", "d.o"]
+                ],
+                "{variant:?}"
+            );
+            let rules: Vec<_> = parsed.root().rules().collect();
+            assert_eq!(rules.len(), 2, "{variant:?}");
+            assert_eq!(
+                rules[0].targets().collect::<Vec<_>>(),
+                vec!["$(LIB)(m.o n.o)", "lib$(V).a(p.o q.o)"],
+                "{variant:?}"
+            );
+            assert_eq!(
+                rules[1].prerequisites().collect::<Vec<_>>(),
+                vec!["${LIB}(a.o b.o)", "lib$(V).a(c.o d.o)", "e"],
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_archive_member_prerequisite_followed_by_text() {
+        // GNU make keeps text after the `)` in the same word, while BSD make
+        // ends the word at the `)`.
+        let input = "all: lib.a(m.o)x y\n";
+        for (variant, expected) in [
+            (None, vec!["lib.a(m.o)x", "y"]),
+            (Some(MakefileVariant::GNUMake), vec!["lib.a(m.o)x", "y"]),
+            (Some(MakefileVariant::BSDMake), vec!["lib.a(m.o)", "x", "y"]),
+        ] {
+            let parsed = parse(input, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(member_lists(&parsed), vec![vec!["m.o"]], "{variant:?}");
+            let rules: Vec<_> = parsed.root().rules().collect();
+            assert_eq!(
+                rules[0].prerequisites().collect::<Vec<_>>(),
+                expected,
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escaped_dollar_before_paren_is_not_archive() {
+        let parsed = parse("$$(x): $$(y) z\n", None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(member_lists(&parsed), Vec::<Vec<String>>::new());
+        let rules: Vec<_> = parsed.root().rules().collect();
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["$$(x)"]);
+        assert_eq!(
+            rules[0].prerequisites().collect::<Vec<_>>(),
+            vec!["$$(y)", "z"]
+        );
+    }
+
+    #[test]
+    fn test_word_starting_with_paren_is_not_archive() {
+        // GNU make takes no archive name from a word that starts with `(`.
+        let parsed = parse(
+            "(a(b c)): y\nall: (a(b c))\n",
+            Some(MakefileVariant::GNUMake),
+        );
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(member_lists(&parsed), Vec::<Vec<String>>::new());
+        let rules: Vec<_> = parsed.root().rules().collect();
+        assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["(a(b", "c))"]);
+        assert_eq!(
+            rules[1].prerequisites().collect::<Vec<_>>(),
+            vec!["(a(b", "c))"]
         );
     }
 
