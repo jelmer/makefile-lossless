@@ -1189,7 +1189,7 @@ impl VariableDefinition {
         } else {
             &[(WHITESPACE, " ")]
         };
-        let mut elements = value_elements(tokens, &new_expr, None);
+        let mut elements = value_elements(tokens, &new_expr, &[]);
         // A line continuation at the end of the file leaves the line break,
         // and any indentation after it, in the value. Keep the line break as
         // the end of the line.
@@ -1221,7 +1221,7 @@ impl VariableDefinition {
             std::iter::successors(last.next_sibling_or_token(), |it| {
                 it.next_sibling_or_token()
             })
-            .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE))
+            .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE) || is_continuation(&it))
         });
         // TODO: add a body to a `define` line at the end of the file
         if is_undefine || self.is_define() || !rest_is_blank {
@@ -1230,42 +1230,55 @@ impl VariableDefinition {
                 format!("{:?} has no value to set", self.syntax().to_string()),
             ));
         }
-        let is_empty = expr.text().is_empty();
         let index = name.last().unwrap().index() + 1;
-        // The parser includes the whitespace before a comment in a value.
-        let whitespace = self
+        // The parser includes the rest of the logical line up to a comment
+        // in the value: whitespace and line continuations.
+        let rest: Vec<_> = self
             .syntax()
             .children_with_tokens()
-            .nth(index)
-            .and_then(|it| it.into_token())
-            .filter(|t| {
-                !is_empty
-                    && t.kind() == WHITESPACE
-                    && t.next_sibling_or_token()
-                        .is_some_and(|it| it.kind() == COMMENT)
-            });
-        let tokens: &[_] = if is_empty {
-            &[(WHITESPACE, " "), (OPERATOR, "=")]
-        } else {
-            &[(WHITESPACE, " "), (OPERATOR, "="), (WHITESPACE, " ")]
-        };
-        let end = index + usize::from(whitespace.is_some());
-        let elements = value_elements(tokens, expr, whitespace.as_ref().map(|t| t.text()));
-        self.syntax().splice_children(index..end, elements);
+            .skip(index)
+            .take_while(|it| match it.kind() {
+                COMMENT => false,
+                NEWLINE => is_continuation(it),
+                _ => true,
+            })
+            .filter_map(|it| it.into_token())
+            .collect();
+        let mut tokens = vec![(WHITESPACE, " "), (OPERATOR, "=")];
+        let mut trailing = &rest[..];
+        if !expr.text().is_empty() {
+            tokens.push((WHITESPACE, " "));
+        } else if let Some((first, tail)) =
+            rest.split_first().filter(|(t, _)| t.kind() == WHITESPACE)
+        {
+            // The whitespace after the operator is not part of an empty value.
+            tokens.push((WHITESPACE, first.text()));
+            trailing = tail;
+        }
+        let elements = value_elements(&tokens, expr, trailing);
+        // TODO: splice them out once rowan's splice_children removes more
+        // than the first child of the range, as it does from 0.17 on.
+        for token in &rest {
+            token.detach();
+        }
+        self.syntax().splice_children(index..index, elements);
         Ok(())
     }
 }
 
 /// The elements to insert for a value: `tokens` followed by `expr`, an EXPR
-/// node, with any `trailing_whitespace` added to it.
+/// node, with copies of `trailing` added to it.
 fn value_elements(
     tokens: &[(crate::SyntaxKind, &str)],
     expr: &SyntaxNode<crate::lossless::Lang>,
-    trailing_whitespace: Option<&str>,
+    trailing: &[crate::lossless::SyntaxToken],
 ) -> Vec<crate::lossless::SyntaxElement> {
     let mut children: Vec<_> = expr.green().children().map(|it| it.to_owned()).collect();
-    children
-        .extend(trailing_whitespace.map(|ws| rowan::GreenToken::new(WHITESPACE.into(), ws).into()));
+    children.extend(
+        trailing
+            .iter()
+            .map(|t| rowan::GreenToken::new(t.kind().into(), t.text()).into()),
+    );
     detached_elements(tokens, Some(rowan::GreenNode::new(EXPR.into(), children)))
 }
 
@@ -2606,6 +2619,58 @@ mod tests {
             );
             assert_eq!(makefile.code(), text);
         }
+    }
+
+    #[test]
+    fn test_set_value_without_operator_continuation() {
+        // The rest of the logical line, up to a comment, becomes part of the
+        // value, as the parser has it.
+        fn set_value_continued(text: &str, value: &str) -> String {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            var.set_value(value);
+            crate::test_util::assert_matches_reparse(&makefile);
+            makefile.code()
+        }
+        assert_eq!(
+            set_value_continued("export X \\\n", "new"),
+            "export X = new \\\n"
+        );
+        assert_eq!(
+            set_value_continued("export X\\\n", "new"),
+            "export X = new\\\n"
+        );
+        assert_eq!(
+            set_value_continued("export X \\\r\n", "new"),
+            "export X = new \\\r\n"
+        );
+        assert_eq!(
+            set_value_continued("export X \\\n\n", "new"),
+            "export X = new \\\n\n"
+        );
+        assert_eq!(
+            set_value_continued("export X \\\n  # c\n", "new"),
+            "export X = new \\\n  # c\n"
+        );
+        assert_eq!(
+            set_value_continued("unexport X \\\n# c\n", "new"),
+            "unexport X = new \\\n# c\n"
+        );
+        assert_eq!(
+            set_value_continued("export X \n", "new"),
+            "export X = new \n"
+        );
+        assert_eq!(set_value_continued("export X \\\n", ""), "export X = \\\n");
+        assert_eq!(
+            set_value_continued("export X # c\n", ""),
+            "export X = # c\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "has no value to set")]
+    fn test_set_value_export_several_continuation() {
+        set_value("export X \\\n  Y\n", "new");
     }
 
     #[test]
