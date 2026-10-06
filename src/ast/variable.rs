@@ -72,15 +72,15 @@ fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossles
 
 /// The number of `define` blocks opened in the body of a `define` block
 /// and not closed again, counted the way the parser does: by the first word
-/// of each line.
+/// of each logical line.
 fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
     let tokens: Vec<_> = body
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .collect();
-    let lines: Vec<_> = tokens.split(|t| t.kind() == NEWLINE).collect();
+    let lines = tokens.split(|t| t.kind() == NEWLINE && !is_continuation(&t.clone().into()));
     let mut depth = 0usize;
-    for (i, line) in lines.iter().enumerate() {
+    for line in lines {
         let mut words = line
             .iter()
             .skip_while(|t| matches!(t.kind(), WHITESPACE | INDENT));
@@ -90,7 +90,7 @@ fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
         let ends_word = match words.next().map(|t| t.kind()) {
             None | Some(WHITESPACE) => true,
             // A line continuation right after the word.
-            Some(BACKSLASH) => words.next().is_none() && i + 1 < lines.len(),
+            Some(BACKSLASH) => words.next().is_some_and(|t| t.kind() == NEWLINE),
             _ => false,
         };
         match first.text() {
@@ -518,8 +518,17 @@ impl VariableDefinition {
             .filter_map(|it| it.into_token())
             .last();
         match last {
-            Some(t) if t.kind() == NEWLINE => {}
-            Some(_) => inner.push((NEWLINE, eol.as_str())),
+            // A continued last line would continue onto `endef`, so end it
+            // with a blank line.
+            Some(t) if t.kind() == NEWLINE => {
+                if is_continuation(&t.into()) {
+                    inner.push((NEWLINE, eol.as_str()));
+                }
+            }
+            Some(_) => {
+                let len = body.children_with_tokens().count();
+                super::terminate_line_before(&body, len, &eol);
+            }
             // An empty body: end the `define` line instead.
             None => {
                 super::terminate_line_before(self.syntax(), body.index(), &eol);
@@ -2822,5 +2831,51 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.add_endef().unwrap());
         assert_eq!(makefile.code(), "ifdef X\ndefine A\nx\nendif\nendef\n");
+    }
+
+    #[test]
+    fn test_add_endef_after_continuation() {
+        // A newline after the backslash would continue the last line onto
+        // `endef`, so a blank line ends it first.
+        for (text, expected) in [
+            ("define A\nx \\\n", "define A\nx \\\n\nendef\n"),
+            ("define A\nx \\", "define A\nx \\\n\nendef\n"),
+            ("define A\nx \\\\\\", "define A\nx \\\\\\\n\nendef\n"),
+            ("define A\nx \\\\", "define A\nx \\\\\nendef\n"),
+            ("define A\nx \\\n  ", "define A\nx \\\n  \nendef\n"),
+            ("define A\n# c \\", "define A\n# c \\\n\nendef\n"),
+            ("define A\r\nx \\\r\n", "define A\r\nx \\\r\n\r\nendef\r\n"),
+        ] {
+            assert_eq!(
+                add_endef(text),
+                (Ok(true), expected.to_string()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_endef_nested_continuation() {
+        // Like make, nested defines are found at the start of logical lines.
+        for (text, expected) in [
+            (
+                "define A\nx \\\ndefine B\n",
+                "define A\nx \\\ndefine B\nendef\n",
+            ),
+            (
+                "define A\ndefine B \\\nendef\n",
+                "define A\ndefine B \\\nendef\nendef\nendef\n",
+            ),
+            (
+                "define A\ndefine\\\n  B\n",
+                "define A\ndefine\\\n  B\nendef\nendef\n",
+            ),
+        ] {
+            assert_eq!(
+                add_endef(text),
+                (Ok(true), expected.to_string()),
+                "{text:?}"
+            );
+        }
     }
 }
