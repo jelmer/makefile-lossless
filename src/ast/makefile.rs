@@ -1,3 +1,4 @@
+use super::build_copy;
 use super::rule::build_targets_node;
 use super::{index_before_doc_comment, line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
@@ -1345,13 +1346,8 @@ impl Makefile {
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
-        // Add if branch items
         for item in if_items {
-            // Clone the item's syntax tree into our builder
-            let item_text = item.syntax().to_string();
-            // Parse it again to get green nodes
-            builder.token(IDENTIFIER.into(), item_text.trim());
-            builder.token(NEWLINE.into(), &eol);
+            build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
         }
 
         // Add else clause if provided
@@ -1361,11 +1357,8 @@ impl Makefile {
             builder.token(NEWLINE.into(), &eol);
             builder.finish_node();
 
-            // Add else branch items
             for item in else_iter {
-                let item_text = item.syntax().to_string();
-                builder.token(IDENTIFIER.into(), item_text.trim());
-                builder.token(NEWLINE.into(), &eol);
+                build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
             }
         }
 

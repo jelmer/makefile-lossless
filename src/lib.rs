@@ -24,7 +24,9 @@
 //! Editing methods that add new lines end them the same way as the first
 //! line of the file, so that files with CRLF line endings keep them. Nodes
 //! that are not yet part of a file, such as those created by [`Rule::new`],
-//! use `"\n"`.
+//! use `"\n"`. Rules and other items inserted into a file are converted to
+//! its line ending, except for line breaks after a backslash, since whether
+//! a backslash before a CRLF continues the line depends on the make variant.
 
 mod ast;
 mod bsd_condition;

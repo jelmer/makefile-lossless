@@ -121,15 +121,51 @@ fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
         .last()
 }
 
-/// `node`, or a copy of it with `eol` appended if it doesn't end in a line
-/// break, so that it can be inserted in front of another line.
+/// Line breaks in `node` that are not `eol`, other than those after a
+/// backslash: whether a backslash before a CRLF continues the line depends
+/// on the make variant, which the tree doesn't record.
+fn foreign_line_breaks(node: &SyntaxNode, eol: &str) -> Vec<SyntaxToken> {
+    node.descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|t| {
+            t.kind() == NEWLINE
+                && t.text() != eol
+                && t.prev_token().is_none_or(|p| !p.text().ends_with('\\'))
+        })
+        .collect()
+}
+
+/// `node`, or a copy of it in which line breaks are `eol` and with `eol`
+/// appended if it doesn't end in a line break, so that it can be inserted
+/// in front of another line of a makefile that uses `eol`.
 pub(crate) fn with_trailing_newline(node: &SyntaxNode, eol: &str) -> SyntaxNode {
-    if last_token(node).is_none_or(|t| t.kind() == NEWLINE) {
+    if foreign_line_breaks(node, eol).is_empty()
+        && last_token(node).is_none_or(|t| t.kind() == NEWLINE)
+    {
         return node.clone();
     }
     let copy = SyntaxNode::new_root_mut(node.green().into_owned());
+    for token in foreign_line_breaks(&copy, eol) {
+        let index = token.index();
+        token
+            .parent()
+            .expect("tokens always have a parent")
+            .splice_children(index..index + 1, detached_elements(&[(NEWLINE, eol)], None));
+    }
     terminate_line_before(&copy, copy.children_with_tokens().count(), eol);
     copy
+}
+
+/// Add a copy of `node` to `builder`.
+pub(crate) fn build_copy(builder: &mut rowan::GreenNodeBuilder, node: &SyntaxNode) {
+    builder.start_node(node.kind().into());
+    for child in node.children_with_tokens() {
+        match child {
+            rowan::NodeOrToken::Node(n) => build_copy(builder, &n),
+            rowan::NodeOrToken::Token(t) => builder.token(t.kind().into(), t.text()),
+        }
+    }
+    builder.finish_node();
 }
 
 /// Whether `last`, the last token of a line without a line break, ends in
