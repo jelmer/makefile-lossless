@@ -93,7 +93,9 @@ pub enum ParseErrorKind {
     UnclosedIncludePath,
     /// A BSD make `.include` path not delimited by `<...>` or `"..."`.
     UndelimitedIncludePath,
-    /// Unexpected text where the end of the line was expected.
+    /// Unexpected text where the end of the line was expected. GNU make
+    /// only warns about text after a directive such as `else junk` or
+    /// `endef junk`, while BSD make treats it as an error.
     ExtraneousText,
     /// A token that cannot start any construct.
     UnexpectedToken,
@@ -2538,36 +2540,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.skip_ws();
 
                         // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
-                        if self.current() == Some(IDENTIFIER) {
-                            let next_token = &self.tokens.last().unwrap().1;
-                            if Self::is_conditional_start(next_token) {
-                                // This is "else ifdef", "else ifeq", etc.
-                                // Parse the conditional part
-                                match next_token.as_str() {
-                                    "ifdef" | "ifndef" => {
-                                        self.bump(); // Consume the directive token
-                                        self.skip_ws_and_continuations();
-                                        self.parse_simple_condition();
-                                    }
-                                    "ifeq" | "ifneq" => {
-                                        self.bump(); // Consume the directive token
-                                        self.skip_ws_and_continuations();
-                                        self.parse_parenthesized_expr();
-                                    }
-                                    _ => unreachable!(),
-                                }
-                                // The newline will be consumed by the conditional body loop
-                            } else {
-                                // Plain 'else' with something else after it (not a conditional keyword)
-                                // The newline will be consumed by the conditional body loop
+                        // The newline will be consumed by the conditional body loop.
+                        match self.tokens.last() {
+                            Some((IDENTIFIER, t)) if matches!(t.as_str(), "ifdef" | "ifndef") => {
+                                self.bump();
+                                self.skip_ws_and_continuations();
+                                self.parse_simple_condition();
                             }
-                        } else if self.current() == Some(COMMENT) {
-                            // Plain 'else' with a trailing comment; the
-                            // newline will be consumed by the conditional
-                            // body loop
-                            self.bump();
-                        } else {
-                            // Plain 'else' - the newline will be consumed by the conditional body loop
+                            Some((IDENTIFIER, t)) if matches!(t.as_str(), "ifeq" | "ifneq") => {
+                                self.bump();
+                                self.skip_ws_and_continuations();
+                                self.parse_parenthesized_expr();
+                            }
+                            _ => {
+                                self.parse_extraneous_text("else", false);
+                                if self.current() == Some(COMMENT) {
+                                    self.bump();
+                                }
+                            }
                         }
 
                         self.builder.finish_node(); // finish CONDITIONAL_ELSE
@@ -2593,35 +2583,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Consume the endif
                         self.bump();
 
-                        // Be more permissive with what follows endif
-                        self.skip_ws();
-
-                        // Handle common patterns after endif:
-                        // 1. Comments: endif # comment
-                        // 2. Whitespace at end of file
-                        // 3. Newlines
-                        if self.current() == Some(COMMENT) {
-                            self.parse_comment();
-                        } else if self.current() == Some(NEWLINE) {
-                            self.bump();
-                        } else if self.current() == Some(WHITESPACE) {
-                            // Skip whitespace without an error
-                            self.skip_ws();
-                            if self.current() == Some(NEWLINE) {
-                                self.bump();
-                            }
-                            // If we're at EOF after whitespace, that's fine too
-                        } else if !self.is_at_eof() {
-                            // For any other tokens, be lenient and just consume until EOL
-                            // This makes the parser more resilient to various "endif" formattings
-                            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
-                                self.bump();
-                            }
-                            if self.current() == Some(NEWLINE) {
-                                self.bump();
-                            }
-                        }
-                        // If we're at EOF after endif, that's fine
+                        self.parse_directive_line_end("endif", false);
 
                         self.builder.finish_node(); // finish CONDITIONAL_ENDIF
                         true
@@ -3596,7 +3558,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(OPERATOR) {
                 self.bump();
             }
-            self.parse_define_line_end("define", false);
+            self.parse_directive_line_end("define", false);
 
             // The body of the define lives in an EXPR node so that
             // `raw_value()` returns it. We consume token-by-token until we
@@ -3611,7 +3573,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             break 'body;
                         }
                         self.bump_endef_keyword();
-                        self.parse_define_line_end("endef", true);
+                        self.parse_directive_line_end("endef", true);
                         continue;
                     }
                     Some("define") => depth += 1,
@@ -3625,7 +3587,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Consume the closing `endef` line itself (if we found it).
             if depth == 0 {
                 self.bump_endef_keyword();
-                self.parse_define_line_end("endef", false);
+                self.parse_directive_line_end("endef", false);
             } else {
                 self.error(
                     ParseErrorKind::MissingEndef,
@@ -3756,10 +3718,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Consume the rest of a `define` header after the operator, or of an
-        /// `endef` line, which may only contain a comment. Other text is
-        /// reported as extraneous; it is wrapped in an ERROR node unless it is
-        /// part of the value of an enclosing define.
-        fn parse_define_line_end(&mut self, directive: &str, in_value: bool) {
+        /// `endef` or `endif` line, which may only contain a comment. Other
+        /// text is reported as extraneous; it is wrapped in an ERROR node
+        /// unless it is part of the value of an enclosing define.
+        fn parse_directive_line_end(&mut self, directive: &str, in_value: bool) {
+            self.parse_extraneous_text(directive, in_value);
+            if self.current() == Some(COMMENT) {
+                self.bump();
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+        }
+
+        /// Report any text before the end of the line or a comment as
+        /// extraneous to `directive`, wrapping it in an ERROR node unless
+        /// `in_value`.
+        fn parse_extraneous_text(&mut self, directive: &str, in_value: bool) {
             self.skip_ws_and_continuations();
             if !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
                 if !in_value {
@@ -3777,12 +3752,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if !in_value {
                     self.builder.finish_node();
                 }
-            }
-            if self.current() == Some(COMMENT) {
-                self.bump();
-            }
-            if self.current() == Some(NEWLINE) {
-                self.bump();
             }
         }
 
@@ -6363,6 +6332,150 @@ mod tests {
 "##
         );
         assert_eq!(code, parsed.root().to_string());
+    }
+
+    /// The error kinds and lines, and the if and else bodies of the single
+    /// conditional in `code`.
+    fn parse_single_conditional(
+        code: &str,
+        variant: Option<MakefileVariant>,
+    ) -> (Vec<(ParseErrorKind, usize)>, Option<String>, Option<String>) {
+        let parsed = parse(code, variant);
+        assert_eq!(code, parsed.root().to_string());
+        let conditionals: Vec<_> = parsed.root().conditionals().collect();
+        assert_eq!(1, conditionals.len(), "{code:?}");
+        (
+            parsed.errors.iter().map(|e| (e.kind(), e.line)).collect(),
+            conditionals[0].if_body(),
+            conditionals[0].else_body(),
+        )
+    }
+
+    #[test]
+    fn test_conditional_extraneous_text() {
+        // GNU make warns "extraneous text after 'else' directive" (or
+        // 'endif') and otherwise ignores the text.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, line) in [
+                ("ifdef X\nA = 1\nelse junk\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse junk # c\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse $(Y)\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse endif\nA = 2\nendif\n", 3),
+                ("ifdef X\nA = 1\nelse \\\njunk\nA = 2\nendif\n", 4),
+                ("ifdef X\nA = 1\nelse\nA = 2\nendif junk\n", 5),
+                ("ifdef X\nA = 1\nelse\nA = 2\nendif junk # c\n", 5),
+                ("ifdef X\nA = 1\nelse\nA = 2\nendif \\\n junk\n", 6),
+            ] {
+                assert_eq!(
+                    parse_single_conditional(code, variant),
+                    (
+                        vec![(ParseErrorKind::ExtraneousText, line)],
+                        Some("A = 1\n".to_string()),
+                        Some("\nA = 2\n".to_string())
+                    ),
+                    "{code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_extraneous_text_tree() {
+        let code = "ifdef X\nelse junk\nendif junk\n";
+        let parsed = parse(code, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.line))
+                .collect::<Vec<_>>(),
+            vec![
+                (ParseErrorKind::ExtraneousText, 2),
+                (ParseErrorKind::ExtraneousText, 3)
+            ]
+        );
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..29
+  CONDITIONAL@0..29
+    CONDITIONAL_IF@0..8
+      IDENTIFIER@0..5 "ifdef"
+      WHITESPACE@5..6 " "
+      EXPR@6..7
+        IDENTIFIER@6..7 "X"
+      NEWLINE@7..8 "\n"
+    CONDITIONAL_ELSE@8..17
+      IDENTIFIER@8..12 "else"
+      WHITESPACE@12..13 " "
+      ERROR@13..17
+        IDENTIFIER@13..17 "junk"
+    NEWLINE@17..18 "\n"
+    CONDITIONAL_ENDIF@18..29
+      IDENTIFIER@18..23 "endif"
+      WHITESPACE@23..24 " "
+      ERROR@24..28
+        IDENTIFIER@24..28 "junk"
+      NEWLINE@28..29 "\n"
+"##
+        );
+        assert_eq!(code, parsed.root().to_string());
+    }
+
+    #[test]
+    fn test_conditional_no_extraneous_text() {
+        for code in [
+            "ifdef X\nA = 1\nelse # c\nA = 2\nendif # c\n",
+            "ifdef X\nA = 1\nelse  \nA = 2\nendif  \n",
+            "ifdef X\nA = 1\nelse ifdef Y\nA = 2\nendif\n",
+            "ifdef X\nA = 1\nelse ifeq (a,b)\nA = 2\nendif\n",
+            "ifdef X\nA = 1\nelse\nA = 2\nendif",
+        ] {
+            let (errors, if_body, _) = parse_single_conditional(code, None);
+            assert_eq!(
+                (errors, if_body),
+                (vec![], Some("A = 1\n".to_string())),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_else_extraneous_text() {
+        let code = "ifdef X\nelse ifdef Y\nelse junk\nA = 2\nendif\n";
+        assert_eq!(
+            parse_single_conditional(code, None).0,
+            vec![(ParseErrorKind::ExtraneousText, 3)]
+        );
+    }
+
+    #[test]
+    fn test_block_conditional_extraneous_text() {
+        // BSD make: "The .else directive does not take arguments", a fatal
+        // error once parsing finishes, but the line is still a `.else`.
+        for (variant, code) in [
+            (None, ".if 1\nA = 1\n.else junk\nA = 2\n.endif junk\n"),
+            (
+                Some(MakefileVariant::BSDMake),
+                ".if 1\nA = 1\n.else junk\nA = 2\n.endif junk\n",
+            ),
+            (
+                Some(MakefileVariant::NMake),
+                "!IF 1\nA = 1\n!ELSE junk\nA = 2\n!ENDIF junk\n",
+            ),
+        ] {
+            assert_eq!(
+                parse_single_conditional(code, variant),
+                (
+                    vec![
+                        (ParseErrorKind::ExtraneousText, 3),
+                        (ParseErrorKind::ExtraneousText, 5)
+                    ],
+                    Some("A = 1\n".to_string()),
+                    Some("A = 2\n".to_string())
+                ),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
