@@ -1102,10 +1102,15 @@ impl VariableDefinition {
     /// For a `define` block, `new_value` is the body, as returned by
     /// [`Self::raw_value`]. A line ending is added if it does not end in one.
     ///
+    /// A space is added between the operator and a value that was empty, as
+    /// in `X =`. An `export` or `unexport` directive of a single variable
+    /// without a value, as in `export X`, becomes an assignment with `=`.
+    ///
     /// # Panics
     ///
-    /// Panics if `new_value` can not be written as the value, as described
-    /// for [`Self::try_set_value`], which returns an error instead.
+    /// Panics if `new_value` can not be written as the value, or the
+    /// definition can not have one, as described for
+    /// [`Self::try_set_value`], which returns an error instead.
     ///
     /// # Example
     /// ```
@@ -1128,7 +1133,9 @@ impl VariableDefinition {
     /// contains a newline that is not part of a line continuation or ends
     /// in a backslash that would continue the line. In a `define` block
     /// newlines are allowed, but the body must not end the block early,
-    /// e.g. with an `endef` line.
+    /// e.g. with an `endef` line. Also returns an error if the definition
+    /// can not have a value, such as an `undefine` directive or an `export`
+    /// directive of several variables.
     ///
     /// # Example
     /// ```
@@ -1140,11 +1147,6 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = a \\\n  b\n");
     /// ```
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
-        let Some(expr) = self.value_expr() else {
-            // TODO: add an EXPR node to definitions without one
-            return Ok(());
-        };
-
         let new_expr = if self.is_define() {
             let eol = line_ending(self.syntax());
             let body = if new_value.is_empty() || new_value.ends_with('\n') {
@@ -1176,7 +1178,18 @@ impl VariableDefinition {
             })
         };
 
-        let mut elements = vec![new_expr.into()];
+        let Some(expr) = self.value_expr() else {
+            return self.insert_value(&new_expr);
+        };
+        let after_operator = expr
+            .prev_sibling_or_token()
+            .is_some_and(|it| it.kind() == OPERATOR);
+        let tokens: &[_] = if new_value.is_empty() || self.is_define() || !after_operator {
+            &[]
+        } else {
+            &[(WHITESPACE, " ")]
+        };
+        let mut elements = value_elements(tokens, &new_expr, None);
         // A line continuation at the end of the file leaves the line break,
         // and any indentation after it, in the value. Keep the line break as
         // the end of the line.
@@ -1195,6 +1208,65 @@ impl VariableDefinition {
             .splice_children(expr_idx..expr_idx + 1, elements);
         Ok(())
     }
+
+    /// Internal: add an `=` operator and `expr`, an EXPR node, to a
+    /// definition without a value, as in `export X`.
+    fn insert_value(&mut self, expr: &SyntaxNode<crate::lossless::Lang>) -> Result<(), Error> {
+        let name = self.name_elements();
+        let is_undefine = self
+            .directive_keywords()
+            .iter()
+            .any(|t| t.text() == "undefine");
+        let rest_is_blank = name.last().is_some_and(|last| {
+            std::iter::successors(last.next_sibling_or_token(), |it| {
+                it.next_sibling_or_token()
+            })
+            .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE))
+        });
+        // TODO: add a body to a `define` line at the end of the file
+        if is_undefine || self.is_define() || !rest_is_blank {
+            return Err(value_error(
+                "set_value",
+                format!("{:?} has no value to set", self.syntax().to_string()),
+            ));
+        }
+        let is_empty = expr.text().is_empty();
+        let index = name.last().unwrap().index() + 1;
+        // The parser includes the whitespace before a comment in a value.
+        let whitespace = self
+            .syntax()
+            .children_with_tokens()
+            .nth(index)
+            .and_then(|it| it.into_token())
+            .filter(|t| {
+                !is_empty
+                    && t.kind() == WHITESPACE
+                    && t.next_sibling_or_token()
+                        .is_some_and(|it| it.kind() == COMMENT)
+            });
+        let tokens: &[_] = if is_empty {
+            &[(WHITESPACE, " "), (OPERATOR, "=")]
+        } else {
+            &[(WHITESPACE, " "), (OPERATOR, "="), (WHITESPACE, " ")]
+        };
+        let end = index + usize::from(whitespace.is_some());
+        let elements = value_elements(tokens, expr, whitespace.as_ref().map(|t| t.text()));
+        self.syntax().splice_children(index..end, elements);
+        Ok(())
+    }
+}
+
+/// The elements to insert for a value: `tokens` followed by `expr`, an EXPR
+/// node, with any `trailing_whitespace` added to it.
+fn value_elements(
+    tokens: &[(crate::SyntaxKind, &str)],
+    expr: &SyntaxNode<crate::lossless::Lang>,
+    trailing_whitespace: Option<&str>,
+) -> Vec<crate::lossless::SyntaxElement> {
+    let mut children: Vec<_> = expr.green().children().map(|it| it.to_owned()).collect();
+    children
+        .extend(trailing_whitespace.map(|ws| rowan::GreenToken::new(WHITESPACE.into(), ws).into()));
+    detached_elements(tokens, Some(rowan::GreenNode::new(EXPR.into(), children)))
 }
 
 #[cfg(test)]
@@ -2484,6 +2556,68 @@ mod tests {
         assert!(code.contains("export"), "Should preserve export prefix");
         assert!(code.contains(":="), "Should preserve := operator");
         assert!(code.contains("new_value"), "Should have new value");
+    }
+
+    /// Set the value of the only variable definition in `text`.
+    fn set_value(text: &str, value: &str) -> String {
+        let makefile: Makefile = text.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value(value);
+        assert_eq!(var.raw_value().as_deref().map(str::trim_end), Some(value));
+        crate::test_util::assert_matches_reparse(&makefile);
+        makefile.code()
+    }
+
+    #[test]
+    fn test_set_value_empty() {
+        assert_eq!(set_value("X =\n", "new"), "X = new\n");
+        assert_eq!(set_value("X :=\n", "new"), "X := new\n");
+        assert_eq!(set_value("X ?=\n", "new"), "X ?= new\n");
+        assert_eq!(set_value("X=\n", "new"), "X= new\n");
+        assert_eq!(set_value("X = \n", "new"), "X = new\n");
+        assert_eq!(set_value("export X =\n", "new"), "export X = new\n");
+        assert_eq!(set_value("a: X =\n", "new"), "a: X = new\n");
+        assert_eq!(set_value("X =\r\n", "new"), "X = new\r\n");
+        assert_eq!(set_value("X =", "new"), "X = new");
+        assert_eq!(set_value("X =\n", ""), "X =\n");
+    }
+
+    #[test]
+    fn test_set_value_without_operator() {
+        assert_eq!(set_value("export X\n", "new"), "export X = new\n");
+        assert_eq!(set_value("export X", "new"), "export X = new");
+        assert_eq!(set_value("unexport X\n", "new"), "unexport X = new\n");
+        assert_eq!(set_value("export X\r\n", "new"), "export X = new\r\n");
+        assert_eq!(set_value("export X # c\n", "new"), "export X = new # c\n");
+        assert_eq!(set_value("export X\n", ""), "export X =\n");
+    }
+
+    #[test]
+    fn test_try_set_value_without_value() {
+        for text in ["undefine X\n", "export X Y\n", "define X"] {
+            let (makefile, _) = Makefile::from_str_relaxed(text);
+            let mut var = makefile.variable_definitions().next().unwrap();
+            let error = var.try_set_value("new").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Parse error: Error at line 1: {text:?} has no value to set\n1| set_value\n"
+                )
+            );
+            assert_eq!(makefile.code(), text);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "has no value to set")]
+    fn test_set_value_undefine() {
+        set_value("undefine X\n", "new");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no value to set")]
+    fn test_set_value_export_several() {
+        set_value("export X Y\n", "new");
     }
 
     fn keywords(text: &str) -> Vec<Vec<(String, &str)>> {
