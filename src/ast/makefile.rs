@@ -1605,6 +1605,8 @@ impl Makefile {
     /// `index` is a position in [`Makefile::rules`], so it can refer to a
     /// rule inside a conditional or loop.
     ///
+    /// Comments above the rule are kept.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1658,6 +1660,8 @@ impl Makefile {
     ///
     /// `index` is a position in [`Makefile::rules`], so it can refer to a
     /// rule inside a conditional or loop.
+    ///
+    /// Comments above the rule are kept; [`Rule::remove`] removes them too.
     ///
     /// # Example
     /// ```
@@ -1715,6 +1719,10 @@ impl Makefile {
     /// conditions. If `index` is `rules().count()`, the new rule is
     /// appended to the end of the makefile.
     ///
+    /// If the rule at `index` has comment lines directly above it, with no
+    /// blank line in between, the new rule is inserted before them, since
+    /// they document the existing rule.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1739,7 +1747,9 @@ impl Makefile {
         }
 
         let (parent, target_index) = match rules.get(index) {
-            Some(rule) => (rule.parent().unwrap(), rule.index()),
+            // Insert before the rule at the given index, and any comment
+            // documenting it
+            Some(rule) => (rule.parent().unwrap(), index_before_doc_comment(rule)),
             None => (
                 self.syntax().clone(),
                 self.syntax().children_with_tokens().count(),
@@ -3967,6 +3977,87 @@ VAR3 = value3
         // Should not have trailing blank line
         assert_eq!(makefile.code(), "%:\n\tdh $@\n");
         assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_insert_rule_before_doc_comment() {
+        let cases = [
+            ("a:\n# doc\nc:\n", 1, "a:\n\nb:\n\n# doc\nc:\n"),
+            (
+                "a:\n# doc\n# more\nc:\n",
+                1,
+                "a:\n\nb:\n\n# doc\n# more\nc:\n",
+            ),
+            ("# doc\nc:\n", 0, "b:\n\n# doc\nc:\n"),
+            (
+                "a:\n\techo\n# doc\nc:\n",
+                1,
+                "a:\n\techo\n\nb:\n\n# doc\nc:\n",
+            ),
+            (
+                "X = 1\n# x\n\n# doc\nc:\n",
+                0,
+                "X = 1\n# x\n\nb:\n\n# doc\nc:\n",
+            ),
+            ("X = 1\n# x\n\nc:\n", 0, "X = 1\n# x\n\nb:\n\nc:\n"),
+            ("a:\n  # x\nc:\n", 1, "a:\n  # x\n\nb:\n\nc:\n"),
+            (
+                "ifdef X\n# doc\nc:\nendif\n",
+                0,
+                "ifdef X\nb:\n\n# doc\nc:\nendif\n",
+            ),
+            (
+                "a:\nifdef X\nc:\n\techo\n# doc\nd:\nendif\n",
+                2,
+                "a:\nifdef X\nc:\n\techo\n\nb:\n\n# doc\nd:\nendif\n",
+            ),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .insert_rule(index, "b:\n".parse().unwrap())
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(
+                reparsed
+                    .rules()
+                    .nth(index)
+                    .unwrap()
+                    .targets()
+                    .collect::<Vec<_>>(),
+                vec!["b"],
+                "{text:?} at {index}"
+            );
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_insert_rule_after_non_doc_comment() {
+        // A trailing comment or a shebang does not document the next rule.
+        for text in ["X = 1 # x\nc:\n", "#!/usr/bin/make -f\nc:\n"] {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.insert_rule(0, "b:\n".parse().unwrap()).unwrap();
+            let result = makefile.to_string();
+            let (before, after) = result.split_once("b:\n").unwrap();
+            assert_eq!(before.trim_end(), text.strip_suffix("\nc:\n").unwrap());
+            assert_eq!(after, "\nc:\n");
+        }
+    }
+
+    #[test]
+    fn test_replace_rule_keeps_doc_comment() {
+        let mut makefile: Makefile = "a:\n\techo\n# doc\nc:\n".parse().unwrap();
+        makefile.replace_rule(1, "z:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\techo\n# doc\nz:\n");
+    }
+
+    #[test]
+    fn test_remove_rule_keeps_doc_comment() {
+        let mut makefile: Makefile = "a:\n# doc\nc:\n".parse().unwrap();
+        makefile.remove_rule(1).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n# doc\n");
     }
 
     #[test]
