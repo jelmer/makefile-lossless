@@ -975,9 +975,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(IDENTIFIER) => {
                         let token = &self.tokens.last().unwrap().1.clone();
                         // Check if this is a starting conditional directive
-                        if Self::is_conditional_start(token)
-                            && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-                        {
+                        if Self::is_conditional_start(token) && self.at_conditional_keyword() {
                             // If we're not inside a conditional (depth == 0) and it doesn't
                             // continue the recipe, this is a top-level conditional, not part
                             // of the rule. Blank lines don't end a rule's recipe.
@@ -1102,7 +1100,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// preceding rule.
         fn recipe_continues(&self) -> bool {
             let bsd = self.bsd_directives_enabled();
-            let gnu = self.gnu_directives_enabled();
             let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
@@ -1159,20 +1156,28 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             None => return false,
                         }
                     }
-                    (IDENTIFIER, t) if gnu && Self::is_conditional_start(t) => {
+                    // TODO: Like make, take a line such as `ifdef = 1` as an
+                    // assignment.
+                    (IDENTIFIER, t)
+                        if Self::is_conditional_start(t) && self.conditional_keyword_at(end) =>
+                    {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
-                    (IDENTIFIER, "else") if gnu => match stack.last_mut() {
-                        Some(context) => {
-                            let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
-                            in_rule = context.next_branch(in_rule, is_final);
+                    (IDENTIFIER, "else") if self.conditional_keyword_at(end) => {
+                        match stack.last_mut() {
+                            Some(context) => {
+                                let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
+                                in_rule = context.next_branch(in_rule, is_final);
+                            }
+                            None => return false,
                         }
-                        None => return false,
-                    },
-                    (IDENTIFIER, "endif") if gnu => match stack.pop() {
-                        Some(context) => in_rule = context.end(in_rule),
-                        None => return false,
-                    },
+                    }
+                    (IDENTIFIER, "endif") if self.conditional_keyword_at(end) => {
+                        match stack.pop() {
+                            Some(context) => in_rule = context.end(in_rule),
+                            None => return false,
+                        }
+                    }
                     _ if self
                         .bsd_directive_at(end)
                         .is_some_and(|(name, _)| self.bsd_directive_in_rule(name))
@@ -1199,8 +1204,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether the current token is one of `keywords`, followed by
-        /// whitespace, a comment or the end of the line, as make requires
-        /// for its directives.
+        /// whitespace, a line continuation, a comment or the end of the line,
+        /// as make requires for its directives.
         fn at_keyword(&self, keywords: &[&str]) -> bool {
             self.keyword_at(self.tokens.len(), keywords)
         }
@@ -1208,12 +1213,44 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Like `at_keyword`, for the token at `end - 1` in the token stack.
         fn keyword_at(&self, end: usize, keywords: &[&str]) -> bool {
             let mut tokens = self.tokens[..end].iter().rev();
-            tokens.next().is_some_and(|(kind, text)| {
+            if !tokens.next().is_some_and(|(kind, text)| {
                 *kind == IDENTIFIER && keywords.contains(&text.as_str())
-            }) && matches!(
-                tokens.next(),
-                None | Some((WHITESPACE | NEWLINE | COMMENT, _))
-            )
+            }) {
+                return false;
+            }
+            match tokens.next() {
+                None | Some((WHITESPACE | NEWLINE | COMMENT, _)) => true,
+                Some((BACKSLASH, _)) => matches!(tokens.next(), Some((NEWLINE, _))),
+                _ => false,
+            }
+        }
+
+        /// Whether the token at `end - 1` in the token stack is a GNU make
+        /// conditional keyword such as `ifeq` or `endif`. As for other
+        /// directives, `ifeq: a` is a rule. GNU make rejects `ifeq(a,b)`,
+        /// but it is still read as a conditional for error recovery.
+        fn conditional_keyword_at(&self, end: usize) -> bool {
+            if !self.gnu_directives_enabled() {
+                return false;
+            }
+            if self.keyword_at(end, &["ifdef", "ifndef", "ifeq", "ifneq", "else", "endif"]) {
+                return true;
+            }
+            let mut tokens = self.tokens[..end].iter().rev();
+            matches!(tokens.next(), Some((IDENTIFIER, t)) if t == "ifeq" || t == "ifneq")
+                && matches!(tokens.next(), Some((LPAREN | QUOTE, _)))
+        }
+
+        /// Whether the current token is a GNU make conditional keyword that
+        /// starts a conditional line. Like make, this checks for an
+        /// assignment first, so `ifdef = 1` defines a variable.
+        fn at_conditional_keyword(&mut self) -> bool {
+            self.conditional_keyword_at(self.tokens.len()) && !self.is_assignment_line()
+        }
+
+        /// Whether the current token is a GNU make `vpath` directive.
+        fn at_vpath_keyword(&self) -> bool {
+            self.gnu_directives_enabled() && self.at_keyword(&["vpath"])
         }
 
         /// Whether the current token is a GNU make `load` or `-load`
@@ -2746,11 +2783,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             matches!(rest.next(), Some((IDENTIFIER, t)) if Self::is_conditional_start(t))
         }
 
-        // Helper to check if a token is a conditional directive
-        fn is_conditional_directive(&self, token: &str) -> bool {
-            Self::is_conditional_start(token) || token == "else" || token == "endif"
-        }
-
         // Helper method to handle conditional token
         fn handle_conditional_token(&mut self, token: &str, depth: &mut usize) -> bool {
             match token {
@@ -2892,6 +2924,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             self.parse_directive(name, count);
                             continue;
                         }
+                        if !self.at_conditional_keyword() {
+                            self.parse_normal_content();
+                            continue;
+                        }
                         let token = self.tokens.last().unwrap().1.clone();
                         match token.as_str() {
                             "else" => {
@@ -2948,10 +2984,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.parse_include();
             } else if self.at_load_keyword() {
                 self.parse_load();
-            } else if self.gnu_directives_enabled()
-                && self.current() == Some(IDENTIFIER)
-                && self.tokens.last().unwrap().1 == "vpath"
-            {
+            } else if self.at_vpath_keyword() {
                 self.parse_vpath();
             } else if self.is_expression_statement_line() {
                 self.parse_expression_statement();
@@ -4057,7 +4090,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             loop {
                 Self::skip_ws_and_continuation_tokens(&mut tokens);
                 match tokens.next() {
+                    // As for other directives, `define:` is a rule.
                     Some((IDENTIFIER, text)) if text == "define" => {
+                        let mut after = tokens.clone();
+                        match after.next() {
+                            None | Some((WHITESPACE | NEWLINE | COMMENT, _)) => {}
+                            Some((BACKSLASH, _)) if matches!(after.next(), Some((NEWLINE, _))) => {}
+                            _ => return false,
+                        }
                         Self::skip_ws_and_continuation_tokens(&mut tokens);
                         return !matches!(
                             tokens.next(),
@@ -4097,9 +4137,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn parse_identifier_token(&mut self) -> bool {
             let token = &self.tokens.last().unwrap().1;
 
-            if Self::is_conditional_start(token)
-                && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-            {
+            if Self::is_conditional_start(token) && self.at_conditional_keyword() {
                 self.parse_conditional();
                 return true;
             }
@@ -4118,10 +4156,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             match self.current() {
                 None => false,
                 Some(IDENTIFIER) => {
-                    let token = &self.tokens.last().unwrap().1;
-                    if self.is_conditional_directive(token)
-                        && matches!(self.variant, None | Some(MakefileVariant::GNUMake))
-                    {
+                    if self.at_conditional_keyword() {
                         self.parse_conditional();
                         true
                     } else {
@@ -4291,14 +4326,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let tokens = std::mem::replace(&mut self.tokens, line);
             let is_statement = match self.tokens.last() {
                 None | Some((NEWLINE | COMMENT, _)) => true,
-                Some((IDENTIFIER, text)) if text == "vpath" && !self.is_bsd_make() => true,
-                Some((IDENTIFIER, text))
-                    if self.is_conditional_directive(text) && self.gnu_directives_enabled() =>
-                {
-                    true
-                }
                 _ => {
-                    self.directive().is_some()
+                    self.at_vpath_keyword()
+                        || self.at_conditional_keyword()
+                        || self.directive().is_some()
                         || self.is_define_line()
                         || self.is_assignment_line()
                         || (self.bsd_directives_enabled() && self.is_bsd_assignment_line())
@@ -8130,6 +8161,109 @@ rule: dependency
     NEWLINE@8..9 "\n"
 "#
         );
+    }
+
+    #[test]
+    fn test_directive_names_as_targets() {
+        // Make only takes a word as a directive if whitespace, a comment or
+        // the end of the line follows it.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            for (code, targets, prerequisites) in [
+                ("ifeq:\n\techo $@\n", vec!["ifeq"], vec![]),
+                ("ifneq: a\n", vec!["ifneq"], vec!["a"]),
+                ("ifdef::\n\techo $@\n", vec!["ifdef"], vec![]),
+                ("ifndef:\n", vec!["ifndef"], vec![]),
+                ("else:\n\techo $@\n", vec!["else"], vec![]),
+                ("endif:\n\techo $@\n", vec!["endif"], vec![]),
+                ("define:\n\techo $@\n", vec!["define"], vec![]),
+                ("endef:\n", vec!["endef"], vec![]),
+                ("vpath:\n\techo $@\n", vec!["vpath"], vec![]),
+                ("vpath:x\n", vec!["vpath"], vec!["x"]),
+                ("undefine:\n", vec!["undefine"], vec![]),
+                ("override:\n", vec!["override"], vec![]),
+                ("export:x\n", vec!["export"], vec!["x"]),
+                ("include: x\n", vec!["include"], vec!["x"]),
+                ("load:\n", vec!["load"], vec![]),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rules: Vec<_> = root.rules().collect();
+                assert_eq!(rules.len(), 1, "{variant:?} {code:?}");
+                assert_eq!(
+                    targets,
+                    rules[0].targets().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(
+                    prerequisites,
+                    rules[0].prerequisites().collect::<Vec<_>>(),
+                    "{variant:?} {code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_directive_names_as_targets_in_conditional() {
+        let code = "ifeq (a,a)\nelse:\n\techo $@\nendif:\n\techo $@\nendif\n";
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            assert_eq!(root.conditionals().count(), 1, "{variant:?}");
+            let targets: Vec<_> = root
+                .rules()
+                .flat_map(|r| r.targets().collect::<Vec<_>>())
+                .collect();
+            assert_eq!(targets, vec!["else", "endif"], "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_conditional_keywords_as_variables() {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, name) in [
+                ("ifeq=1\n", "ifeq"),
+                ("ifdef = 2\n", "ifdef"),
+                ("endif:=3\n", "endif"),
+                ("else ?= 4\n", "else"),
+                ("define += 5\n", "define"),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                assert_eq!(root.conditionals().count(), 0, "{variant:?} {code:?}");
+                let names: Vec<_> = root.variable_definitions().map(|v| v.name()).collect();
+                assert_eq!(names, vec![Some(name.to_string())], "{variant:?} {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_keyword_forms() {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for code in [
+                "ifdef#c\nendif#c\n",
+                "ifdef\\\n  X\nelse\\\n\nendif\n",
+                "ifeq(a,b)\nendif\n",
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                assert_eq!(root.conditionals().count(), 1, "{variant:?} {code:?}");
+                assert_eq!(root.rules().count(), 0, "{variant:?} {code:?}");
+            }
+        }
     }
 
     #[test]
