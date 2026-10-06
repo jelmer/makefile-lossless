@@ -473,10 +473,31 @@ impl ParsedReference {
             let parsed = parser.parse_simple_expr(variant)?;
             return Ok((parsed, parser.pos));
         }
-        let unescaped = UnescapedHash::new(text);
-        let mut parser = Parser::new(&unescaped.text);
-        let parsed = parser.parse_expr().map_err(|e| unescaped.map_error(e))?;
-        Ok((parsed, unescaped.original_offset(parser.pos)))
+        // Unescaping all of `text` would make parsing each reference in a
+        // long value take time proportional to the rest of the value, so
+        // parse a growing prefix until that succeeds. A prefix not ending in
+        // a backslash unescapes to a prefix of the unescaped text. Within the
+        // braces, the end of the text is never where an expression can end:
+        // a modifier that reaches it is followed by a missing closing brace,
+        // and the fallback to `from=to` after an unrecognized modifier needs
+        // a closing brace before the end. So parsing a prefix either fails
+        // or gives the same result as parsing all of `text`.
+        let mut len = 64;
+        loop {
+            let mut end = len.min(text.len());
+            while end < text.len() && (!text.is_char_boundary(end) || text[..end].ends_with('\\')) {
+                end += 1;
+            }
+            let unescaped = UnescapedHash::new(&text[..end]);
+            let mut parser = Parser::new(&unescaped.text);
+            let result = parser.parse_expr();
+            if end < text.len() && result.is_err() {
+                len = end * 2;
+                continue;
+            }
+            let parsed = result.map_err(|e| unescaped.map_error(e))?;
+            return Ok((parsed, unescaped.original_offset(parser.pos)));
+        }
     }
 
     /// Parse the text between the braces of a variable reference, such as
@@ -561,8 +582,16 @@ pub(crate) struct UnescapedHash {
     escapes: Vec<usize>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The number of bytes unescaped by [`UnescapedHash::new`] on this thread.
+    static UNESCAPED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl UnescapedHash {
     pub(crate) fn new(original: &str) -> Self {
+        #[cfg(test)]
+        UNESCAPED_BYTES.with(|n| n.set(n.get() + original.len()));
         let mut text = String::with_capacity(original.len());
         let mut removed = vec![];
         let mut escapes = vec![];
@@ -2501,6 +2530,80 @@ mod tests {
             ParsedReference::parse_prefix("$(X:a=b) rest", GNUMake),
             Ok((reference("X", vec![sysv("a", "b")]), 8))
         );
+    }
+
+    #[test]
+    fn test_parse_prefix_linear() {
+        // An evaluator parses each reference in a value with the rest of the
+        // value after it, so the work must not depend on the length of the
+        // rest.
+        let text = "${X:S/a/b/g} \\# ".repeat(20000);
+        UNESCAPED_BYTES.with(|n| n.set(0));
+        let mut pos = 0;
+        let mut count = 0;
+        while let Some(offset) = text[pos..].find('$') {
+            pos += offset;
+            let (parsed, len) = ParsedReference::parse_prefix(&text[pos..], BSDMake).unwrap();
+            assert_eq!(parsed, reference("X", vec![subst("a", "b", global())]));
+            pos += len;
+            count += 1;
+        }
+        assert_eq!(count, 20000);
+        let scanned = UNESCAPED_BYTES.with(|n| n.get());
+        assert!(
+            scanned <= 10 * text.len(),
+            "unescaped {} bytes for {} bytes of text",
+            scanned,
+            text.len()
+        );
+    }
+
+    #[test]
+    fn test_parse_prefix_long() {
+        // Parse all of the text at once, as parse_prefix did before it
+        // parsed growing prefixes.
+        fn parse_whole(text: &str) -> Result<(ParsedReference, usize), ReferenceError> {
+            let unescaped = UnescapedHash::new(text);
+            let mut parser = Parser::new(&unescaped.text);
+            let parsed = parser.parse_expr().map_err(|e| unescaped.map_error(e))?;
+            Ok((parsed, unescaped.original_offset(parser.pos)))
+        }
+        let templates = [
+            "${X:S/PAD/b/g} rest",
+            "${X:MPAD\\#*} \\# rest",
+            "${X:foo{}PAD a=b} c}",
+            "${X:fooPAD{ a=b} c}",
+            "${X:fooPAD} a=b}",
+            "${X:_=PAD} rest",
+            "${X:_=PAD",
+            "${X:ts\\0PAD} rest",
+            "${X:gmtime=PAD} rest",
+            "${X:mtime=PAD} rest",
+            "${X:UPAD:hash} rest",
+            "${X:UPAD:hash",
+            "${X:UPAD:range=12} rest",
+            "${X:UPAD:sh}",
+            "${X:@v@PAD${v}@} rest",
+            "${X:S/PAD\\\\#/x/}",
+            "${X:S/PAD\\#/x/}",
+            "${X:UPAD:Z} rest",
+            "${X:UPAD",
+            "${PAD:Q}${Y}",
+        ];
+        let pads = ["a", "1", "\\", "\\#", "\\\\", "\u{e9}", "${Y}", "}"];
+        for template in templates {
+            for pad in pads {
+                for n in 0..140 {
+                    let text = template.replace("PAD", &pad.repeat(n));
+                    assert_eq!(
+                        ParsedReference::parse_prefix(&text, BSDMake),
+                        parse_whole(&text),
+                        "{:?}",
+                        text
+                    );
+                }
+            }
+        }
     }
 
     #[test]
