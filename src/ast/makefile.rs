@@ -1297,6 +1297,7 @@ impl Makefile {
             [
                 targets.green().into_owned().into(),
                 rowan::GreenToken::new(OPERATOR.into(), ":").into(),
+                rowan::GreenNode::new(PREREQUISITES.into(), []).into(),
                 rowan::GreenToken::new(NEWLINE.into(), &eol).into(),
             ],
         ));
@@ -3487,6 +3488,25 @@ override_dh_auto_configure:
                 vec!["b"],
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_add_rule_matches_reparse() {
+        for text in [
+            "",
+            "X = 1\n",
+            "X = 1\r\n",
+            "X = 1",
+            "ifdef X\nall:\nendif\n",
+        ] {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.add_rule("b");
+            assert_matches_reparse(&makefile);
+
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.try_add_rule("$(OBJS)").unwrap();
+            assert_matches_reparse(&makefile);
         }
     }
 
