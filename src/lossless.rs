@@ -7,6 +7,7 @@ use std::str::FromStr;
 mod error;
 mod parser;
 mod recipe;
+mod text_references;
 mod variable_reference;
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ mod tests;
 pub use error::*;
 pub(crate) use parser::*;
 pub use recipe::*;
+pub(crate) use text_references::*;
 pub use variable_reference::*;
 
 /// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
@@ -219,22 +221,14 @@ pub(crate) fn node_text(node: &SyntaxNode) -> String {
 /// tokens, followed by a RECIPE node holding `recipe` if given.
 pub(crate) fn detached_elements(
     tokens: &[(SyntaxKind, &str)],
-    recipe: Option<&[(SyntaxKind, &str)]>,
+    recipe: Option<rowan::GreenNode>,
 ) -> Vec<SyntaxElement> {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(ROOT.into());
-    for (kind, text) in tokens {
-        builder.token((*kind).into(), text);
-    }
-    if let Some(recipe) = recipe {
-        builder.start_node(RECIPE.into());
-        for (kind, text) in recipe {
-            builder.token((*kind).into(), text);
-        }
-        builder.finish_node();
-    }
-    builder.finish_node();
-    let root = SyntaxNode::new_root_mut(builder.finish());
+    let mut children: Vec<rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken>> = tokens
+        .iter()
+        .map(|(kind, text)| rowan::GreenToken::new((*kind).into(), text).into())
+        .collect();
+    children.extend(recipe.map(Into::into));
+    let root = SyntaxNode::new_root_mut(rowan::GreenNode::new(ROOT.into(), children));
     let elements: Vec<_> = root.children_with_tokens().collect();
     for element in &elements {
         element.detach();

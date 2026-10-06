@@ -55,9 +55,8 @@ impl VariableReference {
     /// Returns `None` for expressions without a variable name, such as BSD
     /// make's `${:Uvalue}`.
     ///
-    /// Note: Variable references inside recipes and `define` bodies are not
-    /// parsed into the syntax tree (they are stored as raw text). This only
-    /// finds references in variable values, prerequisites, and targets.
+    /// Note: Variable references inside `define` bodies are not parsed into
+    /// the syntax tree (they are stored as raw text).
     ///
     /// # Example
     /// ```

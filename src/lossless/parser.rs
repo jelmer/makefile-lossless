@@ -329,16 +329,29 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .to_string()
         }
 
-        fn parse_recipe_line(&mut self) {
-            self.builder.start_node(RECIPE.into());
+        /// Run `f`, which adds the children of a `kind` node, and add that
+        /// node with the variable references in it as EXPR nodes, found as
+        /// make finds them when expanding a recipe.
+        fn with_references(&mut self, kind: SyntaxKind, f: impl FnOnce(&mut Self)) {
+            let outer = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
+            self.builder.start_node(kind.into());
+            f(self);
+            self.builder.finish_node();
+            let node = std::mem::replace(&mut self.builder, outer).finish();
+            emit_node_with_references(&mut self.builder, &node, self.variant);
+        }
 
+        fn parse_recipe_line(&mut self) {
+            self.with_references(RECIPE, Self::parse_recipe_line_contents);
+        }
+
+        fn parse_recipe_line_contents(&mut self) {
             // Check for and consume the indent
             if self.current() != Some(INDENT) {
                 self.error(
                     ParseErrorKind::Other,
                     "recipe line must start with a tab".to_string(),
                 );
-                self.builder.finish_node();
                 return;
             }
             self.bump();
@@ -415,19 +428,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ => break,
                 }
             }
-
-            self.builder.finish_node();
         }
 
         /// Parse a recipe given on the rule line after a `;`, up to the end
         /// of the line. Like make, take everything after the `;` and any
         /// whitespace following it as the recipe text, including `#`.
         fn parse_inline_recipe(&mut self) {
-            self.builder.start_node(RECIPE.into());
-            self.bump_as(OPERATOR);
-            self.skip_ws();
-            self.parse_text_to_eol(true);
-            self.builder.finish_node();
+            self.with_references(RECIPE, |p| {
+                p.bump_as(OPERATOR);
+                p.skip_ws();
+                p.parse_text_to_eol(true);
+            });
         }
 
         /// Consume the rest of the logical line, including any `#` and
@@ -867,7 +878,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Parse a recipe line indented with spaces as a recipe of the
         /// current rule, recording a missing separator error.
         fn parse_space_indented_recipe(&mut self) {
-            self.builder.start_node(RECIPE.into());
+            self.with_references(RECIPE, Self::parse_space_indented_recipe_contents);
+        }
+
+        fn parse_space_indented_recipe_contents(&mut self) {
             self.record_error(
                 ParseErrorKind::MissingSeparator,
                 "missing separator (recipe lines must start with a tab)".to_string(),
@@ -896,7 +910,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     break;
                 }
             }
-            self.builder.finish_node();
         }
 
         /// Whether `op` can separate targets from prerequisites. `&:` and

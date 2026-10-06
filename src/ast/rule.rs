@@ -4,13 +4,13 @@ use super::{
     escape_hashes, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
-    node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
-    ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
+    node_text, recipe_green, remove_with_preceding_comments, trim_trailing_newlines, Conditional,
+    Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
-use rowan::{GreenNode, GreenNodeBuilder, GreenToken};
+use rowan::{GreenNode, GreenToken};
 
 /// The text of a target or prerequisite as make reads it: line
 /// continuations are collapsed and `\#` is unescaped as described by
@@ -150,18 +150,7 @@ impl RuleItem {
     /// Try to cast a syntax node to a RuleItem
     pub(crate) fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
-            RECIPE => {
-                // Extract the recipe text from the RECIPE node
-                let text = node.children_with_tokens().find_map(|it| {
-                    if let Some(token) = it.as_token() {
-                        if token.kind() == TEXT {
-                            return Some(token.text().to_string());
-                        }
-                    }
-                    None
-                })?;
-                Some(RuleItem::Recipe(text))
-            }
+            RECIPE => Recipe::cast(node)?.first_line_text().map(RuleItem::Recipe),
             CONDITIONAL => Conditional::cast(node).map(RuleItem::Conditional),
             _ => None,
         }
@@ -277,14 +266,7 @@ impl Rule {
         }
         children.push(GreenToken::new(NEWLINE.into(), "\n").into());
         for recipe in recipes {
-            let recipe = GreenNode::new(
-                RECIPE.into(),
-                [
-                    GreenToken::new(INDENT.into(), "\t").into(),
-                    GreenToken::new(TEXT.into(), recipe).into(),
-                    GreenToken::new(NEWLINE.into(), "\n").into(),
-                ],
-            );
+            let recipe = recipe_green(&[(INDENT, "\t"), (TEXT, recipe), (NEWLINE, "\n")]);
             children.push(recipe.into());
         }
         let syntax = SyntaxNode::new_root_mut(GreenNode::new(RULE.into(), children));
@@ -1049,14 +1031,11 @@ impl Rule {
             .expect("Recipe node must have a parent");
 
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = SyntaxNode::new_root_mut(recipe_green(&[
+            (INDENT, "\t"),
+            (TEXT, line),
+            (NEWLINE, &eol),
+        ]));
 
         parent.splice_children(target_index..target_index + 1, vec![syntax.into()]);
 
@@ -1075,13 +1054,11 @@ impl Rule {
     pub fn push_command(&mut self, line: &str) {
         let index = self.recipe_end_index();
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = SyntaxNode::new_root_mut(recipe_green(&[
+            (INDENT, "\t"),
+            (TEXT, line),
+            (NEWLINE, &eol),
+        ]));
 
         let index = terminate_line_before(self.syntax(), index, &eol);
         self.syntax()

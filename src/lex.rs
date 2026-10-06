@@ -60,6 +60,8 @@ pub struct Lexer<'a> {
     /// Whether the current logical line so far is a `.` at its start,
     /// optionally followed by whitespace, so that a directive name follows.
     after_directive_dot: bool,
+    /// Whether `#` can start a comment.
+    comments: bool,
 }
 
 /// The characters that nmake takes literally after a `^`.
@@ -92,6 +94,7 @@ impl<'a> Lexer<'a> {
             nmake_inline_files: 0,
             line_start: true,
             after_directive_dot: false,
+            comments: true,
         }
     }
 
@@ -381,7 +384,8 @@ impl<'a> Lexer<'a> {
                     return Some((SyntaxKind::NEWLINE, text));
                 }
                 '#' if self.line_type == Some(LineType::Other)
-                    && ((self.bsd && after_lbracket)
+                    && (!self.comments
+                        || (self.bsd && after_lbracket)
                         || (self.hash_in_references && self.reference_depth > 0)) => {}
                 '#' => {
                     return Some((SyntaxKind::COMMENT, self.read_comment()));
@@ -629,6 +633,24 @@ pub(crate) fn lex_non_recipe_line(
         .last()
         .is_some_and(|(kind, text)| *kind == SyntaxKind::COMMENT && text.ends_with('\n'));
     (tokens, lexer.continuation || comment_continues)
+}
+
+/// Lex text inside a variable reference in a recipe line or `define`
+/// body, where `#` does not start a comment. Each line is lexed as an
+/// ordinary makefile line.
+pub(crate) fn lex_reference_text(
+    input: &str,
+    variant: Option<MakefileVariant>,
+) -> Vec<(SyntaxKind, String)> {
+    input
+        .split_inclusive('\n')
+        .flat_map(|line| {
+            let mut lexer = Lexer::new(line, variant);
+            lexer.line_type = Some(LineType::Other);
+            lexer.comments = false;
+            lexer.collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[cfg(test)]

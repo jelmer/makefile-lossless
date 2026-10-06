@@ -672,6 +672,15 @@ thread_local! {
 }
 
 impl UnescapedHash {
+    /// `text` as is, for a recipe line, where BSD make does not unescape
+    /// `\#`.
+    pub(crate) fn verbatim(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn new(original: &str) -> Self {
         #[cfg(test)]
         UNESCAPED_BYTES.with(|n| n.set(n.get() + original.len()));

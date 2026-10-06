@@ -11,6 +11,7 @@ mod expression_statement;
 mod general;
 mod include;
 mod line_col;
+mod recipe_references;
 mod recipes;
 mod references;
 mod rule_context;
