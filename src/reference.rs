@@ -372,14 +372,58 @@ pub struct ParsedReference {
     pub modifiers: Vec<Modifier>,
 }
 
+/// The class of a [`ReferenceError::Syntax`] error.
+///
+/// Use this rather than matching on error messages, which are meant for
+/// humans and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReferenceSyntaxErrorKind {
+    /// Text follows the reference where the end of the text was expected.
+    TrailingText,
+    /// The text does not start with `$`.
+    ExpectedDollar,
+    /// The text starts with `$$`, which stands for a literal `$`.
+    EscapedDollar,
+    /// A `$` is followed by nothing, or by a character that cannot be a
+    /// variable name (make: "Dollar followed by nothing").
+    MissingVariableName,
+    /// An expression such as `${FOO` has no closing brace (make: "Unclosed
+    /// expression" or "Unclosed variable").
+    UnclosedExpression,
+    /// A modifier is followed by something other than `:` or the closing
+    /// brace (make: "Missing delimiter ':' after modifier").
+    MissingModifierSeparator,
+    /// `:S` or `:C` is not followed by a delimiter (make: "Missing
+    /// delimiter for modifier").
+    MissingModifierDelimiter,
+    /// A modifier that make recognizes by its first characters is malformed,
+    /// such as `:[]` or `:tx` (make: "Bad modifier").
+    BadModifier,
+    /// The variable name of `:@` contains a `$`.
+    DollarInLoopVariable,
+    /// The character number in `:ts\NNN` or `:ts\xNN` is out of range.
+    InvalidCharacterNumber,
+    /// The argument of `:range=` is not a number.
+    InvalidRangeNumber,
+    /// The argument of `:mtime=` is neither a number nor `error`.
+    InvalidMtimeArgument,
+    /// A part of a modifier such as `:S/from/to/` is not terminated by its
+    /// delimiter (make: "Unfinished modifier").
+    UnfinishedModifier,
+}
+
 /// An error parsing a variable reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReferenceError {
     /// The reference is malformed.
+    #[non_exhaustive]
     Syntax {
         /// The byte offset of the error in the text.
         offset: usize,
+        /// The class of the error.
+        kind: ReferenceSyntaxErrorKind,
         /// A description of the error.
         message: String,
     },
@@ -398,10 +442,22 @@ pub enum ReferenceError {
     },
 }
 
+impl ReferenceError {
+    /// The class of the error, if it is a [`ReferenceError::Syntax`] error.
+    pub fn syntax_kind(&self) -> Option<ReferenceSyntaxErrorKind> {
+        match self {
+            ReferenceError::Syntax { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ReferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReferenceError::Syntax { offset, message } => {
+            ReferenceError::Syntax {
+                offset, message, ..
+            } => {
                 write!(f, "{} at offset {}", message, offset)
             }
             ReferenceError::UnknownModifier { offset, modifier } => {
@@ -472,7 +528,11 @@ impl ParsedReference {
     pub fn parse(text: &str, variant: MakefileVariant) -> Result<Self, ReferenceError> {
         let (parsed, end) = Self::parse_prefix(text, variant)?;
         if end != text.len() {
-            return Err(syntax_error(end, "unexpected text after reference"));
+            return Err(syntax_error(
+                end,
+                ReferenceSyntaxErrorKind::TrailingText,
+                "unexpected text after reference",
+            ));
         }
         Ok(parsed)
     }
@@ -547,6 +607,7 @@ impl ParsedReference {
         if parser.pos != unescaped.text.len() {
             return Err(syntax_error(
                 unescaped.original_offset(parser.pos),
+                ReferenceSyntaxErrorKind::TrailingText,
                 "unexpected text after reference",
             ));
         }
@@ -657,8 +718,13 @@ impl UnescapedHash {
 
     fn map_error(&self, error: ReferenceError) -> ReferenceError {
         match error {
-            ReferenceError::Syntax { offset, message } => ReferenceError::Syntax {
+            ReferenceError::Syntax {
+                offset,
+                kind,
+                message,
+            } => ReferenceError::Syntax {
                 offset: self.original_offset(offset),
+                kind,
                 message,
             },
             ReferenceError::UnknownModifier { offset, modifier } => {
@@ -672,9 +738,14 @@ impl UnescapedHash {
     }
 }
 
-fn syntax_error(offset: usize, message: impl Into<String>) -> ReferenceError {
+fn syntax_error(
+    offset: usize,
+    kind: ReferenceSyntaxErrorKind,
+    message: impl Into<String>,
+) -> ReferenceError {
     ReferenceError::Syntax {
         offset,
+        kind,
         message: message.into(),
     }
 }
@@ -741,7 +812,11 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Result<ParsedReference, ReferenceError> {
         let start = self.pos;
         if self.bump() != Some('$') {
-            return Err(syntax_error(start, "expected '$'"));
+            return Err(syntax_error(
+                start,
+                ReferenceSyntaxErrorKind::ExpectedDollar,
+                "expected '$'",
+            ));
         }
         let endc = match self.peek() {
             Some('(') => ')',
@@ -749,11 +824,16 @@ impl<'a> Parser<'a> {
             Some('$') => {
                 return Err(syntax_error(
                     start,
+                    ReferenceSyntaxErrorKind::EscapedDollar,
                     "'$$' is an escaped dollar, not a reference",
                 ))
             }
             None | Some(':' | ')' | '}') => {
-                return Err(syntax_error(start, "missing variable name after '$'"))
+                return Err(syntax_error(
+                    start,
+                    ReferenceSyntaxErrorKind::MissingVariableName,
+                    "missing variable name after '$'",
+                ))
             }
             Some(c) => {
                 self.bump();
@@ -796,6 +876,7 @@ impl<'a> Parser<'a> {
     fn unclosed_error(&self, delims: Delims) -> ReferenceError {
         syntax_error(
             self.pos,
+            ReferenceSyntaxErrorKind::UnclosedExpression,
             format!("unclosed expression, expecting '{}'", delims.endc.unwrap()),
         )
     }
@@ -823,7 +904,13 @@ impl<'a> Parser<'a> {
                 Some('(' | '{') => {
                     self.parse_expr()?;
                 }
-                None => return Err(syntax_error(self.pos, "missing variable name after '$'")),
+                None => {
+                    return Err(syntax_error(
+                        self.pos,
+                        ReferenceSyntaxErrorKind::MissingVariableName,
+                        "missing variable name after '$'",
+                    ))
+                }
                 // Like make, only skip the '$' since the next character
                 // cannot be a variable name.
                 Some(':' | ')' | '}') => {
@@ -865,6 +952,7 @@ impl<'a> Parser<'a> {
                 _ => {
                     return Err(syntax_error(
                         self.pos,
+                        ReferenceSyntaxErrorKind::MissingModifierSeparator,
                         format!(
                             "missing delimiter ':' after modifier ':{}'",
                             &self.text[start..self.pos]
@@ -1029,6 +1117,7 @@ impl<'a> Parser<'a> {
             .map_or(self.text.len() - start, |(i, _)| i);
         syntax_error(
             start,
+            ReferenceSyntaxErrorKind::BadModifier,
             format!("bad modifier ':{}'", &self.text[start..start + len]),
         )
     }
@@ -1071,6 +1160,7 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| {
                 syntax_error(
                     start,
+                    ReferenceSyntaxErrorKind::DollarInLoopVariable,
                     "in the :@ modifier, the variable name must not contain a dollar",
                 )
             })?;
@@ -1137,7 +1227,11 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.bump();
         self.bump().ok_or_else(|| {
-            syntax_error(start, format!("missing delimiter for modifier ':{}'", name))
+            syntax_error(
+                start,
+                ReferenceSyntaxErrorKind::MissingModifierDelimiter,
+                format!("missing delimiter for modifier ':{}'", name),
+            )
         })
     }
 
@@ -1279,6 +1373,7 @@ impl<'a> Parser<'a> {
         let value = u8::from_str_radix(&self.rest()[..digits_len], radix).map_err(|_| {
             syntax_error(
                 self.pos,
+                ReferenceSyntaxErrorKind::InvalidCharacterNumber,
                 format!("invalid character number at '{}'", self.rest()),
             )
         })?;
@@ -1333,6 +1428,7 @@ impl<'a> Parser<'a> {
         digits.parse().map(Some).map_err(|_| {
             syntax_error(
                 self.pos,
+                ReferenceSyntaxErrorKind::InvalidRangeNumber,
                 format!("invalid number '{}' for ':range' modifier", digits),
             )
         })
@@ -1354,6 +1450,7 @@ impl<'a> Parser<'a> {
         }
         Err(syntax_error(
             start,
+            ReferenceSyntaxErrorKind::InvalidMtimeArgument,
             format!("invalid argument '{}' for modifier ':mtime'", self.rest()),
         ))
     }
@@ -1488,7 +1585,11 @@ impl<'a> Parser<'a> {
                 arg.push_char('$');
             }
             None | Some(':' | ')' | '}') => {
-                return Err(syntax_error(start, "missing variable name after '$'"));
+                return Err(syntax_error(
+                    start,
+                    ReferenceSyntaxErrorKind::MissingVariableName,
+                    "missing variable name after '$'",
+                ));
             }
             Some(_) => {
                 self.bump_n(2);
@@ -1551,6 +1652,7 @@ impl<'a> Parser<'a> {
             let Some(c) = c else {
                 return Err(syntax_error(
                     self.pos,
+                    ReferenceSyntaxErrorKind::UnfinishedModifier,
                     format!("unfinished modifier ('{}' missing)", delim.unwrap()),
                 ));
             };
@@ -1606,6 +1708,7 @@ impl<'a> Parser<'a> {
             let Some(c) = self.peek() else {
                 return Err(syntax_error(
                     self.pos,
+                    ReferenceSyntaxErrorKind::UnfinishedModifier,
                     format!("unfinished modifier ('{}' missing)", delim),
                 ));
             };
@@ -1660,7 +1763,11 @@ impl<'a> Parser<'a> {
     ) -> Result<ParsedReference, ReferenceError> {
         let start = self.pos;
         if self.bump() != Some('$') {
-            return Err(syntax_error(start, "expected '$'"));
+            return Err(syntax_error(
+                start,
+                ReferenceSyntaxErrorKind::ExpectedDollar,
+                "expected '$'",
+            ));
         }
         let endc = match self.peek() {
             Some('(') => ')',
@@ -1668,10 +1775,17 @@ impl<'a> Parser<'a> {
             Some('$') => {
                 return Err(syntax_error(
                     start,
+                    ReferenceSyntaxErrorKind::EscapedDollar,
                     "'$$' is an escaped dollar, not a reference",
                 ))
             }
-            None => return Err(syntax_error(start, "missing variable name after '$'")),
+            None => {
+                return Err(syntax_error(
+                    start,
+                    ReferenceSyntaxErrorKind::MissingVariableName,
+                    "missing variable name after '$'",
+                ))
+            }
             Some(c) => {
                 self.bump();
                 return Ok(ParsedReference {
@@ -1686,6 +1800,7 @@ impl<'a> Parser<'a> {
                 .ok_or_else(|| {
                     syntax_error(
                         self.text.len(),
+                        ReferenceSyntaxErrorKind::UnclosedExpression,
                         format!("unclosed reference, expecting '{}'", endc),
                     )
                 })?
@@ -1793,6 +1908,7 @@ fn parse_simple_arg(text: &str, offset: usize) -> Result<ModifierArg, ReferenceE
                         .ok_or_else(|| {
                             syntax_error(
                                 offset + text.len() - rest.len() + i,
+                                ReferenceSyntaxErrorKind::UnclosedExpression,
                                 "unclosed nested reference",
                             )
                         })?
@@ -1802,6 +1918,7 @@ fn parse_simple_arg(text: &str, offset: usize) -> Result<ModifierArg, ReferenceE
             None => {
                 return Err(syntax_error(
                     offset + text.len() - rest.len() + i,
+                    ReferenceSyntaxErrorKind::MissingVariableName,
                     "missing variable name after '$'",
                 ))
             }
@@ -1901,7 +2018,9 @@ mod tests {
 
     fn syntax(text: &str) -> (usize, String) {
         match ParsedReference::parse(text, BSDMake) {
-            Err(ReferenceError::Syntax { offset, message }) => (offset, message),
+            Err(ReferenceError::Syntax {
+                offset, message, ..
+            }) => (offset, message),
             other => panic!("expected syntax error, got {:?}", other),
         }
     }
@@ -2682,6 +2801,37 @@ mod tests {
     }
 
     #[test]
+    fn test_syntax_error_kinds() {
+        use ReferenceSyntaxErrorKind::*;
+        let kind = |text: &str, variant| {
+            ParsedReference::parse(text, variant)
+                .unwrap_err()
+                .syntax_kind()
+        };
+        let cases = [
+            ("${X}y", BSDMake, TrailingText),
+            ("X", BSDMake, ExpectedDollar),
+            ("$$", BSDMake, EscapedDollar),
+            ("$", BSDMake, MissingVariableName),
+            ("${X", BSDMake, UnclosedExpression),
+            ("$(X", GNUMake, UnclosedExpression),
+            ("$(X:a=${A)", GNUMake, UnclosedExpression),
+            ("$(X:Lx)", BSDMake, MissingModifierSeparator),
+            ("${X:S", BSDMake, MissingModifierDelimiter),
+            ("${X:[]}", BSDMake, BadModifier),
+            ("${X:@$v@x@}", BSDMake, DollarInLoopVariable),
+            (r"${X:ts\400}", BSDMake, InvalidCharacterNumber),
+            ("${X:range=x}", BSDMake, InvalidRangeNumber),
+            ("${X:mtime=x}", BSDMake, InvalidMtimeArgument),
+            ("${X:S/a/b", BSDMake, UnfinishedModifier),
+        ];
+        for (text, variant, expected) in cases {
+            assert_eq!(kind(text, variant), Some(expected), "{}", text);
+        }
+        assert_eq!(kind("${X:Z}", BSDMake), None);
+    }
+
+    #[test]
     fn test_parse_prefix() {
         assert_eq!(
             ParsedReference::parse_prefix("${X:S/}/)/} rest", BSDMake),
@@ -2884,6 +3034,7 @@ mod tests {
             ParsedReference::parse("$(X", GNUMake),
             Err(ReferenceError::Syntax {
                 offset: 3,
+                kind: ReferenceSyntaxErrorKind::UnclosedExpression,
                 message: "unclosed reference, expecting ')'".to_string()
             })
         );

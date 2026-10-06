@@ -41,7 +41,7 @@ pub use ast::makefile::MakefileItem;
 pub use ast::rule::{RuleItem, RuleOperator};
 pub use bsd_condition::{
     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
-    BsdConditionError, BsdFunction, BsdOperand,
+    BsdConditionError, BsdConditionErrorKind, BsdFunction, BsdOperand,
 };
 pub use incremental::{apply_edit_to_text, TextEdit};
 pub use lossless::{
@@ -52,8 +52,8 @@ pub use lossless::{
 };
 pub use parse::Parse;
 pub use reference::{
-    AssignOp, Modifier, ModifierArg, ModifierArgPart, ParsedReference, ReferenceError, SortOrder,
-    SubstituteFlags, WordSelector,
+    AssignOp, Modifier, ModifierArg, ModifierArgPart, ParsedReference, ReferenceError,
+    ReferenceSyntaxErrorKind, SortOrder, SubstituteFlags, WordSelector,
 };
 pub use rowan::TextRange;
 pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
