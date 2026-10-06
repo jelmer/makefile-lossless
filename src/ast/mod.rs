@@ -49,6 +49,133 @@ pub(crate) fn is_continuation(element: &SyntaxElement) -> bool {
     }
 }
 
+/// A line directly above an item that holds nothing but a comment or
+/// whitespace.
+pub(crate) struct LineAbove {
+    /// The tokens of the line in source order, including its line ending.
+    pub(crate) tokens: Vec<SyntaxToken>,
+    /// The comment on the line, or `None` for a blank line.
+    pub(crate) comment: Option<SyntaxToken>,
+}
+
+/// The token before `token`. Unlike [`SyntaxToken::prev_token`], this
+/// skips nodes without tokens, such as an empty PREREQUISITES node.
+pub(crate) fn prev_token(token: &SyntaxToken) -> Option<SyntaxToken> {
+    let mut element = SyntaxElement::Token(token.clone());
+    loop {
+        let Some(prev) = element.prev_sibling_or_token() else {
+            element = element.parent()?.into();
+            continue;
+        };
+        match prev {
+            SyntaxElement::Token(t) => return Some(t),
+            SyntaxElement::Node(n) => match n
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .last()
+            {
+                Some(t) => return Some(t),
+                None => element = n.into(),
+            },
+        }
+    }
+}
+
+/// The token after `token`, skipping nodes without tokens.
+pub(crate) fn next_token(token: &SyntaxToken) -> Option<SyntaxToken> {
+    let mut element = SyntaxElement::Token(token.clone());
+    loop {
+        let Some(next) = element.next_sibling_or_token() else {
+            element = element.parent()?.into();
+            continue;
+        };
+        match next {
+            SyntaxElement::Token(t) => return Some(t),
+            SyntaxElement::Node(n) => {
+                match n.descendants_with_tokens().find_map(|it| it.into_token()) {
+                    Some(t) => return Some(t),
+                    None => element = n.into(),
+                }
+            }
+        }
+    }
+}
+
+/// Whether a line starts after `prev`, the token before it.
+fn starts_line(prev: Option<&SyntaxToken>) -> bool {
+    prev.is_none_or(|t| t.kind() == NEWLINE && !is_continuation(&t.clone().into()))
+}
+
+/// The indentation before `node`, if it starts a line.
+pub(crate) fn line_indent(node: &SyntaxNode) -> Option<SyntaxToken> {
+    let indent = prev_token(&node.first_token()?)?;
+    (indent.kind() == WHITESPACE && starts_line(prev_token(&indent).as_ref())).then_some(indent)
+}
+
+/// The comment and blank lines directly above `node`, nearest first.
+///
+/// This stops at a line with anything else on it, so a trailing comment as
+/// in `X = 1 # x` and a comment continuing the previous line with a
+/// backslash are not included. It also stops at a shebang line and at the
+/// start of the parent of `node`. The lines are found by token, as the
+/// parser puts comments that follow a recipe into the preceding rule.
+///
+/// The comment lines before the first blank line document `node`.
+pub(crate) fn lines_above(node: &SyntaxNode) -> Vec<LineAbove> {
+    let mut lines = Vec::new();
+    let Some(parent) = node.parent() else {
+        return lines;
+    };
+    let in_parent = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == parent);
+    let Some(first) = node.first_token() else {
+        return lines;
+    };
+    let mut prev = match line_indent(node) {
+        Some(indent) => prev_token(&indent),
+        None => prev_token(&first),
+    };
+    if !starts_line(prev.as_ref()) {
+        return lines;
+    }
+    while let Some(newline) = prev.filter(&in_parent) {
+        let mut tokens = vec![newline.clone()];
+        let mut comment = None;
+        let mut before = prev_token(&newline);
+        if let Some(token) = before.clone().filter(|t| t.kind() == COMMENT) {
+            if token.text().starts_with("#!") || !in_parent(&token) {
+                break;
+            }
+            before = prev_token(&token);
+            tokens.push(token.clone());
+            comment = Some(token);
+        }
+        if let Some(token) = before.clone().filter(|t| t.kind() == WHITESPACE) {
+            before = prev_token(&token);
+            tokens.push(token);
+        }
+        if !starts_line(before.as_ref()) {
+            break;
+        }
+        tokens.reverse();
+        lines.push(LineAbove { tokens, comment });
+        prev = before;
+    }
+    lines
+}
+
+/// Detach `tokens` from the tree, along with any BLANK_LINE node left empty.
+pub(crate) fn detach_tokens(tokens: impl IntoIterator<Item = SyntaxToken>) {
+    for token in tokens {
+        let parent = token.parent();
+        token.detach();
+        if let Some(parent) =
+            parent.filter(|p| p.kind() == BLANK_LINE && p.first_child_or_token().is_none())
+        {
+            parent.detach();
+        }
+    }
+}
+
 /// Whether `node` is a variable reference delimited by parentheses or
 /// braces, such as `$(X)` or `${X}`.
 fn is_delimited_reference(node: &SyntaxNode) -> bool {

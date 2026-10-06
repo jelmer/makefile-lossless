@@ -880,9 +880,26 @@ VAR3 = value3
         .expect("Should have second variable");
     var2.remove();
 
-    // Verify comment and up to 1 empty line are removed
-    // Should have VAR1, then newline, then VAR3 (empty line removed)
-    assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    // The empty line still separates VAR1 from VAR3
+    assert_eq!(makefile.code(), "VAR1 = value1\n\nVAR3 = value3\n");
+}
+
+#[test]
+fn test_variable_remove_last_with_empty_line() {
+    let makefile: Makefile = "VAR1 = value1\n\n# Comment about VAR2\nVAR2 = value2\n"
+        .parse()
+        .unwrap();
+    let mut var2 = makefile.variable_definitions().nth(1).unwrap();
+    var2.remove();
+    assert_eq!(makefile.code(), "VAR1 = value1\n");
+}
+
+#[test]
+fn test_variable_remove_doc_comment_after_rule() {
+    let makefile: Makefile = "a:\n\techo\n# doc\nX = 1\nY = 2\n".parse().unwrap();
+    let mut var = makefile.variable_definitions().next().unwrap();
+    var.remove();
+    assert_eq!(makefile.code(), "a:\n\techo\nY = 2\n");
 }
 
 #[test]
@@ -904,9 +921,7 @@ VAR3 = value3
         .expect("Should have second variable");
     var2.remove();
 
-    // Verify comment and only 1 empty line are removed (one empty line preserved)
-    // Should preserve one empty line before where VAR2 was
-    assert_eq!(makefile.code(), "VAR1 = value1\n\nVAR3 = value3\n");
+    assert_eq!(makefile.code(), "VAR1 = value1\n\n\nVAR3 = value3\n");
 }
 
 #[test]

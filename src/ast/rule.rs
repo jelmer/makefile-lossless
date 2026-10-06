@@ -1715,7 +1715,10 @@ impl Rule {
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
     ///
-    /// This will also remove any preceding comments and up to 1 empty line before the rule.
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     /// When removing the last rule in a makefile, this will also trim any trailing blank lines
     /// from the previous rule to avoid leaving extra whitespace at the end of the file.
     pub fn remove(self) -> Result<(), Error> {

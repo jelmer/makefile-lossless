@@ -1,6 +1,9 @@
 use super::build_copy;
 use super::rule::build_targets_node;
-use super::{index_before_doc_comment, line_ending, terminate_line_before, with_trailing_newline};
+use super::{
+    detach_tokens, index_before_doc_comment, line_ending, lines_above, terminate_line_before,
+    with_trailing_newline,
+};
 use crate::lossless::{
     line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Include, Load, Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition,
@@ -315,11 +318,6 @@ impl MakefileItem {
         })
     }
 
-    /// Check if a token is a regular comment (not a shebang)
-    fn is_regular_comment(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> bool {
-        token.kind() == COMMENT && !token.text().starts_with("#!")
-    }
-
     /// Extract comment text from a comment token, removing '#' prefix
     fn extract_comment_text(token: &rowan::SyntaxToken<crate::lossless::Lang>) -> String {
         let text = token.text();
@@ -329,38 +327,13 @@ impl MakefileItem {
             .to_string()
     }
 
-    /// Helper to find all preceding comment-related elements up to the first non-comment element
-    ///
-    /// Returns elements in reverse order (from closest to furthest from the item)
-    fn collect_preceding_comment_elements(
-        &self,
-    ) -> Vec<rowan::NodeOrToken<SyntaxNode, rowan::SyntaxToken<crate::lossless::Lang>>> {
-        let mut elements = Vec::new();
-        let mut current = self.syntax().prev_sibling_or_token();
-
-        while let Some(element) = current {
-            match &element {
-                rowan::NodeOrToken::Token(token) if Self::is_regular_comment(token) => {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Token(token)
-                    if token.kind() == NEWLINE || token.kind() == WHITESPACE =>
-                {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
-                    elements.push(element.clone());
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    // Hit a shebang, stop here
-                    break;
-                }
-                _ => break,
-            }
-            current = element.prev_sibling_or_token();
-        }
-
-        elements
+    /// The comment tokens above this item, nearest first, going past blank
+    /// lines.
+    fn preceding_comment_tokens(&self) -> Vec<rowan::SyntaxToken<crate::lossless::Lang>> {
+        lines_above(self.syntax())
+            .into_iter()
+            .filter_map(|line| line.comment)
+            .collect()
     }
 
     /// Helper to parse comment text and extract properly formatted comment tokens
@@ -475,6 +448,9 @@ impl MakefileItem {
     ///
     /// Returns an iterator of comment strings (without the leading '#' and whitespace).
     ///
+    /// These are the whole-line comments above the item, going past blank
+    /// lines, up to a line with anything else on it or a shebang line.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -486,18 +462,12 @@ impl MakefileItem {
     /// assert_eq!(comments[1], "Comment 2");
     /// ```
     pub fn preceding_comments(&self) -> impl Iterator<Item = String> {
-        let elements = self.collect_preceding_comment_elements();
-        let mut comments = Vec::new();
-
-        // Process elements in reverse order (furthest to closest)
-        for element in elements.iter().rev() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    comments.push(Self::extract_comment_text(token));
-                }
-            }
-        }
-
+        let mut comments: Vec<_> = self
+            .preceding_comment_tokens()
+            .iter()
+            .map(Self::extract_comment_text)
+            .collect();
+        comments.reverse();
         comments.into_iter()
     }
 
@@ -526,48 +496,26 @@ impl MakefileItem {
     /// );
     /// ```
     pub fn doc_comments(&self) -> impl Iterator<Item = String> {
-        type Token = rowan::SyntaxToken<crate::lossless::Lang>;
-        fn prev_skipping_indent(token: &Token) -> Option<Token> {
-            match token.prev_token() {
-                Some(t) if t.kind() == WHITESPACE => t.prev_token(),
-                prev => prev,
-            }
-        }
-        // `None` is the start of the file.
-        fn at_line_start(prev: &Option<Token>) -> bool {
-            prev.as_ref()
-                .is_none_or(|t| t.kind() == NEWLINE && !super::is_continuation(&t.clone().into()))
-        }
-
-        let mut lines = Vec::new();
-        let mut before = self
-            .syntax()
-            .first_token()
-            .and_then(|t| prev_skipping_indent(&t));
-        while let Some(newline) = before.as_ref().filter(|_| at_line_start(&before)) {
-            let Some(comment) = newline.prev_token().filter(Self::is_regular_comment) else {
-                break;
-            };
-            let prev = prev_skipping_indent(&comment);
-            if !at_line_start(&prev) {
-                break;
-            }
-            let text = comment.text().trim_start_matches('#');
-            lines.push(
+        let mut lines: Vec<_> = lines_above(self.syntax())
+            .into_iter()
+            .map_while(|line| line.comment)
+            .map(|comment| {
+                let text = comment.text().trim_start_matches('#');
                 text.strip_prefix(' ')
                     .unwrap_or(text)
                     .trim_end()
-                    .to_string(),
-            );
-            before = prev;
-        }
+                    .to_string()
+            })
+            .collect();
         lines.reverse();
         lines.into_iter()
     }
 
     /// Remove all preceding comments for this MakefileItem
     ///
-    /// Returns the number of comments removed.
+    /// The comment lines found by [`Self::preceding_comments`] are removed;
+    /// blank lines between them are kept. Returns the number of comments
+    /// removed.
     ///
     /// # Example
     /// ```
@@ -579,54 +527,14 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Comment"));
     /// ```
     pub fn remove_comments(&mut self) -> Result<usize, Error> {
-        let parent = self.get_parent_or_error("remove comments from", "remove_comments")?;
-        let collected_elements = self.collect_preceding_comment_elements();
-
-        // Count the comments
-        let mut comment_count = 0;
-        for element in collected_elements.iter() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    comment_count += 1;
-                }
-            }
-        }
-
-        // Determine which elements to remove - similar to remove_with_preceding_comments
-        // We remove comments and up to 1 blank line worth of newlines
-        let mut elements_to_remove = Vec::new();
-        let mut consecutive_newlines = 0;
-        for element in collected_elements.iter().rev() {
-            let should_remove = match element {
-                rowan::NodeOrToken::Token(token) if token.kind() == COMMENT => {
-                    consecutive_newlines = 0;
-                    true // Remove comments
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == NEWLINE => {
-                    consecutive_newlines += 1;
-                    comment_count > 0 && consecutive_newlines <= 1
-                }
-                rowan::NodeOrToken::Token(token) if token.kind() == WHITESPACE => comment_count > 0,
-                rowan::NodeOrToken::Node(n) if n.kind() == BLANK_LINE => {
-                    consecutive_newlines += 1;
-                    comment_count > 0 && consecutive_newlines <= 1
-                }
-                _ => false,
-            };
-
-            if should_remove {
-                elements_to_remove.push(element.clone());
-            }
-        }
-
-        // Remove elements in reverse order (from highest index to lowest)
-        elements_to_remove.sort_by_key(|el| std::cmp::Reverse(el.index()));
-        for element in elements_to_remove {
-            let idx = element.index();
-            parent.splice_children(idx..idx + 1, vec![]);
-        }
-
-        Ok(comment_count)
+        self.get_parent_or_error("remove comments from", "remove_comments")?;
+        let lines: Vec<_> = lines_above(self.syntax())
+            .into_iter()
+            .filter(|line| line.comment.is_some())
+            .collect();
+        let count = lines.len();
+        detach_tokens(lines.into_iter().flat_map(|line| line.tokens));
+        Ok(count)
     }
 
     /// Modify the first preceding comment for this MakefileItem
@@ -647,33 +555,24 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Old comment"));
     /// ```
     pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
-        let parent = self.get_parent_or_error("modify comment for", "modify_comment")?;
+        self.get_parent_or_error("modify comment for", "modify_comment")?;
         let (new_comment_token, _) = Self::parse_comment_tokens(
             new_comment_text,
             &line_ending(self.syntax()),
             "modify_comment",
         )?;
 
-        // Find the first preceding comment (closest to the item)
-        let collected_elements = self.collect_preceding_comment_elements();
-        let comment_element = collected_elements.iter().find(|element| {
-            if let rowan::NodeOrToken::Token(token) = element {
-                token.kind() == COMMENT
-            } else {
-                false
-            }
-        });
-
-        if let Some(element) = comment_element {
-            let idx = element.index();
-            parent.splice_children(
-                idx..idx + 1,
-                vec![rowan::NodeOrToken::Token(new_comment_token)],
-            );
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        // The comment closest to the item
+        let Some(comment) = self.preceding_comment_tokens().into_iter().next() else {
+            return Ok(false);
+        };
+        let parent = comment.parent().expect("comment has a parent");
+        let idx = comment.index();
+        parent.splice_children(
+            idx..idx + 1,
+            vec![rowan::NodeOrToken::Token(new_comment_token)],
+        );
+        Ok(true)
     }
 
     /// Insert a new MakefileItem before this item
@@ -2382,7 +2281,42 @@ mod tests {
         let count = item.remove_comments().unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(makefile.to_string(), "VAR0 = x\nVAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR0 = x\n\nVAR = value\n");
+    }
+
+    #[test]
+    fn test_makefile_item_comments_after_rule() {
+        // The parser puts the comment into the RULE node of `a`.
+        let text = "a:\n\techo\n# far\n\n# doc of b\nb:\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let item = makefile.items().nth(1).unwrap();
+        assert_eq!(
+            item.preceding_comments().collect::<Vec<_>>(),
+            vec!["far", "doc of b"]
+        );
+
+        let mut item = makefile.items().nth(1).unwrap();
+        assert!(item.modify_comment("new").unwrap());
+        assert_eq!(makefile.to_string(), "a:\n\techo\n# far\n\n# new\nb:\n");
+
+        let mut item = makefile.items().nth(1).unwrap();
+        assert_eq!(item.remove_comments().unwrap(), 2);
+        assert_eq!(makefile.to_string(), "a:\n\techo\n\nb:\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_makefile_item_preceding_comments_stop_at_content() {
+        for text in [
+            "X = 1 # x\nb:\n",
+            "X = a \\\n# continued\nb:\n",
+            "ifdef X # c\nb:\nendif\n",
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let rule = makefile.rules().next().unwrap();
+            let item = MakefileItem::Rule(rule);
+            assert_eq!(item.preceding_comments().count(), 0, "{text:?}");
+        }
     }
 
     #[test]

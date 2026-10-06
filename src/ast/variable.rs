@@ -860,7 +860,10 @@ impl VariableDefinition {
 
     /// Remove this variable definition from its parent makefile
     ///
-    /// This will also remove any preceding comments and up to 1 empty line before the variable.
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     ///
     /// # Example
     /// ```
