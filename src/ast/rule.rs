@@ -655,9 +655,9 @@ impl Rule {
             .find_map(|e| e.into_node().filter(|n| n.kind() == PREREQUISITES))
     }
 
-    /// The normal and order-only prerequisites of the rule, with line
-    /// continuations collapsed as described by `syntax`.
-    fn prerequisite_lists(&self, syntax: LineSyntax) -> (Vec<String>, Vec<String>) {
+    /// The PREREQUISITE nodes of the rule, split into normal and
+    /// order-only ones.
+    fn prerequisite_nodes(&self) -> (Vec<SyntaxNode>, Vec<SyntaxNode>) {
         let mut normal = Vec::new();
         let mut order_only = Vec::new();
         let Some(node) = self.prerequisites_node() else {
@@ -670,17 +670,130 @@ impl Rule {
                     seen_pipe = true;
                 }
                 rowan::NodeOrToken::Node(n) if n.kind() == PREREQUISITE => {
-                    let text = node_name_text(&n, syntax).trim().to_string();
                     if seen_pipe {
-                        order_only.push(text);
+                        order_only.push(n);
                     } else {
-                        normal.push(text);
+                        normal.push(n);
                     }
                 }
                 _ => {}
             }
         }
         (normal, order_only)
+    }
+
+    /// The normal and order-only prerequisites of the rule, with line
+    /// continuations collapsed as described by `syntax`.
+    fn prerequisite_lists(&self, syntax: LineSyntax) -> (Vec<String>, Vec<String>) {
+        let text = |n: SyntaxNode| node_name_text(&n, syntax).trim().to_string();
+        let (normal, order_only) = self.prerequisite_nodes();
+        (
+            normal.into_iter().map(text).collect(),
+            order_only.into_iter().map(text).collect(),
+        )
+    }
+
+    /// The source range of a PREREQUISITE node, without surrounding
+    /// whitespace.
+    fn prerequisite_range(node: SyntaxNode) -> rowan::TextRange {
+        let range = node.text_range();
+        let text = node.text().to_string();
+        let start = text.len() - text.trim_start().len();
+        let end = text.trim_end().len().max(start);
+        rowan::TextRange::new(
+            range.start() + rowan::TextSize::from(start as u32),
+            range.start() + rowan::TextSize::from(end as u32),
+        )
+    }
+
+    /// The source ranges of the normal prerequisites of this rule, in the
+    /// same order as [`Self::prerequisites`].
+    ///
+    /// As for [`Self::target_ranges`], each range covers the prerequisite
+    /// as written, including any escapes and variable references.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Rule, TextRange};
+    ///
+    /// let rule: Rule = "all: a\\ b $(C) | d\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.prerequisite_ranges().collect::<Vec<_>>(),
+    ///     vec![
+    ///         TextRange::new(5.into(), 9.into()),
+    ///         TextRange::new(10.into(), 14.into()),
+    ///     ]
+    /// );
+    /// ```
+    pub fn prerequisite_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.prerequisite_nodes()
+            .0
+            .into_iter()
+            .map(Self::prerequisite_range)
+    }
+
+    /// The source ranges of the order-only prerequisites of this rule, in
+    /// the same order as [`Self::order_only_prerequisites`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Rule, TextRange};
+    ///
+    /// let rule: Rule = "all: a | b c\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.order_only_prerequisite_ranges().collect::<Vec<_>>(),
+    ///     vec![
+    ///         TextRange::new(9.into(), 10.into()),
+    ///         TextRange::new(11.into(), 12.into()),
+    ///     ]
+    /// );
+    /// ```
+    pub fn order_only_prerequisite_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.prerequisite_nodes()
+            .1
+            .into_iter()
+            .map(Self::prerequisite_range)
+    }
+
+    /// The source range of the prerequisite list of this rule.
+    ///
+    /// The range starts right after the rule operator (or, for a static
+    /// pattern rule, after the colon following the target pattern) and
+    /// ends before a `;` recipe, a comment or the end of the line, so it
+    /// includes surrounding whitespace, the `|` and any line continuations.
+    /// It is empty for a rule without prerequisites, and `None` if the rule
+    /// has no prerequisite list, as for a target-specific variable
+    /// assignment.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Rule, TextRange};
+    ///
+    /// let rule: Rule = "all: a b ; cmd\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.prerequisite_list_range(),
+    ///     Some(TextRange::new(4.into(), 9.into()))
+    /// );
+    ///
+    /// let rule: Rule = "all:\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.prerequisite_list_range(),
+    ///     Some(TextRange::new(4.into(), 4.into()))
+    /// );
+    ///
+    /// let rule: Rule = "all: CFLAGS = -O2\n".parse().unwrap();
+    /// assert_eq!(rule.prerequisite_list_range(), None);
+    /// ```
+    pub fn prerequisite_list_range(&self) -> Option<rowan::TextRange> {
+        let node = self.prerequisites_node()?;
+        let operator = node
+            .siblings_with_tokens(rowan::Direction::Prev)
+            .find(|e| e.kind() == OPERATOR)?;
+        let end = node
+            .children_with_tokens()
+            .find(|e| e.kind() == COMMENT)
+            .map_or(node.text_range().end(), |c| c.text_range().start());
+        Some(rowan::TextRange::new(operator.text_range().end(), end))
     }
 
     /// Get the normal prerequisites in the rule
@@ -1698,6 +1811,161 @@ mod tests {
     #[test]
     fn test_target_ranges_empty() {
         assert_eq!(target_range_texts(": dep\n"), Vec::<String>::new());
+    }
+
+    /// The prerequisite and order-only prerequisite range texts of the
+    /// first rule, plus the prerequisite list range text.
+    fn prerequisite_range_texts(
+        text: &str,
+        variant: MakefileVariant,
+    ) -> (Vec<&str>, Vec<&str>, Option<&str>) {
+        let parsed = Makefile::parse_with_variant(text, variant);
+        let rule = parsed.tree().rules().next().unwrap();
+        let normal: Vec<_> = rule.prerequisite_ranges().map(|r| &text[r]).collect();
+        let order_only: Vec<_> = rule
+            .order_only_prerequisite_ranges()
+            .map(|r| &text[r])
+            .collect();
+        assert_eq!(rule.prerequisites().count(), normal.len());
+        assert_eq!(rule.order_only_prerequisites().count(), order_only.len());
+        (
+            normal,
+            order_only,
+            rule.prerequisite_list_range().map(|r| &text[r]),
+        )
+    }
+
+    #[test]
+    fn test_prerequisite_ranges() {
+        let rule: Rule = "all: a  bb | ccc\n".parse().unwrap();
+        assert_eq!(
+            rule.prerequisite_ranges().collect::<Vec<_>>(),
+            vec![
+                rowan::TextRange::new(5.into(), 6.into()),
+                rowan::TextRange::new(8.into(), 10.into()),
+            ]
+        );
+        assert_eq!(
+            rule.order_only_prerequisite_ranges().collect::<Vec<_>>(),
+            vec![rowan::TextRange::new(13.into(), 16.into())]
+        );
+        assert_eq!(
+            rule.prerequisite_list_range(),
+            Some(rowan::TextRange::new(4.into(), 16.into()))
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_ranges_texts() {
+        assert_eq!(
+            prerequisite_range_texts(
+                "all: $(subst a , b,c) x$(Y)z a\\ b a\\#b a\\|b lib.a(m.o)\n",
+                MakefileVariant::GNUMake
+            ),
+            (
+                vec![
+                    "$(subst a , b,c)",
+                    "x$(Y)z",
+                    "a\\ b",
+                    "a\\#b",
+                    "a\\|b",
+                    "lib.a(m.o)"
+                ],
+                vec![],
+                Some(" $(subst a , b,c) x$(Y)z a\\ b a\\#b a\\|b lib.a(m.o)")
+            )
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_ranges_continuation() {
+        assert_eq!(
+            prerequisite_range_texts("all: a \\\n  b | \\\n c\n", MakefileVariant::GNUMake),
+            (vec!["a", "b"], vec!["c"], Some(" a \\\n  b | \\\n c"))
+        );
+        assert_eq!(
+            prerequisite_range_texts(
+                "all: \\\n  $(subst a \\\n  b,c,x)\n",
+                MakefileVariant::GNUMake
+            ),
+            (
+                vec!["$(subst a \\\n  b,c,x)"],
+                vec![],
+                Some(" \\\n  $(subst a \\\n  b,c,x)")
+            )
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_ranges_crlf() {
+        assert_eq!(
+            prerequisite_range_texts("all: a b\r\n\tcmd\r\n", MakefileVariant::GNUMake),
+            (vec!["a", "b"], vec![], Some(" a b"))
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_list_range_comment_and_recipe() {
+        assert_eq!(
+            prerequisite_range_texts("all: a # comment\n", MakefileVariant::GNUMake),
+            (vec!["a"], vec![], Some(" a "))
+        );
+        assert_eq!(
+            prerequisite_range_texts("all: a ; cmd\n", MakefileVariant::GNUMake),
+            (vec!["a"], vec![], Some(" a "))
+        );
+        assert_eq!(
+            prerequisite_range_texts("all: ;cmd\n", MakefileVariant::GNUMake),
+            (vec![], vec![], Some(" "))
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_list_range_empty() {
+        assert_eq!(
+            prerequisite_range_texts("all:\n", MakefileVariant::GNUMake),
+            (vec![], vec![], Some(""))
+        );
+        assert_eq!(
+            prerequisite_range_texts("all: | \n", MakefileVariant::GNUMake),
+            (vec![], vec![], Some(" | "))
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_list_range_static_pattern() {
+        assert_eq!(
+            prerequisite_range_texts("$(OBJS): %.o: %.c | dir\n", MakefileVariant::GNUMake),
+            (vec!["%.c"], vec!["dir"], Some(" %.c | dir"))
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_list_range_target_specific() {
+        assert_eq!(
+            prerequisite_range_texts("all: CFLAGS = -O2\n", MakefileVariant::GNUMake),
+            (vec![], vec![], None)
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_ranges_bsd() {
+        assert_eq!(
+            prerequisite_range_texts("all! a ${B:S/x/y/} .WAIT c\n", MakefileVariant::BSDMake),
+            (
+                vec!["a", "${B:S/x/y/}", ".WAIT", "c"],
+                vec![],
+                Some(" a ${B:S/x/y/} .WAIT c")
+            )
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_ranges_nmake() {
+        assert_eq!(
+            prerequisite_range_texts("all: a.obj $(B)\n", MakefileVariant::NMake),
+            (vec!["a.obj", "$(B)"], vec![], Some(" a.obj $(B)"))
+        );
     }
 
     #[test]
