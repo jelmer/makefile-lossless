@@ -1187,14 +1187,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             None => return false,
                         }
                     }
-                    // TODO: Like make, take a line such as `ifdef = 1` as an
-                    // assignment.
                     (IDENTIFIER, t)
-                        if Self::is_conditional_start(t) && self.conditional_keyword_at(end) =>
+                        if Self::is_conditional_start(t) && self.conditional_line_at(end) =>
                     {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
-                    (IDENTIFIER, "else") if self.conditional_keyword_at(end) => {
+                    (IDENTIFIER, "else") if self.conditional_line_at(end) => {
                         match stack.last_mut() {
                             Some(context) => {
                                 let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
@@ -1203,12 +1201,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             None => return false,
                         }
                     }
-                    (IDENTIFIER, "endif") if self.conditional_keyword_at(end) => {
-                        match stack.pop() {
-                            Some(context) => in_rule = context.end(in_rule),
-                            None => return false,
-                        }
-                    }
+                    (IDENTIFIER, "endif") if self.conditional_line_at(end) => match stack.pop() {
+                        Some(context) => in_rule = context.end(in_rule),
+                        None => return false,
+                    },
                     _ if self
                         .bsd_directive_at(end)
                         .is_some_and(|(name, _)| self.bsd_directive_in_rule(name))
@@ -1273,10 +1269,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether the current token is a GNU make conditional keyword that
-        /// starts a conditional line. Like make, this checks for an
-        /// assignment first, so `ifdef = 1` defines a variable.
-        fn at_conditional_keyword(&mut self) -> bool {
-            self.conditional_keyword_at(self.tokens.len()) && !self.is_assignment_line()
+        /// starts a conditional line.
+        fn at_conditional_keyword(&self) -> bool {
+            self.conditional_line_at(self.tokens.len())
+        }
+
+        /// Whether the token at `end - 1` in the token stack starts a GNU
+        /// make conditional line. Like make, this checks for an assignment
+        /// first, so `ifdef = 1` defines a variable.
+        fn conditional_line_at(&self, end: usize) -> bool {
+            self.conditional_keyword_at(end) && !self.assignment_at(end)
         }
 
         /// Whether the current token is a GNU make `vpath` directive.
@@ -4562,15 +4564,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 })
         }
 
-        /// Whether the line is an `undefine` directive, optionally preceded
-        /// by modifiers. `undefine = 1` and `undefine: all` instead assign to
-        /// or make a target named "undefine".
-        fn is_undefine_line(&self) -> bool {
+        /// Whether the line starting at `end - 1` in the token stack is an
+        /// `undefine` directive, optionally preceded by modifiers.
+        /// `undefine = 1` and `undefine: all` instead assign to or make a
+        /// target named "undefine".
+        fn undefine_at(&self, end: usize) -> bool {
             if !self.gnu_directives_enabled() {
                 return false;
             }
-            let mut words = self
-                .tokens
+            let mut words = self.tokens[..end]
                 .iter()
                 .rev()
                 .filter(|(kind, _)| *kind != WHITESPACE)
@@ -4598,14 +4600,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     && !self.line_has_dependency_operator())
         }
 
-        fn is_assignment_line(&mut self) -> bool {
-            if self.is_undefine_line() {
+        fn is_assignment_line(&self) -> bool {
+            self.assignment_at(self.tokens.len())
+        }
+
+        /// Like `is_assignment_line`, for the line starting at `end - 1` in
+        /// the token stack.
+        fn assignment_at(&self, end: usize) -> bool {
+            if self.undefine_at(end) {
                 return true;
             }
             let gnu = self.gnu_directives_enabled();
             let is_directive =
                 |text: &str| gnu && matches!(text, "export" | "unexport" | "override" | "private");
-            let mut tokens = self.tokens.iter().rev().peekable();
+            let mut tokens = self.tokens[..end].iter().rev().peekable();
             let mut seen_name = false;
             // Whitespace after the name: anything but an operator now means
             // this is not an assignment.
@@ -8287,6 +8295,37 @@ rule: dependency
                 let root = parsed.root();
                 assert_eq!(code, root.to_string());
                 assert_eq!(root.conditionals().count(), 0, "{variant:?} {code:?}");
+                let names: Vec<_> = root.variable_definitions().map(|v| v.name()).collect();
+                assert_eq!(names, vec![Some(name.to_string())], "{variant:?} {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_keyword_assignment_ends_rule() {
+        // As for any other assignment, a comment before `ifdef = 1` doesn't
+        // belong to the rule, as no recipe line can follow.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, name) in [
+                ("all:\n\techo a\n\n# c\nifdef = 1\n\techo b\n", "ifdef"),
+                ("all:\n\techo a\n\n# c\nifndef := 1\n\techo b\n", "ifndef"),
+            ] {
+                let parsed = parse(code, variant);
+                assert_eq!(
+                    parsed.errors,
+                    vec![ErrorInfo {
+                        message: "indented line not part of a rule".to_string(),
+                        line: 6,
+                        context: "\techo b".to_string(),
+                        kind: ParseErrorKind::RecipeBeforeFirstTarget,
+                    }],
+                    "{variant:?} {code:?}"
+                );
+                let root = parsed.root();
+                assert_eq!(code, root.to_string());
+                let rules: Vec<_> = root.rules().collect();
+                assert_eq!(rules.len(), 1, "{variant:?} {code:?}");
+                assert_eq!(rules[0].to_string(), "all:\n\techo a\n\n");
                 let names: Vec<_> = root.variable_definitions().map(|v| v.name()).collect();
                 assert_eq!(names, vec![Some(name.to_string())], "{variant:?} {code:?}");
             }
