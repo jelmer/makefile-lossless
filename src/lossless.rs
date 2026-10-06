@@ -8433,6 +8433,88 @@ rule: dependency
     }
 
     #[test]
+    fn test_plus_and_question_mark_in_names() {
+        // Outside of `+=` and `?=`, make takes `+` and `?` as part of a
+        // name, as in `c++filt.1` or `libstdc++`.
+        let text = "c++ = x\nv+ = b\nx += 1\ny+=3\nz?=4\nw?=?y\n\
+                    all: c++filt.1 a?\n\
+                    c++filt.1 a? + ?: x$+ $? c++\n\
+                    \t@echo $+ $?\n\
+                    libstdc++.a(c++.o): c++.o\n\
+                    .ORDER: c++filt.1 a?\n";
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+            Some(MakefileVariant::NMake),
+        ] {
+            let parsed = parse(text, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), text, "{variant:?}");
+            assert_eq!(
+                makefile
+                    .variable_definitions()
+                    .map(|v| (
+                        v.name().unwrap(),
+                        v.assignment_operator().unwrap(),
+                        v.raw_value().unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("c++".to_string(), "=".to_string(), "x".to_string()),
+                    ("v+".to_string(), "=".to_string(), "b".to_string()),
+                    ("x".to_string(), "+=".to_string(), "1".to_string()),
+                    ("y".to_string(), "+=".to_string(), "3".to_string()),
+                    ("z".to_string(), "?=".to_string(), "4".to_string()),
+                    ("w".to_string(), "?=".to_string(), "?y".to_string()),
+                ],
+                "{variant:?}"
+            );
+            let rules = makefile.rules().collect::<Vec<_>>();
+            assert_eq!(
+                rules
+                    .iter()
+                    .map(|r| (
+                        r.targets().collect::<Vec<_>>(),
+                        r.prerequisites().collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        vec!["all".to_string()],
+                        vec!["c++filt.1".to_string(), "a?".to_string()]
+                    ),
+                    (
+                        vec![
+                            "c++filt.1".to_string(),
+                            "a?".to_string(),
+                            "+".to_string(),
+                            "?".to_string()
+                        ],
+                        vec!["x$+".to_string(), "$?".to_string(), "c++".to_string()]
+                    ),
+                    (
+                        vec!["libstdc++.a(c++.o)".to_string()],
+                        vec!["c++.o".to_string()]
+                    ),
+                    (
+                        vec![".ORDER".to_string()],
+                        vec!["c++filt.1".to_string(), "a?".to_string()]
+                    ),
+                ],
+                "{variant:?}"
+            );
+            assert_eq!(
+                rules[1].recipes().collect::<Vec<_>>(),
+                vec!["@echo $+ $?".to_string()],
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_inline_recipe() {
         let parsed = parse("all: dep ; echo hi # x\n\tcmd\n", None);
         assert_eq!(parsed.errors, vec![]);
