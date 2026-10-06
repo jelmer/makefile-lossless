@@ -471,7 +471,7 @@ fn test_recipe_insert_after_unterminated() {
 fn test_add_after_unterminated_line() {
     let mut makefile = parse_crlf("X = 1\r\nY = 1");
     makefile.add_rule("b");
-    assert_eq!(makefile.to_string(), "X = 1\r\nY = 1\r\nb:\r\n");
+    assert_eq!(makefile.to_string(), "X = 1\r\nY = 1\r\n\r\nb:\r\n");
 
     let mut makefile = parse_crlf("X = 1\r\nY = 1");
     makefile
