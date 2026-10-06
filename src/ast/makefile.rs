@@ -104,7 +104,17 @@ fn check_conditional(
 /// text must end in a line ending unless empty; see
 /// [`terminate_line_before`].
 fn needs_blank_line_at_end(root: &SyntaxNode) -> bool {
-    let text = root.text().to_string();
+    needs_blank_line_before(root, root.children_with_tokens().count())
+}
+
+/// Like [`needs_blank_line_at_end`], for an item inserted before the
+/// child at `index` of `root`.
+fn needs_blank_line_before(root: &SyntaxNode, index: usize) -> bool {
+    let text: String = root
+        .children_with_tokens()
+        .take(index)
+        .map(|it| it.to_string())
+        .collect();
     let Some(body) = text.strip_suffix('\n') else {
         return false;
     };
@@ -1612,6 +1622,11 @@ impl Makefile {
     /// blank line in between, the new rule is inserted before them, since
     /// they document the existing rule.
     ///
+    /// The new rule is separated from any preceding content by a blank
+    /// line, unless that content already ends in one or is the start of a
+    /// conditional branch or loop body, and from the following rule by a
+    /// blank line, unless the new rule already ends in one.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1645,89 +1660,33 @@ impl Makefile {
             ),
         };
 
-        // Build the nodes to insert
+        // No blank line directly after a conditional or loop header
+        let at_block_start = rules.get(index).is_some_and(|rule| {
+            rule.prev_sibling()
+                .is_some_and(|n| matches!(n.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE | FOR_HEADER))
+        });
+
         let eol = line_ending(self.syntax());
         let new_node = with_trailing_newline(new_rule.syntax(), &eol);
+        let target_index = terminate_line_before(&parent, target_index, &eol);
+
+        let blank_line = || {
+            let mut bl_builder = GreenNodeBuilder::new();
+            bl_builder.start_node(BLANK_LINE.into());
+            bl_builder.token(NEWLINE.into(), &eol);
+            bl_builder.finish_node();
+            SyntaxNode::new_root_mut(bl_builder.finish()).into()
+        };
         let mut nodes_to_insert = Vec::new();
-
-        // Determine if we need to add blank lines to maintain formatting consistency
-        if index == 0 && !rules.is_empty() {
-            // Inserting before the first rule - check if first rule has a blank line before it
-            // If so, we should add one after our new rule instead
-            // For now, just add the rule without a blank line before it
-            nodes_to_insert.push(new_node.clone().into());
-
-            // Add a blank line after the new rule
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-            nodes_to_insert.push(blank_line.into());
-        } else if index < rules.len() {
-            // Inserting in the middle (before an existing rule)
-            // The syntax tree structure is: ... [maybe BLANK_LINE] RULE(target) ...
-            // We're inserting right before RULE(target)
-
-            // If there's a BLANK_LINE immediately before the target rule,
-            // it will stay there and separate the previous rule from our new rule.
-            // We don't need to add a BLANK_LINE before our new rule in that case.
-
-            // But we DO need to add a BLANK_LINE after our new rule to separate it
-            // from the target rule (which we're inserting before).
-
-            // Check if there's a blank line immediately before target_index
-            let has_blank_before = if target_index > 0 {
-                parent
-                    .children_with_tokens()
-                    .nth(target_index - 1)
-                    .and_then(|n| n.as_node().map(|node| node.kind() == BLANK_LINE))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-
-            // No blank line directly after a conditional or loop header
-            let at_block_start = rules[index].prev_sibling().is_some_and(|n| {
-                matches!(n.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE | FOR_HEADER)
-            });
-
-            // Only add a blank before if there isn't one already and we're not at the start
-            if !has_blank_before && index > 0 && !at_block_start {
-                let mut bl_builder = GreenNodeBuilder::new();
-                bl_builder.start_node(BLANK_LINE.into());
-                bl_builder.token(NEWLINE.into(), &eol);
-                bl_builder.finish_node();
-                let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-                nodes_to_insert.push(blank_line.into());
-            }
-
-            // Add the new rule
-            nodes_to_insert.push(new_node.clone().into());
-
-            // Always add a blank line after the new rule to separate it from the next rule
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-            nodes_to_insert.push(blank_line.into());
-        } else {
-            // Inserting at the end when there are existing rules
-            // Add a blank line before the new rule
-            let mut bl_builder = GreenNodeBuilder::new();
-            bl_builder.start_node(BLANK_LINE.into());
-            bl_builder.token(NEWLINE.into(), &eol);
-            bl_builder.finish_node();
-            let blank_line = SyntaxNode::new_root_mut(bl_builder.finish());
-            nodes_to_insert.push(blank_line.into());
-
-            // Add the new rule
-            nodes_to_insert.push(new_node.clone().into());
+        if !at_block_start && needs_blank_line_before(&parent, target_index) {
+            nodes_to_insert.push(blank_line());
+        }
+        let needs_blank_after = index < rules.len() && needs_blank_line_at_end(&new_node);
+        nodes_to_insert.push(new_node.into());
+        if needs_blank_after {
+            nodes_to_insert.push(blank_line());
         }
 
-        // Insert all nodes at the target index
-        let target_index = terminate_line_before(&parent, target_index, &eol);
         insert_items(&parent, target_index, nodes_to_insert);
         Ok(())
     }
@@ -2905,7 +2864,7 @@ override_dh_auto_configure:
         let mut makefile: Makefile = "a:\n\tx\n\nb:\n\ty\n".parse().unwrap();
         let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
         makefile.insert_rule(1, new_rule).unwrap();
-        assert_eq!(makefile.to_string(), "a:\n\tx\n\n\nnew:\n\tz\n\nb:\n\ty\n");
+        assert_eq!(makefile.to_string(), "a:\n\tx\n\nnew:\n\tz\n\nb:\n\ty\n");
     }
 
     #[test]
@@ -2942,6 +2901,11 @@ override_dh_auto_configure:
                 "a:\nifdef X\nc:\nendif\ne:\n",
                 2,
                 "a:\nifdef X\nc:\nendif\n\nb:\n\ne:\n",
+            ),
+            (
+                "a:\nifdef X\nc:\n\nd:\nendif\n",
+                2,
+                "a:\nifdef X\nc:\n\nb:\n\nd:\nendif\n",
             ),
         ];
         for (text, index, expected) in cases {
@@ -2997,6 +2961,60 @@ override_dh_auto_configure:
         assert_eq!(makefile.to_string(), "a:\nifdef X\nz:\nendif\ny:\n");
         let reparsed: Makefile = makefile.to_string().parse().unwrap();
         assert_eq!(rule_targets(&reparsed), vec!["a", "z", "y"]);
+    }
+
+    #[test]
+    fn test_insert_rule_blank_line() {
+        let cases = [
+            ("", 0, "b:\n"),
+            ("all: a\n", 1, "all: a\n\nb:\n"),
+            ("all: a\n\n", 1, "all: a\n\nb:\n"),
+            ("all: a\n\n\n", 1, "all: a\n\n\nb:\n"),
+            ("X = 1\n", 0, "X = 1\n\nb:\n"),
+            ("X = 1\n\n", 0, "X = 1\n\nb:\n"),
+            ("# comment\n", 0, "# comment\n\nb:\n"),
+            ("\n", 0, "\nb:\n"),
+            (
+                "ifdef X\nY = 1\nendif\n\n",
+                0,
+                "ifdef X\nY = 1\nendif\n\nb:\n",
+            ),
+            ("a:\n", 0, "b:\n\na:\n"),
+            ("a:\n\n", 0, "b:\n\na:\n\n"),
+            ("\na:\n", 0, "\nb:\n\na:\n"),
+            ("X = 1\na:\n", 0, "X = 1\n\nb:\n\na:\n"),
+            ("X = 1\n\na:\n", 0, "X = 1\n\nb:\n\na:\n"),
+            ("a:\nc:\n", 1, "a:\n\nb:\n\nc:\n"),
+            ("a:\n\nc:\n", 1, "a:\n\nb:\n\nc:\n"),
+            ("a:\n\n\nc:\n", 1, "a:\n\n\nb:\n\nc:\n"),
+            ("a:\n\tx\n\nc:\n", 1, "a:\n\tx\n\nb:\n\nc:\n"),
+            ("a:\nX = 1\nc:\n", 1, "a:\nX = 1\n\nb:\n\nc:\n"),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .insert_rule(index, "b:\n".parse().unwrap())
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(
+                reparsed
+                    .rules()
+                    .nth(index)
+                    .unwrap()
+                    .targets()
+                    .collect::<Vec<_>>(),
+                vec!["b"],
+                "{text:?} at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_rule_ending_in_blank_line() {
+        let mut makefile: Makefile = "a:\n".parse().unwrap();
+        makefile.insert_rule(0, "b:\n\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "b:\n\na:\n");
     }
 
     #[test]
