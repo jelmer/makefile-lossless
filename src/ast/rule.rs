@@ -1,61 +1,127 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use super::{
-    collapse_continuations, is_continuation, line_ending, terminate_line_before, LineSyntax,
+    escape_hashes, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
     node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional, Error,
-    ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
+    ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
-use rowan::GreenNodeBuilder;
+use rowan::{GreenNode, GreenNodeBuilder, GreenToken};
 
-// Helper function to build a PREREQUISITES node containing PREREQUISITE nodes,
-// optionally followed by trailing whitespace.
+/// The text of a target or prerequisite as make reads it: line
+/// continuations are collapsed and `\#` is unescaped as described by
+/// `syntax`, while other backslashes are kept as written.
+fn name_text(
+    root: &SyntaxNode,
+    tokens: impl IntoIterator<Item = SyntaxToken>,
+    syntax: LineSyntax,
+) -> String {
+    // nmake has no `\#` escape, so a `#` after a backslash starts a comment
+    // there, but the parser does not know that and keeps it in the name.
+    // TODO: Stop at `\#` for nmake once the parser does.
+    logical_text(root, tokens, syntax, syntax != LineSyntax::NMake)
+}
+
+fn node_name_text(node: &SyntaxNode, syntax: LineSyntax) -> String {
+    let tokens = node
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token());
+    name_text(node, tokens, syntax)
+}
+
+/// `name` escaped so that GNU make reads it back as a target or
+/// prerequisite name, as [`Rule::targets`] returns it.
+fn escape_name(name: &str, before_comment: bool) -> String {
+    escape_hashes(name, false, before_comment)
+}
+
+fn name_error(context: &str, message: String) -> Error {
+    Error::Parse(ParseError {
+        errors: vec![ErrorInfo {
+            kind: crate::ParseErrorKind::Other,
+            message,
+            line: 1,
+            context: context.to_string(),
+        }],
+    })
+}
+
+/// Parse `line` as a makefile consisting of a single rule.
+fn parse_rule_line(line: &str) -> Option<Rule> {
+    let parsed = crate::lossless::parse(line, None);
+    let mut items = parsed.root().syntax().children();
+    items
+        .next()
+        .and_then(Rule::cast)
+        .filter(|_| parsed.errors.is_empty() && items.next().is_none())
+}
+
+/// A PREREQUISITES node containing PREREQUISITE nodes, optionally followed
+/// by trailing whitespace. With `before_comment`, the node is directly
+/// followed by a comment.
+///
+/// The prerequisites are escaped as needed, and an error is returned if
+/// [`Rule::prerequisites`] would not read them back.
 fn build_prerequisites_node(
     prereqs: &[String],
     include_leading_space: bool,
     trailing_space: Option<&str>,
-) -> SyntaxNode {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(PREREQUISITES.into());
-
-    for (i, prereq) in prereqs.iter().enumerate() {
-        // Add space: before first prerequisite if requested, and between all prerequisites
-        if (i == 0 && include_leading_space) || i > 0 {
-            builder.token(WHITESPACE.into(), " ");
+    before_comment: bool,
+) -> Result<SyntaxNode, Error> {
+    let mut children = Vec::new();
+    if !prereqs.is_empty() {
+        let before_comment = before_comment && trailing_space.is_none();
+        let mut line = String::from("x:");
+        for (i, prereq) in prereqs.iter().enumerate() {
+            line.push(' ');
+            line.push_str(&escape_name(
+                prereq,
+                before_comment && i + 1 == prereqs.len(),
+            ));
         }
-
-        // Build each PREREQUISITE node
-        builder.start_node(PREREQUISITE.into());
-        builder.token(IDENTIFIER.into(), prereq);
-        builder.finish_node();
+        line.push_str(if before_comment { "#\n" } else { "\n" });
+        let parsed = parse_rule_line(&line)
+            .filter(|rule| rule.prerequisites().eq(prereqs.iter().cloned()))
+            .and_then(|rule| rule.prerequisites_node())
+            .ok_or_else(|| {
+                name_error(
+                    "set_prerequisites",
+                    format!("Cannot write {prereqs:?} as prerequisites"),
+                )
+            })?;
+        for (i, node) in parsed
+            .children()
+            .filter(|n| n.kind() == PREREQUISITE)
+            .enumerate()
+        {
+            if i > 0 || include_leading_space {
+                children.push(GreenToken::new(WHITESPACE.into(), " ").into());
+            }
+            children.push(node.green().into_owned().into());
+        }
     }
-
     if let Some(space) = trailing_space {
-        builder.token(WHITESPACE.into(), space);
+        children.push(GreenToken::new(WHITESPACE.into(), space).into());
     }
-
-    builder.finish_node();
-    SyntaxNode::new_root_mut(builder.finish())
+    Ok(SyntaxNode::new_root_mut(GreenNode::new(
+        PREREQUISITES.into(),
+        children,
+    )))
 }
 
-// Helper function to build targets section (TARGETS node)
-fn build_targets_node(targets: &[String]) -> SyntaxNode {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(TARGETS.into());
-
-    for (i, target) in targets.iter().enumerate() {
-        if i > 0 {
-            builder.token(WHITESPACE.into(), " ");
-        }
-        builder.token(IDENTIFIER.into(), target);
-    }
-
-    builder.finish_node();
-    SyntaxNode::new_root_mut(builder.finish())
+/// A TARGETS node for `targets`, escaped as needed. Returns an error if
+/// [`Rule::targets`] would not read them back.
+pub(crate) fn build_targets_node(targets: &[String], context: &str) -> Result<SyntaxNode, Error> {
+    let escaped: Vec<_> = targets.iter().map(|t| escape_name(t, false)).collect();
+    parse_rule_line(&format!("{}:\n", escaped.join(" ")))
+        .filter(|rule| rule.targets().eq(targets.iter().cloned()))
+        .and_then(|rule| rule.syntax().children().find(|n| n.kind() == TARGETS))
+        .map(|node| SyntaxNode::new_root_mut(node.green().into_owned()))
+        .ok_or_else(|| name_error(context, format!("Cannot write {targets:?} as targets")))
 }
 
 /// Represents different types of items that can appear in a Rule's body
@@ -115,6 +181,14 @@ impl Rule {
     /// * `prerequisites` - A slice of prerequisite names (can be empty)
     /// * `recipes` - A slice of recipe lines (can be empty)
     ///
+    /// Targets and prerequisites are escaped as by [`Rule::set_targets`]
+    /// and [`Rule::set_prerequisites`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are no targets, or if a target or prerequisite can
+    /// not be written so that it reads back the same.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -125,52 +199,32 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo Done"]);
     /// ```
     pub fn new(targets: &[&str], prerequisites: &[&str], recipes: &[&str]) -> Rule {
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RULE.into());
-
-        // Build targets
-        for (i, target) in targets.iter().enumerate() {
-            if i > 0 {
-                builder.token(WHITESPACE.into(), " ");
-            }
-            builder.token(IDENTIFIER.into(), target);
-        }
-
-        // Add colon
-        builder.token(OPERATOR.into(), ":");
-
-        // Build prerequisites
+        let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let targets = build_targets_node(&owned(targets), "Rule::new")
+            .unwrap_or_else(|e| panic!("invalid targets: {e}"));
+        let mut children: Vec<rowan::NodeOrToken<GreenNode, GreenToken>> = vec![
+            targets.green().into_owned().into(),
+            GreenToken::new(OPERATOR.into(), ":").into(),
+        ];
         if !prerequisites.is_empty() {
-            builder.token(WHITESPACE.into(), " ");
-            builder.start_node(PREREQUISITES.into());
-
-            for (i, prereq) in prerequisites.iter().enumerate() {
-                if i > 0 {
-                    builder.token(WHITESPACE.into(), " ");
-                }
-                builder.start_node(PREREQUISITE.into());
-                builder.token(IDENTIFIER.into(), prereq);
-                builder.finish_node();
-            }
-
-            builder.finish_node();
+            let prerequisites = build_prerequisites_node(&owned(prerequisites), false, None, false)
+                .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
+            children.push(GreenToken::new(WHITESPACE.into(), " ").into());
+            children.push(prerequisites.green().into_owned().into());
         }
-
-        // Add newline after rule declaration
-        builder.token(NEWLINE.into(), "\n");
-
-        // Build recipes
+        children.push(GreenToken::new(NEWLINE.into(), "\n").into());
         for recipe in recipes {
-            builder.start_node(RECIPE.into());
-            builder.token(INDENT.into(), "\t");
-            builder.token(TEXT.into(), recipe);
-            builder.token(NEWLINE.into(), "\n");
-            builder.finish_node();
+            let recipe = GreenNode::new(
+                RECIPE.into(),
+                [
+                    GreenToken::new(INDENT.into(), "\t").into(),
+                    GreenToken::new(TEXT.into(), recipe).into(),
+                    GreenToken::new(NEWLINE.into(), "\n").into(),
+                ],
+            );
+            children.push(recipe.into());
         }
-
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let syntax = SyntaxNode::new_root_mut(GreenNode::new(RULE.into(), children));
         Rule::cast(syntax).unwrap()
     }
 
@@ -303,34 +357,29 @@ impl Rule {
     // Helper method to extract targets from a TARGETS node
     fn extract_targets_from_node(node: &SyntaxNode, syntax: LineSyntax) -> Vec<String> {
         let mut result = Vec::new();
-        let mut current_target = String::new();
+        let mut current = Vec::new();
 
         for child in node.children_with_tokens() {
-            if let Some(token) = child.as_token() {
-                match token.kind() {
-                    // Whitespace and line continuations (backslash-newline
-                    // plus the continued line's indent) delimit targets. The
-                    // parser keeps an escaped space as TEXT, and whitespace
-                    // inside archive member parentheses is part of the nested
-                    // ARCHIVE_MEMBERS node.
-                    kind if kind == WHITESPACE || is_continuation(&child) => {
-                        if !current_target.is_empty() {
-                            result.push(std::mem::take(&mut current_target));
-                        }
-                    }
-                    _ => {
-                        current_target.push_str(token.text());
-                    }
+            // Whitespace and line continuations (backslash-newline plus the
+            // continued line's indent) delimit targets. The parser keeps an
+            // escaped space as TEXT, and whitespace inside archive member
+            // parentheses is part of the nested ARCHIVE_MEMBERS node.
+            if child.kind() == WHITESPACE || is_continuation(&child) {
+                if !current.is_empty() {
+                    result.push(name_text(node, current.drain(..), syntax));
                 }
-            } else if let Some(child_node) = child.as_node() {
-                // Handle nested nodes like ARCHIVE_MEMBERS
-                current_target.push_str(&collapse_continuations(child_node, syntax));
+                continue;
+            }
+            match child {
+                rowan::NodeOrToken::Token(token) => current.push(token),
+                rowan::NodeOrToken::Node(n) => {
+                    current.extend(n.descendants_with_tokens().filter_map(|it| it.into_token()))
+                }
             }
         }
 
-        // Push the last target if any
-        if !current_target.is_empty() {
-            result.push(current_target);
+        if !current.is_empty() {
+            result.push(name_text(node, current, syntax));
         }
 
         result
@@ -338,10 +387,14 @@ impl Rule {
 
     /// Targets of this rule
     ///
-    /// Backslashes are kept as written, as for variable names: `a\ b` is
-    /// the single target `a\ b`, which GNU make reads as `a b`. Line
-    /// continuations are collapsed as GNU make does; see
-    /// [`Self::targets_for`] for other variants.
+    /// GNU make removes the backslash from `\#` when reading the line, so
+    /// `a\#b` is the target `a#b`; as for [`VariableDefinition::value`],
+    /// the backslashes before it are halved. Other backslashes are kept as
+    /// written, as for variable names: `a\ b` is the single target `a\ b`,
+    /// which GNU make reads as `a b`. Line continuations are collapsed as
+    /// GNU make does; see [`Self::targets_for`] for other variants.
+    ///
+    /// [`VariableDefinition::value`]: crate::VariableDefinition::value
     ///
     /// # Example
     /// ```
@@ -349,18 +402,23 @@ impl Rule {
     ///
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+    ///
+    /// let rule: Rule = "a\\#b: c\n".parse().unwrap();
+    /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a#b"]);
     /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
         self.targets_with(LineSyntax::Gnu)
     }
 
-    /// Targets of this rule, with line continuations collapsed as
-    /// `variant` does.
+    /// Targets of this rule, with line continuations collapsed and `\#`
+    /// unescaped as `variant` does.
     ///
     /// GNU make drops the whitespace before a line continuation, while
     /// POSIX make (and GNU make after `.POSIX:`) and BSD make keep it. This
     /// matters inside variable references, such as in function arguments
-    /// or BSD make modifiers.
+    /// or BSD make modifiers. BSD make also unescapes `\#` inside variable
+    /// references, and does not halve the backslashes before it. nmake
+    /// has no `\#` escape, so it is kept as written.
     ///
     /// # Example
     /// ```
@@ -504,7 +562,7 @@ impl Rule {
                     seen_pipe = true;
                 }
                 rowan::NodeOrToken::Node(n) if n.kind() == PREREQUISITE => {
-                    let text = collapse_continuations(&n, syntax).trim().to_string();
+                    let text = node_name_text(&n, syntax).trim().to_string();
                     if seen_pipe {
                         order_only.push(text);
                     } else {
@@ -520,9 +578,10 @@ impl Rule {
     /// Get the normal prerequisites in the rule
     ///
     /// Order-only prerequisites (those after a `|`) are not included; see
-    /// [`Rule::order_only_prerequisites`]. As with [`Rule::targets`],
-    /// backslashes are kept as written. Line continuations are collapsed
-    /// as GNU make does; see [`Self::prerequisites_for`] for other variants.
+    /// [`Rule::order_only_prerequisites`]. As with [`Rule::targets`], `\#`
+    /// is unescaped and other backslashes are kept as written. Line
+    /// continuations are collapsed as GNU make does; see
+    /// [`Self::prerequisites_for`] for other variants.
     ///
     /// # Example
     /// ```
@@ -535,7 +594,8 @@ impl Rule {
     }
 
     /// Get the normal prerequisites in the rule, with line continuations
-    /// collapsed as `variant` does; see [`Self::targets_for`].
+    /// collapsed and `\#` unescaped as `variant` does; see
+    /// [`Self::targets_for`].
     ///
     /// # Example
     /// ```
@@ -551,7 +611,8 @@ impl Rule {
     }
 
     /// Get the order-only prerequisites in the rule, i.e. those after the
-    /// first `|` in the prerequisite list.
+    /// first `|` in the prerequisite list. These are read as for
+    /// [`Rule::prerequisites`].
     ///
     /// # Example
     /// ```
@@ -565,7 +626,8 @@ impl Rule {
     }
 
     /// Get the order-only prerequisites in the rule, with line
-    /// continuations collapsed as `variant` does; see [`Self::targets_for`].
+    /// continuations collapsed and `\#` unescaped as `variant` does; see
+    /// [`Self::targets_for`].
     ///
     /// # Example
     /// ```
@@ -588,8 +650,8 @@ impl Rule {
     ///
     /// For a rule like `$(OBJS): %.o: %.c`, this returns `%.o`, while
     /// [`Rule::prerequisites`] returns the prerequisite patterns. Returns
-    /// `None` if this is not a static pattern rule. Line continuations are
-    /// collapsed as GNU make does; see [`Self::static_pattern_for`] for
+    /// `None` if this is not a static pattern rule. The pattern is read as
+    /// for [`Rule::prerequisites`]; see [`Self::static_pattern_for`] for
     /// other variants.
     ///
     /// # Example
@@ -609,7 +671,8 @@ impl Rule {
     }
 
     /// Get the target pattern of a static pattern rule, with line
-    /// continuations collapsed as `variant` does; see [`Self::targets_for`].
+    /// continuations collapsed and `\#` unescaped as `variant` does; see
+    /// [`Self::targets_for`].
     ///
     /// # Example
     /// ```
@@ -628,7 +691,7 @@ impl Rule {
         self.syntax()
             .children()
             .find(|n| n.kind() == TARGET_PATTERN)
-            .map(|n| collapse_continuations(&n, syntax).trim().to_string())
+            .map(|n| node_name_text(&n, syntax).trim().to_string())
     }
 
     /// Get the commands in the rule
@@ -1040,6 +1103,11 @@ impl Rule {
     /// Only the normal prerequisites are replaced; order-only prerequisites
     /// (after a `|`) are kept.
     ///
+    /// The prerequisites are taken as [`Rule::prerequisites`] returns them,
+    /// and `#` is escaped. Returns an error if a prerequisite can not be
+    /// written so that it reads back the same, such as one containing
+    /// whitespace or a `|`.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -1084,7 +1152,12 @@ impl Rule {
             } else {
                 None
             };
-            let fresh = build_prerequisites_node(&prereqs, !has_external_whitespace, separator);
+            let fresh = build_prerequisites_node(
+                &prereqs,
+                !has_external_whitespace,
+                separator,
+                next_kind == Some(COMMENT),
+            )?;
             let old_green = node.green();
             let rest = old_green.children().skip(keep).map(|c| c.to_owned());
             let green = rowan::GreenNode::new(
@@ -1105,8 +1178,6 @@ impl Rule {
         }
 
         // Insert new PREREQUISITES (need leading space inside node)
-        let new_prereqs = build_prerequisites_node(&prereqs, true, None);
-
         let insert_pos = self
             .syntax()
             .children_with_tokens()
@@ -1123,6 +1194,12 @@ impl Rule {
                 })
             })?;
 
+        let before_comment = self
+            .syntax()
+            .children_with_tokens()
+            .nth(insert_pos)
+            .is_some_and(|e| e.kind() == COMMENT);
+        let new_prereqs = build_prerequisites_node(&prereqs, true, None, before_comment)?;
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![new_prereqs.into()]);
 
@@ -1184,7 +1261,7 @@ impl Rule {
         })?;
 
         // Build new targets node
-        let new_targets_node = build_targets_node(&new_targets);
+        let new_targets_node = build_targets_node(&new_targets, "rename_target")?;
 
         // Replace the TARGETS node
         self.syntax().splice_children(
@@ -1213,6 +1290,10 @@ impl Rule {
     /// Set the targets for this rule, replacing any existing ones
     ///
     /// Returns an error if the targets list is empty (rules must have at least one target).
+    ///
+    /// The targets are taken as [`Rule::targets`] returns them, and `#` is
+    /// escaped. Returns an error if a target can not be written so that it
+    /// reads back the same, such as one containing whitespace or a `:`.
     ///
     /// # Example
     /// ```
@@ -1257,8 +1338,10 @@ impl Rule {
         })?;
 
         // Build new targets node
-        let new_targets_node =
-            build_targets_node(&targets.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let new_targets_node = build_targets_node(
+            &targets.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "set_targets",
+        )?;
 
         // Replace the TARGETS node
         self.syntax().splice_children(
@@ -1345,7 +1428,7 @@ impl Rule {
         })?;
 
         // Build new targets node
-        let new_targets_node = build_targets_node(&new_targets);
+        let new_targets_node = build_targets_node(&new_targets, "remove_target")?;
 
         // Replace the TARGETS node
         self.syntax().splice_children(
@@ -2561,5 +2644,182 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["${B:S/a/b/  :S/c/d/}"]
         );
+    }
+
+    #[test]
+    fn test_rule_names_unescape_hash() {
+        let text = "a\\#b c\\\\\\#d: e\\#f g\\\\\\#h $(subst \\#,x,y) | o\\#p\n";
+        let gnu = [
+            vec!["a#b", "c\\#d"],
+            vec!["e#f", "g\\#h", "$(subst \\#,x,y)"],
+            vec!["o#p"],
+        ];
+        let bsd = [
+            vec!["a#b", "c\\\\#d"],
+            vec!["e#f", "g\\\\#h", "$(subst #,x,y)"],
+            vec!["o#p"],
+        ];
+        let as_written = [
+            vec!["a\\#b", "c\\\\\\#d"],
+            vec!["e\\#f", "g\\\\\\#h", "$(subst \\#,x,y)"],
+            vec!["o\\#p"],
+        ];
+        for parsed in [
+            Makefile::parse(text),
+            Makefile::parse_with_variant(text, MakefileVariant::GNUMake),
+        ] {
+            assert!(parsed.ok(), "{:?}", parsed.errors());
+            let makefile = parsed.tree();
+            assert_eq!(makefile.to_string(), text);
+            let rule = makefile.rules().next().unwrap();
+            let names = |variant: Option<MakefileVariant>| match variant {
+                Some(v) => [
+                    rule.targets_for(v).collect::<Vec<_>>(),
+                    rule.prerequisites_for(v).collect(),
+                    rule.order_only_prerequisites_for(v).collect(),
+                ],
+                None => [
+                    rule.targets().collect(),
+                    rule.prerequisites().collect(),
+                    rule.order_only_prerequisites().collect(),
+                ],
+            };
+            assert_eq!(names(None), gnu);
+            assert_eq!(names(Some(MakefileVariant::GNUMake)), gnu);
+            assert_eq!(names(Some(MakefileVariant::POSIXMake)), gnu);
+            assert_eq!(names(Some(MakefileVariant::BSDMake)), bsd);
+            assert_eq!(names(Some(MakefileVariant::NMake)), as_written);
+        }
+
+        let text = "a\\#b c\\\\\\#d: e\\#f g\\\\\\#h\n";
+        for (variant, expected) in [
+            (
+                MakefileVariant::POSIXMake,
+                [vec!["a#b", "c\\#d"], vec!["e#f", "g\\#h"]],
+            ),
+            (
+                MakefileVariant::BSDMake,
+                [vec!["a#b", "c\\\\#d"], vec!["e#f", "g\\\\#h"]],
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert!(parsed.ok(), "{variant:?}: {:?}", parsed.errors());
+            let makefile = parsed.tree();
+            assert_eq!(makefile.to_string(), text);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(
+                [
+                    rule.targets_for(variant).collect::<Vec<_>>(),
+                    rule.prerequisites_for(variant).collect()
+                ],
+                expected,
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_static_pattern_unescape_hash() {
+        let makefile: Makefile = "x\\#1: %\\#1: %\\#2\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(targets(&rule), vec!["x#1"]);
+        assert_eq!(rule.static_pattern(), Some("%#1".to_string()));
+        assert_eq!(
+            rule.static_pattern_for(MakefileVariant::BSDMake),
+            Some("%#1".to_string())
+        );
+        assert_eq!(
+            rule.static_pattern_for(MakefileVariant::NMake),
+            Some("%\\#1".to_string())
+        );
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["%#2"]);
+    }
+
+    #[test]
+    fn test_prerequisite_backslashes_before_comment() {
+        // GNU make halves the backslashes before a comment, BSD make keeps
+        // them.
+        let makefile: Makefile = "a: b\\\\# c\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b\\"]);
+        assert_eq!(
+            rule.prerequisites_for(MakefileVariant::BSDMake)
+                .collect::<Vec<_>>(),
+            vec!["b\\\\"]
+        );
+    }
+
+    #[test]
+    fn test_set_rule_names_escapes_hash() {
+        let makefile: Makefile = "a: b\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.set_targets(vec!["x#y", "p\\#q"]).unwrap();
+        assert_eq!(makefile.to_string(), "x\\#y p\\\\\\#q: b\n");
+        assert_eq!(targets(&rule), vec!["x#y", "p\\#q"]);
+        rule.set_prerequisites(vec!["$(subst #,x,y)", "e#f"])
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "x\\#y p\\\\\\#q: $(subst #,x,y) e\\#f\n"
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["$(subst #,x,y)", "e#f"]
+        );
+        rule.add_prerequisite("g#h").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "x\\#y p\\\\\\#q: $(subst #,x,y) e\\#f g\\#h\n"
+        );
+        assert!(rule.remove_prerequisite("e#f").unwrap());
+        assert_eq!(
+            makefile.to_string(),
+            "x\\#y p\\\\\\#q: $(subst #,x,y) g\\#h\n"
+        );
+        assert!(rule.rename_target("x#y", "n#m").unwrap());
+        assert_eq!(
+            makefile.to_string(),
+            "n\\#m p\\\\\\#q: $(subst #,x,y) g\\#h\n"
+        );
+        rule.add_target("z").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "n\\#m p\\\\\\#q z: $(subst #,x,y) g\\#h\n"
+        );
+        assert!(rule.remove_target("n#m").unwrap());
+        assert_eq!(makefile.to_string(), "p\\\\\\#q z: $(subst #,x,y) g\\#h\n");
+    }
+
+    #[test]
+    fn test_set_prerequisites_before_comment() {
+        let makefile: Makefile = "a: b# c\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.set_prerequisites(vec!["x\\"]).unwrap();
+        assert_eq!(makefile.to_string(), "a: x\\\\# c\n");
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["x\\"]);
+    }
+
+    #[test]
+    fn test_new_rule_escapes_hash() {
+        let rule = Rule::new(&["a#b"], &["c#d", "e"], &["echo #"]);
+        assert_eq!(rule.to_string(), "a\\#b: c\\#d e\n\techo #\n");
+        assert_eq!(targets(&rule), vec!["a#b"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["c#d", "e"]);
+
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("x#y");
+        assert_eq!(makefile.to_string(), "x\\#y:\n");
+        assert_eq!(targets(&rule), vec!["x#y"]);
+    }
+
+    #[test]
+    fn test_set_rule_names_unrepresentable() {
+        let makefile: Makefile = "a: b\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        assert!(rule.set_targets(vec!["x y"]).is_err());
+        assert!(rule.set_targets(vec!["x:"]).is_err());
+        assert!(rule.set_prerequisites(vec!["c | d"]).is_err());
+        assert!(rule.set_prerequisites(vec!["c;d"]).is_err());
+        assert_eq!(makefile.to_string(), "a: b\n");
     }
 }

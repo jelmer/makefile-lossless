@@ -1,6 +1,6 @@
 use super::bsd::{directive_keyword, keyword_token};
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, logical_text, LineSyntax};
+use super::{collapse_continuations, escape_hashes, logical_text, LineSyntax};
 use crate::lossless::{
     parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
@@ -20,59 +20,6 @@ fn strip_delimiters(path: &str) -> Option<&str> {
         _ => return None,
     };
     rest.find(close).map(|end| &rest[..end])
-}
-
-/// Escape each `#` in `path` outside variable references, so that make
-/// does not read it as the start of a comment.
-///
-/// GNU make halves the backslashes before `\#` and, if `before_comment`,
-/// those at the end of the path; BSD make does neither and also starts a
-/// comment at a `#` inside a variable reference.
-fn escape_hashes(path: &str, bsd: bool, before_comment: bool) -> String {
-    let mut escaped = String::new();
-    let mut backslashes = 0;
-    // The closing delimiters of the variable references `c` is in.
-    let mut closers = Vec::new();
-    let mut chars = path.chars().peekable();
-    while let Some(c) = chars.next() {
-        escaped.push(c);
-        match c {
-            '\\' => {
-                backslashes += 1;
-                continue;
-            }
-            '$' => match chars.next_if(|n| matches!(n, '(' | '{' | '$')) {
-                Some('(') => {
-                    escaped.push('(');
-                    closers.push(')');
-                }
-                Some('{') => {
-                    escaped.push('{');
-                    closers.push('}');
-                }
-                Some(dollar) => escaped.push(dollar),
-                None => {}
-            },
-            '(' if !closers.is_empty() => closers.push(')'),
-            '{' if !closers.is_empty() => closers.push('}'),
-            ')' | '}' if closers.last() == Some(&c) => {
-                closers.pop();
-            }
-            '#' if bsd || closers.is_empty() => {
-                escaped.pop();
-                if !bsd {
-                    escaped.push_str(&"\\".repeat(backslashes));
-                }
-                escaped.push_str("\\#");
-            }
-            _ => {}
-        }
-        backslashes = 0;
-    }
-    if before_comment && !bsd {
-        escaped.push_str(&"\\".repeat(backslashes));
-    }
-    escaped
 }
 
 impl Include {

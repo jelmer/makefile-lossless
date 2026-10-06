@@ -6429,7 +6429,7 @@ mod tests {
         let rules: Vec<_> = makefile.rules().collect();
         assert_eq!(1, rules.len());
         assert_eq!(
-            vec!["a\\#b".to_string(), "c".to_string()],
+            vec!["a#b".to_string(), "c".to_string()],
             rules[0].prerequisites().collect::<Vec<_>>()
         );
         assert_eq!(
