@@ -932,6 +932,11 @@ impl Conditional {
     }
 
     /// Remove this conditional from the makefile
+    ///
+    /// This also removes the comment lines directly above it, with no blank line in between, as
+    /// they document it. If that leaves a blank line above where it was
+    /// followed by another blank line or the end of the file, the blank line
+    /// above is removed too.
     pub fn remove(&mut self) -> Result<(), Error> {
         let Some(parent) = self.syntax().parent() else {
             return Err(Error::Parse(ParseError {
