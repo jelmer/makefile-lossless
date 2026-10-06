@@ -229,6 +229,29 @@ fn test_set_value_tree_matches_reparse() {
 }
 
 #[test]
+fn test_set_value_continuation_at_end() {
+    // The line break of a line continuation ending the file is kept, but
+    // the continuation is replaced with the value.
+    for (text, value, expected) in [
+        ("X := a \\\n", "new", "X := new\n"),
+        ("X := a \\\r\n", "new", "X := new\r\n"),
+        ("X := a \\\n  ", "new", "X := new\n"),
+        ("export X := $(A) \\\n", "new", "export X := new\n"),
+        ("t: X := a \\\n", "new", "t: X := new\n"),
+        ("X := a \\\n", "b \\\n  c", "X := b \\\n  c\n"),
+        ("X := a \\", "new", "X := new"),
+        ("X := a \\\n\n", "new", "X := new\n"),
+    ] {
+        let makefile: Makefile = text.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_value(value).unwrap();
+        assert_eq!(makefile.code(), expected, "{text:?}");
+        assert_eq!(var.raw_value(), Some(value.to_string()), "{text:?}");
+        assert_matches_reparse(&makefile);
+    }
+}
+
+#[test]
 fn test_set_value_define() {
     let makefile: Makefile = "define X\nold\nendef\n".parse().unwrap();
     let mut var = makefile.variable_definitions().next().unwrap();

@@ -1,9 +1,9 @@
 use super::makefile::MakefileItem;
 use super::{is_continuation, line_ending, logical_text, LineSyntax};
 use crate::lossless::{
-    is_sunsh_operator, node_text, parse, remove_with_preceding_comments, scan_recipe_variable_refs,
-    Error, ErrorInfo, ParseError, RecipeVariableReference, VariableDefinition,
-    ASSIGNMENT_OPERATORS,
+    detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
+    scan_recipe_variable_refs, Error, ErrorInfo, ParseError, RecipeVariableReference,
+    VariableDefinition, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -935,9 +935,23 @@ impl VariableDefinition {
             })
         };
 
+        let mut elements = vec![new_expr.into()];
+        // A line continuation at the end of the file leaves the line break,
+        // and any indentation after it, in the value. Keep the line break as
+        // the end of the line.
+        let ends_line = !self.is_define() && expr.next_sibling_or_token().is_none();
+        let newline = expr
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() != INDENT)
+            .last()
+            .filter(|t| ends_line && t.kind() == NEWLINE);
+        if let Some(newline) = newline {
+            elements.extend(detached_elements(&[(NEWLINE, newline.text())], None));
+        }
         let expr_idx = expr.index();
         self.syntax()
-            .splice_children(expr_idx..expr_idx + 1, vec![new_expr.into()]);
+            .splice_children(expr_idx..expr_idx + 1, elements);
         Ok(())
     }
 }
