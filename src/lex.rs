@@ -452,12 +452,16 @@ impl<'a> Lexer<'a> {
                         };
                         Some((kind, text))
                     }
+                    // Only `?=` and `+=` are operators; a lone `?` or `+` is
+                    // part of a name such as `c++filt`.
                     '?' | '+' => {
                         let mut text = self.input.next().unwrap().to_string();
                         if let Some(eq) = self.input.next_if_eq(&'=') {
                             text.push(eq);
+                            Some((SyntaxKind::OPERATOR, text))
+                        } else {
+                            Some((SyntaxKind::TEXT, text))
                         }
-                        Some((SyntaxKind::OPERATOR, text))
                     }
                     '=' => {
                         self.input.next();
@@ -1297,13 +1301,13 @@ override_dh_auto_clean:
         assert_eq!(ops("X::==y\n"), vec!["::=", "="]);
         assert_eq!(ops("X:::==y\n"), vec![":::=", "="]);
         assert_eq!(ops("X ?= =y\n"), vec!["?=", "="]);
-        assert_eq!(ops("X?=?y\n"), vec!["?=", "?"]);
+        assert_eq!(ops("X?=?y\n"), vec!["?="]);
         assert_eq!(ops("X?=:y\n"), vec!["?=", ":"]);
         assert_eq!(ops("X=::y\n"), vec!["=", "::"]);
         assert_eq!(ops("X==y\n"), vec!["=", "="]);
-        assert_eq!(ops("a::?b\n"), vec!["::", "?"]);
+        assert_eq!(ops("a::?b\n"), vec!["::"]);
         assert_eq!(ops("a:::b\n"), vec!["::", ":"]);
-        assert_eq!(ops("a?:b\n"), vec!["?", ":"]);
+        assert_eq!(ops("a?:b\n"), vec![":"]);
         assert_eq!(ops("a:=:b\n"), vec![":=", ":"]);
         assert_eq!(ops("a:: b\n"), vec!["::"]);
         assert_eq!(ops("$(OBJS): %.o: %.c\n"), vec![":", ":"]);
