@@ -134,6 +134,21 @@ macro_rules! ast_node {
         }
 
         impl $ast {
+            /// Get the source range of this node, including any trailing
+            /// newline it owns.
+            ///
+            /// # Example
+            /// ```
+            /// use makefile_lossless::{Makefile, TextRange};
+            ///
+            /// let makefile: Makefile = "VAR = 1\nall:\n\techo hi\n".parse().unwrap();
+            /// let rule = makefile.rules().next().unwrap();
+            /// assert_eq!(rule.text_range(), TextRange::new(8.into(), 22.into()));
+            /// ```
+            pub fn text_range(&self) -> rowan::TextRange {
+                self.0.text_range()
+            }
+
             /// Get the line number (0-indexed) where this node starts.
             pub fn line(&self) -> usize {
                 line_col_at_offset(&self.0, self.0.text_range().start()).0

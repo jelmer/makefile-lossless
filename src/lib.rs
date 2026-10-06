@@ -57,7 +57,7 @@ pub use reference::{
     AssignOp, Modifier, ModifierArg, ModifierArgPart, ParsedReference, ReferenceError,
     ReferenceSyntaxErrorKind, SortOrder, SubstituteFlags, WordSelector,
 };
-pub use rowan::TextRange;
+pub use rowan::{TextRange, TextSize};
 pub use text::{is_in_prerequisites, variable_at_offset, word_at_offset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
