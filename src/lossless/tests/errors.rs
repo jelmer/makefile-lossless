@@ -454,6 +454,88 @@ fn error_lines(input: &str, variant: Option<MakefileVariant>) -> Vec<(ParseError
 }
 
 #[test]
+fn test_invalid_ifeq_arguments() {
+    // GNU make: "invalid syntax in conditional". The rest of the
+    // conditional is parsed as usual.
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        for input in [
+            "ifeq ()\nX = 1\nendif\n",
+            "ifeq (a)\nX = 1\nendif\n",
+            "ifneq ((a,b))\nX = 1\nendif\n",
+            "ifeq ($(a,b))\nX = 1\nendif\n",
+            "ifeq \"\"\nX = 1\nendif\n",
+            "ifeq \"a\" \nX = 1\nendif\n",
+            "ifeq \"a\" a b\nX = 1\nendif\n",
+            "ifeq \"a\" # c\nX = 1\nendif\n",
+            "ifeq x y\nX = 1\nendif\n",
+        ] {
+            assert_eq!(
+                error_lines(input, variant),
+                vec![(ParseErrorKind::InvalidConditional, 1)],
+                "{input:?}"
+            );
+            let makefile = parse(input, variant).root();
+            let names: Vec<_> = makefile
+                .variable_definitions()
+                .map(|v| v.name().unwrap())
+                .collect();
+            assert_eq!(names, vec!["X"], "{input:?}");
+        }
+        assert_eq!(
+            error_lines("ifdef A\nelse ifeq ()\nendif\n", variant),
+            vec![(ParseErrorKind::InvalidConditional, 2)]
+        );
+        for input in [
+            "ifeq (,)\nendif\n",
+            "ifeq (a,b,c)\nendif\n",
+            "ifeq ((a),(b))\nendif\n",
+            "ifeq ($(a,b),c)\nendif\n",
+            "ifeq ( \\\n , )\nendif\n",
+            "ifeq '' \"\"\nendif\n",
+        ] {
+            assert_eq!(error_lines(input, variant), vec![], "{input:?}");
+        }
+    }
+}
+
+#[test]
+fn test_duplicate_else() {
+    // GNU make: "only one 'else' per conditional".
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        for (input, line) in [
+            ("ifdef A\nX = 1\nelse\nX = 2\nelse\nX = 3\nendif\n", 5),
+            ("ifdef A\nelse\nelse ifdef B\nendif\n", 3),
+            ("ifdef A\nelse ifdef B\nelse\nelse\nendif\n", 4),
+            (
+                "all:\nifdef A\n\techo\nelse\n\techo\nelse\n\techo\nendif\n",
+                6,
+            ),
+        ] {
+            assert_eq!(
+                error_lines(input, variant),
+                vec![(ParseErrorKind::DuplicateElse, line)],
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            error_lines(
+                "ifdef A\nelse ifdef B\nelse\nifdef C\nelse\nendif\nendif\n",
+                variant
+            ),
+            vec![]
+        );
+    }
+    // BSD make only warns about an extra `.else`.
+    assert_eq!(
+        error_lines(
+            ".if 1\n.else\n.else\n.endif\n",
+            Some(MakefileVariant::BSDMake)
+        ),
+        vec![]
+    );
+}
+
+#[test]
 fn test_unterminated_block_error_line() {
     // GNU make reports a missing endef at the define line, and a
     // missing endif (like BSD make) at the line after the last one.
