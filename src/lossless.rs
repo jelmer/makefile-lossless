@@ -16093,7 +16093,7 @@ test:
             assert_eq!(parsed.errors, vec![]);
             assert_eq!(
                 node_kinds(&parsed.syntax()),
-                "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\n  RECIPE\n"
+                "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n        EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n      EXPR\n        EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\n  RECIPE\n"
             );
             assert_eq!(parsed.root().to_string(), code);
         }
