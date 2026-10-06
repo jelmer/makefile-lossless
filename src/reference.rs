@@ -615,6 +615,121 @@ impl ParsedReference {
     }
 }
 
+/// A part of make text, as returned by [`split_references`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextPart {
+    /// Text without any `$`, as written.
+    Literal(Range<usize>),
+    /// `$$`, which stands for a literal `$`.
+    EscapedDollar(Range<usize>),
+    /// A variable reference or function call starting with `$`.
+    Reference {
+        /// The byte range of the reference, from the `$` up to and including
+        /// the closing brace. If the reference is not closed, the range
+        /// extends to the end of the text.
+        range: Range<usize>,
+        /// The result of [`ParsedReference::parse`] on the text in `range`.
+        /// Error offsets are relative to the start of `range`.
+        parsed: Result<ParsedReference, ReferenceError>,
+    },
+}
+
+impl TextPart {
+    /// The byte range of this part.
+    pub fn range(&self) -> Range<usize> {
+        match self {
+            TextPart::Literal(range)
+            | TextPart::EscapedDollar(range)
+            | TextPart::Reference { range, .. } => range.clone(),
+        }
+    }
+}
+
+/// Split make text into literal text, `$$` escapes and references, with
+/// byte ranges into `text`.
+///
+/// This is meant for text that does not come straight from the source,
+/// such as [`Recipe::shell_text`](crate::Recipe::shell_text) or an include
+/// path after expansion; for the source itself, use the
+/// [`VariableReference`](crate::VariableReference) API. References are
+/// recognized as [`ParsedReference::parse_prefix`] does: for
+/// [`MakefileVariant::GNUMake`] a function call such as `$(wildcard *.c)`
+/// is a [`TextPart::Reference`] whose `parsed` is a
+/// [`ReferenceError::FunctionCall`], and for [`MakefileVariant::BSDMake`]
+/// `\#` stands for `#`. A malformed reference is still a
+/// [`TextPart::Reference`], with the error in `parsed`.
+///
+/// The parts are in order and together cover all of `text`.
+///
+/// # Example
+/// ```
+/// use makefile_lossless::{split_references, MakefileVariant, TextPart};
+///
+/// let parts = split_references("cp $(SRC) $$HOME/$@", MakefileVariant::GNUMake);
+/// assert_eq!(
+///     parts.iter().map(TextPart::range).collect::<Vec<_>>(),
+///     vec![0..3, 3..9, 9..10, 10..12, 12..17, 17..19]
+/// );
+/// assert!(matches!(&parts[1], TextPart::Reference { parsed: Ok(r), .. } if r.name == "SRC"));
+/// assert!(matches!(&parts[3], TextPart::EscapedDollar(_)));
+/// ```
+pub fn split_references(text: &str, variant: MakefileVariant) -> Vec<TextPart> {
+    let mut parts = vec![];
+    let mut pos = 0;
+    while pos < text.len() {
+        let Some(dollar) = text[pos..].find('$').map(|i| pos + i) else {
+            parts.push(TextPart::Literal(pos..text.len()));
+            break;
+        };
+        if dollar > pos {
+            parts.push(TextPart::Literal(pos..dollar));
+        }
+        if text[dollar + 1..].starts_with('$') {
+            parts.push(TextPart::EscapedDollar(dollar..dollar + 2));
+            pos = dollar + 2;
+            continue;
+        }
+        let (len, parsed) = reference_prefix(&text[dollar..], variant);
+        pos = dollar + len;
+        parts.push(TextPart::Reference {
+            range: dollar..pos,
+            parsed,
+        });
+    }
+    parts
+}
+
+/// Parse the reference at the start of `text`, which starts with a `$`
+/// that is not followed by another one, and return the length of its text
+/// along with the result.
+fn reference_prefix(
+    text: &str,
+    variant: MakefileVariant,
+) -> (usize, Result<ParsedReference, ReferenceError>) {
+    if variant == MakefileVariant::BSDMake {
+        return match ParsedReference::parse_prefix(text, variant) {
+            Ok((parsed, len)) => (len, Ok(parsed)),
+            // The extent of a malformed BSD make expression is not known;
+            // make itself gives up on the rest of the line.
+            Err(e) => (text.len(), Err(e)),
+        };
+    }
+    let mut parser = Parser::new(text);
+    let result = parser.parse_simple_expr(variant);
+    // The parser stops after the closing brace even if the body is not a
+    // variable reference, and right after the `$` if there is no name or
+    // closing brace.
+    let unclosed = result.as_ref().err().and_then(ReferenceError::syntax_kind)
+        == Some(ReferenceSyntaxErrorKind::UnclosedExpression);
+    let len = if parser.pos <= 1 && unclosed {
+        text.len()
+    } else {
+        parser.pos.max(1)
+    };
+    (len, result)
+}
+
 /// Find the extent of the BSD make expression at the start of `text`, as
 /// [`ParsedReference::parse_prefix`] does, along with the byte ranges of the
 /// expressions nested directly in it. `$$` counts as a nested expression,
@@ -1983,6 +2098,156 @@ mod tests {
         let mut modifiers = mods(text);
         assert_eq!(modifiers.len(), 1, "{:?}", modifiers);
         modifiers.remove(0)
+    }
+
+    /// The parts of `text`, as `(kind, text)` where kind is `L` for a
+    /// literal, `$` for `$$`, `R` for a reference and `E` for a malformed
+    /// reference.
+    fn split(text: &str, variant: MakefileVariant) -> Vec<(char, &str)> {
+        let parts = split_references(text, variant);
+        assert_eq!(
+            parts.iter().map(TextPart::range).fold(0, |end, range| {
+                assert_eq!(range.start, end);
+                range.end
+            }),
+            text.len()
+        );
+        parts
+            .into_iter()
+            .map(|part| {
+                let kind = match &part {
+                    TextPart::Literal(_) => 'L',
+                    TextPart::EscapedDollar(_) => '$',
+                    TextPart::Reference { parsed: Ok(_), .. } => 'R',
+                    TextPart::Reference { parsed: Err(_), .. } => 'E',
+                };
+                (kind, &text[part.range()])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_split_references() {
+        assert_eq!(
+            split("a $(B) ${C}d$E$$f", GNUMake),
+            vec![
+                ('L', "a "),
+                ('R', "$(B)"),
+                ('L', " "),
+                ('R', "${C}"),
+                ('L', "d"),
+                ('R', "$E"),
+                ('$', "$$"),
+                ('L', "f"),
+            ]
+        );
+        assert_eq!(split("", GNUMake), vec![]);
+        assert_eq!(split("plain", GNUMake), vec![('L', "plain")]);
+        assert_eq!(split("$$$$", GNUMake), vec![('$', "$$"), ('$', "$$")]);
+        assert_eq!(split("$$$X", GNUMake), vec![('$', "$$"), ('R', "$X")]);
+    }
+
+    #[test]
+    fn test_split_references_parsed() {
+        let parts = split_references("$(SRCS:.c=.o)$@", GNUMake);
+        assert_eq!(
+            parts,
+            vec![
+                TextPart::Reference {
+                    range: 0..13,
+                    parsed: ParsedReference::parse("$(SRCS:.c=.o)", GNUMake),
+                },
+                TextPart::Reference {
+                    range: 13..15,
+                    parsed: Ok(ParsedReference {
+                        name: "@".to_string(),
+                        modifiers: vec![],
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_references_nested() {
+        assert_eq!(
+            split("x$(A_$(B))y${C$(D)}", GNUMake),
+            vec![
+                ('L', "x"),
+                ('R', "$(A_$(B))"),
+                ('L', "y"),
+                ('R', "${C$(D)}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_references_function_call() {
+        let parts = split_references("$(wildcard *.c) $(X)", GNUMake);
+        assert_eq!(
+            parts[0],
+            TextPart::Reference {
+                range: 0..15,
+                parsed: Err(ReferenceError::FunctionCall {
+                    name: "wildcard".to_string()
+                }),
+            }
+        );
+        assert_eq!(
+            split("$(wildcard *.c) $(X)", GNUMake),
+            vec![('E', "$(wildcard *.c)"), ('L', " "), ('R', "$(X)")]
+        );
+        // Only GNU make has functions.
+        assert_eq!(
+            split("$(wildcard *.c)", POSIXMake),
+            vec![('R', "$(wildcard *.c)")]
+        );
+    }
+
+    #[test]
+    fn test_split_references_malformed() {
+        assert_eq!(split("a $(B c", GNUMake), vec![('L', "a "), ('E', "$(B c")]);
+        assert_eq!(split("a $", GNUMake), vec![('L', "a "), ('E', "$")]);
+        // The nested reference is unclosed, but the outer one is closed.
+        assert_eq!(
+            split("$(X:a=${A) b", GNUMake),
+            vec![('E', "$(X:a=${A)"), ('L', " b")]
+        );
+    }
+
+    #[test]
+    fn test_split_references_bsd() {
+        assert_eq!(
+            split("cc ${SRCS:M*.c:S/$/x/} -o $@ $$x", BSDMake),
+            vec![
+                ('L', "cc "),
+                ('R', "${SRCS:M*.c:S/$/x/}"),
+                ('L', " -o "),
+                ('R', "$@"),
+                ('L', " "),
+                ('$', "$$"),
+                ('L', "x"),
+            ]
+        );
+        assert_eq!(
+            split("${A:S/\\#/x/} \\#", BSDMake),
+            vec![('R', "${A:S/\\#/x/}"), ('L', " \\#")]
+        );
+        assert_eq!(split("${A:S} ${B}", BSDMake), vec![('E', "${A:S} ${B}")]);
+    }
+
+    #[test]
+    fn test_split_references_nmake() {
+        assert_eq!(
+            split("$(CC) $@ $(OBJS:.obj=.o)", NMake),
+            vec![
+                ('R', "$(CC)"),
+                ('L', " "),
+                ('R', "$@"),
+                ('L', " "),
+                ('R', "$(OBJS:.obj=.o)"),
+            ]
+        );
     }
 
     fn reference(name: &str, modifiers: Vec<Modifier>) -> ParsedReference {

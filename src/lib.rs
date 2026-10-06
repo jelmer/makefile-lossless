@@ -53,6 +53,7 @@ pub use lossless::{
     VariableReference, Vpath,
 };
 pub use parse::Parse;
+pub use reference::{split_references, TextPart};
 pub use reference::{
     AssignOp, Modifier, ModifierArg, ModifierArgPart, ParsedReference, ReferenceError,
     ReferenceSyntaxErrorKind, SortOrder, SubstituteFlags, WordSelector,
