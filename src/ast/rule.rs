@@ -705,7 +705,8 @@ impl Rule {
     ///
     /// Order-only prerequisites (those after a `|`) are not included; see
     /// [`Rule::order_only_prerequisites`]. As with [`Rule::targets`], `\#`
-    /// is unescaped and other backslashes are kept as written. Line
+    /// is unescaped and other backslashes are kept as written: `a\|b` is
+    /// the single prerequisite `a\|b`, which GNU make reads as `a|b`. Line
     /// continuations are collapsed as GNU make does; see
     /// [`Self::prerequisites_for`] for other variants.
     ///
@@ -737,7 +738,7 @@ impl Rule {
     }
 
     /// Get the order-only prerequisites in the rule, i.e. those after the
-    /// first `|` in the prerequisite list. These are read as for
+    /// first unescaped `|` in the prerequisite list. These are read as for
     /// [`Rule::prerequisites`].
     ///
     /// # Example
@@ -2932,6 +2933,46 @@ mod tests {
             parse_rule_names(text, crate::MakefileVariant::BSDMake).1,
             vec!["a\\b", "c\\", "d", "e\\:f"]
         );
+    }
+
+    #[test]
+    fn test_prerequisite_escaped_pipe() {
+        // GNU make reads `a\|b` as the single prerequisite `a|b`, but `\\|`
+        // is an escaped backslash followed by the order-only separator.
+        let cases: [(&str, &[&str], &[&str]); 5] = [
+            ("all: a\\|b c\n", &["a\\|b", "c"], &[]),
+            ("all: a \\|b\n", &["a", "\\|b"], &[]),
+            ("all: a\\|\n", &["a\\|"], &[]),
+            ("all: a\\\\|b c\n", &["a\\\\"], &["b", "c"]),
+            ("all: a\\|b | c\\|d\n", &["a\\|b"], &["c\\|d"]),
+        ];
+        for (text, normal, order_only) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            assert_eq!(makefile.to_string(), text);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), normal, "{text:?}");
+            assert_eq!(
+                rule.order_only_prerequisites().collect::<Vec<_>>(),
+                order_only,
+                "{text:?}"
+            );
+        }
+        // BSD make has no order-only prerequisites.
+        assert_eq!(
+            parse_rule_names("all: a\\|b c\n", crate::MakefileVariant::BSDMake).1,
+            vec!["a\\|b", "c"]
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_escaped_semicolon() {
+        // GNU make does not honour `\;`: the `;` still starts the recipe.
+        let text = "all: a\\;b c\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.to_string(), text);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a\\"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["b c"]);
     }
 
     #[test]
