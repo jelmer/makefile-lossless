@@ -22,6 +22,19 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
     }
 }
 
+/// Whether an item appended to `root` needs a blank line before it, i.e.
+/// the makefile is neither empty nor already ends in a blank line. The
+/// text must end in a line ending unless empty; see
+/// [`terminate_line_before`].
+fn needs_blank_line_at_end(root: &SyntaxNode) -> bool {
+    let text = root.text().to_string();
+    let Some(body) = text.strip_suffix('\n') else {
+        return false;
+    };
+    let last_line = body.rsplit('\n').next().unwrap_or(body);
+    !last_line.trim().is_empty()
+}
+
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
 #[non_exhaustive]
@@ -901,7 +914,9 @@ impl Makefile {
 
     /// Add a new rule to the makefile
     ///
-    /// The target is escaped as by [`Rule::set_targets`].
+    /// The target is escaped as by [`Rule::set_targets`]. The rule is
+    /// separated from any preceding content by a blank line, unless the
+    /// makefile already ends in one.
     ///
     /// # Panics
     ///
@@ -951,11 +966,7 @@ impl Makefile {
             &eol,
         );
 
-        // Add a blank line before the new rule if there are existing rules
-        // This maintains standard makefile formatting
-        let needs_blank_line = self.syntax().children().any(|c| c.kind() == RULE);
-
-        if needs_blank_line {
+        if needs_blank_line_at_end(self.syntax()) {
             // Create a BLANK_LINE node
             let mut bl_builder = GreenNodeBuilder::new();
             bl_builder.start_node(BLANK_LINE.into());
@@ -2663,6 +2674,42 @@ override_dh_auto_configure:
     }
 
     #[test]
+    fn test_add_rule_blank_line() {
+        let cases = [
+            ("", "b:\n"),
+            ("all: a\n", "all: a\n\nb:\n"),
+            ("all: a\n\n", "all: a\n\nb:\n"),
+            ("all: a\n\n\n", "all: a\n\n\nb:\n"),
+            ("all:\n\techo\n", "all:\n\techo\n\nb:\n"),
+            ("all:\n\techo\n\n", "all:\n\techo\n\nb:\n"),
+            ("ifdef X\nall:\nendif\n", "ifdef X\nall:\nendif\n\nb:\n"),
+            ("ifdef X\nall:\nendif\n\n", "ifdef X\nall:\nendif\n\nb:\n"),
+            ("X = 1\n", "X = 1\n\nb:\n"),
+            ("X = 1\n\n", "X = 1\n\nb:\n"),
+            ("# comment\n", "# comment\n\nb:\n"),
+            ("include a.mk\n", "include a.mk\n\nb:\n"),
+            ("\n", "\nb:\n"),
+            ("all:\r\n\r\n", "all:\r\n\r\nb:\r\n"),
+        ];
+        for (text, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.add_rule("b");
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(
+                reparsed
+                    .rules()
+                    .last()
+                    .unwrap()
+                    .targets()
+                    .collect::<Vec<_>>(),
+                vec!["b"],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_try_add_rule() {
         let mut makefile: Makefile = "all: $(OBJS) a#b\n".parse().unwrap();
         for target in ["$(OBJS)", "a#b", "$(call f,x y)", "lib(a.o)", "a\\ b"] {
@@ -3308,21 +3355,21 @@ VAR3 = value3
     fn test_add_rule_after_unterminated_line() {
         let mut makefile: Makefile = "X = 1".parse().unwrap();
         makefile.add_rule("b");
-        assert_eq!(makefile.to_string(), "X = 1\nb:\n");
+        assert_eq!(makefile.to_string(), "X = 1\n\nb:\n");
     }
 
     #[test]
     fn test_add_rule_after_unterminated_define() {
         let mut makefile: Makefile = "define V\nx\nendef".parse().unwrap();
         makefile.add_rule("b");
-        assert_eq!(makefile.to_string(), "define V\nx\nendef\nb:\n");
+        assert_eq!(makefile.to_string(), "define V\nx\nendef\n\nb:\n");
     }
 
     #[test]
     fn test_add_rule_after_unterminated_conditional() {
         let mut makefile: Makefile = "ifdef X\nY = 1\nendif".parse().unwrap();
         makefile.add_rule("b");
-        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\nb:\n");
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\n\nb:\n");
     }
 
     #[test]
@@ -3374,7 +3421,7 @@ VAR3 = value3
     fn test_add_phony_target_after_unterminated_line() {
         let mut makefile: Makefile = "X = 1".parse().unwrap();
         makefile.add_phony_target("clean").unwrap();
-        assert_eq!(makefile.to_string(), "X = 1\n.PHONY: clean\n");
+        assert_eq!(makefile.to_string(), "X = 1\n\n.PHONY: clean\n");
     }
 
     #[test]
