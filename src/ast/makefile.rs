@@ -1,7 +1,8 @@
 use super::{line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
-    parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
-    Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
+    line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
+    ForLoop, Include, Load, Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition,
+    VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
 use crate::MakefileVariant;
@@ -97,6 +98,31 @@ impl MakefileItem {
     /// This is cheap, unlike computing the line number.
     pub fn text_range(&self) -> rowan::TextRange {
         self.syntax().text_range()
+    }
+
+    /// Get the line number (0-indexed) where this item starts.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "VAR = 1\n\nall:\n\techo\n".parse().unwrap();
+    /// let lines: Vec<_> = makefile.items().map(|item| item.line()).collect();
+    /// assert_eq!(lines, vec![0, 2]);
+    /// ```
+    pub fn line(&self) -> usize {
+        self.line_col().0
+    }
+
+    /// Get the column number (0-indexed, in bytes) where this item starts.
+    pub fn column(&self) -> usize {
+        self.line_col().1
+    }
+
+    /// Get both line and column (0-indexed) where this item starts.
+    /// Returns (line, column) where column is measured in bytes from the start of the line.
+    pub fn line_col(&self) -> (usize, usize) {
+        let node = self.syntax();
+        line_col_at_offset(node, node.text_range().start())
     }
 
     /// Helper to get parent node or return an appropriate error
@@ -1759,6 +1785,53 @@ impl Makefile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_makefile_item_line_col() {
+        let text = "VAR = 1\nall: dep\n\techo\ninclude foo.mk\nvpath %.c src\n.undef VAR\n$(info hi)\nload foo.so\n.for x in a b\n.endfor\nifdef X\na:\nelse\nb:\nendif\n\techo hi\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.to_string(), text);
+        let items: Vec<_> = makefile
+            .items()
+            .map(|item| {
+                let kind = match item {
+                    MakefileItem::Rule(_) => "rule",
+                    MakefileItem::Variable(_) => "variable",
+                    MakefileItem::Include(_) => "include",
+                    MakefileItem::Conditional(_) => "conditional",
+                    MakefileItem::Vpath(_) => "vpath",
+                    MakefileItem::ForLoop(_) => "for",
+                    MakefileItem::Directive(_) => "directive",
+                    MakefileItem::ExpressionStatement(_) => "expression",
+                    MakefileItem::Load(_) => "load",
+                    MakefileItem::Recipe(_) => "recipe",
+                };
+                (kind, item.line(), item.column(), item.line_col())
+            })
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("variable", 0, 0, (0, 0)),
+                ("rule", 1, 0, (1, 0)),
+                ("include", 3, 0, (3, 0)),
+                ("vpath", 4, 0, (4, 0)),
+                ("directive", 5, 0, (5, 0)),
+                ("expression", 6, 0, (6, 0)),
+                ("load", 7, 0, (7, 0)),
+                ("for", 8, 0, (8, 0)),
+                ("conditional", 10, 0, (10, 0)),
+                ("recipe", 15, 0, (15, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_makefile_item_column() {
+        let makefile: Makefile = "\n  VAR = 1\n".parse().unwrap();
+        let item = makefile.items().next().unwrap();
+        assert_eq!(item.line_col(), (1, 2));
+    }
 
     #[test]
     fn test_makefile_item_replace_variable_with_variable() {

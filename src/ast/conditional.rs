@@ -123,6 +123,33 @@ impl ConditionalItem {
     pub fn text_range(&self) -> rowan::TextRange {
         self.syntax().text_range()
     }
+
+    /// Get the line number (0-indexed) where this item starts.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nX = 1\n\nY = 2\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let branch = cond.branches().next().unwrap();
+    /// let lines: Vec<_> = branch.items().map(|item| item.line()).collect();
+    /// assert_eq!(lines, vec![1, 3]);
+    /// ```
+    pub fn line(&self) -> usize {
+        self.line_col().0
+    }
+
+    /// Get the column number (0-indexed, in bytes) where this item starts.
+    pub fn column(&self) -> usize {
+        self.line_col().1
+    }
+
+    /// Get both line and column (0-indexed) where this item starts.
+    /// Returns (line, column) where column is measured in bytes from the start of the line.
+    pub fn line_col(&self) -> (usize, usize) {
+        let node = self.syntax();
+        line_col_at_offset(node, node.text_range().start())
+    }
 }
 
 /// A single branch of a [`Conditional`]: the initial `if`, an `else if`
@@ -923,6 +950,53 @@ mod tests {
         BsdComparisonOp, BsdCondition, BsdConditionError, BsdFunction, BsdOperand, MakefileItem,
         MakefileVariant, ParseErrorKind, RuleItem,
     };
+
+    #[test]
+    fn test_conditional_item_line_col() {
+        let text = "ifdef X\nVAR = 1\nall:\n\techo\n  ifdef Y\n  endif\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.to_string(), text);
+        let cond = makefile.conditionals().next().unwrap();
+        let branch = cond.branches().next().unwrap();
+        let items: Vec<_> = branch
+            .items()
+            .map(|item| {
+                let kind = match item {
+                    ConditionalItem::Item(MakefileItem::Variable(_)) => "variable",
+                    ConditionalItem::Item(MakefileItem::Rule(_)) => "rule",
+                    ConditionalItem::Item(MakefileItem::Conditional(_)) => "conditional",
+                    ConditionalItem::Recipe(_) => "recipe",
+                    _ => "other",
+                };
+                (kind, item.line(), item.column(), item.line_col())
+            })
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("variable", 1, 0, (1, 0)),
+                ("rule", 2, 0, (2, 0)),
+                ("conditional", 4, 2, (4, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_conditional_item_recipe_line_col() {
+        let text = "all:\nifdef X\n\techo x\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.to_string(), text);
+        let rule = makefile.rules().next().unwrap();
+        let Some(RuleItem::Conditional(cond)) = rule.items().next() else {
+            panic!("expected conditional");
+        };
+        let branch = cond.branches().next().unwrap();
+        let items: Vec<_> = branch
+            .items()
+            .map(|item| (matches!(item, ConditionalItem::Recipe(_)), item.line_col()))
+            .collect();
+        assert_eq!(items, vec![(true, (2, 0))]);
+    }
 
     fn describe_item(item: ConditionalItem) -> String {
         match item {
