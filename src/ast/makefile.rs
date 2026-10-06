@@ -1769,10 +1769,13 @@ impl Makefile {
 
     /// Insert an include directive at a specific position
     ///
-    /// The position is relative to other top-level items (rules, variables, includes, conditionals).
-    /// If the item at `index` has comment lines directly above it, with no
-    /// blank line in between, the include is inserted before them, since
-    /// they document that item.
+    /// `index` is a position in [`Makefile::items`], which only has top-level
+    /// items: the include is inserted directly before the item at `index`,
+    /// after any blank lines preceding it, or appended to the end of the
+    /// makefile if `index` is `items().count()`. No blank lines are added
+    /// around it. If the item at `index` has comment lines directly above
+    /// it, with no blank line in between, the include is inserted before
+    /// them, since they document that item.
     ///
     /// # Arguments
     /// * `index` - The position to insert at (0 = beginning, items().count() = end)
@@ -1791,7 +1794,7 @@ impl Makefile {
     /// assert_eq!(items.len(), 3); // VAR, include, rule
     /// ```
     pub fn insert_include(&mut self, index: usize, path: &str) -> Result<Include, Error> {
-        let items: Vec<_> = self.syntax().children().collect();
+        let items: Vec<_> = self.items().collect();
 
         if index > items.len() {
             return Err(Error::Parse(ParseError {
@@ -1807,28 +1810,25 @@ impl Makefile {
         let eol = line_ending(self.syntax());
         let syntax = Include::new(path, &eol)?.syntax().clone();
 
-        let target_index = if index == items.len() {
-            // Insert at the end
-            self.syntax().children_with_tokens().count()
-        } else {
+        let target_index = match items.get(index) {
             // Insert before the item at the given index, and any comment
             // documenting it
-            index_before_doc_comment(&items[index])
+            Some(item) => index_before_doc_comment(item.syntax()),
+            None => self.syntax().children_with_tokens().count(),
         };
 
-        // Insert the include node
         let target_index = terminate_line_before(self.syntax(), target_index, &eol);
         self.syntax()
-            .splice_children(target_index..target_index, vec![syntax.into()]);
+            .splice_children(target_index..target_index, vec![syntax.clone().into()]);
 
-        // Find and return the newly added include
-        // It should be at the child index we inserted at
-        Ok(Include::cast(self.syntax().children().nth(index).unwrap()).unwrap())
+        Ok(Include::cast(syntax).unwrap())
     }
 
     /// Insert an include directive after a specific MakefileItem
     ///
     /// This is useful when you want to insert an include relative to another item in the makefile.
+    /// `after` may be nested, e.g. in a conditional, in which case the include
+    /// is inserted in the same branch.
     ///
     /// # Arguments
     /// * `after` - The MakefileItem to insert after
@@ -1852,23 +1852,10 @@ impl Makefile {
         after: &MakefileItem,
         path: &str,
     ) -> Result<Include, Error> {
-        let eol = line_ending(self.syntax());
-        let syntax = Include::new(path, &eol)?.syntax().clone();
-
-        // Find the position of the item to insert after
         let after_syntax = after.syntax();
-        let target_index = terminate_line_before(self.syntax(), index_after(after_syntax), &eol);
-
-        // Insert the include node after the target item
-        self.syntax()
-            .splice_children(target_index..target_index, vec![syntax.into()]);
-
-        // Find and return the newly added include
-        // It should be the child immediately after the 'after' item
-        let after_child_index = self
-            .syntax()
-            .children()
-            .position(|child| child.text_range() == after_syntax.text_range())
+        let parent = after_syntax
+            .parent()
+            .filter(|_| after_syntax.ancestors().last().as_ref() == Some(self.syntax()))
             .ok_or_else(|| {
                 Error::Parse(ParseError {
                     errors: vec![ErrorInfo {
@@ -1880,7 +1867,13 @@ impl Makefile {
                 })
             })?;
 
-        Ok(Include::cast(self.syntax().children().nth(after_child_index + 1).unwrap()).unwrap())
+        let eol = line_ending(self.syntax());
+        let syntax = Include::new(path, &eol)?.syntax().clone();
+
+        let target_index = terminate_line_before(&parent, index_after(after_syntax), &eol);
+        parent.splice_children(target_index..target_index, vec![syntax.clone().into()]);
+
+        Ok(Include::cast(syntax).unwrap())
     }
 }
 
@@ -3926,6 +3919,102 @@ VAR3 = value3
         assert_eq!(makefile.to_string(), "a:\n\techo a \\\n\n\techo b\n");
         assert_eq!(rule.recipe_count(), 2);
         assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_index_skips_blank_lines() {
+        let cases = [
+            ("X = 1\n\nY = 2\n", 0, "include a.mk\nX = 1\n\nY = 2\n"),
+            ("X = 1\n\nY = 2\n", 1, "X = 1\n\ninclude a.mk\nY = 2\n"),
+            ("X = 1\n\nY = 2\n", 2, "X = 1\n\nY = 2\ninclude a.mk\n"),
+            ("\n\nX = 1\n", 0, "\n\ninclude a.mk\nX = 1\n"),
+            ("\n\nX = 1\n", 1, "\n\nX = 1\ninclude a.mk\n"),
+            ("X = 1\n\n", 1, "X = 1\n\ninclude a.mk\n"),
+            ("a:\n\techo\n\nb:\n", 1, "a:\n\techo\n\ninclude a.mk\nb:\n"),
+            (
+                "X = 1\n\n# doc\nY = 2\n",
+                1,
+                "X = 1\n\ninclude a.mk\n# doc\nY = 2\n",
+            ),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            let include = makefile.insert_include(index, "a.mk").unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            assert_eq!(include.path(), Some("a.mk".to_string()));
+            assert_eq!(
+                makefile.items().nth(index).unwrap().syntax(),
+                include.syntax(),
+                "{text:?} at {index}"
+            );
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_insert_include_index_out_of_bounds_with_blank_lines() {
+        let mut makefile: Makefile = "X = 1\n\nY = 2\n".parse().unwrap();
+        let Err(err) = makefile.insert_include(3, "a.mk") else {
+            panic!("expected an error");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Parse error: Error at line 1: Index 3 out of bounds (max 2)\n1| insert_include\n"
+        );
+        assert_eq!(makefile.to_string(), "X = 1\n\nY = 2\n");
+    }
+
+    #[test]
+    fn test_insert_include_after_nested_item() {
+        let mut makefile: Makefile = "ifdef X\nA = 1\nendif\nB = 2\n".parse().unwrap();
+        let a = makefile
+            .conditionals()
+            .next()
+            .unwrap()
+            .if_items()
+            .next()
+            .unwrap();
+        let include = makefile.insert_include_after(&a, "a.mk").unwrap();
+        assert_eq!(include.path(), Some("a.mk".to_string()));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nA = 1\ninclude a.mk\nendif\nB = 2\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_after_nested_item_before_doc_comment() {
+        let mut makefile: Makefile = "ifdef X\nA = 1\n# doc\nB = 2\nendif\n".parse().unwrap();
+        let a = makefile
+            .conditionals()
+            .next()
+            .unwrap()
+            .if_items()
+            .next()
+            .unwrap();
+        makefile.insert_include_after(&a, "a.mk").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nA = 1\ninclude a.mk\n# doc\nB = 2\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_after_foreign_item() {
+        let mut makefile: Makefile = "A = 1\n".parse().unwrap();
+        let other: Makefile = "B = 2\n".parse().unwrap();
+        let b = other.items().next().unwrap();
+        let Err(err) = makefile.insert_include_after(&b, "a.mk") else {
+            panic!("expected an error");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Parse error: Error at line 1: Could not find the reference item\n1| insert_include_after\n"
+        );
+        assert_eq!(makefile.to_string(), "A = 1\n");
+        assert_eq!(other.to_string(), "B = 2\n");
     }
 
     #[test]
