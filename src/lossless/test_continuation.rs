@@ -1,4 +1,5 @@
 use super::*;
+use crate::MakefileVariant;
 
 #[test]
 fn test_recipe_continuation_lines() {
@@ -531,4 +532,113 @@ fn test_parse_unexpected_tokens_at_top_level_does_not_panic() {
             "round-trip mismatch for {src:?}"
         );
     }
+}
+
+/// The text of each line continuation in `text`, with the text before it.
+fn continuations(text: &str, variant: MakefileVariant) -> Vec<(&str, &str)> {
+    let makefile = Makefile::parse_with_variant(text, variant).tree();
+    makefile
+        .line_continuations()
+        .map(|range| {
+            let start = usize::from(range.start());
+            (&text[..start], &text[range])
+        })
+        .collect()
+}
+
+#[test]
+fn test_line_continuations() {
+    let text = "A = a \\\n  b\nall: x \\\n  y\n\techo \\\n\t  z\n# c \\\n d\n";
+    assert_eq!(
+        continuations(text, MakefileVariant::GNUMake),
+        vec![
+            ("A = a ", "\\\n"),
+            ("A = a \\\n  b\nall: x ", "\\\n"),
+            ("A = a \\\n  b\nall: x \\\n  y\n\techo ", "\\\n"),
+            (
+                "A = a \\\n  b\nall: x \\\n  y\n\techo \\\n\t  z\n# c ",
+                "\\\n"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_line_continuations_ranges() {
+    let makefile: Makefile = "all: a \\\n  b\n\techo \\\r\n\tc\n".parse().unwrap();
+    assert_eq!(
+        makefile.line_continuations().collect::<Vec<_>>(),
+        vec![
+            rowan::TextRange::new(7.into(), 9.into()),
+            rowan::TextRange::new(19.into(), 22.into()),
+        ]
+    );
+}
+
+#[test]
+fn test_line_continuations_escaped_backslash() {
+    assert_eq!(
+        continuations(
+            "A = a \\\\\nB = b \\\\\\\n  c\nall:\n\techo \\\\\n\techo \\\\\\\n",
+            MakefileVariant::GNUMake
+        ),
+        vec![
+            ("A = a \\\\\nB = b \\\\", "\\\n"),
+            (
+                "A = a \\\\\nB = b \\\\\\\n  c\nall:\n\techo \\\\\n\techo \\\\",
+                "\\\n"
+            ),
+        ]
+    );
+    // A backslash at the end of the text does not continue anything.
+    assert_eq!(continuations("A = a \\", MakefileVariant::GNUMake), vec![]);
+}
+
+#[test]
+fn test_line_continuations_crlf() {
+    let text = "A = a \\\r\n  b\r\n# c \\\r\n d\r\nall:\r\n\techo \\\r\n\t  e\r\n";
+    assert_eq!(
+        continuations(text, MakefileVariant::GNUMake)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>(),
+        vec!["\\\r\n", "\\\r\n", "\\\r\n"]
+    );
+}
+
+#[test]
+fn test_line_continuations_define_and_conditional() {
+    let text = "define X\na \\\nb\nendef\nifdef Y\nZ = $(subst a \\\n  b,c,d)\nendif\n";
+    assert_eq!(
+        continuations(text, MakefileVariant::GNUMake),
+        vec![
+            ("define X\na ", "\\\n"),
+            ("define X\na \\\nb\nendef\nifdef Y\nZ = $(subst a ", "\\\n"),
+        ]
+    );
+}
+
+#[test]
+fn test_line_continuations_bsd() {
+    let text =
+        ".for f in a \\\n  b\nX += ${f}\n.endfor\n.if defined(A) || \\\n  defined(B)\n.endif\n";
+    assert_eq!(
+        continuations(text, MakefileVariant::BSDMake),
+        vec![
+            (".for f in a ", "\\\n"),
+            (
+                ".for f in a \\\n  b\nX += ${f}\n.endfor\n.if defined(A) || ",
+                "\\\n"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_line_continuations_nmake() {
+    let text = "A = x ^\\\nB = y \\\n  z\n";
+    assert_eq!(
+        continuations(text, MakefileVariant::NMake),
+        vec![("A = x ^\\\nB = y ", "\\\n")]
+    );
 }
