@@ -3973,10 +3973,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Parse an indented command line outside of rule context. GNU make
-        /// parses it like any other line, while BSD make, POSIX and nmake
-        /// read it as a command line, which is an error without a target.
-        /// Inside a conditional it is only an error if make takes that
-        /// branch, as lines in other branches are skipped unread.
+        /// parses it like any other line if it is a statement, while BSD
+        /// make, POSIX and nmake read it as a command line. Either way, a
+        /// command line is an error without a target. For BSD make, inside
+        /// a conditional it is only an error if make takes that branch, as
+        /// lines in other branches are skipped unread.
         fn parse_indented_line_outside_rule(&mut self) {
             if self.indented_lines_are_commands() {
                 if self.at_bsd_comment_line() {
@@ -3990,8 +3991,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     );
                 }
                 self.parse_recipe_line();
-            } else {
+            } else if self.indented_line_is_statement() {
                 self.relex_as_non_recipe_line();
+            } else {
+                self.record_error(
+                    ParseErrorKind::RecipeBeforeFirstTarget,
+                    "indented line not part of a rule".to_string(),
+                );
+                self.parse_recipe_line();
             }
         }
 
@@ -4048,8 +4055,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether the tab-indented line at the current position, read as an
-        /// ordinary line, is valid outside of rule context: anything but a
-        /// line that can only be a rule and has no dependency operator.
+        /// ordinary line, is valid outside of rule context in GNU make: a
+        /// comment, blank line, directive or assignment. Expressions and
+        /// rules are not.
         fn indented_line_is_statement(&mut self) -> bool {
             let (mut line, _) = self.lex_as_non_recipe_line();
             line.reverse();
@@ -4072,8 +4080,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         || (self.bsd_directives_enabled() && self.is_bsd_assignment_line())
                         || self.at_include_keyword()
                         || self.at_load_keyword()
-                        || self.is_expression_statement_line()
-                        || self.line_has_dependency_operator()
                 }
             };
             self.tokens = tokens;
@@ -12420,7 +12426,7 @@ override_dh_install:
                 .iter()
                 .map(|e| e.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["expected ':'"]
+            vec!["indented line not part of a rule"]
         );
 
         // Should preserve the code
@@ -14726,6 +14732,80 @@ test:
     }
 
     #[test]
+    fn test_tab_indented_lines_outside_rule() {
+        // GNU make reads a tab-indented line outside of rule context as an
+        // ordinary line only if it is a comment, directive or assignment;
+        // anything else is "recipe commences before first target", even if
+        // it is an expression that expands to nothing. BSD make, POSIX and
+        // nmake read every such line as a command.
+        let error = vec![ParseErrorKind::RecipeBeforeFirstTarget];
+        for (line, gnu) in [
+            ("\t$(info hi)\n", error.clone()),
+            ("\t$(eval X=1)\n", error.clone()),
+            ("\t$(X)\n", error.clone()),
+            ("\t$(info a) ; b\n", error.clone()),
+            ("\techo hi\n", error.clone()),
+            ("\tfoo: bar\n", error.clone()),
+            ("\tX = 1\n", vec![]),
+            ("\texport X\n", vec![]),
+            ("\tinclude foo.mk\n", vec![]),
+            ("\tifdef X\nendif\n", vec![]),
+            ("\t# c\n", vec![]),
+            ("\t\n", vec![]),
+        ] {
+            for prefix in ["", "a:\n\techo a\nY = 1\n"] {
+                let input = format!("{}{}all:\n\techo ok\n", prefix, line);
+                for variant in [None, Some(MakefileVariant::GNUMake)] {
+                    assert_eq!(
+                        error_kinds(&input, variant),
+                        gnu,
+                        "{:?} {:?}",
+                        variant,
+                        input
+                    );
+                    assert_eq!(parse(&input, variant).root().to_string(), input);
+                }
+                if line.starts_with("\t#") || line == "\t\n" || line.contains("ifdef") {
+                    continue;
+                }
+                for variant in [
+                    MakefileVariant::BSDMake,
+                    MakefileVariant::POSIXMake,
+                    MakefileVariant::NMake,
+                ] {
+                    assert_eq!(
+                        error_kinds(&input, Some(variant)),
+                        error,
+                        "{:?} {:?}",
+                        variant,
+                        input
+                    );
+                    assert_eq!(parse(&input, Some(variant)).root().to_string(), input);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tab_indented_expression_outside_rule_is_recipe() {
+        let input = "\t$(info hi)\nall:\n\techo ok\n";
+        let parsed = parse(input, None);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.line, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "indented line not part of a rule")]
+        );
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RECIPE\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n"
+        );
+        assert_eq!(parsed.root().to_string(), input);
+    }
+
+    #[test]
     fn test_error_kind_conditionals() {
         assert_eq!(
             error_kinds("ifdef FOO\nX = 1\n", None),
@@ -15636,7 +15716,7 @@ test:
                 .iter()
                 .map(|e| (e.line, e.message.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(8, "unexpected token TEXT"), (8, "expected ':'")]
+            vec![(8, "indented line not part of a rule")]
         );
         assert_eq!(parsed.root().code(), input);
     }
@@ -15657,13 +15737,13 @@ test:
 
     #[test]
     fn test_statements_after_conditional_ending_rule_on_some_paths() {
+        // GNU make only reads directives, assignments and comments as such
+        // outside of rule context; other lines are recipe lines of `all` if
+        // X is undefined, or "recipe commences before first target".
         let prefix = "all:\n\t@echo a\nifdef X\nY=1\nendif\n";
         for (line, kinds) in [
-            ("\t$(info x)\n", "EXPRESSION_STATEMENT\n  EXPR\n"),
-            (
-                "\tfoo: bar\n",
-                "RULE\n  TARGETS\n  PREREQUISITES\n    PREREQUISITE\n",
-            ),
+            ("\t$(info x)\n", "RECIPE\n"),
+            ("\tfoo: bar\n", "RECIPE\n"),
             ("\tinclude foo.mk\n", "INCLUDE\n  EXPR\n"),
             ("\t# comment\n", ""),
         ] {
@@ -15734,7 +15814,7 @@ test:
         assert_eq!(
             parsed.errors,
             vec![ErrorInfo {
-                message: "expected ':'".to_string(),
+                message: "indented line not part of a rule".to_string(),
                 line: 4,
                 context: "\techo b".to_string(),
                 kind: ParseErrorKind::RecipeBeforeFirstTarget,
