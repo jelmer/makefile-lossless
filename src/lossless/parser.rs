@@ -2521,18 +2521,29 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // Check if we have parenthesized or quoted syntax
             if self.current() == Some(LPAREN) {
                 // Parenthesized syntax: ifeq (arg1,arg2)
+                let start = self.current_range().start();
                 self.bump(); // Consume opening paren
-                self.parse_parenthesized_expr_internal(false);
+                if self.parse_parenthesized_expr_internal(false) == Some(false) {
+                    // As in `ifeq ()` or `ifeq (a)`.
+                    let range = rowan::TextRange::new(start, self.current_range().start());
+                    let line = self.line_at(start);
+                    self.push_error(
+                        ParseErrorKind::InvalidConditional,
+                        "invalid syntax in conditional: expected two arguments separated by a comma"
+                            .to_string(),
+                        range,
+                        line,
+                    );
+                }
             } else if self.current() == Some(QUOTE) {
                 // Quoted syntax: ifeq "arg1" "arg2" or ifeq 'arg1' 'arg2'
                 self.parse_quoted_comparison();
             } else {
-                self.error(
+                self.record_error(
                     ParseErrorKind::InvalidConditional,
                     "expected opening parenthesis or quote".to_string(),
                 );
-                self.builder.finish_node();
-                return;
+                self.skip_invalid_condition();
             }
 
             self.builder.finish_node();
@@ -2541,9 +2552,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.expect_eol();
         }
 
-        // Internal helper to parse parenthesized expressions
-        fn parse_parenthesized_expr_internal(&mut self, is_variable_ref: bool) {
+        /// Parse the rest of a parenthesized expression, after its opening
+        /// parenthesis. Returns `None` if it is not closed on the line, and
+        /// otherwise whether it contains a comma outside of nested
+        /// parentheses and variable references.
+        fn parse_parenthesized_expr_internal(&mut self, is_variable_ref: bool) -> Option<bool> {
             let mut paren_count = 1;
+            let mut top_level_comma = false;
             // Each nested LPAREN opens an EXPR node that the matching RPAREN
             // closes. If EOF arrives before those RPARENs do, we must still
             // close them or the green tree ends up unbalanced (rowan panics
@@ -2574,6 +2589,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Handle variable references
                         self.parse_variable_reference();
                     }
+                    Some(COMMA) => {
+                        top_level_comma |= paren_count == 1;
+                        self.bump();
+                    }
                     // Leave the newline for the caller, like GNU make,
                     // which does not let the reference span lines.
                     Some(NEWLINE) | None => {
@@ -2597,6 +2616,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             for _ in 0..open_nested {
                 self.builder.finish_node();
             }
+            (paren_count == 0).then_some(top_level_comma)
         }
 
         /// Parse the arguments of `ifeq "a" "b"`. Each argument ends at the
@@ -2608,10 +2628,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.skip_ws_and_continuations();
                 }
                 if self.current() != Some(QUOTE) {
-                    self.error(
+                    self.record_error(
                         ParseErrorKind::InvalidConditional,
                         format!("expected {which} quoted argument"),
                     );
+                    self.skip_invalid_condition();
                     return;
                 }
                 if !self.parse_quoted_argument() {
@@ -2622,6 +2643,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     return;
                 }
             }
+        }
+
+        /// Put the rest of an invalid `ifeq` condition, up to the end of the
+        /// line or a comment, in an ERROR node.
+        fn skip_invalid_condition(&mut self) {
+            if matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
+                return;
+            }
+            self.builder.start_node(ERROR.into());
+            while !matches!(self.current(), None | Some(NEWLINE | COMMENT)) {
+                if !self.consume_line_continuation() {
+                    self.bump();
+                }
+            }
+            self.builder.finish_node();
         }
 
         /// Parse a quoted argument of `ifeq`, starting at its opening quote.
@@ -2870,6 +2906,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut depth = 1;
 
             let mut rule_context = ConditionalRuleContext::new(self.in_rule);
+            let mut seen_final_else = false;
 
             // More reliable loop detection
             let mut position_count = std::collections::HashMap::<usize, usize>::new();
@@ -2901,7 +2938,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         let token = self.tokens.last().unwrap().1.clone();
                         match token.as_str() {
                             "else" => {
+                                if seen_final_else {
+                                    self.record_error(
+                                        ParseErrorKind::DuplicateElse,
+                                        "only one `else` per conditional".to_string(),
+                                    );
+                                }
                                 let is_final = !self.is_else_if_at(self.tokens.len());
+                                seen_final_else |= is_final;
                                 self.in_rule = rule_context.next_branch(self.in_rule, is_final);
                             }
                             "endif" => self.in_rule = rule_context.end(self.in_rule),

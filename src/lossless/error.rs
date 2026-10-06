@@ -70,6 +70,9 @@ pub enum ParseErrorKind {
     ExtraneousEndif,
     /// An `else` (or BSD `.elif`) without a matching conditional.
     ElseWithoutIf,
+    /// An `else` after the final `else` of a conditional (GNU make: "only
+    /// one 'else' per conditional").
+    DuplicateElse,
     /// A malformed BSD `.for` loop header.
     InvalidForLoop,
     /// A BSD `.for` loop that is not closed before the end of the input.
