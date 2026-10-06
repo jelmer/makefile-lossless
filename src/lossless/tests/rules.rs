@@ -190,6 +190,53 @@ fn test_parse_double_colon_static_pattern_rule() {
 }
 
 #[test]
+fn test_static_pattern_after_single_char_backslash_variable() {
+    // `$\` is a reference to the variable `\`, so its backslash doesn't
+    // escape the `:` that follows.
+    let parsed = parse("a: %$\\: %.c\n", None);
+    assert_eq!(parsed.errors, vec![]);
+    assert_eq!(
+        format!("{:#?}", parsed.syntax()),
+        r#"ROOT@0..12
+  RULE@0..12
+    TARGETS@0..1
+      IDENTIFIER@0..1 "a"
+    OPERATOR@1..2 ":"
+    WHITESPACE@2..3 " "
+    TARGET_PATTERN@3..6
+      IDENTIFIER@3..4 "%"
+      EXPR@4..6
+        DOLLAR@4..5 "$"
+        BACKSLASH@5..6 "\\"
+    OPERATOR@6..7 ":"
+    WHITESPACE@7..8 " "
+    PREREQUISITES@8..11
+      PREREQUISITE@8..11
+        IDENTIFIER@8..11 "%.c"
+    NEWLINE@11..12 "\n"
+"#
+    );
+}
+
+#[test]
+fn test_static_pattern_colon_after_backslash_variable_at_eof() {
+    for code in ["a:$\\:", "!$\\:", &format!("!${}:", "\\".repeat(25))] {
+        let parsed = parse(code, None);
+        assert_eq!(parsed.root().to_string(), code);
+        let rule = parsed.root().rules().next().unwrap();
+        assert_eq!(rule.prerequisites().count(), 0, "{code:?}");
+    }
+}
+
+#[test]
+fn test_space_after_backslash_variable_separates_prerequisites() {
+    let parsed = parse("all: x$\\ y\n", None);
+    assert_eq!(parsed.errors, vec![]);
+    let rule = parsed.root().rules().next().unwrap();
+    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["x$\\", "y"]);
+}
+
+#[test]
 fn test_parse_grouped_targets() {
     let parsed = parse("a b &: c\n", None);
     assert_eq!(parsed.errors, vec![]);
