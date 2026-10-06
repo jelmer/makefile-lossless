@@ -3901,7 +3901,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Produces a `VARIABLE` node structured like a regular assignment:
         ///
         /// - the `define` keyword itself (kept as an `IDENTIFIER` token);
-        /// - the variable's identifier;
+        /// - the variable's name, with any variable references in it as
+        ///   EXPR nodes;
         /// - the assignment operator (defaults to `=` if absent);
         /// - an `EXPR` node containing the verbatim body (without the
         ///   surrounding newlines that bracket it);
@@ -3983,12 +3984,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// GNU make takes everything up to the assignment operator (or the end
         /// of the line), minus surrounding whitespace, as the name. An
         /// operator only counts after a single word, so `define A B =` names
-        /// the variable "A B =". Each part of the name between line
-        /// continuations becomes a single IDENTIFIER token.
+        /// the variable "A B =".
         fn parse_define_name(&mut self) {
             let mut depth = 0;
             let mut multiword = false;
-            if !self.bump_define_name_part(&mut depth, &mut multiword) {
+            if !self.parse_define_name_part(&mut depth, &mut multiword) {
                 self.record_error(
                     ParseErrorKind::ExpectedVariableName,
                     "empty variable name in `define`".to_string(),
@@ -4007,45 +4007,86 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ => {}
                 }
                 multiword |= depth == 0;
-                let bumped = self.bump_define_name_part(&mut depth, &mut multiword);
+                let bumped = self.parse_define_name_part(&mut depth, &mut multiword);
                 debug_assert!(bumped, "name part after a continuation is empty");
             }
         }
 
-        /// Consume the part of a `define` name up to the next line
-        /// continuation, operator or end of line as a single IDENTIFIER
-        /// token, leaving trailing whitespace. That may span several tokens,
-        /// e.g. `\n` lexes as BACKSLASH + IDENTIFIER and `foo bar` contains
-        /// whitespace. Returns false if the part is empty.
-        fn bump_define_name_part(&mut self, depth: &mut usize, multiword: &mut bool) -> bool {
-            let mut tokens = self.tokens.iter().rev().peekable();
-            let mut len = 0;
-            // Whether the previous token is an unescaped backslash.
-            let mut escaped = false;
-            let mut after_ws = false;
-            while let Some((kind, _)) = tokens.peek() {
-                let at_continuation = *kind == BACKSLASH
-                    && !escaped
-                    && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
-                let at_operator = *kind == OPERATOR && *depth == 0 && !*multiword;
-                if at_continuation || at_operator || matches!(*kind, NEWLINE | COMMENT) {
+        /// Parse the part of a `define` name up to the next line
+        /// continuation, operator or end of line, leaving trailing
+        /// whitespace. As in an ordinary assignment's name, variable
+        /// references become EXPR nodes. Each word between them is merged
+        /// into a single IDENTIFIER token, so that `\n` (BACKSLASH +
+        /// IDENTIFIER) reads as one word and the `=` in a name like `A B =`
+        /// is not mistaken for the assignment operator. Returns false if the
+        /// part is empty.
+        fn parse_define_name_part(&mut self, depth: &mut usize, multiword: &mut bool) -> bool {
+            let mut word = String::new();
+            let mut parsed = false;
+            while let Some(kind) = self.current() {
+                let at_end = match kind {
+                    NEWLINE | COMMENT => true,
+                    OPERATOR => *depth == 0 && !*multiword,
+                    _ => self.is_line_continuation(),
+                };
+                if at_end {
                     break;
                 }
-                match *kind {
-                    LPAREN | LBRACE => *depth += 1,
-                    RPAREN | RBRACE => *depth = depth.saturating_sub(1),
-                    _ => {}
+                match kind {
+                    DOLLAR => {
+                        self.flush_define_name_word(&mut word);
+                        self.parse_variable_reference();
+                    }
+                    WHITESPACE if *depth == 0 => {
+                        if self.define_name_part_ends_after_ws(*multiword) {
+                            break;
+                        }
+                        self.flush_define_name_word(&mut word);
+                        *multiword = true;
+                        self.bump();
+                    }
+                    _ => {
+                        match kind {
+                            LPAREN | LBRACE => *depth += 1,
+                            RPAREN | RBRACE => *depth = depth.saturating_sub(1),
+                            _ => {}
+                        }
+                        let (_, text) = self.tokens.pop().unwrap();
+                        self.pending_backslash_escape =
+                            kind == BACKSLASH && !self.pending_backslash_escape;
+                        word.push_str(&text);
+                    }
                 }
-                if *depth == 0 && *kind == WHITESPACE {
-                    after_ws = true;
-                } else if after_ws {
-                    *multiword = true;
-                }
-                escaped = *kind == BACKSLASH && !escaped;
-                tokens.next();
-                len += 1;
+                parsed = true;
             }
-            self.bump_as_identifier(len)
+            self.flush_define_name_word(&mut word);
+            parsed
+        }
+
+        /// Add the text collected by [`Self::parse_define_name_part`] as an
+        /// IDENTIFIER token.
+        fn flush_define_name_word(&mut self, word: &mut String) {
+            if !word.is_empty() {
+                self.builder.token(IDENTIFIER.into(), &std::mem::take(word));
+            }
+        }
+
+        /// Whether the part of a `define` name ends at the whitespace at the
+        /// current position, because a line continuation, the end of the
+        /// line or, after a single word, an operator follows it.
+        fn define_name_part_ends_after_ws(&self, multiword: bool) -> bool {
+            let mut rest = self
+                .tokens
+                .iter()
+                .rev()
+                .map(|(kind, _)| *kind)
+                .skip_while(|kind| *kind == WHITESPACE);
+            match rest.next() {
+                None | Some(NEWLINE | COMMENT) => true,
+                Some(OPERATOR) => !multiword,
+                Some(BACKSLASH) => rest.next() == Some(NEWLINE),
+                Some(_) => false,
+            }
         }
 
         /// Consume a gmake-style `export` name in BSD make, which is
@@ -5028,7 +5069,7 @@ impl VariableReference {
         if syntax
             .parent()
             .and_then(VariableDefinition::cast)
-            .is_some_and(|v| v.is_define())
+            .is_some_and(|v| v.is_define() && v.value_expr().as_ref() == Some(&syntax))
         {
             return None;
         }
@@ -7727,6 +7768,39 @@ mod tests {
         var.set_name("C");
         assert_eq!(var.name(), Some("C".to_string()));
         assert_eq!(makefile.code(), "define C\nbody\nendef\n");
+    }
+
+    #[test]
+    fn test_define_name_reference_tree() {
+        let code = "define $(PREFIX)_FLAGS :=\n$(B)\nendef\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r##"ROOT@0..37
+  VARIABLE@0..37
+    IDENTIFIER@0..6 "define"
+    WHITESPACE@6..7 " "
+    EXPR@7..16
+      DOLLAR@7..8 "$"
+      LPAREN@8..9 "("
+      IDENTIFIER@9..15 "PREFIX"
+      RPAREN@15..16 ")"
+    IDENTIFIER@16..22 "_FLAGS"
+    WHITESPACE@22..23 " "
+    OPERATOR@23..25 ":="
+    NEWLINE@25..26 "\n"
+    EXPR@26..31
+      DOLLAR@26..27 "$"
+      LPAREN@27..28 "("
+      IDENTIFIER@28..29 "B"
+      RPAREN@29..30 ")"
+      NEWLINE@30..31 "\n"
+    IDENTIFIER@31..36 "endef"
+    NEWLINE@36..37 "\n"
+"##
+        );
+        assert_eq!(code, parsed.root().to_string());
     }
 
     #[test]
