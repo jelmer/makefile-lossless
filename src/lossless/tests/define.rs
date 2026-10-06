@@ -504,6 +504,41 @@ fn test_define_body_keyword_needs_separator() {
 }
 
 #[test]
+fn test_define_body_line_continuation() {
+    // make joins continued lines in a define body before looking for
+    // `define` and `endef`, so a continued line swallows a following
+    // `endef` line.
+    for code in [
+        "define A\nx \\\nendef\n",
+        "define A\n\tx \\\nendef\n",
+        "define A\nx \\\nendef # c\n",
+        "define A\nx \\\\\\\nendef\n",
+        "define A\ndefine B \\\nendef\nendef\n",
+    ] {
+        assert_eq!(
+            parse_single_define(code, None),
+            (
+                vec![(ParseErrorKind::MissingEndef, 1)],
+                None,
+                Some(code["define A\n".len()..].to_string())
+            ),
+            "{code:?}"
+        );
+    }
+    for (code, value) in [
+        ("define A\nx \\\nendef\nendef\n", "x \\\nendef\n"),
+        ("define A\nx \\\\\nendef\n", "x \\\\\n"),
+        ("define A\nx \\\ny\nendef\n", "x \\\ny\n"),
+    ] {
+        assert_eq!(
+            parse_single_define(code, None),
+            (vec![], None, Some(value.to_string())),
+            "{code:?}"
+        );
+    }
+}
+
+#[test]
 fn test_directive_followed_by_comment() {
     // Outside a define body make strips comments first, so `endif#c` is
     // still `endif`.
