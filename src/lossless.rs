@@ -1105,7 +1105,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// a known variant, a `!` followed by a `:` on the same logical line is
         /// instead part of a target name, as in GNU make's `a!b:`.
         fn at_bang_dependency_operator(&self) -> bool {
-            if !matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!") {
+            if !self.at_bang() {
                 return false;
             }
             match self.variant {
@@ -1115,10 +1115,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        fn at_bang(&self) -> bool {
+            matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!")
+        }
+
         /// Whether the current token is a `!` that is part of a name.
         fn at_literal_bang(&self) -> bool {
-            matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!")
-                && !self.at_bang_dependency_operator()
+            self.at_bang() && !self.at_bang_dependency_operator()
         }
 
         /// Look ahead (without consuming) from the current token, which
@@ -4255,14 +4258,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.parse_assignment();
                     true
                 }
+                // Like make, check for an assignment first, so that `!x = 1`
+                // defines a variable even where `!` is a dependency operator.
+                Some(OPERATOR) if self.at_bang() && self.is_variable_assignment_line() => {
+                    self.parse_assignment();
+                    true
+                }
                 Some(OPERATOR) if self.at_dependency_operator() => {
                     self.parse_rule();
                     true
                 }
-                Some(OPERATOR)
-                    if self.at_literal_bang()
-                        && (self.line_has_dependency_operator() || self.is_assignment_line()) =>
-                {
+                Some(OPERATOR) if self.at_literal_bang() && self.line_has_dependency_operator() => {
                     self.parse_normal_content();
                     true
                 }
@@ -8550,9 +8556,14 @@ rule: dependency
 
     #[test]
     fn test_bang_in_variable_names() {
-        for variant in [MakefileVariant::GNUMake, MakefileVariant::POSIXMake] {
-            for (code, name) in [("!x = 1\n", "!x"), ("a!b = 2\n", "a!b")] {
-                let parsed = parse(code, Some(variant));
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            for (code, name) in [("!x = 1\n", "!x"), ("!x=1\n", "!x"), ("a!b = 2\n", "a!b")] {
+                let parsed = parse(code, variant);
                 assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
                 let root = parsed.root();
                 assert_eq!(code, root.to_string());
