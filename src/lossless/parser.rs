@@ -799,6 +799,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         break
                     }
+                    // TODO: nmake's `$$@`, the target as a dependent, is
+                    // parsed as a `$$` followed by `@`.
                     DOLLAR => {
                         let escape = self.at_dollar_escape();
                         self.parse_variable_reference();
@@ -2476,9 +2478,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // before looking at what it contains. BSD make does not take
                 // `:` as a name either, so `$:` is a lone `$` and a `:`. Only
                 // the first character of a token such as `XY` or a run of
-                // whitespace is the name.
+                // whitespace is the name, except for nmake's `$**`, which
+                // the lexer reads as one token.
                 let text = &self.tokens.last().unwrap().1;
-                let first_len = text.chars().next().unwrap().len_utf8();
+                let first_len = if self.variant == Some(MakefileVariant::NMake) && text == "**" {
+                    2
+                } else {
+                    text.chars().next().unwrap().len_utf8()
+                };
                 if text.len() > first_len {
                     self.bump_token_head(first_len);
                 } else {

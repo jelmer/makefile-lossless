@@ -51,7 +51,8 @@ impl VariableReference {
     /// For function calls like `$(wildcard *.c)`, returns `"wildcard"`.
     /// Modifiers are not part of the name, so `${SRCS:M*.c}` returns
     /// `"SRCS"`, while nested references are, as in `${VAR.${M}}`. For
-    /// single-character references such as `$@`, returns that character.
+    /// single-character references such as `$@`, returns that character,
+    /// and for nmake's `$**`, `"**"`.
     ///
     /// Returns `None` for expressions without a variable name, such as BSD
     /// make's `${:Uvalue}`.
@@ -66,9 +67,9 @@ impl VariableReference {
     pub fn name(&self) -> Option<String> {
         let elements = self.name_elements();
         if !self.is_delimited() {
-            // A single-character reference such as `$@` or `$X`
-            let token = elements.first()?.as_token()?.clone();
-            return token.text().chars().next().map(String::from);
+            // A single-character reference such as `$@` or `$X`, or nmake's
+            // `$**`
+            return Some(elements.first()?.as_token()?.text().to_string());
         }
         let name: String = elements.iter().map(|it| it.to_string()).collect();
         if name.is_empty() {
@@ -111,7 +112,7 @@ impl VariableReference {
     /// [`Self::name`].
     ///
     /// For a function call this is the function name, and for a
-    /// single-character reference such as `$@` the character after the `$`.
+    /// single-character reference such as `$@` the text after the `$`.
     /// Returns `None` if [`Self::name`] does.
     ///
     /// # Example
@@ -135,12 +136,7 @@ impl VariableReference {
     pub fn name_range(&self) -> Option<rowan::TextRange> {
         let elements = self.name_elements();
         if !self.is_delimited() {
-            let token = elements.first()?.as_token()?.clone();
-            let first = token.text().chars().next()?;
-            return Some(rowan::TextRange::at(
-                token.text_range().start(),
-                rowan::TextSize::of(first),
-            ));
+            return Some(elements.first()?.as_token()?.text_range());
         }
         let first = elements.first()?.text_range();
         let last = elements.last()?.text_range();
