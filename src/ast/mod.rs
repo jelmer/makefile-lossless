@@ -298,7 +298,9 @@ pub(crate) fn logical_text(
     }
     text.push_str(&"\\".repeat(backslashes));
     if syntax == LineSyntax::Bsd {
-        text.truncate(text.trim_end_matches([' ', '\t']).len().max(keep));
+        // BSD make removes anything `isspace()` accepts.
+        let trimmed = text.trim_end_matches([' ', '\t', '\r', '\x0b', '\x0c']);
+        text.truncate(trimmed.len().max(keep));
     }
     text
 }

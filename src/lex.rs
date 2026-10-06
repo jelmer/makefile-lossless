@@ -114,6 +114,25 @@ impl<'a> Lexer<'a> {
         c == ' ' || c == '\t'
     }
 
+    /// Whether `c` separates words outside recipes. BSD make takes any
+    /// character `isspace()` accepts, including a lone CR.
+    fn is_word_separator(&self, c: char) -> bool {
+        Self::is_whitespace(c) || (self.bsd && !self.gnu && matches!(c, '\r' | '\x0b' | '\x0c'))
+    }
+
+    /// Read word separators up to the end of the line.
+    fn read_word_separators(&mut self) -> String {
+        let mut result = String::new();
+        while let Some(&c) = self.input.peek() {
+            if self.at_newline() || !self.is_word_separator(c) {
+                break;
+            }
+            self.input.next();
+            result.push(c);
+        }
+        result
+    }
+
     /// Whether the input is at a line ending. Like GNU make and BSD make,
     /// only take LF and CRLF as line endings; a lone CR is an ordinary
     /// character.
@@ -380,8 +399,8 @@ impl<'a> Lexer<'a> {
                     Some((SyntaxKind::TEXT, text))
                 }
                 LineType::Other => match c {
-                    c if Self::is_whitespace(c) => {
-                        Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
+                    c if self.is_word_separator(c) => {
+                        Some((SyntaxKind::WHITESPACE, self.read_word_separators()))
                     }
                     c if Self::is_valid_identifier_char(c) => Some((
                         SyntaxKind::IDENTIFIER,

@@ -16838,7 +16838,13 @@ mod test_crlf {
             let makefile = parse_lone_cr("all: a\rb\n\techo a\rb\n\techo c\r\n", variant);
             let rule = makefile.rules().next().unwrap();
             assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
-            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a\rb"]);
+            // BSD make splits words on a lone CR, but not recipes.
+            let prerequisites = if variant == Some(crate::MakefileVariant::BSDMake) {
+                vec!["a", "b"]
+            } else {
+                vec!["a\rb"]
+            };
+            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), prerequisites);
             assert_eq!(
                 rule.recipes().collect::<Vec<_>>(),
                 vec!["echo a\rb", "echo c"]
@@ -16911,6 +16917,52 @@ mod test_crlf {
         assert_eq!(
             rule.recipes().collect::<Vec<_>>(),
             vec!["echo a \\\r", "echo b"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_cr_separates_words() {
+        // BSD make splits words on anything isspace() accepts.
+        for space in ['\r', '\x0b', '\x0c'] {
+            let src = format!("a{space}b c: d{space}e f\n");
+            let makefile = parse_lone_cr(&src, Some(crate::MakefileVariant::BSDMake));
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+            assert_eq!(
+                rule.prerequisites().collect::<Vec<_>>(),
+                vec!["d", "e", "f"]
+            );
+            for variant in VARIANTS {
+                if variant == Some(crate::MakefileVariant::BSDMake) {
+                    continue;
+                }
+                let makefile = parse_lone_cr(&src, variant);
+                let rule = makefile.rules().next().unwrap();
+                assert_eq!(
+                    rule.targets().collect::<Vec<_>>(),
+                    vec![format!("a{space}b"), "c".to_string()],
+                    "{variant:?}"
+                );
+                assert_eq!(
+                    rule.prerequisites().collect::<Vec<_>>(),
+                    vec![format!("d{space}e"), "f".to_string()],
+                    "{variant:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bsd_cr_around_assignment() {
+        let makefile = parse_lone_cr(
+            "X\r=\ry\rz\r\x0b\r\n",
+            Some(crate::MakefileVariant::BSDMake),
+        );
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(
+            var.value(crate::MakefileVariant::BSDMake),
+            Some("y\rz".to_string())
         );
     }
 
