@@ -766,6 +766,9 @@ impl VariableDefinition {
     /// References in the variable's name are not included. For a `define`
     /// block, those in the body are.
     ///
+    /// The whitespace before a comment after the value is kept, although
+    /// make includes it in the value.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1106,6 +1109,9 @@ impl VariableDefinition {
     /// in `X =`. An `export` or `unexport` directive of a single variable
     /// without a value, as in `export X`, becomes an assignment with `=`.
     ///
+    /// The whitespace before a comment after the value is kept, although
+    /// make includes it in the value.
+    ///
     /// # Panics
     ///
     /// Panics if `new_value` can not be written as the value, or the
@@ -1189,7 +1195,18 @@ impl VariableDefinition {
         } else {
             &[(WHITESPACE, " ")]
         };
-        let mut elements = value_elements(tokens, &new_expr, &[]);
+        // The parser puts the whitespace before a comment at the end of the
+        // value, or before it if the value is empty.
+        let before_comment = expr
+            .next_sibling_or_token()
+            .filter(|it| it.kind() == COMMENT && !new_value.is_empty())
+            .and_then(|_| {
+                expr.last_child_or_token()
+                    .or_else(|| expr.prev_sibling_or_token())
+            })
+            .and_then(|it| it.into_token())
+            .filter(|t| t.kind() == WHITESPACE);
+        let mut elements = value_elements(tokens, &new_expr, before_comment.as_slice());
         // A line continuation at the end of the file leaves the line break,
         // and any indentation after it, in the value. Keep the line break as
         // the end of the line.
@@ -1822,6 +1839,27 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_value("new");
         assert_eq!(makefile.code(), "A.${B} = new\n");
+    }
+
+    #[test]
+    fn test_set_value_before_comment() {
+        // The whitespace before a comment is kept.
+        for (text, value, expected) in [
+            ("X = a # c\n", "new", "X = new # c\n"),
+            ("X = a  # c\n", "new", "X = new  # c\n"),
+            ("X = # c\n", "new", "X = new # c\n"),
+            ("X =  # c\n", "new", "X =  new  # c\n"),
+            ("X =\t# c\n", "new", "X =\tnew\t# c\n"),
+            ("X =# c\n", "new", "X = new# c\n"),
+            ("a: X = # c\n", "new", "a: X = new # c\n"),
+            ("export X := a # c\r\n", "new", "export X := new # c\r\n"),
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            var.set_value(value);
+            assert_eq!(makefile.code(), expected, "{text:?}");
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]
