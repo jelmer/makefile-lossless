@@ -36,7 +36,7 @@ use std::str::FromStr;
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{
+/// use makefile_edit::{
 ///     parse_bsd_condition, BsdComparisonOp, BsdCondition, BsdFunction, BsdOperand,
 /// };
 /// assert_eq!(
@@ -298,7 +298,7 @@ impl std::error::Error for BsdConditionError {}
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{parse_bsd_condition, BsdCondition, BsdFunction, BsdOperand};
+/// use makefile_edit::{parse_bsd_condition, BsdCondition, BsdFunction, BsdOperand};
 /// assert_eq!(
 ///     parse_bsd_condition("!empty(MACHINE_ARCH:Mmips*) || ${MKPIC} == no").unwrap(),
 ///     BsdCondition::Or(vec![
@@ -308,7 +308,7 @@ impl std::error::Error for BsdConditionError {}
 ///         })),
 ///         BsdCondition::Compare {
 ///             lhs: BsdOperand::VariableReference("${MKPIC}".to_string()),
-///             op: makefile_lossless::BsdComparisonOp::Equal,
+///             op: makefile_edit::BsdComparisonOp::Equal,
 ///             rhs: BsdOperand::Word("no".to_string()),
 ///         },
 ///     ])
@@ -348,7 +348,7 @@ fn parse(text: &str, left_unquoted_ok: bool) -> Result<BsdCondition, BsdConditio
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{
+/// use makefile_edit::{
 ///     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
 ///     BsdOperand,
 /// };

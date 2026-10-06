@@ -135,7 +135,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "VAR = 1\n\nall:\n\techo\n".parse().unwrap();
     /// let lines: Vec<_> = makefile.items().map(|item| item.line()).collect();
     /// assert_eq!(lines, vec![0, 2]);
@@ -259,7 +259,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile: Makefile = "VAR1 = old\nrule:\n\tcommand\n".parse().unwrap();
     /// let temp: Makefile = "VAR2 = new\n".parse().unwrap();
     /// let new_var = temp.variable_definitions().next().unwrap();
@@ -292,7 +292,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
     /// let mut item = makefile.items().next().unwrap();
     /// item.add_comment("This is a variable").unwrap();
@@ -323,7 +323,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
     /// let item = makefile.items().next().unwrap();
     /// let comments: Vec<_> = item.preceding_comments().collect();
@@ -362,7 +362,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "# Not this\n\n## Build it\n#   indented\nall:\n".parse().unwrap();
     /// let item = makefile.items().next().unwrap();
     /// assert_eq!(item.doc_comments().collect::<Vec<_>>(), vec!["Build it", "  indented"]);
@@ -417,7 +417,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "# Comment 1\n# Comment 2\nVAR = value\n".parse().unwrap();
     /// let mut item = makefile.items().next().unwrap();
     /// let count = item.remove_comments().unwrap();
@@ -482,7 +482,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "# Old comment\nVAR = value\n".parse().unwrap();
     /// let mut item = makefile.items().next().unwrap();
     /// let modified = item.modify_comment("New comment").unwrap();
@@ -527,7 +527,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
     /// let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
     /// let new_var = temp.variable_definitions().next().unwrap();
@@ -554,7 +554,7 @@ impl MakefileItem {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
     /// let temp: Makefile = "VAR_NEW = inserted\n".parse().unwrap();
     /// let new_var = temp.variable_definitions().next().unwrap();
@@ -775,7 +775,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let parsed = Makefile::parse_with_variant(
     ///     ".if defined(DEBUG)\nCFLAGS+= -g\n.endif\n",
     ///     MakefileVariant::BSDMake,
@@ -839,7 +839,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "rule: dependency\n\tcommand\n".parse().unwrap();
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
@@ -870,7 +870,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let makefile: Makefile = r#"VAR = value
     /// ifdef DEBUG
     /// CFLAGS = -g
@@ -892,7 +892,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "VAR1 = value1\nVAR2 = value2\nVAR1 = value3\n".parse().unwrap();
     /// let vars: Vec<_> = makefile.find_variable("VAR1").collect();
     /// assert_eq!(vars.len(), 2);
@@ -917,7 +917,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "CFLAGS = $(BASE_FLAGS) -Wall\nall: $(TARGETS)\n".parse().unwrap();
     /// let refs: Vec<_> = makefile.variable_references().collect();
     /// let names: Vec<_> = refs.iter().filter_map(|r| r.name()).collect();
@@ -937,7 +937,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "CC = gcc\nall: build\n\techo done\n".parse().unwrap();
     /// let range = TextRange::new(0.into(), 8.into());
     /// let items: Vec<_> = makefile.items_in_range(range).collect();
@@ -994,7 +994,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "# line 1\n# line 2\n# line 3\nall:\n\techo done\n".parse().unwrap();
     /// let blocks: Vec<_> = makefile.comment_blocks().collect();
     /// assert_eq!(blocks.len(), 1);
@@ -1016,7 +1016,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "# a\nFOO = 1 # b\nall:\n\techo # c\n".parse().unwrap();
     /// let ranges: Vec<_> = makefile.comment_ranges().collect();
     /// assert_eq!(
@@ -1045,7 +1045,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile = Makefile::new();
     /// makefile.add_rule("rule");
     /// assert_eq!(makefile.to_string(), "rule:\n");
@@ -1063,7 +1063,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile = Makefile::new();
     /// makefile.try_add_rule("a#b").unwrap();
     /// assert!(makefile.try_add_rule("a b").is_err());
@@ -1101,7 +1101,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile = Makefile::new();
     /// makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
     /// assert!(makefile.to_string().contains("ifdef DEBUG"));
@@ -1197,7 +1197,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let mut makefile = Makefile::new();
     /// let temp1: Makefile = "CFLAGS = -g\n".parse().unwrap();
     /// let var1 = temp1.variable_definitions().next().unwrap();
@@ -1317,9 +1317,9 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
-    /// let new_rule: makefile_lossless::Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+    /// let new_rule: makefile_edit::Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
     /// makefile.replace_rule(0, new_rule).unwrap();
     /// assert!(makefile.rules().any(|r| r.targets().any(|t| t == "new_rule")));
     /// ```
@@ -1371,7 +1371,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
     /// let removed = makefile.remove_rule(0).unwrap();
     /// assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["rule1"]);
@@ -1427,9 +1427,9 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
-    /// let new_rule: makefile_lossless::Rule = "inserted_rule:\n\tinserted_command\n".parse().unwrap();
+    /// let new_rule: makefile_edit::Rule = "inserted_rule:\n\tinserted_command\n".parse().unwrap();
     /// makefile.insert_rule(1, new_rule).unwrap();
     /// let targets: Vec<_> = makefile.rules().flat_map(|r| r.targets().collect::<Vec<_>>()).collect();
     /// assert_eq!(targets, vec!["rule1", "inserted_rule", "rule2"]);
@@ -1548,7 +1548,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "include config.mk\nifdef DEBUG\n-include .env\nendif\n"
     ///     .parse()
     ///     .unwrap();
@@ -1564,7 +1564,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "include config.mk\n-include .env\n".parse().unwrap();
     /// let paths = makefile.included_files().collect::<Vec<_>>();
     /// assert_eq!(paths, vec!["config.mk", ".env"]);
@@ -1580,7 +1580,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
     /// let rule = makefile.find_rule_by_target("rule2");
     /// assert!(rule.is_some());
@@ -1595,7 +1595,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.find_rules_by_target("rule1").collect();
     /// assert_eq!(rules.len(), 2);
@@ -1611,7 +1611,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
     /// let rule = makefile.find_rule_by_target_pattern("foo.o");
     /// assert!(rule.is_some());
@@ -1628,7 +1628,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
     /// assert_eq!(rules.len(), 2);
@@ -1645,7 +1645,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile = Makefile::new();
     /// makefile.add_phony_target("clean").unwrap();
     /// assert!(makefile.is_phony("clean"));
@@ -1672,7 +1672,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
     /// assert!(makefile.remove_phony_target("clean").unwrap());
     /// assert!(!makefile.is_phony("clean"));
@@ -1712,7 +1712,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
     /// assert!(makefile.is_phony("clean"));
     /// assert!(makefile.is_phony("test"));
@@ -1728,7 +1728,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
     /// let phony_targets: Vec<_> = makefile.phony_targets().collect();
     /// assert_eq!(phony_targets, vec!["clean", "test", "build"]);
@@ -1750,7 +1750,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile = Makefile::new();
     /// makefile.add_include("config.mk").unwrap();
     /// assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["config.mk"]);
@@ -1784,7 +1784,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR = value\nrule:\n\tcommand\n".parse().unwrap();
     /// makefile.insert_include(1, "config.mk").unwrap();
     /// let items: Vec<_> = makefile.items().collect();
@@ -1840,7 +1840,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR1 = value1\nVAR2 = value2\n".parse().unwrap();
     /// let first_var = makefile.items().next().unwrap();
     /// makefile.insert_include_after(&first_var, "config.mk").unwrap();

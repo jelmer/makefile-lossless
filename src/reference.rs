@@ -355,7 +355,7 @@ pub enum Modifier {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{MakefileVariant, Modifier, ParsedReference};
+/// use makefile_edit::{MakefileVariant, Modifier, ParsedReference};
 /// let parsed = ParsedReference::parse("${SRCS:M*.c:Q}", MakefileVariant::BSDMake).unwrap();
 /// assert_eq!(parsed.name, "SRCS");
 /// assert_eq!(
@@ -664,7 +664,7 @@ impl TextPart {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{split_references, MakefileVariant, TextPart};
+/// use makefile_edit::{split_references, MakefileVariant, TextPart};
 ///
 /// let parts = split_references("cp $(SRC) $$HOME/$@", MakefileVariant::GNUMake);
 /// assert_eq!(
