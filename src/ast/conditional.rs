@@ -4,7 +4,7 @@ use super::{line_ending, logical_text, terminate_line_before, with_trailing_newl
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
-    ErrorInfo, Lang, ParseError, Recipe,
+    ErrorInfo, Lang, ParseError, Recipe, Rule, VariableDefinition,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -120,6 +120,12 @@ impl ConditionalItem {
     /// Get the range of this item in the source text.
     pub fn text_range(&self) -> rowan::TextRange {
         self.syntax().text_range()
+    }
+
+    /// The branches of the conditionals this item is in, outermost first;
+    /// see [`MakefileItem::enclosing_branches`].
+    pub fn enclosing_branches(&self) -> Vec<ConditionalBranch> {
+        enclosing_branches(self.syntax())
     }
 
     /// Get the line number (0-indexed) where this item starts.
@@ -493,6 +499,177 @@ impl ConditionalBranch {
     pub fn line(&self) -> usize {
         line_col_at_offset(&self.header, self.header.text_range().start()).0
     }
+
+    /// The conditional this branch belongs to.
+    pub fn conditional(&self) -> Conditional {
+        self.header
+            .parent()
+            .and_then(Conditional::cast)
+            .expect("branch header is a child of a conditional")
+    }
+
+    /// The position of this branch in [`Conditional::branches`]: 0 for the
+    /// initial `if`, then 1, 2, ... for each `else` branch.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nelse ifdef B\nelse\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let indexes: Vec<_> = cond.branches().map(|b| b.index()).collect();
+    /// assert_eq!(indexes, vec![0, 1, 2]);
+    /// ```
+    pub fn index(&self) -> usize {
+        self.header
+            .siblings(Direction::Prev)
+            .skip(1)
+            .filter(|n| matches!(n.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE))
+            .count()
+    }
+
+    /// The range of this whole branch: its directive line and its body, up
+    /// to the next `else` or `endif` directive.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nX = 1\nelse\nX = 2\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let ranges: Vec<_> = cond.branches().map(|b| b.text_range()).collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![TextRange::new(0.into(), 14.into()), TextRange::new(14.into(), 25.into())]
+    /// );
+    /// ```
+    pub fn text_range(&self) -> rowan::TextRange {
+        let start = self.header.text_range().start();
+        let end = self
+            .header
+            .siblings_with_tokens(Direction::Next)
+            .take_while(|n| {
+                n.as_node() == Some(&self.header)
+                    || !matches!(n.kind(), CONDITIONAL_ELSE | CONDITIONAL_ENDIF)
+            })
+            .last()
+            .map_or(start, |n| n.text_range().end());
+        rowan::TextRange::new(start, end)
+    }
+
+    /// The range of the directive line starting this branch, such as
+    /// `ifdef A` or `else ifeq ($(B),1)`, without its line ending. A
+    /// trailing comment on the line is included.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nX = 1\nelse\nX = 2\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let ranges: Vec<_> = cond.branches().map(|b| b.directive_range()).collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![TextRange::new(0.into(), 7.into()), TextRange::new(14.into(), 18.into())]
+    /// );
+    /// ```
+    pub fn directive_range(&self) -> rowan::TextRange {
+        let range = self.header.text_range();
+        match self.header.last_token() {
+            Some(token) if token.kind() == NEWLINE => {
+                rowan::TextRange::new(range.start(), token.text_range().start())
+            }
+            _ => range,
+        }
+    }
+
+    /// Whether this branch and `other` are different branches of the same
+    /// conditional, so that make never takes both.
+    ///
+    /// Branches of different conditionals are never exclusive, even when
+    /// their conditions contradict each other.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\na:\nelse\nb:\nendif\nifndef A\nc:\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let branches: Vec<_> = makefile.rules().map(|r| r.enclosing_branches()).collect();
+    /// assert!(branches[0][0].is_exclusive_with(&branches[1][0]));
+    /// assert!(!branches[0][0].is_exclusive_with(&branches[0][0]));
+    /// assert!(!branches[0][0].is_exclusive_with(&branches[2][0]));
+    /// ```
+    pub fn is_exclusive_with(&self, other: &ConditionalBranch) -> bool {
+        self.header != other.header && self.header.parent() == other.header.parent()
+    }
+}
+
+impl std::fmt::Debug for ConditionalBranch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConditionalBranch")
+            .field("index", &self.index())
+            .field("range", &self.text_range())
+            .finish()
+    }
+}
+
+/// The branches of the conditionals enclosing `node`, outermost first.
+pub(crate) fn enclosing_branches(node: &SyntaxNode<Lang>) -> Vec<ConditionalBranch> {
+    let mut branches: Vec<_> = node
+        .ancestors()
+        .filter(|n| n.parent().is_some_and(|p| p.kind() == CONDITIONAL))
+        .filter_map(|child| {
+            child
+                .siblings(Direction::Prev)
+                .find(|n| matches!(n.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE))
+                .map(|header| ConditionalBranch { header })
+        })
+        .collect();
+    branches.reverse();
+    branches
+}
+
+impl Rule {
+    /// The conditional branches this rule is in, outermost first; see
+    /// [`MakefileItem::enclosing_branches`].
+    pub fn enclosing_branches(&self) -> Vec<ConditionalBranch> {
+        enclosing_branches(self.syntax())
+    }
+}
+
+impl VariableDefinition {
+    /// The conditional branches this variable definition is in, outermost
+    /// first; see [`MakefileItem::enclosing_branches`].
+    ///
+    /// For a target-specific assignment this includes the branches the rule
+    /// is in.
+    pub fn enclosing_branches(&self) -> Vec<ConditionalBranch> {
+        enclosing_branches(self.syntax())
+    }
+}
+
+impl Recipe {
+    /// The conditional branches this recipe line is in, outermost first;
+    /// see [`MakefileItem::enclosing_branches`].
+    ///
+    /// This includes both conditionals in the rule body around the recipe
+    /// line and conditionals around the rule.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nall:\nifdef B\n\techo b\nendif\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
+    /// let conditions: Vec<_> = recipe
+    ///     .enclosing_branches()
+    ///     .iter()
+    ///     .map(|b| b.condition().unwrap())
+    ///     .collect();
+    /// assert_eq!(conditions, vec!["A", "B"]);
+    /// ```
+    pub fn enclosing_branches(&self) -> Vec<ConditionalBranch> {
+        enclosing_branches(self.syntax())
+    }
 }
 
 impl Conditional {
@@ -651,6 +828,24 @@ impl Conditional {
             .children()
             .filter(|it| matches!(it.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE))
             .map(|header| ConditionalBranch { header })
+    }
+
+    /// Whether this conditional is terminated by an `endif` (or `.endif`,
+    /// `!ENDIF`). The parser accepts a conditional that runs to the end of
+    /// the file without one.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "ifdef A\nX = 1\nendif\n".parse().unwrap();
+    /// assert!(makefile.conditionals().next().unwrap().has_endif());
+    /// let (makefile, _) = Makefile::from_str_relaxed("ifdef A\nX = 1\n");
+    /// assert!(!makefile.conditionals().next().unwrap().has_endif());
+    /// ```
+    pub fn has_endif(&self) -> bool {
+        self.syntax()
+            .children()
+            .any(|it| it.kind() == CONDITIONAL_ENDIF)
     }
 
     /// Check if this conditional has an else clause
@@ -961,11 +1156,7 @@ impl Conditional {
                 }],
             }));
         }
-        if self
-            .syntax()
-            .children_with_tokens()
-            .any(|c| c.kind() == CONDITIONAL_ENDIF)
-        {
+        if self.has_endif() {
             return Ok(false);
         }
 
@@ -1026,6 +1217,7 @@ mod tests {
         BsdComparisonOp, BsdCondition, BsdConditionError, BsdConditionErrorKind, BsdFunction,
         BsdOperand, MakefileItem, MakefileVariant, ParseErrorKind, RuleItem,
     };
+    use rowan::ast::AstNode;
 
     #[test]
     fn test_conditional_item_line_col() {
@@ -2391,6 +2583,332 @@ endif
                 Some("! else"),
                 Some("!ENDIF"),
             ]])
+        );
+    }
+
+    /// (condition, index) of a branch.
+    type BranchKey = (Option<String>, usize);
+
+    /// The keys of the branches enclosing each variable definition.
+    fn variable_branches(makefile: &Makefile) -> Vec<(String, Vec<BranchKey>)> {
+        makefile
+            .variable_definitions()
+            .map(|v| {
+                let branches = v
+                    .enclosing_branches()
+                    .iter()
+                    .map(|b| (b.condition(), b.index()))
+                    .collect();
+                (v.name().unwrap(), branches)
+            })
+            .collect()
+    }
+
+    fn s(text: &str) -> Option<String> {
+        Some(text.to_string())
+    }
+
+    #[test]
+    fn test_enclosing_branches_nested_else_if() {
+        let makefile: Makefile = "A = 0\nifdef X\nB = 1\nifeq ($(Y),1)\nC = 2\nelse\nD = 3\nendif\nelse ifdef Z\nE = 4\nelse\nF = 5\nendif\nG = 6\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            variable_branches(&makefile),
+            vec![
+                ("A".to_string(), vec![]),
+                ("B".to_string(), vec![(s("X"), 0)]),
+                ("C".to_string(), vec![(s("X"), 0), (s("($(Y),1)"), 0)]),
+                ("D".to_string(), vec![(s("X"), 0), (None, 1)]),
+                ("E".to_string(), vec![(s("Z"), 1)]),
+                ("F".to_string(), vec![(None, 2)]),
+                ("G".to_string(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_enclosing_branches_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            ".if ${A}\nX=1\n.elif ${B}\n.for f in a b\nY=2\n.endfor\n.else\n.ifdef C\nZ=3\n.endif\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            variable_branches(&makefile),
+            vec![
+                ("X".to_string(), vec![(s("${A}"), 0)]),
+                ("Y".to_string(), vec![(s("${B}"), 1)]),
+                ("Z".to_string(), vec![(None, 2), (s("C"), 0)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_enclosing_branches_nmake() {
+        let makefile = Makefile::parse_with_variant(
+            "!IF 1\nX=1\n!ELSE IFDEF B\nY=2\n!ELSE\nZ=3\n!ENDIF\n",
+            MakefileVariant::NMake,
+        )
+        .tree();
+        assert_eq!(
+            variable_branches(&makefile),
+            vec![
+                ("X".to_string(), vec![(s("1"), 0)]),
+                ("Y".to_string(), vec![(s("B"), 1)]),
+                ("Z".to_string(), vec![(None, 2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_enclosing_branches_in_rules() {
+        let makefile: Makefile = "ifdef A\nall: X = 1\nall:\n\techo all\nifdef B\n\techo b\nelse\n\techo not b\nendif\nendif\n"
+            .parse()
+            .unwrap();
+        let conditions = |branches: Vec<ConditionalBranch>| -> Vec<BranchKey> {
+            branches
+                .iter()
+                .map(|b| (b.condition(), b.index()))
+                .collect()
+        };
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(conditions(rules[0].enclosing_branches()), vec![(s("A"), 0)]);
+        assert_eq!(conditions(rules[1].enclosing_branches()), vec![(s("A"), 0)]);
+        let scoped = rules[0].scoped_assignment().unwrap();
+        assert_eq!(conditions(scoped.enclosing_branches()), vec![(s("A"), 0)]);
+        let recipes: Vec<_> = rules[1]
+            .recipe_nodes()
+            .map(|r| (r.text(), conditions(r.enclosing_branches())))
+            .collect();
+        assert_eq!(
+            recipes,
+            vec![
+                ("echo all".to_string(), vec![(s("A"), 0)]),
+                ("echo b".to_string(), vec![(s("A"), 0), (s("B"), 0)]),
+                ("echo not b".to_string(), vec![(s("A"), 0), (None, 1)]),
+            ]
+        );
+        let items: Vec<_> = makefile.items().collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].enclosing_branches(), vec![]);
+        let MakefileItem::Conditional(cond) = &items[0] else {
+            panic!("expected conditional");
+        };
+        let branch = cond.branches().next().unwrap();
+        let inner: Vec<_> = branch
+            .items()
+            .map(|item| conditions(item.enclosing_branches()))
+            .collect();
+        assert_eq!(inner, vec![vec![(s("A"), 0)], vec![(s("A"), 0)]]);
+    }
+
+    #[test]
+    fn test_enclosing_branches_recipe_after_conditional() {
+        let makefile: Makefile = "ifdef X\na:\nelse\nb:\nendif\n\techo hi\n".parse().unwrap();
+        let Some(MakefileItem::Recipe(recipe)) = makefile.items().nth(1) else {
+            panic!("expected recipe");
+        };
+        assert_eq!(recipe.enclosing_branches(), vec![]);
+    }
+
+    /// The ancestor walk makefile-lsp used before enclosing_branches existed.
+    fn branches_by_ancestors(
+        node: &rowan::SyntaxNode<crate::lossless::Lang>,
+    ) -> Vec<(rowan::TextRange, usize)> {
+        node.ancestors()
+            .zip(node.ancestors().skip(1))
+            .filter(|(_, parent)| parent.kind() == crate::SyntaxKind::CONDITIONAL)
+            .map(|(child, conditional)| {
+                let branch = conditional
+                    .children()
+                    .take_while(|c| c != &child)
+                    .filter(|c| c.kind() == crate::SyntaxKind::CONDITIONAL_ELSE)
+                    .count();
+                (conditional.text_range(), branch)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_enclosing_branches_matches_ancestor_walk() {
+        let texts = [
+            "ifdef X\na:\nelse\nb:\nendif\nc:\n",
+            "ifdef X\nifdef Y\na:\nelse ifdef Z\nb:\nelse\nc:\nendif\nendif\nd:\n",
+            "all:\nifdef X\n\techo a\nelse\n\techo b\nendif\n\techo\n",
+            "ifdef X\nall:\nifdef Y\n\techo a\nelse ifdef Z\n\techo b\nendif\nendif\n",
+            "ifdef X\r\nA = 1\r\nelse\r\nB = 2\r\nendif\r\n",
+            "ifeq ($(A),\\\n  1)\nA = 1\nelse\nB = 2\nendif\n",
+        ];
+        for text in texts {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut nodes: Vec<rowan::SyntaxNode<crate::lossless::Lang>> = Vec::new();
+            nodes.extend(makefile.rules().map(|r| r.syntax().clone()));
+            nodes.extend(makefile.variable_definitions().map(|v| v.syntax().clone()));
+            nodes.extend(makefile.rules().flat_map(|r| {
+                r.recipe_nodes()
+                    .map(|n| n.syntax().clone())
+                    .collect::<Vec<_>>()
+            }));
+            assert!(!nodes.is_empty(), "{:?}", text);
+            for node in nodes {
+                let mut expected = branches_by_ancestors(&node);
+                expected.reverse();
+                let actual: Vec<_> = super::enclosing_branches(&node)
+                    .iter()
+                    .map(|b| (b.conditional().syntax().text_range(), b.index()))
+                    .collect();
+                assert_eq!(actual, expected, "{:?}", text);
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_conditional() {
+        let makefile: Makefile = "ifdef A\nifdef B\nX = 1\nendif\nendif\n".parse().unwrap();
+        let outer = makefile.conditionals().next().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        let branches = var.enclosing_branches();
+        assert_eq!(branches.len(), 2);
+        assert!(branches[0].conditional() == outer);
+        assert_eq!(branches[1].conditional().condition(), s("B"));
+        assert!(branches[1].conditional().parent().is_some());
+        assert_eq!(branches[0], outer.branches().next().unwrap());
+    }
+
+    #[test]
+    fn test_is_exclusive_with() {
+        let makefile: Makefile = "ifdef A\nX = 1\nifdef B\nY = 1\nelse\nY = 2\nendif\nelse ifdef C\nX = 2\nelse\nX = 3\nendif\nifdef A\nZ = 1\nendif\n"
+            .parse()
+            .unwrap();
+        let branches: Vec<Vec<ConditionalBranch>> = makefile
+            .variable_definitions()
+            .map(|v| v.enclosing_branches())
+            .collect();
+        let exclusive = |a: usize, b: usize| {
+            branches[a]
+                .iter()
+                .any(|x| branches[b].iter().any(|y| x.is_exclusive_with(y)))
+        };
+        // X=1, Y=1, Y=2, X=2, X=3, Z=1
+        assert!(!exclusive(0, 0));
+        assert!(!exclusive(0, 1));
+        assert!(exclusive(1, 2));
+        assert!(exclusive(2, 1));
+        assert!(exclusive(0, 3));
+        assert!(exclusive(1, 3));
+        assert!(exclusive(3, 4));
+        assert!(exclusive(0, 4));
+        assert!(!exclusive(0, 5));
+        assert!(!exclusive(4, 5));
+    }
+
+    #[test]
+    fn test_branch_ranges() {
+        let text = "ifdef A\nX = 1\nelse ifeq ($(B),1) # c\nX = 2\n\nelse\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        let ranges: Vec<_> = cond
+            .branches()
+            .map(|b| {
+                (
+                    &text[b.text_range().start().into()..b.text_range().end().into()],
+                    &text[b.directive_range().start().into()..b.directive_range().end().into()],
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                ("ifdef A\nX = 1\n", "ifdef A"),
+                (
+                    "else ifeq ($(B),1) # c\nX = 2\n\n",
+                    "else ifeq ($(B),1) # c"
+                ),
+                ("else\n", "else"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branch_ranges_crlf_and_continuation() {
+        let text = "ifeq ($(A),\\\r\n  1)\r\nX = 1\r\nelse\r\nX = 2\r\nendif\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        let ranges: Vec<_> = cond
+            .branches()
+            .map(|b| {
+                (
+                    &text[b.text_range().start().into()..b.text_range().end().into()],
+                    &text[b.directive_range().start().into()..b.directive_range().end().into()],
+                )
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (
+                    "ifeq ($(A),\\\r\n  1)\r\nX = 1\r\n",
+                    "ifeq ($(A),\\\r\n  1)"
+                ),
+                ("else\r\nX = 2\r\n", "else"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branch_ranges_bsd_unterminated() {
+        let text = ".if ${A}\nX=1\n.elif ${B}\nY=2\n";
+        let (makefile, _) = Makefile::from_str_relaxed(text);
+        let cond = makefile.conditionals().next().unwrap();
+        assert!(!cond.has_endif());
+        let ranges: Vec<_> = cond
+            .branches()
+            .map(|b| {
+                (
+                    u32::from(b.text_range().start()),
+                    u32::from(b.text_range().end()),
+                )
+            })
+            .collect();
+        assert_eq!(ranges, vec![(0, 13), (13, 28)]);
+    }
+
+    #[test]
+    fn test_has_endif() {
+        let makefile: Makefile = "ifdef A\nendif\n".parse().unwrap();
+        assert!(makefile.conditionals().next().unwrap().has_endif());
+
+        let makefile =
+            Makefile::parse_with_variant(".if 1\n.endif\n", MakefileVariant::BSDMake).tree();
+        assert!(makefile.conditionals().next().unwrap().has_endif());
+
+        let makefile =
+            Makefile::parse_with_variant("!IF 1\n!ENDIF\n", MakefileVariant::NMake).tree();
+        assert!(makefile.conditionals().next().unwrap().has_endif());
+
+        // The only endif closes the inner conditional.
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef A\nifdef B\nendif\n");
+        let outer = makefile.conditionals().next().unwrap();
+        assert!(!outer.has_endif());
+        let Some(MakefileItem::Conditional(inner)) = outer.if_items().next() else {
+            panic!("expected nested conditional");
+        };
+        assert!(inner.has_endif());
+    }
+
+    #[test]
+    fn test_branch_debug() {
+        let makefile: Makefile = "ifdef A\nX = 1\nelse\nendif\n".parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        let debug: Vec<_> = cond.branches().map(|b| format!("{:?}", b)).collect();
+        assert_eq!(
+            debug,
+            vec![
+                "ConditionalBranch { index: 0, range: 0..14 }",
+                "ConditionalBranch { index: 1, range: 14..19 }",
+            ]
         );
     }
 }
