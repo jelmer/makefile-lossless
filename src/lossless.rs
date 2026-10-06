@@ -553,7 +553,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // Check if the last TEXT token ended with a backslash (continuation)
                 let is_continuation = last_text_content
                     .as_ref()
-                    .map(|text| text.trim_end().ends_with('\\'))
+                    .map(|text| text.trim_end_matches([' ', '\t']).ends_with('\\'))
                     .unwrap_or(false);
 
                 if is_continuation {
@@ -2275,12 +2275,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
                 && !self.is_line_continuation()
+                && !(self.variant == Some(MakefileVariant::BSDMake)
+                    && self
+                        .tokens
+                        .last()
+                        .is_some_and(|(_, text)| text.starts_with(':')))
             {
                 // Single character variable like $X or $$. A `)` or `}` is
                 // left alone: make finds the end of an enclosing reference
-                // before looking at what it contains. Only the first
-                // character of a token such as `XY` or a run of whitespace is
-                // the name.
+                // before looking at what it contains. BSD make does not take
+                // `:` as a name either, so `$:` is a lone `$` and a `:`. Only
+                // the first character of a token such as `XY` or a run of
+                // whitespace is the name.
                 let text = &self.tokens.last().unwrap().1;
                 let first_len = text.chars().next().unwrap().len_utf8();
                 if text.len() > first_len {
@@ -2776,6 +2782,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             Some((WHITESPACE, _)) => {
                                 seen_reference = true;
                                 continue;
+                            }
+                            // BSD make does not take `:` as a name.
+                            Some((OPERATOR, text))
+                                if text == ":"
+                                    && self.variant == Some(MakefileVariant::BSDMake) =>
+                            {
+                                return false
                             }
                             Some((kind, text))
                                 if text.chars().count() == 1
@@ -6134,6 +6147,53 @@ mod tests {
             ),
             vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i", "$$"]
         );
+    }
+
+    #[test]
+    fn test_bsd_dollar_colon_is_not_a_reference() {
+        // BSD make does not take `:` as a variable name, so `$:` expands to
+        // `:` and the line is a dependency line without targets.
+        let parsed = parse("$:\n", Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(
+            format!("{:#?}", parsed.syntax()),
+            r#"ROOT@0..3
+  RULE@0..3
+    TARGETS@0..1
+      EXPR@0..1
+        DOLLAR@0..1 "$"
+    OPERATOR@1..2 ":"
+    PREREQUISITES@2..2
+    NEWLINE@2..3 "\n"
+"#
+        );
+        let makefile = Makefile::parse_with_variant("a$: b\n", MakefileVariant::BSDMake).tree();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a$"]);
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            reference_texts("X = $: $:: ${:U$:}\n", MakefileVariant::BSDMake),
+            vec!["${:U$:}"]
+        );
+    }
+
+    #[test]
+    fn test_gnu_dollar_colon_is_a_reference() {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse("$:\n", variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(
+                format!("{:#?}", parsed.syntax()),
+                r#"ROOT@0..3
+  EXPRESSION_STATEMENT@0..3
+    EXPR@0..2
+      DOLLAR@0..1 "$"
+      OPERATOR@1..2 ":"
+    NEWLINE@2..3 "\n"
+"#,
+                "{variant:?}"
+            );
+        }
     }
 
     #[test]
@@ -17067,7 +17127,9 @@ mod test_crlf {
 
     #[test]
     fn test_bsd_for_and_directive() {
-        let src = ".for i in a \\\r\n  b\r\nX+= ${i}\r\n.endfor\r\n.error bad \\\r\n  thing\r\n";
+        // BSD make does not continue a line ending in a backslash and CRLF,
+        // so continue these with LF.
+        let src = ".for i in a \\\n  b\r\nX+= ${i}\r\n.endfor\r\n.error bad \\\n  thing\r\n";
         let makefile = Makefile::parse_with_variant(src, crate::MakefileVariant::BSDMake).tree();
         assert_eq!(makefile.to_string(), src);
         let items: Vec<_> = makefile.items().collect();
@@ -17445,7 +17507,13 @@ mod test_crlf {
             let makefile = parse_lone_cr("all: a\rb\n\techo a\rb\n\techo c\r\n", variant);
             let rule = makefile.rules().next().unwrap();
             assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
-            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a\rb"]);
+            // BSD make splits words on a lone CR, but not recipes.
+            let prerequisites = if variant == Some(crate::MakefileVariant::BSDMake) {
+                vec!["a", "b"]
+            } else {
+                vec!["a\rb"]
+            };
+            assert_eq!(rule.prerequisites().collect::<Vec<_>>(), prerequisites);
             assert_eq!(
                 rule.recipes().collect::<Vec<_>>(),
                 vec!["echo a\rb", "echo c"]
@@ -17487,6 +17555,106 @@ mod test_crlf {
         let rule = makefile.rules().next().unwrap();
         rule.recipe_nodes().next().unwrap().insert_after("echo b");
         assert_eq!(makefile.to_string(), "X = a\rb\nall:\n\techo a\n\techo b\n");
+    }
+
+    #[test]
+    fn test_bsd_backslash_before_crlf() {
+        // BSD make takes the backslash as escaping the CR, so the line is
+        // not continued.
+        let bsd = Some(crate::MakefileVariant::BSDMake);
+        let makefile = parse_lone_cr("X = a \\\r\nY = b\r\n", bsd);
+        assert_eq!(
+            variables(&makefile),
+            vec![
+                ("X".to_string(), "a \\\r".to_string()),
+                ("Y".to_string(), "b".to_string()),
+            ]
+        );
+        let makefile = parse_lone_cr("all: a \\\r\nb:\r\n", bsd);
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["all", "b"]);
+        let makefile = parse_lone_cr("# c \\\r\nX = 1\r\n", bsd);
+        assert_eq!(
+            variables(&makefile),
+            vec![("X".to_string(), "1".to_string())]
+        );
+        let makefile = parse_lone_cr("all:\r\n\techo a \\\r\n\techo b\r\n", bsd);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a \\\r", "echo b"]
+        );
+    }
+
+    #[test]
+    fn test_bsd_cr_separates_words() {
+        // BSD make splits words on anything isspace() accepts.
+        for space in ['\r', '\x0b', '\x0c'] {
+            let src = format!("a{space}b c: d{space}e f\n");
+            let makefile = parse_lone_cr(&src, Some(crate::MakefileVariant::BSDMake));
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+            assert_eq!(
+                rule.prerequisites().collect::<Vec<_>>(),
+                vec!["d", "e", "f"]
+            );
+            for variant in VARIANTS {
+                if variant == Some(crate::MakefileVariant::BSDMake) {
+                    continue;
+                }
+                let makefile = parse_lone_cr(&src, variant);
+                let rule = makefile.rules().next().unwrap();
+                assert_eq!(
+                    rule.targets().collect::<Vec<_>>(),
+                    vec![format!("a{space}b"), "c".to_string()],
+                    "{variant:?}"
+                );
+                assert_eq!(
+                    rule.prerequisites().collect::<Vec<_>>(),
+                    vec![format!("d{space}e"), "f".to_string()],
+                    "{variant:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bsd_cr_around_assignment() {
+        let makefile = parse_lone_cr(
+            "X\r=\ry\rz\r\x0b\r\n",
+            Some(crate::MakefileVariant::BSDMake),
+        );
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X".to_string()));
+        assert_eq!(
+            var.value(crate::MakefileVariant::BSDMake),
+            Some("y\rz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_backslash_before_crlf_continues() {
+        for variant in VARIANTS {
+            if variant == Some(crate::MakefileVariant::BSDMake) {
+                continue;
+            }
+            let makefile = parse_lone_cr("X = a \\\r\nY = b\r\n", variant);
+            assert_eq!(
+                variables(&makefile),
+                vec![("X".to_string(), "a \\\nY = b".to_string())],
+                "{variant:?}"
+            );
+            let makefile = parse_lone_cr("all:\r\n\techo a \\\r\n\techo b\r\n", variant);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(
+                rule.recipes().collect::<Vec<_>>(),
+                vec!["echo a \\\necho b"],
+                "{variant:?}"
+            );
+        }
     }
 }
 

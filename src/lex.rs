@@ -111,6 +111,25 @@ impl<'a> Lexer<'a> {
         c == ' ' || c == '\t'
     }
 
+    /// Whether `c` separates words outside recipes. BSD make takes any
+    /// character `isspace()` accepts, including a lone CR.
+    fn is_word_separator(&self, c: char) -> bool {
+        Self::is_whitespace(c) || (self.bsd && !self.gnu && matches!(c, '\r' | '\x0b' | '\x0c'))
+    }
+
+    /// Read word separators up to the end of the line.
+    fn read_word_separators(&mut self) -> String {
+        let mut result = String::new();
+        while let Some(&c) = self.input.peek() {
+            if self.at_newline() || !self.is_word_separator(c) {
+                break;
+            }
+            self.input.next();
+            result.push(c);
+        }
+        result
+    }
+
     /// Whether the input is at a line ending. Like GNU make and BSD make,
     /// only take LF and CRLF as line endings; a lone CR is an ordinary
     /// character.
@@ -123,10 +142,26 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Whether the input is at a CRLF whose CR BSD make takes as escaped
+    /// by an unescaped backslash before it, so that the line ends at the LF
+    /// and is not continued.
+    fn at_escaped_cr(&self, after_backslash: bool) -> bool {
+        let mut probe = self.input.clone();
+        self.bsd
+            && !self.gnu
+            && after_backslash
+            && probe.next() == Some('\r')
+            && probe.next() == Some('\n')
+    }
+
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
-        while !self.at_newline() {
+        loop {
+            let after_backslash = result.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+            if self.at_newline() && !self.at_escaped_cr(after_backslash) {
+                break;
+            }
             let Some(c) = self.input.next() else {
                 break;
             };
@@ -268,8 +303,8 @@ impl<'a> Lexer<'a> {
                     Some((SyntaxKind::TEXT, text))
                 }
                 LineType::Other => match c {
-                    c if Self::is_whitespace(c) => {
-                        Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
+                    c if self.is_word_separator(c) => {
+                        Some((SyntaxKind::WHITESPACE, self.read_word_separators()))
                     }
                     c if Self::is_valid_identifier_char(c) => Some((
                         SyntaxKind::IDENTIFIER,
@@ -376,6 +411,10 @@ impl<'a> Lexer<'a> {
                         if !escaped && self.input.peek() == Some(&'#') {
                             self.input.next();
                             return Some((SyntaxKind::TEXT, "\\#".to_string()));
+                        }
+                        if self.at_escaped_cr(!escaped) {
+                            self.input.next();
+                            return Some((SyntaxKind::TEXT, "\\\r".to_string()));
                         }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
