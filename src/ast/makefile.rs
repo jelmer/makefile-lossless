@@ -330,6 +330,70 @@ impl MakefileItem {
         comments.into_iter()
     }
 
+    /// Get the doc comment of this item: the whole-line `#` comments directly
+    /// above it, in source order.
+    ///
+    /// Unlike [`Self::preceding_comments`], this stops at a blank line, so
+    /// a comment separated from the item by an empty line is not part of
+    /// its doc comment. It also stops at a shebang (`#!`) line and at a line
+    /// with anything but a comment on it, so trailing comments such as the
+    /// one in `FOO = 1 # x` and comments continuing a previous line with a
+    /// backslash are not included. Indented comment lines are included.
+    ///
+    /// Each line is returned without its leading `#` characters, one space
+    /// following them and trailing whitespace.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "# Not this\n\n## Build it\n#   indented\nall:\n".parse().unwrap();
+    /// let item = makefile.items().next().unwrap();
+    /// assert_eq!(item.doc_comments().collect::<Vec<_>>(), vec!["Build it", "  indented"]);
+    /// assert_eq!(
+    ///     item.preceding_comments().collect::<Vec<_>>(),
+    ///     vec!["Not this", "# Build it", "  indented"]
+    /// );
+    /// ```
+    pub fn doc_comments(&self) -> impl Iterator<Item = String> {
+        type Token = rowan::SyntaxToken<crate::lossless::Lang>;
+        fn prev_skipping_indent(token: &Token) -> Option<Token> {
+            match token.prev_token() {
+                Some(t) if t.kind() == WHITESPACE => t.prev_token(),
+                prev => prev,
+            }
+        }
+        // `None` is the start of the file.
+        fn at_line_start(prev: &Option<Token>) -> bool {
+            prev.as_ref()
+                .is_none_or(|t| t.kind() == NEWLINE && !super::is_continuation(&t.clone().into()))
+        }
+
+        let mut lines = Vec::new();
+        let mut before = self
+            .syntax()
+            .first_token()
+            .and_then(|t| prev_skipping_indent(&t));
+        while let Some(newline) = before.as_ref().filter(|_| at_line_start(&before)) {
+            let Some(comment) = newline.prev_token().filter(Self::is_regular_comment) else {
+                break;
+            };
+            let prev = prev_skipping_indent(&comment);
+            if !at_line_start(&prev) {
+                break;
+            }
+            let text = comment.text().trim_start_matches('#');
+            lines.push(
+                text.strip_prefix(' ')
+                    .unwrap_or(text)
+                    .trim_end()
+                    .to_string(),
+            );
+            before = prev;
+        }
+        lines.reverse();
+        lines.into_iter()
+    }
+
     /// Remove all preceding comments for this MakefileItem
     ///
     /// Returns the number of comments removed.
@@ -910,6 +974,35 @@ impl Makefile {
     /// ```
     pub fn comment_blocks(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
         CommentBlockIter::new(self.syntax())
+    }
+
+    /// Get the ranges of all comments in the makefile, in source order.
+    ///
+    /// This includes whole-line comments, trailing comments such as the one
+    /// in `FOO = 1 # x`, comments in conditional directive lines and a
+    /// shebang line. It also includes recipe lines and lines in `define`
+    /// bodies that start with `#`, although make passes those on unchanged
+    /// rather than treating them as comments. A `#` elsewhere in a recipe
+    /// line, as in `echo # x`, is not included. Each range starts at the
+    /// `#` and ends before the line ending, after any lines the comment is
+    /// continued onto with a backslash.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "# a\nFOO = 1 # b\nall:\n\techo # c\n".parse().unwrap();
+    /// let ranges: Vec<_> = makefile.comment_ranges().collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![TextRange::new(0.into(), 3.into()), TextRange::new(12.into(), 15.into())]
+    /// );
+    /// ```
+    pub fn comment_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() == COMMENT)
+            .map(|t| t.text_range())
     }
 
     /// Add a new rule to the makefile
@@ -2651,6 +2744,186 @@ override_dh_auto_configure:
             makefile.included_files().collect::<Vec<_>>(),
             vec!["${f}.mk"]
         );
+    }
+
+    fn doc_comments_of_rules(text: &str) -> Vec<Vec<String>> {
+        let makefile = Makefile::from_str_relaxed(text).0;
+        makefile
+            .rules()
+            .map(|r| MakefileItem::Rule(r).doc_comments().collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_doc_comments() {
+        assert_eq!(
+            doc_comments_of_rules("# one\n#two\n#  three  \na:\n"),
+            vec![vec!["one", "two", " three"]]
+        );
+        assert_eq!(
+            doc_comments_of_rules("# far\n\n# near\na:\n"),
+            vec![vec!["near"]]
+        );
+        assert_eq!(
+            doc_comments_of_rules("# far\n   \n# near\na:\n"),
+            vec![vec!["near"]]
+        );
+        assert_eq!(
+            doc_comments_of_rules("# far\n\na:\n"),
+            vec![Vec::<String>::new()]
+        );
+        assert_eq!(doc_comments_of_rules("a:\n"), vec![Vec::<String>::new()]);
+        assert_eq!(
+            doc_comments_of_rules("##\n## Help\n#\na:\n"),
+            vec![vec!["", "Help", ""]]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_shebang() {
+        assert_eq!(
+            doc_comments_of_rules("#!/usr/bin/make -f\n# doc\na:\n"),
+            vec![vec!["doc"]]
+        );
+        assert_eq!(
+            doc_comments_of_rules("#!/usr/bin/make -f\na:\n"),
+            vec![Vec::<String>::new()]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_stop_at_content() {
+        assert_eq!(
+            doc_comments_of_rules("FOO = 1 # trailing\na:\n"),
+            vec![Vec::<String>::new()]
+        );
+        assert_eq!(
+            doc_comments_of_rules("FOO = 1 # trailing\n# doc\na:\n"),
+            vec![vec!["doc"]]
+        );
+        assert_eq!(
+            doc_comments_of_rules("ifdef X # on directive\na:\nendif\n"),
+            vec![Vec::<String>::new()]
+        );
+        assert_eq!(
+            doc_comments_of_rules("FOO = a \\\n# continued\nb:\n"),
+            vec![Vec::<String>::new()]
+        );
+        assert_eq!(
+            doc_comments_of_rules("a:\n\t# recipe\nb:\n"),
+            vec![Vec::<String>::new(), Vec::<String>::new()]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_after_rule() {
+        assert_eq!(
+            doc_comments_of_rules("# a doc\na:\n\techo a\n# b doc\nb:\n"),
+            vec![vec!["a doc"], vec!["b doc"]]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_comment_continuation() {
+        assert_eq!(
+            doc_comments_of_rules("# one \\\n  two\na:\n"),
+            vec![vec!["one \\\n  two"]]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_crlf() {
+        assert_eq!(
+            doc_comments_of_rules("# far\r\n\r\n# one \r\n# two\r\na:\r\n"),
+            vec![vec!["one", "two"]]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_indented() {
+        let makefile: Makefile = "ifdef X\n  # doc\n  FOO = 1\nendif\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(
+            MakefileItem::Variable(var)
+                .doc_comments()
+                .collect::<Vec<_>>(),
+            vec!["doc"]
+        );
+    }
+
+    #[test]
+    fn test_doc_comments_in_conditionals() {
+        let makefile: Makefile =
+            "ifdef X\n# in if\nFOO = 1\nelse\n# in else\nFOO = 2\nendif\n# after\nBAR = 3\n"
+                .parse()
+                .unwrap();
+        let docs: Vec<Vec<String>> = makefile
+            .variable_definitions()
+            .map(|v| MakefileItem::Variable(v).doc_comments().collect())
+            .collect();
+        assert_eq!(docs, vec![vec!["in if"], vec!["in else"], vec!["after"]]);
+
+        let cond = makefile.items().next().unwrap();
+        assert_eq!(cond.doc_comments().count(), 0);
+    }
+
+    #[test]
+    fn test_doc_comments_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            "# doc\n.if ${A}\n# inner\nX=1\n.endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        let item = makefile.items().next().unwrap();
+        assert_eq!(item.doc_comments().collect::<Vec<_>>(), vec!["doc"]);
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(
+            MakefileItem::Variable(var)
+                .doc_comments()
+                .collect::<Vec<_>>(),
+            vec!["inner"]
+        );
+    }
+
+    #[test]
+    fn test_comment_ranges() {
+        let text = "#!/bin/make\n# a\n  # b\nFOO = 1 # c\nifdef X # d\nall: # e\n\t# f\n\techo # g\nendif\ndefine F\n# h\nendef\n# i \\\n  j\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let comments: Vec<_> = makefile
+            .comment_ranges()
+            .map(|r| &text[r.start().into()..r.end().into()])
+            .collect();
+        assert_eq!(
+            comments,
+            vec![
+                "#!/bin/make",
+                "# a",
+                "# b",
+                "# c",
+                "# d",
+                "# e",
+                "# f",
+                "# h",
+                "# i \\\n  j"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_ranges_crlf() {
+        let text = "# a\r\nFOO = 1 # b\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let comments: Vec<_> = makefile
+            .comment_ranges()
+            .map(|r| &text[r.start().into()..r.end().into()])
+            .collect();
+        assert_eq!(comments, vec!["# a", "# b"]);
+    }
+
+    #[test]
+    fn test_comment_ranges_none() {
+        let makefile: Makefile = "all:\n\techo '#'\n".parse().unwrap();
+        assert_eq!(makefile.comment_ranges().count(), 0);
     }
 
     #[test]
