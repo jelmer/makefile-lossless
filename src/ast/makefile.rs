@@ -502,6 +502,15 @@ impl ExtractFromItem for VariableDefinition {
     }
 }
 
+impl ExtractFromItem for Include {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Include(i) => Some(i),
+            _ => None,
+        }
+    }
+}
+
 // Internal stack-based iterator for recursively collecting items from conditionals
 struct RecursiveItemsIter<T> {
     stack: VecDeque<MakefileItem>,
@@ -1437,20 +1446,24 @@ impl Makefile {
         Ok(())
     }
 
-    /// Get all include directives in the makefile
+    /// Get all include directives in the makefile, including those inside
+    /// conditionals and loops
     ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
-    /// let makefile: Makefile = "include config.mk\n-include .env\n".parse().unwrap();
+    /// let makefile: Makefile = "include config.mk\nifdef DEBUG\n-include .env\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
     /// let includes = makefile.includes().collect::<Vec<_>>();
     /// assert_eq!(includes.len(), 2);
     /// ```
     pub fn includes(&self) -> impl Iterator<Item = Include> {
-        self.syntax().children().filter_map(Include::cast)
+        RecursiveItemsIter::new(self.items())
     }
 
-    /// Get all included file paths
+    /// Get the file paths of all include directives, as returned by
+    /// [`Makefile::includes`]
     ///
     /// # Example
     /// ```
@@ -1460,30 +1473,8 @@ impl Makefile {
     /// assert_eq!(paths, vec!["config.mk", ".env"]);
     /// ```
     pub fn included_files(&self) -> impl Iterator<Item = String> + '_ {
-        // We need to collect all Include nodes from anywhere in the syntax tree,
-        // not just direct children of the root, to handle includes in conditionals
-        fn collect_includes(node: &SyntaxNode) -> Vec<Include> {
-            let mut includes = Vec::new();
-
-            // First check if this node itself is an Include
-            if let Some(include) = Include::cast(node.clone()) {
-                includes.push(include);
-            }
-
-            // Then recurse into all children
-            for child in node.children() {
-                includes.extend(collect_includes(&child));
-            }
-
-            includes
-        }
-
-        // Start collection from the root node
-        let includes = collect_includes(self.syntax());
-
         // Skip includes without file names, such as a bare `include`.
-        includes
-            .into_iter()
+        self.includes()
             .filter_map(|include| include.path())
             .filter(|path| !path.is_empty())
     }
@@ -2589,5 +2580,50 @@ override_dh_auto_configure:
             .map(|v| v.name().unwrap())
             .collect();
         assert_eq!(names, vec!["A", "B", "C", "D", "E"]);
+    }
+
+    #[test]
+    fn test_includes_in_conditionals() {
+        let makefile: Makefile = "include a.mk\nifdef X\ninclude b.mk\nelse\n-include c.mk\nifdef Y\ninclude d.mk\nendif\nendif\nall:\nifdef Z\ninclude e.mk\nendif\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            makefile.includes().map(|i| i.path()).collect::<Vec<_>>(),
+            vec![
+                Some("a.mk".to_string()),
+                Some("b.mk".to_string()),
+                Some("c.mk".to_string()),
+                Some("d.mk".to_string()),
+                Some("e.mk".to_string()),
+            ]
+        );
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["a.mk", "b.mk", "c.mk", "d.mk", "e.mk"]
+        );
+    }
+
+    #[test]
+    fn test_includes_in_for_loop() {
+        let makefile = Makefile::parse_with_variant(
+            ".for f in a b\n.include \"${f}.mk\"\n.endfor\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            makefile.includes().map(|i| i.path()).collect::<Vec<_>>(),
+            vec![Some("${f}.mk".to_string())]
+        );
+        assert_eq!(
+            makefile.included_files().collect::<Vec<_>>(),
+            vec!["${f}.mk"]
+        );
+    }
+
+    #[test]
+    fn test_remove_include_in_conditional() {
+        let makefile: Makefile = "ifdef X\ninclude b.mk\nendif\n".parse().unwrap();
+        makefile.includes().next().unwrap().remove().unwrap();
+        assert_eq!(makefile.to_string(), "ifdef X\nendif\n");
     }
 }
