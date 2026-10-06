@@ -4852,6 +4852,7 @@ impl VariableReference {
     ///
     /// Returns `Some` if the node is an EXPR whose first token is `$` followed by
     /// `(`, `{`, or an identifier (for single-character variables like `$X`).
+    /// An escaped dollar sign (`$$`) is not a reference.
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         if syntax.kind() != EXPR {
             return None;
@@ -4864,7 +4865,9 @@ impl VariableReference {
             return None;
         }
         // Accept $(...), ${...}, or $X (single-char)
-        tokens.next()?;
+        if tokens.next()?.kind() == DOLLAR {
+            return None;
+        }
         Some(Self(syntax))
     }
 
@@ -4881,8 +4884,8 @@ impl VariableReference {
     /// `"SRCS"`, while nested references are, as in `${VAR.${M}}`. For
     /// single-character references such as `$@`, returns that character.
     ///
-    /// Returns `None` for `$$` and for expressions without a variable name,
-    /// such as BSD make's `${:Uvalue}`.
+    /// Returns `None` for expressions without a variable name, such as BSD
+    /// make's `${:Uvalue}`.
     ///
     /// Note: Variable references inside recipes are not parsed into the syntax tree
     /// (recipes are stored as raw text). This only finds references in variable values,
@@ -4900,11 +4903,7 @@ impl VariableReference {
         let open = children.next()?;
         if !matches!(open.kind(), LPAREN | LBRACE) {
             // A single-character reference such as `$@` or `$X`
-            let token = open.into_token()?;
-            if token.kind() == DOLLAR {
-                return None;
-            }
-            return token.text().chars().next().map(String::from);
+            return open.into_token()?.text().chars().next().map(String::from);
         }
         let mut name = String::new();
         for child in children {
@@ -6008,7 +6007,6 @@ mod tests {
                 None,
                 Some("@".to_string()),
                 Some("wildcard".to_string()),
-                None,
             ]
         );
     }
@@ -6337,7 +6335,7 @@ mod tests {
                 "X = ${X:@i@${D}/$i/small@} $i/small $$x\n",
                 MakefileVariant::BSDMake
             ),
-            vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i", "$$"]
+            vec!["${X:@i@${D}/$i/small@}", "${D}", "$i", "$i"]
         );
     }
 
@@ -6399,7 +6397,7 @@ mod tests {
         ] {
             assert_eq!(
                 reference_texts("V = $XY $i/small $$x\n", variant),
-                vec!["$X", "$i", "$$"],
+                vec!["$X", "$i"],
                 "{variant:?}"
             );
             assert_eq!(
