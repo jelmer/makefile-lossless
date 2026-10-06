@@ -4,8 +4,9 @@ use super::{
     escape_hashes, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
-    node_text, recipe_green, remove_with_preceding_comments, trim_trailing_newlines, Conditional,
-    Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
+    build_command, node_text, recipe_green, remove_with_preceding_comments, trim_trailing_newlines,
+    Conditional, Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
+    SyntaxToken,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -1128,13 +1129,40 @@ impl Rule {
     /// rule.replace_command(0, "new command");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `line` can not be written as a single recipe line. Use
+    /// [`Rule::try_replace_command`] to get an error instead.
     pub fn replace_command(&mut self, i: usize, line: &str) -> bool {
+        self.try_replace_command(i, line)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
+
+    /// Replace the command at index i with a new line, like
+    /// [`Rule::replace_command`]
+    ///
+    /// Returns `Ok(false)` if there is no command at index `i`, and an
+    /// error, leaving the rule unchanged, if `line` can not be written as a
+    /// single recipe line: if it contains a newline that is not part of a
+    /// line continuation, or ends in a backslash that would join it with
+    /// the next line.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "rule:\n\tcommand\n".parse().unwrap();
+    /// assert!(rule.try_replace_command(0, "echo a \\\n\tb").unwrap());
+    /// assert!(rule.try_replace_command(0, "echo a\necho b").is_err());
+    /// assert_eq!(rule.to_string(), "rule:\n\techo a \\\n\tb\n");
+    /// ```
+    pub fn try_replace_command(&mut self, i: usize, line: &str) -> Result<bool, Error> {
         let Some(mut recipe) = self.recipe_nodes().nth(i) else {
-            return false;
+            return Ok(false);
         };
         if recipe.is_inline() {
-            recipe.replace_text(line);
-            return true;
+            recipe.try_replace_text(line)?;
+            return Ok(true);
         }
         let target_node = recipe.syntax();
         let target_index = target_node.index();
@@ -1142,19 +1170,18 @@ impl Rule {
             .parent()
             .expect("Recipe node must have a parent");
 
-        let eol = line_ending(self.syntax());
-        let syntax = SyntaxNode::new_root_mut(recipe_green(&[
-            (INDENT, "\t"),
-            (TEXT, line),
-            (NEWLINE, &eol),
-        ]));
-
+        let syntax = build_command(line, &line_ending(self.syntax()), "replace_command")?;
         parent.splice_children(target_index..target_index + 1, vec![syntax.into()]);
 
-        true
+        Ok(true)
     }
 
     /// Add a new command to the rule
+    ///
+    /// # Panics
+    ///
+    /// Panics if `line` can not be written as a single recipe line. Use
+    /// [`Rule::try_push_command`] to get an error instead.
     ///
     /// # Example
     /// ```
@@ -1164,17 +1191,32 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
     /// ```
     pub fn push_command(&mut self, line: &str) {
-        let index = self.recipe_end_index();
-        let eol = line_ending(self.syntax());
-        let syntax = SyntaxNode::new_root_mut(recipe_green(&[
-            (INDENT, "\t"),
-            (TEXT, line),
-            (NEWLINE, &eol),
-        ]));
+        self.try_push_command(line)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
 
+    /// Add a new command to the rule, like [`Rule::push_command`]
+    ///
+    /// Returns an error, leaving the rule unchanged, if `line` can not be
+    /// written as a single recipe line, as for [`Rule::try_replace_command`].
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Rule;
+    /// let mut rule: Rule = "rule:\n".parse().unwrap();
+    /// assert!(rule.try_push_command("echo a\necho b").is_err());
+    /// assert!(rule.try_push_command("echo a \\").is_err());
+    /// rule.try_push_command("echo a").unwrap();
+    /// assert_eq!(rule.to_string(), "rule:\n\techo a\n");
+    /// ```
+    pub fn try_push_command(&mut self, line: &str) -> Result<(), Error> {
+        let eol = line_ending(self.syntax());
+        let syntax = build_command(line, &eol, "push_command")?;
+        let index = self.recipe_end_index();
         let index = terminate_line_before(self.syntax(), index, &eol);
         self.syntax()
             .splice_children(index..index, vec![syntax.into()]);
+        Ok(())
     }
 
     /// Remove command at given index
@@ -1210,14 +1252,29 @@ impl Rule {
     /// let recipes: Vec<_> = rule.recipes().collect();
     /// assert_eq!(recipes, vec!["command1", "inserted_command", "command2"]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `line` can not be written as a single recipe line. Use
+    /// [`Rule::try_insert_command`] to get an error instead.
     pub fn insert_command(&mut self, index: usize, line: &str) -> bool {
+        self.try_insert_command(index, line)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
+
+    /// Insert command at given index, like [`Rule::insert_command`]
+    ///
+    /// Returns `Ok(false)` if `index` is out of range, and an error, leaving
+    /// the rule unchanged, if `line` can not be written as a single recipe
+    /// line, as for [`Rule::try_replace_command`].
+    pub fn try_insert_command(&mut self, index: usize, line: &str) -> Result<bool, Error> {
         let recipes: Vec<_> = self.recipe_nodes().collect();
         match recipes.get(index) {
-            Some(recipe) => recipe.insert_before(line),
-            None if index == recipes.len() => self.push_command(line),
-            None => return false,
+            Some(recipe) => recipe.try_insert_before(line)?,
+            None if index == recipes.len() => self.try_push_command(line)?,
+            None => return Ok(false),
         }
-        true
+        Ok(true)
     }
 
     /// Get the number of commands/recipes in this rule

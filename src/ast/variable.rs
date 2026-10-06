@@ -1,8 +1,9 @@
 use super::makefile::MakefileItem;
-use super::{is_continuation, logical_text, LineSyntax};
+use super::{is_continuation, line_ending, logical_text, LineSyntax};
 use crate::lossless::{
-    is_sunsh_operator, node_text, remove_with_preceding_comments, scan_recipe_variable_refs,
-    RecipeVariableReference, VariableDefinition, ASSIGNMENT_OPERATORS,
+    is_sunsh_operator, node_text, parse, remove_with_preceding_comments, scan_recipe_variable_refs,
+    Error, ErrorInfo, ParseError, RecipeVariableReference, VariableDefinition,
+    ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -23,6 +24,50 @@ fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNo
         }
     }
     builder.finish_node();
+}
+
+fn value_error(context: &str, message: String) -> Error {
+    Error::Parse(ParseError {
+        errors: vec![ErrorInfo {
+            kind: crate::ParseErrorKind::Other,
+            message,
+            line: 1,
+            context: context.to_string(),
+        }],
+    })
+}
+
+/// Whether `text` has a line break that is not part of a line continuation,
+/// or ends in a backslash that would continue the line.
+fn breaks_line(text: &str) -> bool {
+    let mut backslashes = 0;
+    for c in text.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '\n' | '\r' if backslashes % 2 == 0 => return true,
+            // The `\n` of a `\r\n` continuation follows the `\r`.
+            '\r' => {}
+            _ => backslashes = 0,
+        }
+    }
+    backslashes % 2 == 1
+}
+
+/// The EXPR node of the single variable definition in `text`, followed by
+/// another line, if it parses without errors and its raw value is `value`.
+fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossless::Lang>> {
+    let parsed = parse(&format!("{text}Z = 1\n"), None);
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let vars: Vec<_> = parsed.root().variable_definitions().collect();
+    let [var, _] = vars.as_slice() else {
+        return None;
+    };
+    let expr = var
+        .value_expr()
+        .filter(|_| var.raw_value().as_deref() == Some(value))?;
+    Some(SyntaxNode::new_root_mut(expr.green().into_owned()))
 }
 
 /// Whether `text` is an assignment operator token.
@@ -685,7 +730,42 @@ impl VariableDefinition {
     /// assert_eq!(var.name(), Some("BAZ".to_string()));
     /// assert_eq!(makefile.code(), "export BAZ := bar\n");
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_name` contains a newline. Use
+    /// [`Self::try_set_name`] to get an error instead.
     pub fn set_name(&mut self, new_name: &str) {
+        self.try_set_name(new_name)
+            .unwrap_or_else(|e| panic!("invalid variable name: {e}"))
+    }
+
+    /// Rename the variable, like [`Self::set_name`]
+    ///
+    /// Returns an error, leaving the definition unchanged, if `new_name`
+    /// contains a newline.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "FOO := bar\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.try_set_name("A\nB").is_err());
+    /// var.try_set_name("BAZ").unwrap();
+    /// assert_eq!(makefile.code(), "BAZ := bar\n");
+    /// ```
+    pub fn try_set_name(&mut self, new_name: &str) -> Result<(), Error> {
+        if new_name.contains(['\n', '\r']) {
+            return Err(value_error(
+                "set_name",
+                format!("Variable name {new_name:?} contains a newline"),
+            ));
+        }
+        self.replace_name(new_name);
+        Ok(())
+    }
+
+    fn replace_name(&mut self, new_name: &str) {
         let elements = self.name_elements();
         let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
             return;
@@ -778,6 +858,14 @@ impl VariableDefinition {
     /// Update the value of this variable definition while preserving the rest
     /// (export prefix, operator, whitespace, etc.)
     ///
+    /// For a `define` block, `new_value` is the body, as returned by
+    /// [`Self::raw_value`]. A line ending is added if it does not end in one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_value` can not be written as the value, as described
+    /// for [`Self::try_set_value`], which returns an error instead.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -788,22 +876,69 @@ impl VariableDefinition {
     /// assert!(makefile.code().contains("export VAR := new_value"));
     /// ```
     pub fn set_value(&mut self, new_value: &str) {
-        // Find the EXPR node containing the value
-        let expr_index = self.value_expr().map(|it| it.index());
+        self.try_set_value(new_value)
+            .unwrap_or_else(|e| panic!("invalid variable value: {e}"))
+    }
 
-        if let Some(expr_idx) = expr_index {
-            // Build a new EXPR node with the new value
-            let mut builder = GreenNodeBuilder::new();
-            builder.start_node(EXPR.into());
-            builder.token(IDENTIFIER.into(), new_value);
-            builder.finish_node();
+    /// Update the value of this variable definition, like
+    /// [`Self::set_value`]
+    ///
+    /// Returns an error, leaving the definition unchanged, if `new_value`
+    /// contains a newline that is not part of a line continuation or ends
+    /// in a backslash that would continue the line. In a `define` block
+    /// newlines are allowed, but the body must not end the block early,
+    /// e.g. with an `endef` line.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR = old\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.try_set_value("a\nb").is_err());
+    /// var.try_set_value("a \\\n  b").unwrap();
+    /// assert_eq!(makefile.code(), "VAR = a \\\n  b\n");
+    /// ```
+    pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
+        let Some(expr) = self.value_expr() else {
+            // TODO: add an EXPR node to definitions without one
+            return Ok(());
+        };
 
-            let new_expr = SyntaxNode::new_root_mut(builder.finish());
+        let new_expr = if self.is_define() {
+            let eol = line_ending(self.syntax());
+            let body = if new_value.is_empty() || new_value.ends_with('\n') {
+                new_value.to_string()
+            } else {
+                format!("{new_value}{eol}")
+            };
+            parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &body).ok_or_else(|| {
+                value_error(
+                    "set_value",
+                    format!("Cannot write {new_value:?} as the body of a define block"),
+                )
+            })?
+        } else {
+            if breaks_line(new_value) {
+                return Err(value_error(
+                    "set_value",
+                    format!("Cannot write {new_value:?} as a value on a single line"),
+                ));
+            }
+            parse_value_expr(&format!("X = {new_value}\n"), new_value).unwrap_or_else(|| {
+                // TODO: escape values that the parser would read differently,
+                // such as ones containing `#`
+                let mut builder = GreenNodeBuilder::new();
+                builder.start_node(EXPR.into());
+                builder.token(IDENTIFIER.into(), new_value);
+                builder.finish_node();
+                SyntaxNode::new_root_mut(builder.finish())
+            })
+        };
 
-            // Replace the old EXPR with the new one
-            self.syntax()
-                .splice_children(expr_idx..expr_idx + 1, vec![new_expr.into()]);
-        }
+        let expr_idx = expr.index();
+        self.syntax()
+            .splice_children(expr_idx..expr_idx + 1, vec![new_expr.into()]);
+        Ok(())
     }
 }
 
