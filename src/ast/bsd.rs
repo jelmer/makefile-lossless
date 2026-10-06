@@ -1214,4 +1214,39 @@ mod tests {
         assert!(!parsed.errors().is_empty());
         assert_eq!(parsed.tree().variable_definitions().count(), 0);
     }
+
+    #[test]
+    fn test_conditional_name_ends_at_non_letter() {
+        // BSD make reads the name of a conditional directive up to the
+        // first character that is not a letter, as in NetBSD make's
+        // directive-if.mk.
+        for code in [
+            ".if0\nA=1\n.endif\n",
+            ". if1\nA=1\n.endif\n",
+            ".ifdef0\nA=1\n.endif\n",
+            ".if 0\n.elif1\nA=1\n.endif\n",
+            ".if1x\nA=1\n.endif\n",
+        ] {
+            let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+            assert_eq!(parsed.errors(), &[], "{code:?}");
+            let makefile = parsed.tree();
+            assert_eq!(makefile.conditionals().count(), 1, "{code:?}");
+            assert_eq!(makefile.to_string(), code);
+        }
+        for (code, message) in [
+            (
+                ".if 1\nA=1\n.endif0\n",
+                "The .endif directive does not take arguments",
+            ),
+            (
+                ".if 1\nA=1\n.else0\n.endif\n",
+                "The .else directive does not take arguments",
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+            let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(messages, vec![message], "{code:?}");
+            assert_eq!(parsed.tree().to_string(), code);
+        }
+    }
 }

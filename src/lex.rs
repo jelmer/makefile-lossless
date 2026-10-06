@@ -52,6 +52,11 @@ pub struct Lexer<'a> {
     // TODO: Check whether nmake starts a comment at a `#` in a quoted
     // string; its documentation doesn't say.
     nmake_quoted: bool,
+    /// Whether no token has been read yet on the current logical line.
+    line_start: bool,
+    /// Whether the current logical line so far is a `.` at its start,
+    /// optionally followed by whitespace, so that a directive name follows.
+    after_directive_dot: bool,
 }
 
 /// The characters that nmake takes literally after a `^`.
@@ -81,6 +86,8 @@ impl<'a> Lexer<'a> {
             line: Some(String::new()),
             nmake_definition: None,
             nmake_quoted: false,
+            line_start: true,
+            after_directive_dot: false,
         }
     }
 
@@ -192,6 +199,47 @@ impl<'a> Lexer<'a> {
             result.push(c);
         }
         result
+    }
+
+    /// For BSD make, the length of the identifier starting with `c` up to
+    /// the end of a conditional directive name, if the name is followed by
+    /// something other than a letter. BSD make reads the name up to the
+    /// first non-letter, so `.if0` is `.if 0`.
+    fn bsd_conditional_name_len(&self, c: char) -> Option<usize> {
+        if !self.bsd || self.gnu {
+            return None;
+        }
+        let skip = if self.line_start && c == '.' {
+            1
+        } else if self.after_directive_dot {
+            0
+        } else {
+            return None;
+        };
+        let word: String = self
+            .input
+            .clone()
+            .take_while(|&c| Self::is_valid_identifier_char(c))
+            .collect();
+        let rest = &word[skip..];
+        let name_len = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let conditional = matches!(
+            &rest[..name_len],
+            "if" | "ifdef"
+                | "ifndef"
+                | "ifmake"
+                | "ifnmake"
+                | "elif"
+                | "elifdef"
+                | "elifndef"
+                | "elifmake"
+                | "elifnmake"
+                | "else"
+                | "endif"
+        );
+        (conditional && name_len < rest.len()).then_some(skip + name_len)
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
@@ -330,10 +378,13 @@ impl<'a> Lexer<'a> {
                     c if self.is_word_separator(c) => {
                         Some((SyntaxKind::WHITESPACE, self.read_word_separators()))
                     }
-                    c if Self::is_valid_identifier_char(c) => Some((
-                        SyntaxKind::IDENTIFIER,
-                        self.read_while(Self::is_valid_identifier_char),
-                    )),
+                    c if Self::is_valid_identifier_char(c) => {
+                        let text = match self.bsd_conditional_name_len(c) {
+                            Some(len) => self.input.by_ref().take(len).collect(),
+                            None => self.read_while(Self::is_valid_identifier_char),
+                        };
+                        Some((SyntaxKind::IDENTIFIER, text))
+                    }
                     // Make does not treat quotes specially when reading a
                     // line, so each quote is a token of its own.
                     '"' | '\'' => {
@@ -487,6 +538,12 @@ impl Iterator for Lexer<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let token = self.next_token()?;
+        let at_line_start = std::mem::replace(&mut self.line_start, false);
+        self.after_directive_dot = match token.0 {
+            SyntaxKind::IDENTIFIER => at_line_start && token.1 == ".",
+            SyntaxKind::WHITESPACE => self.after_directive_dot,
+            _ => false,
+        };
         if self.gnu {
             if self.line_type == Some(LineType::Recipe) {
                 self.line = None;
@@ -509,6 +566,7 @@ impl Iterator for Lexer<'_> {
                 self.reference_depth = self.reference_depth.saturating_sub(1)
             }
             SyntaxKind::NEWLINE if !self.continuation => {
+                self.line_start = true;
                 self.reference_depth = 0;
                 self.nmake_definition = None;
                 self.nmake_quoted = false;
