@@ -665,3 +665,171 @@ fn find_reference_end(bytes: &[u8], start: usize, close: u8) -> Option<usize> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_recipe_is_silent_various_prefixes() {
+        let makefile: Makefile = r#"test:
+	@echo silent
+	-echo ignore
+	+echo always
+	@-echo silent_ignore
+	-@echo ignore_silent
+	+@echo always_silent
+	echo normal
+"#
+        .parse()
+        .unwrap();
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 7);
+        assert!(recipes[0].is_silent(), "@echo should be silent");
+        assert!(!recipes[1].is_silent(), "-echo should not be silent");
+        assert!(!recipes[2].is_silent(), "+echo should not be silent");
+        assert!(recipes[3].is_silent(), "@-echo should be silent");
+        assert!(recipes[4].is_silent(), "-@echo should be silent");
+        assert!(recipes[5].is_silent(), "+@echo should be silent");
+        assert!(!recipes[6].is_silent(), "echo should not be silent");
+    }
+
+    #[test]
+    fn test_recipe_is_ignore_errors_various_prefixes() {
+        let makefile: Makefile = r#"test:
+	@echo silent
+	-echo ignore
+	+echo always
+	@-echo silent_ignore
+	-@echo ignore_silent
+	+-echo always_ignore
+	echo normal
+"#
+        .parse()
+        .unwrap();
+
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+
+        assert_eq!(recipes.len(), 7);
+        assert!(
+            !recipes[0].is_ignore_errors(),
+            "@echo should not ignore errors"
+        );
+        assert!(recipes[1].is_ignore_errors(), "-echo should ignore errors");
+        assert!(
+            !recipes[2].is_ignore_errors(),
+            "+echo should not ignore errors"
+        );
+        assert!(recipes[3].is_ignore_errors(), "@-echo should ignore errors");
+        assert!(recipes[4].is_ignore_errors(), "-@echo should ignore errors");
+        assert!(recipes[5].is_ignore_errors(), "+-echo should ignore errors");
+        assert!(
+            !recipes[6].is_ignore_errors(),
+            "echo should not ignore errors"
+        );
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_add() {
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("@");
+        assert_eq!(recipe.text(), "@echo hello");
+        assert!(recipe.is_silent());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_change() {
+        let makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("-");
+        assert_eq!(recipe.text(), "-echo hello");
+        assert!(!recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_remove() {
+        let makefile: Makefile = "all:\n\t@-echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("");
+        assert_eq!(recipe.text(), "echo hello");
+        assert!(!recipe.is_silent());
+        assert!(!recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_combinations() {
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.set_prefix("@-");
+        assert_eq!(recipe.text(), "@-echo hello");
+        assert!(recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+
+        recipe.set_prefix("-@");
+        assert_eq!(recipe.text(), "-@echo hello");
+        assert!(recipe.is_silent());
+        assert!(recipe.is_ignore_errors());
+    }
+
+    #[test]
+    fn test_recipe_replace_text_basic() {
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.replace_text("echo world");
+        assert_eq!(recipe.text(), "echo world");
+
+        // Verify it's still accessible from the rule
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo world"]);
+    }
+
+    #[test]
+    fn test_recipe_replace_text_with_prefix() {
+        let makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        recipe.replace_text("@echo goodbye");
+        assert_eq!(recipe.text(), "@echo goodbye");
+        assert!(recipe.is_silent());
+    }
+
+    #[test]
+    fn test_recipe_multiple_operations() {
+        let makefile: Makefile = "all:\n\techo one\n\techo two\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        // Replace text
+        recipe.replace_text("echo modified");
+        assert_eq!(recipe.text(), "echo modified");
+
+        // Add prefix
+        recipe.set_prefix("@");
+        assert_eq!(recipe.text(), "@echo modified");
+
+        // Insert after
+        recipe.insert_after("echo three");
+
+        // Verify all changes
+        let rule = makefile.rules().next().unwrap();
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["@echo modified", "echo three", "echo two"]);
+    }
+}

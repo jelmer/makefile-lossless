@@ -34,6 +34,8 @@ mod lossless;
 mod parse;
 mod pattern;
 mod reference;
+#[cfg(test)]
+mod test_util;
 mod text;
 
 pub use ast::conditional::{ConditionalBranch, ConditionalItem};
