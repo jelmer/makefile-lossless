@@ -171,30 +171,6 @@ impl Include {
         Some(path.to_string())
     }
 
-    /// The path as written, including any delimiters, with line
-    /// continuations collapsed.
-    fn raw_path(&self) -> Option<String> {
-        self.path_expr().map(|it| {
-            collapse_continuations(&it, LineSyntax::Gnu)
-                .trim()
-                .to_string()
-        })
-    }
-
-    /// Get the text range of the path portion of the include directive.
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::Makefile;
-    /// let makefile: Makefile = "include config.mk\n".parse().unwrap();
-    /// let inc = makefile.includes().next().unwrap();
-    /// let range = inc.path_range().unwrap();
-    /// assert_eq!(&makefile.to_string()[std::ops::Range::from(range)], "config.mk");
-    /// ```
-    pub fn path_range(&self) -> Option<rowan::TextRange> {
-        self.path_expr().map(|it| it.text_range())
-    }
-
     /// The file names of this directive with their source ranges.
     fn path_words(&self) -> Vec<(rowan::TextRange, String)> {
         let Some(expr) = self.path_expr() else {
@@ -305,6 +281,30 @@ impl Include {
     /// ```
     pub fn path_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
         self.path_words().into_iter().map(|(range, _)| range)
+    }
+
+    /// The path as written, including any delimiters, with line
+    /// continuations collapsed.
+    fn raw_path(&self) -> Option<String> {
+        self.path_expr().map(|it| {
+            collapse_continuations(&it, LineSyntax::Gnu)
+                .trim()
+                .to_string()
+        })
+    }
+
+    /// Get the text range of the path portion of the include directive.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "include config.mk\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// let range = inc.path_range().unwrap();
+    /// assert_eq!(&makefile.to_string()[std::ops::Range::from(range)], "config.mk");
+    /// ```
+    pub fn path_range(&self) -> Option<rowan::TextRange> {
+        self.path_expr().map(|it| it.text_range())
     }
 
     /// Check if this is an optional include (-include or sinclude)
