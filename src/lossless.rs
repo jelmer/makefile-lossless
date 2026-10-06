@@ -430,12 +430,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Record an error without consuming the current token.
         fn record_error(&mut self, kind: ParseErrorKind, msg: String) {
             let range = self.current_range();
-            let line = self.original_text[..usize::from(range.start())]
-                .matches('\n')
-                .count()
-                + 1;
-            let context = self.get_context_for_line(line);
-
+            let line = self.line_at(range.start());
             let (kind, message) = if self.current() == Some(INDENT)
                 && kind != ParseErrorKind::RecipeBeforeFirstTarget
             {
@@ -450,7 +445,34 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             } else {
                 (kind, msg)
             };
+            self.push_error(kind, message, range, line);
+        }
 
+        /// Record an error for a block that is still open at the end of the
+        /// input. Like GNU and BSD make, report it on the line after the
+        /// last one, even if the input does not end with a newline.
+        fn record_unterminated_error(&mut self, kind: ParseErrorKind, msg: String) {
+            let range = self.current_range();
+            let line = self.original_text.lines().count() + 1;
+            self.push_error(kind, msg, range, line);
+        }
+
+        /// The 1-based line number of `offset`.
+        fn line_at(&self, offset: rowan::TextSize) -> usize {
+            self.original_text[..usize::from(offset)]
+                .matches('\n')
+                .count()
+                + 1
+        }
+
+        fn push_error(
+            &mut self,
+            kind: ParseErrorKind,
+            message: String,
+            range: rowan::TextRange,
+            line: usize,
+        ) {
+            let context = self.get_context_for_line(line);
             self.errors.push(ErrorInfo {
                 message: message.clone(),
                 line,
@@ -2706,7 +2728,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             if depth > 0 && self.is_at_eof() {
-                self.record_error(
+                self.record_unterminated_error(
                     ParseErrorKind::MissingEndif,
                     "unterminated conditional (missing endif)".to_string(),
                 );
@@ -3385,7 +3407,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.directive_display("if"),
                         self.directive_display("endif")
                     );
-                    self.record_error(ParseErrorKind::MissingEndif, message);
+                    self.record_unterminated_error(ParseErrorKind::MissingEndif, message);
                     break;
                 }
                 let Some((name, count)) = self.directive() else {
@@ -3470,7 +3492,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.for_depth += 1;
             loop {
                 if self.is_at_eof() {
-                    self.record_error(
+                    self.record_unterminated_error(
                         ParseErrorKind::MissingEndfor,
                         "unterminated .for (missing .endfor)".to_string(),
                     );
@@ -3508,6 +3530,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `raw_value()` accessors work transparently for `define` blocks.
         fn parse_define(&mut self) {
             self.in_rule = RuleContext::Outside;
+            // GNU make reports a missing endef at the define line.
+            let start = self.current_range();
             self.builder.start_node(VARIABLE.into());
 
             // Consume any `override`/`export`/`private` modifiers and the
@@ -3558,10 +3582,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.bump_endef_keyword();
                 self.parse_define_line_end("endef", false);
             } else {
-                self.error(
+                self.builder.start_node(ERROR.into());
+                let line = self.line_at(start.start());
+                self.push_error(
                     ParseErrorKind::MissingEndef,
                     "missing `endef` for `define`".to_string(),
+                    start,
+                    line,
                 );
+                self.builder.finish_node();
             }
 
             self.builder.finish_node();
@@ -14332,6 +14361,72 @@ test:
         assert_eq!(
             error_kinds("ifeq (a,b\nendif\n", None),
             vec![ParseErrorKind::UnclosedParenthesis]
+        );
+    }
+
+    fn error_lines(input: &str, variant: Option<MakefileVariant>) -> Vec<(ParseErrorKind, usize)> {
+        let parsed = parse(input, variant);
+        assert_eq!(parsed.root().syntax().to_string(), input);
+        parsed.errors.iter().map(|e| (e.kind(), e.line)).collect()
+    }
+
+    #[test]
+    fn test_unterminated_block_error_line() {
+        // GNU make reports a missing endef at the define line, and a
+        // missing endif (like BSD make) at the line after the last one.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (input, expected) in [
+                (
+                    "a:\n\techo a\n\ndefine foo\nbar\n\n",
+                    (ParseErrorKind::MissingEndef, 4),
+                ),
+                (
+                    "override define foo\nx\n",
+                    (ParseErrorKind::MissingEndef, 1),
+                ),
+                ("define \\\nfoo\nx\n", (ParseErrorKind::MissingEndef, 1)),
+                (
+                    "define foo\ndefine bar\nx\nendef\n",
+                    (ParseErrorKind::MissingEndef, 1),
+                ),
+                ("ifdef X\nbar = 1\n", (ParseErrorKind::MissingEndif, 3)),
+                ("ifdef X\nbar = 1", (ParseErrorKind::MissingEndif, 3)),
+                ("ifdef X", (ParseErrorKind::MissingEndif, 2)),
+                (
+                    "ifdef Y\nifdef X\nbar = 1\nendif\nbaz = 2\n\n",
+                    (ParseErrorKind::MissingEndif, 7),
+                ),
+            ] {
+                assert_eq!(
+                    error_lines(input, variant),
+                    vec![expected],
+                    "{input:?} {variant:?}"
+                );
+            }
+        }
+        // BSD make reports open conditionals and unterminated .for loops at
+        // the line after the last one too.
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            for (input, expected) in [
+                (".if 1\nX = 1\n", (ParseErrorKind::MissingEndif, 3)),
+                (".if 1\nX = 1", (ParseErrorKind::MissingEndif, 3)),
+                (".for i in a\nX = 1\n", (ParseErrorKind::MissingEndfor, 3)),
+                (".for i in a\nX = 1", (ParseErrorKind::MissingEndfor, 3)),
+                (
+                    ".for i in a\n.if 0\n.endfor\n",
+                    (ParseErrorKind::MissingEndif, 3),
+                ),
+            ] {
+                assert_eq!(
+                    error_lines(input, variant),
+                    vec![expected],
+                    "{input:?} {variant:?}"
+                );
+            }
+        }
+        assert_eq!(
+            error_lines("!IF 1\nX = 1\n", Some(MakefileVariant::NMake)),
+            vec![(ParseErrorKind::MissingEndif, 3)]
         );
     }
 
