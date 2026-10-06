@@ -44,11 +44,6 @@ fn check_conditional(
             }],
         })
     };
-    // GNU make reads `ifdef` without a name as testing an empty variable
-    // name, but no caller means that.
-    if condition.trim().is_empty() {
-        return Err(error(format!("Empty condition for {conditional_type}")));
-    }
     let if_line = format!("{conditional_type} {condition}");
     let mut lines = vec![if_line.as_str()];
     lines.extend(if_body.lines());
@@ -1251,9 +1246,13 @@ impl Makefile {
     /// The conditional is separated from any preceding content by a blank
     /// line, unless the makefile already ends in one.
     ///
-    /// Returns an error if the condition is empty or invalid, as in
-    /// `ifeq ()`, or if a body does not read back as part of its branch,
-    /// for example because it contains an `else` or `endif` line.
+    /// Returns an error if the condition is invalid, as in `ifeq ()`, or if
+    /// a body does not read back as part of its branch, for example because
+    /// it contains an `else` or `endif` line. The condition is checked as
+    /// the make the conditional type belongs to would: GNU make accepts
+    /// `ifdef` and `ifndef` without a variable name, testing a variable
+    /// with an empty name that is never defined, while BSD make rejects an
+    /// empty condition for each of its conditional types.
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1305,11 +1304,15 @@ impl Makefile {
         // Build CONDITIONAL_IF
         builder.start_node(CONDITIONAL_IF.into());
         builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
+        if !condition.is_empty() {
+            builder.token(WHITESPACE.into(), " ");
+        }
 
         // Wrap condition in EXPR node
         builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
+        if !condition.is_empty() {
+            builder.token(IDENTIFIER.into(), condition);
+        }
         builder.finish_node();
 
         builder.token(NEWLINE.into(), &eol);
@@ -1425,11 +1428,15 @@ impl Makefile {
         // Build CONDITIONAL_IF
         builder.start_node(CONDITIONAL_IF.into());
         builder.token(IDENTIFIER.into(), conditional_type);
-        builder.token(WHITESPACE.into(), " ");
+        if !condition.is_empty() {
+            builder.token(WHITESPACE.into(), " ");
+        }
 
         // Wrap condition in EXPR node
         builder.start_node(EXPR.into());
-        builder.token(IDENTIFIER.into(), condition);
+        if !condition.is_empty() {
+            builder.token(IDENTIFIER.into(), condition);
+        }
         builder.finish_node();
 
         builder.token(NEWLINE.into(), &eol);
@@ -4258,15 +4265,17 @@ VAR3 = value3
     #[test]
     fn test_add_conditional_rejects_invalid_condition() {
         let cases = [
-            ("ifdef", ""),
-            ("ifndef", " "),
             ("ifdef", "A B"),
             ("ifeq", ""),
             ("ifeq", "()"),
             ("ifneq", "(a)"),
             ("ifeq", "a,b"),
             (".if", ""),
+            (".if", " "),
             (".ifdef", ""),
+            (".ifndef", ""),
+            (".ifmake", ""),
+            (".ifnmake", ""),
         ];
         for (conditional_type, condition) in cases {
             let mut makefile: Makefile = "X = 1\n".parse().unwrap();
@@ -4293,15 +4302,40 @@ VAR3 = value3
     }
 
     #[test]
-    fn test_add_conditional_empty_condition_error() {
+    fn test_add_conditional_bsd_empty_condition_error() {
         let mut makefile = Makefile::new();
-        let Err(error) = makefile.add_conditional("ifdef", "", "Y = 1\n", None) else {
+        let Err(error) = makefile.add_conditional(".ifdef", "", "Y = 1\n", None) else {
             panic!("empty condition accepted");
         };
         assert_eq!(
             error.to_string(),
-            "Parse error: Error at line 1: Empty condition for ifdef\n1| add_conditional\n"
+            "Parse error: Error at line 1: expected condition after .ifdef\n1| .ifdef \n"
         );
+    }
+
+    #[test]
+    fn test_add_conditional_empty_ifdef() {
+        for conditional_type in ["ifdef", "ifndef"] {
+            let mut makefile = Makefile::new();
+            let cond = makefile
+                .add_conditional(conditional_type, "", "", None)
+                .unwrap();
+            assert_eq!(cond.condition(), Some(String::new()));
+            assert_eq!(makefile.to_string(), format!("{conditional_type}\nendif\n"));
+            assert_matches_reparse(&makefile);
+
+            let mut makefile = Makefile::new();
+            makefile
+                .add_conditional_with_items(
+                    conditional_type,
+                    "",
+                    std::iter::empty(),
+                    None::<Vec<MakefileItem>>,
+                )
+                .unwrap();
+            assert_eq!(makefile.to_string(), format!("{conditional_type}\nendif\n"));
+            assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]
