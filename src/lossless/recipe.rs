@@ -2,6 +2,73 @@ use super::*;
 use crate::ast::{line_ending, terminate_line_before};
 use rowan::{GreenNode, GreenToken};
 
+type GreenElement = rowan::NodeOrToken<GreenNode, GreenToken>;
+
+/// The elements of a recipe line holding the command `line`, between its
+/// indentation and its line ending, as the parser reads them.
+///
+/// Returns an error if `line` can not be written as a single recipe line:
+/// if it contains a newline outside of a line continuation, or ends in a
+/// line continuation that would join it with the next line.
+fn recipe_line_content(line: &str, context: &str) -> Result<Vec<GreenElement>, Error> {
+    let parsed = parse(&format!("x:\n\t{line}\n\tz\n"), None);
+    let mut rules = parsed.root().syntax().children();
+    let recipes: Vec<_> = rules
+        .next()
+        .filter(|rule| rule.kind() == RULE && rules.next().is_none())
+        .into_iter()
+        .flat_map(|rule| rule.children().filter(|n| n.kind() == RECIPE))
+        .collect();
+    let [recipe, last] = recipes.as_slice() else {
+        return Err(recipe_line_error(line, context));
+    };
+    if !parsed.errors.is_empty()
+        || recipe.text() != format!("\t{line}\n").as_str()
+        || last.text() != "\tz\n"
+    {
+        return Err(recipe_line_error(line, context));
+    }
+    let children: Vec<_> = recipe.green().children().map(|c| c.to_owned()).collect();
+    Ok(children[1..children.len() - 1].to_vec())
+}
+
+fn recipe_line_error(line: &str, context: &str) -> Error {
+    Error::Parse(ParseError {
+        errors: vec![ErrorInfo {
+            kind: crate::ParseErrorKind::Other,
+            message: format!("Cannot write {line:?} as a single recipe line"),
+            line: 1,
+            context: context.to_string(),
+        }],
+    })
+}
+
+/// A RECIPE node for the command `line`, starting with `prefix` and ending
+/// with the line ending `eol`.
+fn build_recipe(
+    prefix: Vec<GreenElement>,
+    line: &str,
+    eol: &str,
+    context: &str,
+) -> Result<SyntaxNode, Error> {
+    let mut children = prefix;
+    children.extend(recipe_line_content(line, context)?);
+    children.push(GreenToken::new(NEWLINE.into(), eol).into());
+    Ok(SyntaxNode::new_root_mut(GreenNode::new(
+        RECIPE.into(),
+        children,
+    )))
+}
+
+fn tab() -> Vec<GreenElement> {
+    vec![GreenToken::new(INDENT.into(), "\t").into()]
+}
+
+/// A tab-indented RECIPE node for the command `line`, as [`build_recipe`].
+pub(crate) fn build_command(line: &str, eol: &str, context: &str) -> Result<SyntaxNode, Error> {
+    build_recipe(tab(), line, eol, context)
+}
+
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
     ///
@@ -297,6 +364,9 @@ impl Recipe {
     /// The prefix can contain `@` (silent), `-` (ignore errors), and/or `+` (always execute).
     /// Pass an empty string to remove all prefixes.
     ///
+    /// Panics if the prefix contains a newline, as [`Recipe::replace_text`]
+    /// does.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -322,6 +392,13 @@ impl Recipe {
 
     /// Replace the text content of this recipe line
     ///
+    /// # Panics
+    ///
+    /// Panics if `new_text` can not be written as a single recipe line,
+    /// such as text containing a newline that is not part of a line
+    /// continuation. Use [`Recipe::try_replace_text`] to get an error
+    /// instead.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -333,47 +410,60 @@ impl Recipe {
     /// assert_eq!(recipe.text(), "echo world");
     /// ```
     pub fn replace_text(&mut self, new_text: &str) {
+        self.try_replace_text(new_text)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
+
+    /// Replace the text content of this recipe line, like
+    /// [`Recipe::replace_text`]
+    ///
+    /// Returns an error, leaving the recipe unchanged, if `new_text` can
+    /// not be written as a single recipe line. A line continuation is
+    /// allowed, but a newline not preceded by a backslash or a trailing
+    /// backslash that would join the line with the next one is not.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.try_replace_text("echo a \\\n\tb").unwrap();
+    /// assert!(recipe.try_replace_text("echo a\necho b").is_err());
+    /// assert_eq!(makefile.to_string(), "all:\n\techo a \\\n\tb\n");
+    /// ```
+    pub fn try_replace_text(&mut self, new_text: &str) -> Result<(), Error> {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
         let node_index = node.index();
 
-        // Build a new RECIPE node with the new text
-        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
         let inline_prefix = self.inline_prefix();
-        if !inline_prefix.is_empty() {
-            for token in &inline_prefix {
-                tokens.push((token.kind(), token.text().to_string()));
-            }
+        let prefix: Vec<GreenElement> = if !inline_prefix.is_empty() {
+            inline_prefix
+                .iter()
+                .map(|t| GreenToken::new(t.kind().into(), t.text()).into())
+                .collect()
         } else if let Some(indent_token) = node
             .children_with_tokens()
-            .find(|it| it.as_token().map(|t| t.kind() == INDENT).unwrap_or(false))
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == INDENT)
         {
             // Preserve the existing INDENT token
-            tokens.push((INDENT, indent_token.as_token().unwrap().text().to_string()));
+            vec![GreenToken::new(INDENT.into(), indent_token.text()).into()]
         } else {
-            tokens.push((INDENT, "\t".to_string()));
-        }
-
-        tokens.push((TEXT, new_text.to_string()));
+            tab()
+        };
 
         // Preserve the existing NEWLINE token if present
-        if let Some(newline_token) = node
+        let eol = node
             .children_with_tokens()
-            .find(|it| it.as_token().map(|t| t.kind() == NEWLINE).unwrap_or(false))
-        {
-            tokens.push((
-                NEWLINE,
-                newline_token.as_token().unwrap().text().to_string(),
-            ));
-        } else {
-            tokens.push((NEWLINE, line_ending(node)));
-        }
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() == NEWLINE)
+            .last()
+            .map_or_else(|| line_ending(node), |t| t.text().to_string());
 
-        let tokens: Vec<_> = tokens
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect();
-        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&tokens));
+        let new_syntax = build_recipe(prefix, new_text, &eol, "replace_text")?;
 
         // Replace the old node with the new one
         parent.splice_children(node_index..node_index + 1, vec![new_syntax.into()]);
@@ -387,6 +477,7 @@ impl Recipe {
             .and_then(|element| element.into_node())
             .and_then(Recipe::cast)
             .expect("New recipe node should exist at the same index");
+        Ok(())
     }
 
     /// Insert a new recipe line before this one
@@ -401,21 +492,31 @@ impl Recipe {
     /// recipe.insert_before("echo hello");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hello", "echo world"]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `text` can not be written as a single recipe line. Use
+    /// [`Recipe::try_insert_before`] to get an error instead.
     pub fn insert_before(&self, text: &str) {
+        self.try_insert_before(text)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
+
+    /// Insert a new recipe line before this one, like
+    /// [`Recipe::insert_before`]
+    ///
+    /// Returns an error, leaving the rule unchanged, if `text` can not be
+    /// written as a single recipe line, as for [`Recipe::try_replace_text`].
+    pub fn try_insert_before(&self, text: &str) -> Result<(), Error> {
+        let new_syntax = build_command(text, &line_ending(self.syntax()), "insert_before")?;
         // A recipe on the rule line has to move to its own line first.
         let this = self.move_to_own_line().unwrap_or_else(|| self.clone());
         let node = this.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
         let node_index = node.index();
 
-        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&[
-            (INDENT, "\t"),
-            (TEXT, text),
-            (NEWLINE, &line_ending(node)),
-        ]));
-
-        // Insert before this recipe
         parent.splice_children(node_index..node_index, vec![new_syntax.into()]);
+        Ok(())
     }
 
     /// Insert a new recipe line after this one
@@ -430,20 +531,29 @@ impl Recipe {
     /// recipe.insert_after("echo world");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hello", "echo world"]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `text` can not be written as a single recipe line. Use
+    /// [`Recipe::try_insert_after`] to get an error instead.
     pub fn insert_after(&self, text: &str) {
+        self.try_insert_after(text)
+            .unwrap_or_else(|e| panic!("invalid recipe line: {e}"))
+    }
+
+    /// Insert a new recipe line after this one, like [`Recipe::insert_after`]
+    ///
+    /// Returns an error, leaving the rule unchanged, if `text` can not be
+    /// written as a single recipe line, as for [`Recipe::try_replace_text`].
+    pub fn try_insert_after(&self, text: &str) -> Result<(), Error> {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
         let eol = line_ending(node);
+        let new_syntax = build_command(text, &eol, "insert_after")?;
 
-        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&[
-            (INDENT, "\t"),
-            (TEXT, text),
-            (NEWLINE, &eol),
-        ]));
-
-        // Insert after this recipe
         let index = terminate_line_before(&parent, node.index() + 1, &eol);
         parent.splice_children(index..index, vec![new_syntax.into()]);
+        Ok(())
     }
 
     /// Remove this recipe line from its parent

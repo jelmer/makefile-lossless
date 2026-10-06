@@ -142,3 +142,116 @@ fn test_rule_parent() {
     // Parent is ROOT node which doesn't cast to MakefileItem
     assert!(parent.is_none());
 }
+
+/// Lines that can not be written as a single recipe line, comment or
+/// variable value.
+const LINE_BREAKING: [&str; 4] = ["a\nb", "a\r\nb", "a \\", "a \\\\\\"];
+
+#[test]
+fn test_recipe_commands_reject_line_breaks() {
+    let text = "a:\n\techo\nb:\n";
+    let makefile: Makefile = text.parse().unwrap();
+    let mut rule = makefile.rules().next().unwrap();
+    let mut recipe = rule.recipe_nodes().next().unwrap();
+    for line in LINE_BREAKING {
+        assert!(rule.try_push_command(line).is_err(), "{line:?}");
+        assert!(rule.try_insert_command(0, line).is_err(), "{line:?}");
+        assert!(rule.try_replace_command(0, line).is_err(), "{line:?}");
+        assert!(recipe.try_replace_text(line).is_err(), "{line:?}");
+        assert!(recipe.try_insert_before(line).is_err(), "{line:?}");
+        assert!(recipe.try_insert_after(line).is_err(), "{line:?}");
+        assert_eq!(makefile.code(), text, "{line:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "invalid recipe line")]
+fn test_push_command_panics_on_newline() {
+    let mut rule: Rule = "a:\n".parse().unwrap();
+    rule.push_command("echo a\necho b");
+}
+
+#[test]
+fn test_recipe_commands_with_continuation() {
+    let makefile: Makefile = "a:\n\techo\nb:\n".parse().unwrap();
+    let mut rule = makefile.rules().next().unwrap();
+    rule.try_push_command("echo x \\\n\ty").unwrap();
+    assert_eq!(makefile.code(), "a:\n\techo\n\techo x \\\n\ty\nb:\n");
+    assert_matches_reparse(&makefile);
+    assert_eq!(
+        rule.recipes().collect::<Vec<_>>(),
+        vec!["echo", "echo x \\\ny"]
+    );
+
+    assert!(rule.try_replace_command(0, "c \\\n  d # e").unwrap());
+    assert!(rule.try_insert_command(2, "f \\\\").unwrap());
+    assert_eq!(
+        makefile.code(),
+        "a:\n\tc \\\n  d # e\n\techo x \\\n\ty\n\tf \\\\\nb:\n"
+    );
+    assert_matches_reparse(&makefile);
+    assert!(!rule.try_insert_command(4, "g").unwrap());
+    assert!(!rule.try_replace_command(3, "g").unwrap());
+}
+
+#[test]
+fn test_inline_recipe_replace_with_continuation() {
+    let makefile: Makefile = "a: ; echo\n".parse().unwrap();
+    let mut rule = makefile.rules().next().unwrap();
+    assert!(rule.try_replace_command(0, "x \\\n\ty").unwrap());
+    assert_eq!(makefile.code(), "a: ; x \\\n\ty\n");
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_set_value_rejects_line_breaks() {
+    let text = "X = 1\nY = 2\n";
+    let makefile: Makefile = text.parse().unwrap();
+    let mut var = makefile.variable_definitions().next().unwrap();
+    for value in LINE_BREAKING {
+        assert!(var.try_set_value(value).is_err(), "{value:?}");
+        assert_eq!(makefile.code(), text, "{value:?}");
+    }
+    assert!(var.try_set_name("A\nB").is_err());
+    assert_eq!(makefile.code(), text);
+}
+
+#[test]
+fn test_set_value_tree_matches_reparse() {
+    let makefile: Makefile = "X = 1\nY = 2\n".parse().unwrap();
+    let mut var = makefile.variable_definitions().next().unwrap();
+    for value in ["a b", "a $(B) \\\n  c", "a\\\\"] {
+        var.try_set_value(value).unwrap();
+        assert_eq!(makefile.code(), format!("X = {value}\nY = 2\n"));
+        assert_eq!(var.raw_value(), Some(value.to_string()));
+        assert_matches_reparse(&makefile);
+    }
+}
+
+#[test]
+fn test_set_value_define() {
+    let makefile: Makefile = "define X\nold\nendef\n".parse().unwrap();
+    let mut var = makefile.variable_definitions().next().unwrap();
+    var.try_set_value("a b\nc").unwrap();
+    assert_eq!(makefile.code(), "define X\na b\nc\nendef\n");
+    assert_eq!(var.raw_value(), Some("a b\nc\n".to_string()));
+    assert_matches_reparse(&makefile);
+
+    assert!(var.try_set_value("a\nendef\nb").is_err());
+    assert_eq!(makefile.code(), "define X\na b\nc\nendef\n");
+}
+
+#[test]
+fn test_comments_reject_line_breaks() {
+    let text = "# c\nX = 1\n";
+    let makefile: Makefile = text.parse().unwrap();
+    let mut item = makefile.items().next().unwrap();
+    for comment in LINE_BREAKING {
+        assert!(item.add_comment(comment).is_err(), "{comment:?}");
+        assert!(item.modify_comment(comment).is_err(), "{comment:?}");
+        assert_eq!(makefile.code(), text, "{comment:?}");
+    }
+    item.add_comment("d \\\\").unwrap();
+    assert_eq!(makefile.code(), "# c\n# d \\\\\nX = 1\n");
+    assert_matches_reparse(&makefile);
+}

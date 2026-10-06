@@ -219,37 +219,44 @@ impl MakefileItem {
     }
 
     /// Helper to parse comment text and extract properly formatted comment tokens
+    ///
+    /// Returns an error if `comment_text` can not be written as a single
+    /// comment line, such as text containing a newline or ending in a
+    /// backslash that would continue the comment onto the next line.
     fn parse_comment_tokens(
         comment_text: &str,
         eol: &str,
-    ) -> (
-        rowan::SyntaxToken<crate::lossless::Lang>,
-        Option<rowan::SyntaxToken<crate::lossless::Lang>>,
-    ) {
-        let comment_line = format!("# {}{}", comment_text, eol);
-        let temp_makefile = crate::lossless::parse(&comment_line, None);
-        let root = temp_makefile.root();
-
-        let mut comment_token = None;
-        let mut newline_token = None;
-        let mut found_comment = false;
-
-        for element in root.syntax().children_with_tokens() {
-            if let rowan::NodeOrToken::Token(token) = element {
-                if token.kind() == COMMENT {
-                    comment_token = Some(token);
-                    found_comment = true;
-                } else if token.kind() == NEWLINE && found_comment && newline_token.is_none() {
-                    newline_token = Some(token);
-                    break;
-                }
-            }
-        }
-
+        context: &str,
+    ) -> Result<
         (
-            comment_token.expect("Failed to extract comment token"),
-            newline_token,
-        )
+            rowan::SyntaxToken<crate::lossless::Lang>,
+            rowan::SyntaxToken<crate::lossless::Lang>,
+        ),
+        Error,
+    > {
+        let comment = format!("# {}", comment_text);
+        let parsed = crate::lossless::parse(&format!("{comment}{eol}X = 1{eol}"), None);
+        let root = parsed.root();
+        let children: Vec<_> = root.syntax().children_with_tokens().collect();
+        match children.as_slice() {
+            [rowan::NodeOrToken::Token(c), rowan::NodeOrToken::Token(n), rowan::NodeOrToken::Node(v)]
+                if c.kind() == COMMENT
+                    && c.text() == comment
+                    && n.kind() == NEWLINE
+                    && v.kind() == VARIABLE
+                    && parsed.errors.is_empty() =>
+            {
+                Ok((c.clone(), n.clone()))
+            }
+            _ => Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
+                    message: format!("Cannot write {comment_text:?} as a single comment line"),
+                    line: 1,
+                    context: format!("MakefileItem::{context}"),
+                }],
+            })),
+        }
     }
 
     /// Replace this MakefileItem with another MakefileItem
@@ -289,6 +296,8 @@ impl MakefileItem {
     ///
     /// The comment text should not include the leading '#' character.
     /// Multiple comment lines can be added by calling this method multiple times.
+    /// Returns an error if the text can not be written as a single comment
+    /// line, e.g. because it contains a newline.
     ///
     /// # Example
     /// ```
@@ -304,12 +313,12 @@ impl MakefileItem {
 
         // Get properly formatted comment tokens
         let (comment_token, newline_token) =
-            Self::parse_comment_tokens(comment_text, &line_ending(self.syntax()));
+            Self::parse_comment_tokens(comment_text, &line_ending(self.syntax()), "add_comment")?;
 
-        let mut elements = vec![rowan::NodeOrToken::Token(comment_token)];
-        if let Some(newline) = newline_token {
-            elements.push(rowan::NodeOrToken::Token(newline));
-        }
+        let elements = vec![
+            rowan::NodeOrToken::Token(comment_token),
+            rowan::NodeOrToken::Token(newline_token),
+        ];
 
         // Insert comment and newline before the current item
         parent.splice_children(current_index..current_index, elements);
@@ -479,6 +488,8 @@ impl MakefileItem {
     ///
     /// Returns `true` if a comment was found and modified, `false` if no comment exists.
     /// The comment text should not include the leading '#' character.
+    /// Returns an error if the text can not be written as a single comment
+    /// line, e.g. because it contains a newline.
     ///
     /// # Example
     /// ```
@@ -492,6 +503,11 @@ impl MakefileItem {
     /// ```
     pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
         let parent = self.get_parent_or_error("modify comment for", "modify_comment")?;
+        let (new_comment_token, _) = Self::parse_comment_tokens(
+            new_comment_text,
+            &line_ending(self.syntax()),
+            "modify_comment",
+        )?;
 
         // Find the first preceding comment (closest to the item)
         let collected_elements = self.collect_preceding_comment_elements();
@@ -505,8 +521,6 @@ impl MakefileItem {
 
         if let Some(element) = comment_element {
             let idx = element.index();
-            let (new_comment_token, _) =
-                Self::parse_comment_tokens(new_comment_text, &line_ending(self.syntax()));
             parent.splice_children(
                 idx..idx + 1,
                 vec![rowan::NodeOrToken::Token(new_comment_token)],
