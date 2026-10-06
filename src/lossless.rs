@@ -971,6 +971,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 self.bump();
                             }
                             Some(NEWLINE) | None => self.bump(),
+                            _ if self.at_space_indented_recipe() => {
+                                newline_count = 0;
+                                self.parse_space_indented_recipe();
+                            }
                             _ => break,
                         }
                     }
@@ -1035,6 +1039,56 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ => break,
                 }
             }
+        }
+
+        /// Whether the current WHITESPACE token starts a line in a rule that
+        /// can only be a recipe indented with spaces rather than a tab: it is
+        /// not a rule, assignment or directive. GNU make rejects such a line
+        /// with "missing separator".
+        fn at_space_indented_recipe(&mut self) -> bool {
+            if self.in_rule != RuleContext::Inside
+                || !matches!(self.tokens.last(), Some((WHITESPACE, ws)) if !ws.contains('\t'))
+            {
+                return false;
+            }
+            let ws = self.tokens.pop().unwrap();
+            let is_recipe = self.directive().is_none()
+                && !self.line_has_dependency_operator()
+                && !self.has_assignment_operator_on_line()
+                && !self.is_variable_assignment_line()
+                && !self.at_include_keyword()
+                && !matches!(
+                    self.tokens.last(),
+                    Some((IDENTIFIER, word)) if Self::is_conditional_start(word)
+                        || matches!(word.as_str(), "else" | "endif" | "define" | "endef")
+                );
+            self.tokens.push(ws);
+            is_recipe
+        }
+
+        /// Parse a recipe line indented with spaces as a recipe of the
+        /// current rule, recording a missing separator error.
+        fn parse_space_indented_recipe(&mut self) {
+            self.builder.start_node(RECIPE.into());
+            self.record_error(
+                ParseErrorKind::MissingSeparator,
+                "missing separator (recipe lines must start with a tab)".to_string(),
+            );
+            self.bump_as(INDENT);
+            let mut text = String::new();
+            while let Some((kind, _)) = self.tokens.last() {
+                if *kind == NEWLINE {
+                    break;
+                }
+                text.push_str(&self.tokens.pop().unwrap().1);
+            }
+            if !text.is_empty() {
+                self.builder.token(TEXT.into(), &text);
+            }
+            if self.current() == Some(NEWLINE) {
+                self.bump();
+            }
+            self.builder.finish_node();
         }
 
         /// Whether `op` separates targets from prerequisites. `&:` and `&::`
@@ -16677,6 +16731,51 @@ test:
         assert_eq!(
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nVARIABLE\n  EXPR\n"
+        );
+    }
+
+    #[test]
+    fn test_space_indented_recipe_recovered() {
+        let code = "all:\n\techo a\n    echo b\n\n    echo c\nX = 1\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.root().to_string(), code);
+        assert_eq!(
+            parsed
+                .positioned_errors
+                .iter()
+                .map(|e| (e.kind(), e.range, e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ParseErrorKind::MissingSeparator,
+                    rowan::TextRange::new(13.into(), 17.into()),
+                    "missing separator (recipe lines must start with a tab)"
+                ),
+                (
+                    ParseErrorKind::MissingSeparator,
+                    rowan::TextRange::new(25.into(), 29.into()),
+                    "missing separator (recipe lines must start with a tab)"
+                ),
+            ]
+        );
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  RECIPE\n  RECIPE\nVARIABLE\n  EXPR\n"
+        );
+        let rule = parsed.root().rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a", "echo b", "echo c"]
+        );
+    }
+
+    #[test]
+    fn test_space_indented_line_outside_rule_not_recovered() {
+        let code = "X = 1\n    echo b\n";
+        let parsed = parse(code, None);
+        assert_eq!(
+            node_kinds(&parsed.syntax()),
+            "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  ERROR\n"
         );
     }
 
