@@ -894,7 +894,7 @@ impl Makefile {
     /// # Panics
     ///
     /// Panics if `target` can not be written as a single target that reads
-    /// back the same.
+    /// back the same. Use [`Makefile::try_add_rule`] to get an error instead.
     ///
     /// # Example
     /// ```
@@ -904,9 +904,27 @@ impl Makefile {
     /// assert_eq!(makefile.to_string(), "rule:\n");
     /// ```
     pub fn add_rule(&mut self, target: &str) -> Rule {
+        self.try_add_rule(target)
+            .unwrap_or_else(|e| panic!("invalid target: {e}"))
+    }
+
+    /// Add a new rule to the makefile, like [`Makefile::add_rule`]
+    ///
+    /// Returns an error, leaving the makefile unchanged, if `target` can
+    /// not be written as a single target that reads back the same, such as
+    /// one containing whitespace or a `:`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile = Makefile::new();
+    /// makefile.try_add_rule("a#b").unwrap();
+    /// assert!(makefile.try_add_rule("a b").is_err());
+    /// assert_eq!(makefile.to_string(), "a\\#b:\n");
+    /// ```
+    pub fn try_add_rule(&mut self, target: &str) -> Result<Rule, Error> {
         let eol = line_ending(self.syntax());
-        let targets = build_targets_node(&[target.to_string()], "add_rule")
-            .unwrap_or_else(|e| panic!("invalid target: {e}"));
+        let targets = build_targets_node(&[target.to_string()], "add_rule")?;
         let syntax = SyntaxNode::new_root_mut(rowan::GreenNode::new(
             RULE.into(),
             [
@@ -941,7 +959,7 @@ impl Makefile {
 
         // Use children().count() - 1 to get the last added child node
         // (not children_with_tokens().count() which includes tokens)
-        Rule::cast(self.syntax().children().last().unwrap()).unwrap()
+        Ok(Rule::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
     /// Add a new conditional to the makefile
