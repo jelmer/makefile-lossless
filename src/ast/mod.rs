@@ -156,6 +156,18 @@ pub(crate) fn with_trailing_newline(node: &SyntaxNode, eol: &str) -> SyntaxNode 
     copy
 }
 
+/// Add a copy of `node` to `builder`.
+pub(crate) fn build_copy(builder: &mut rowan::GreenNodeBuilder, node: &SyntaxNode) {
+    builder.start_node(node.kind().into());
+    for child in node.children_with_tokens() {
+        match child {
+            rowan::NodeOrToken::Node(n) => build_copy(builder, &n),
+            rowan::NodeOrToken::Token(t) => builder.token(t.kind().into(), t.text()),
+        }
+    }
+    builder.finish_node();
+}
+
 /// Whether `last`, the last token of a line without a line break, ends in
 /// a backslash that would continue the line if one was added.
 fn ends_in_continuation(last: &SyntaxToken) -> bool {

@@ -1,3 +1,4 @@
+use super::build_copy;
 use super::rule::build_targets_node;
 use super::{index_before_doc_comment, line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
@@ -50,18 +51,6 @@ fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
     }
     nodes.push(node.into());
     root.splice_children(pos..pos, nodes);
-}
-
-/// Add a copy of `node` to `builder`.
-fn build_copy(builder: &mut GreenNodeBuilder, node: &SyntaxNode) {
-    builder.start_node(node.kind().into());
-    for child in node.children_with_tokens() {
-        match child {
-            rowan::NodeOrToken::Node(n) => build_copy(builder, &n),
-            rowan::NodeOrToken::Token(t) => builder.token(t.kind().into(), t.text()),
-        }
-    }
-    builder.finish_node();
 }
 
 /// Represents different types of items that can appear in a Makefile
