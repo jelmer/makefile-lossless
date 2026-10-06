@@ -663,6 +663,7 @@ fn test_reference_location_variables() {
             ("$(B)", "value of Some(\"X.$(A)\")"),
             ("$(XS)", "name of Some(\"$(XS)\")"),
             ("$(D)", "name of Some(\"$(D)\")"),
+            ("$(BODY)", "value of Some(\"$(D)\")"),
             ("$(U)", "name of Some(\"$(U)\")"),
         ])
     );
@@ -777,7 +778,8 @@ fn test_reference_location_nmake() {
 
 #[test]
 fn test_reference_name_range() {
-    let text = "A = ${SRCS:M*.c} $(OBJS:.o=.c) ${VAR.${M}} ${:Ufoo} $@ $(wildcard *.c) $(X\\\n Y)\r\n";
+    let text =
+        "A = ${SRCS:M*.c} $(OBJS:.o=.c) ${VAR.${M}} ${:Ufoo} $@ $(wildcard *.c) $(X\\\n Y)\r\n";
     let makefile: Makefile = text.parse().unwrap();
     let names: Vec<_> = makefile
         .variable_references()
