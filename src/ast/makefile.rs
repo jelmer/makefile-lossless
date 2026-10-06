@@ -25,6 +25,16 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
     }
 }
 
+/// The first line of a conditional, without a space after the keyword if
+/// the condition is empty.
+fn conditional_if_line(conditional_type: &str, condition: &str) -> String {
+    if condition.is_empty() {
+        conditional_type.to_string()
+    } else {
+        format!("{conditional_type} {condition}")
+    }
+}
+
 /// Check that a conditional of `conditional_type` with `condition` and the
 /// given bodies reads back as a single conditional, without errors and with
 /// an else branch only if there is an `else_body`. Make rejects e.g.
@@ -46,12 +56,7 @@ fn check_conditional(
             }],
         })
     };
-    // GNU make reads `ifdef` without a name as testing an empty variable
-    // name, but no caller means that.
-    if condition.trim().is_empty() {
-        return Err(error(format!("Empty condition for {conditional_type}")));
-    }
-    let if_line = format!("{conditional_type} {condition}");
+    let if_line = conditional_if_line(conditional_type, condition);
     let mut lines = vec![if_line.as_str()];
     lines.extend(if_body.lines());
     if let Some(else_body) = else_body {
@@ -1319,9 +1324,13 @@ impl Makefile {
     /// line, unless the makefile already ends in one. The bodies are parsed
     /// as makefile text.
     ///
-    /// Returns an error if the condition is empty or invalid, as in
-    /// `ifeq ()`, or if a body does not read back as part of its branch,
-    /// for example because it contains an `else` or `endif` line.
+    /// Returns an error if the condition is invalid, as in `ifeq ()`, or if
+    /// a body does not read back as part of its branch, for example because
+    /// it contains an `else` or `endif` line. The condition is checked as
+    /// the make the conditional type belongs to would: GNU make accepts
+    /// `ifdef` and `ifndef` without a variable name, testing a variable
+    /// with an empty name that is never defined, while BSD make rejects an
+    /// empty condition for each of its conditional types.
     ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
@@ -1368,7 +1377,7 @@ impl Makefile {
 
         let eol = line_ending(self.syntax());
         let syntax = build_conditional(
-            &format!("{conditional_type} {condition}"),
+            &conditional_if_line(conditional_type, condition),
             if_body,
             else_body.map(|body| (else_keyword, body)),
             endif_keyword,
@@ -1453,7 +1462,7 @@ impl Makefile {
         let else_text: Option<String> =
             else_items.map(|items| items.into_iter().map(item_text).collect());
         let syntax = build_conditional(
-            &format!("{conditional_type} {condition}"),
+            &conditional_if_line(conditional_type, condition),
             &if_text,
             else_text.as_deref().map(|text| (else_keyword, text)),
             endif_keyword,
@@ -4669,15 +4678,17 @@ VAR3 = value3
     #[test]
     fn test_add_conditional_rejects_invalid_condition() {
         let cases = [
-            ("ifdef", ""),
-            ("ifndef", " "),
             ("ifdef", "A B"),
             ("ifeq", ""),
             ("ifeq", "()"),
             ("ifneq", "(a)"),
             ("ifeq", "a,b"),
             (".if", ""),
+            (".if", " "),
             (".ifdef", ""),
+            (".ifndef", ""),
+            (".ifmake", ""),
+            (".ifnmake", ""),
         ];
         for (conditional_type, condition) in cases {
             let mut makefile: Makefile = "X = 1\n".parse().unwrap();
@@ -4704,15 +4715,40 @@ VAR3 = value3
     }
 
     #[test]
-    fn test_add_conditional_empty_condition_error() {
+    fn test_add_conditional_bsd_empty_condition_error() {
         let mut makefile = Makefile::new();
-        let Err(error) = makefile.add_conditional("ifdef", "", "Y = 1\n", None) else {
+        let Err(error) = makefile.add_conditional(".ifdef", "", "Y = 1\n", None) else {
             panic!("empty condition accepted");
         };
         assert_eq!(
             error.to_string(),
-            "Parse error: Error at line 1: Empty condition for ifdef\n1| add_conditional\n"
+            "Parse error: Error at line 1: expected condition after .ifdef\n1| .ifdef\n"
         );
+    }
+
+    #[test]
+    fn test_add_conditional_empty_ifdef() {
+        for conditional_type in ["ifdef", "ifndef"] {
+            let mut makefile = Makefile::new();
+            let cond = makefile
+                .add_conditional(conditional_type, "", "", None)
+                .unwrap();
+            assert_eq!(cond.condition(), Some(String::new()));
+            assert_eq!(makefile.to_string(), format!("{conditional_type}\nendif\n"));
+            assert_matches_reparse(&makefile);
+
+            let mut makefile = Makefile::new();
+            makefile
+                .add_conditional_with_items(
+                    conditional_type,
+                    "",
+                    std::iter::empty(),
+                    None::<Vec<MakefileItem>>,
+                )
+                .unwrap();
+            assert_eq!(makefile.to_string(), format!("{conditional_type}\nendif\n"));
+            assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]
