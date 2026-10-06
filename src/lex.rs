@@ -44,7 +44,20 @@ pub struct Lexer<'a> {
     recipe_prefix: char,
     /// Text of the current logical line, if it is not a recipe line.
     line: Option<String>,
+    /// For nmake, whether the first operator on the current logical line
+    /// is `=`, making it a macro definition. `None` before any operator.
+    nmake_definition: Option<bool>,
+    /// For nmake, whether the current logical line has an unclosed `"`, in
+    /// which carets are literal.
+    // TODO: Check whether nmake starts a comment at a `#` in a quoted
+    // string; its documentation doesn't say.
+    nmake_quoted: bool,
 }
+
+/// The characters that nmake takes literally after a `^`.
+pub(crate) const NMAKE_ESCAPABLE: &[char] = &[
+    ':', ';', '#', '(', ')', '$', '^', '\\', '{', '}', '!', '@', '-',
+];
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str, variant: Option<MakefileVariant>) -> Self {
@@ -66,6 +79,8 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             line: Some(String::new()),
+            nmake_definition: None,
+            nmake_quoted: false,
         }
     }
 
@@ -314,6 +329,9 @@ impl<'a> Lexer<'a> {
                     // line, so each quote is a token of its own.
                     '"' | '\'' => {
                         self.input.next();
+                        if c == '"' && self.nmake {
+                            self.nmake_quoted = !self.nmake_quoted;
+                        }
                         Some((SyntaxKind::QUOTE, c.to_string()))
                     }
                     ':' => {
@@ -404,6 +422,23 @@ impl<'a> Lexer<'a> {
                         self.input.next();
                         Some((SyntaxKind::COMMA, ",".to_string()))
                     }
+                    '^' if self.nmake => {
+                        self.input.next();
+                        // A caret in a quoted string is literal, except at the
+                        // end of a line.
+                        if let Some(escaped) = self
+                            .input
+                            .next_if(|c| !self.nmake_quoted && NMAKE_ESCAPABLE.contains(c))
+                        {
+                            return Some((SyntaxKind::TEXT, format!("^{escaped}")));
+                        }
+                        // In a macro definition, a caret at the end of the
+                        // line continues the definition with a newline.
+                        if self.nmake_definition == Some(true) && self.at_newline() {
+                            self.continuation = true;
+                        }
+                        Some((SyntaxKind::TEXT, "^".to_string()))
+                    }
                     '\\' => {
                         self.input.next();
                         // `\#` is a literal hash rather than the start of a
@@ -464,7 +499,16 @@ impl Iterator for Lexer<'_> {
             SyntaxKind::RPAREN | SyntaxKind::RBRACE => {
                 self.reference_depth = self.reference_depth.saturating_sub(1)
             }
-            SyntaxKind::NEWLINE if !self.continuation => self.reference_depth = 0,
+            SyntaxKind::NEWLINE if !self.continuation => {
+                self.reference_depth = 0;
+                self.nmake_definition = None;
+                self.nmake_quoted = false;
+            }
+            SyntaxKind::OPERATOR
+                if self.nmake_definition.is_none() && self.line_type == Some(LineType::Other) =>
+            {
+                self.nmake_definition = Some(token.1 == "=")
+            }
             _ => {}
         }
         self.dollars = if token.0 == SyntaxKind::DOLLAR {
@@ -1257,6 +1301,146 @@ override_dh_auto_clean:
                 (TEXT, "b"),
                 (NEWLINE, "\n"),
             ]
+        );
+    }
+
+    fn lex_nmake(input: &str) -> Vec<(SyntaxKind, String)> {
+        lex(input, Some(MakefileVariant::NMake))
+    }
+
+    fn tokens(tokens: &[(SyntaxKind, &str)]) -> Vec<(SyntaxKind, String)> {
+        tokens.iter().map(|(k, t)| (*k, t.to_string())).collect()
+    }
+
+    #[test]
+    fn test_nmake_caret_escapes() {
+        assert_eq!(
+            lex_nmake("X = a^#b # c\n"),
+            tokens(&[
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (TEXT, "^#"),
+                (IDENTIFIER, "b"),
+                (WHITESPACE, " "),
+                (COMMENT, "# c"),
+                (NEWLINE, "\n"),
+            ])
+        );
+        assert_eq!(
+            lex_nmake("X = a^\\\nY = ^^#b\n"),
+            tokens(&[
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (TEXT, "^\\"),
+                (NEWLINE, "\n"),
+                (IDENTIFIER, "Y"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (TEXT, "^^"),
+                (COMMENT, "#b"),
+                (NEWLINE, "\n"),
+            ])
+        );
+        // A caret before any other character is not an escape.
+        assert_eq!(
+            lex_nmake("X = ^a^$(Y)\n"),
+            tokens(&[
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (TEXT, "^"),
+                (IDENTIFIER, "a"),
+                (TEXT, "^$"),
+                (LPAREN, "("),
+                (IDENTIFIER, "Y"),
+                (RPAREN, ")"),
+                (NEWLINE, "\n"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_caret_not_escape_in_other_variants() {
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            assert_eq!(
+                lex("X = a^#b\n", variant),
+                tokens(&[
+                    (IDENTIFIER, "X"),
+                    (WHITESPACE, " "),
+                    (OPERATOR, "="),
+                    (WHITESPACE, " "),
+                    (IDENTIFIER, "a"),
+                    (TEXT, "^"),
+                    (COMMENT, "#b"),
+                    (NEWLINE, "\n"),
+                ]),
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nmake_caret_newline() {
+        // In a macro definition, a caret at the end of the line continues
+        // the definition on the next line.
+        assert_eq!(
+            lex_nmake("X = a^\n\tb\n"),
+            tokens(&[
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (TEXT, "^"),
+                (NEWLINE, "\n"),
+                (INDENT, "\t"),
+                (IDENTIFIER, "b"),
+                (NEWLINE, "\n"),
+            ])
+        );
+        // Elsewhere it does not.
+        assert_eq!(
+            lex_nmake("a: b^\n\tc\n"),
+            tokens(&[
+                (IDENTIFIER, "a"),
+                (OPERATOR, ":"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "b"),
+                (TEXT, "^"),
+                (NEWLINE, "\n"),
+                (INDENT, "\t"),
+                (TEXT, "c"),
+                (NEWLINE, "\n"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_nmake_caret_in_command() {
+        // Commands are lexed as a whole, carets included.
+        assert_eq!(
+            lex_nmake("a:\n\techo ^#a^\\\n"),
+            tokens(&[
+                (IDENTIFIER, "a"),
+                (OPERATOR, ":"),
+                (NEWLINE, "\n"),
+                (INDENT, "\t"),
+                (TEXT, "echo ^#a^\\"),
+                (NEWLINE, "\n"),
+            ])
         );
     }
 

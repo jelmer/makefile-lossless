@@ -9,6 +9,7 @@ pub mod rule;
 pub mod variable;
 pub mod vpath;
 
+use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{detached_elements, SyntaxElement, SyntaxNode, SyntaxToken};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
@@ -190,8 +191,9 @@ pub(crate) enum LineSyntax {
     /// are never halved, `\#` is unescaped and `#` starts a comment even
     /// inside variable references, and trailing whitespace is removed.
     Bsd,
-    /// Microsoft nmake: as POSIX make, but `\#` is not an escape.
-    // TODO: Support nmake's `^` escapes, such as `^#` and `^\`.
+    /// Microsoft nmake: as POSIX make, but `\#` is not an escape. Instead,
+    /// a caret escapes the characters in [`NMAKE_ESCAPABLE`], and one at
+    /// the end of a line of a macro definition stands for a newline.
     NMake,
 }
 
@@ -214,7 +216,8 @@ impl From<MakefileVariant> for LineSyntax {
 ///
 /// With `comments`, the text is also treated as a line from which a
 /// trailing comment has been removed, which makes a difference for `\#`
-/// and the backslashes before the comment.
+/// and the backslashes before the comment, and nmake's `^` escapes are
+/// unescaped.
 pub(crate) fn logical_text(
     root: &SyntaxNode,
     tokens: impl IntoIterator<Item = SyntaxToken>,
@@ -278,6 +281,20 @@ pub(crate) fn logical_text(
                     in_continuation = false;
                 }
             },
+            TEXT if comments && syntax == LineSyntax::NMake && token.text().starts_with('^') => {
+                text.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                in_continuation = false;
+                match token.text().strip_prefix('^') {
+                    Some(c) if c.len() == 1 && c.starts_with(NMAKE_ESCAPABLE) => text.push_str(c),
+                    // The newline that follows stands for the caret.
+                    Some("")
+                        if token.next_token().is_some_and(|t| {
+                            t.kind() == NEWLINE && t.parent_ancestors().any(|n| &n == root)
+                        }) => {}
+                    _ => text.push_str(token.text()),
+                }
+            }
             kind => {
                 text.push_str(&"\\".repeat(backslashes));
                 if backslashes % 2 == 1 && kind == WHITESPACE {
