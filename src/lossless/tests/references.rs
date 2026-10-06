@@ -24,6 +24,7 @@ fn test_variable_reference_names() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_reference_names() {
     let text = "all:\n\t${.ALLSRC:M*.o} ${VAR.${M}} $(shell echo $(X)) ${X:S/a/${Y}/} $1\n";
     let makefile: Makefile = text.parse().unwrap();
@@ -513,6 +514,7 @@ fn test_complex_variable_references_minimal() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references() {
     let makefile: Makefile = "all:\n\techo $(FOO) ${BAR}\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();
@@ -530,7 +532,7 @@ fn test_recipe_variable_references() {
 }
 
 #[test]
-fn test_variable_references_skip_define_body() {
+fn test_variable_references_in_define_body() {
     let text = "define E\n$(FOO) $(FOO:a=b)\nendef\nX = $(BAR)\n";
     let makefile: Makefile = text.parse().unwrap();
     assert_eq!(
@@ -538,11 +540,16 @@ fn test_variable_references_skip_define_body() {
             .variable_references()
             .map(|r| (r.syntax().text().to_string(), r.name()))
             .collect::<Vec<_>>(),
-        vec![("$(BAR)".to_string(), Some("BAR".to_string()))]
+        vec![
+            ("$(FOO)".to_string(), Some("FOO".to_string())),
+            ("$(FOO:a=b)".to_string(), Some("FOO".to_string())),
+            ("$(BAR)".to_string(), Some("BAR".to_string()))
+        ]
     );
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references_skips_functions_and_automatic() {
     let makefile: Makefile = "all:\n\t$(shell ls) $@ $1 $(REAL)\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();
@@ -556,6 +563,7 @@ fn test_recipe_variable_references_skips_functions_and_automatic() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_recipe_variable_references_across_continuation() {
     let makefile: Makefile = "all:\n\techo $(FOO) \\\n\t  $(BAR)\n".parse().unwrap();
     let rule = makefile.rules().next().unwrap();

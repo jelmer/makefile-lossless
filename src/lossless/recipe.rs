@@ -1,5 +1,6 @@
 use super::*;
 use crate::ast::{line_ending, terminate_line_before};
+use rowan::{GreenNode, GreenToken};
 
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
@@ -46,56 +47,111 @@ impl Recipe {
     }
 
     fn logical_text(&self, include_comments: bool) -> String {
-        let tokens: Vec<_> = self
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.as_token().cloned())
-            .collect();
-
-        if tokens.is_empty() {
-            return String::new();
-        }
-
-        // Skip the first token if it's the leading INDENT
-        let start = if tokens.first().map(|t| t.kind()) == Some(INDENT) {
-            1
-        } else {
-            0
-        };
-
-        // Skip the last token if it's the trailing NEWLINE
-        let end = if tokens.last().map(|t| t.kind()) == Some(NEWLINE) {
-            tokens.len() - 1
-        } else {
-            tokens.len()
-        };
-
-        // For INDENT tokens after a continuation newline, strip the leading tab character.
         let mut after_newline = false;
-        tokens[start..end]
-            .iter()
-            .filter_map(|t| match t.kind() {
-                TEXT => {
-                    after_newline = false;
-                    Some(t.text().to_string())
-                }
-                COMMENT if include_comments => {
-                    after_newline = false;
-                    Some(t.text().to_string())
-                }
-                NEWLINE => {
-                    after_newline = true;
-                    Some(lf_line_endings(t.text()))
-                }
-                INDENT if after_newline => {
-                    after_newline = false;
+        self.body_tokens()
+            .filter_map(|t| {
+                // Tokens in a reference are all text.
+                let nested = t.parent().as_ref() != Some(self.syntax());
+                match t.kind() {
+                    NEWLINE => {
+                        after_newline = true;
+                        Some(lf_line_endings(t.text()))
+                    }
                     // Strip the leading tab from continuation-line indentation
-                    let text = t.text();
-                    Some(text.strip_prefix('\t').unwrap_or(text).to_string())
+                    INDENT if after_newline => {
+                        after_newline = false;
+                        let text = t.text();
+                        Some(text.strip_prefix('\t').unwrap_or(text).to_string())
+                    }
+                    COMMENT if include_comments => {
+                        after_newline = false;
+                        Some(t.text().to_string())
+                    }
+                    // Other tokens directly in the node are the `;` and the
+                    // whitespace before a recipe on the rule line.
+                    _ if t.kind() == TEXT || nested => {
+                        after_newline = false;
+                        Some(t.text().to_string())
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect()
+    }
+
+    /// The tokens of this recipe without the leading indentation and the
+    /// trailing newline.
+    fn body_tokens(&self) -> impl Iterator<Item = SyntaxToken> {
+        let first = self
+            .syntax()
+            .first_child_or_token()
+            .and_then(|it| it.into_token())
+            .filter(|t| t.kind() == INDENT);
+        let last = self
+            .syntax()
+            .last_child_or_token()
+            .and_then(|it| it.into_token())
+            .filter(|t| t.kind() == NEWLINE);
+        self.syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(move |t| Some(t) != first.as_ref() && Some(t) != last.as_ref())
+    }
+
+    /// The text of each line of the command, with its start: the runs of
+    /// text between line breaks, indentation and comments.
+    fn text_lines(&self) -> Vec<(rowan::TextSize, String)> {
+        let mut lines: Vec<(rowan::TextSize, String)> = vec![];
+        let mut in_line = false;
+        for token in self
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+        {
+            let nested = token.parent().as_ref() != Some(self.syntax());
+            let is_text =
+                !matches!(token.kind(), NEWLINE | INDENT) && (nested || token.kind() == TEXT);
+            match lines.last_mut() {
+                Some((_, line)) if is_text && in_line => line.push_str(token.text()),
+                _ if is_text => lines.push((token.text_range().start(), token.text().to_string())),
+                _ => {}
+            }
+            in_line = is_text;
+        }
+        lines
+    }
+
+    /// The text of the first line of the command, if any.
+    pub(crate) fn first_line_text(&self) -> Option<String> {
+        self.text_lines().into_iter().next().map(|(_, text)| text)
+    }
+
+    /// Iterate the variable references in this recipe, in source order.
+    ///
+    /// These are all references, as in [`Makefile::variable_references`]:
+    /// variables, function calls, automatic variables such as `$@` and
+    /// `$(@D)`, and references nested in others. A `$$` is not a reference.
+    /// References are found as make finds them when it expands the recipe,
+    /// so a reference may continue on the next line after a line
+    /// continuation. An unterminated reference is left as text. Lines
+    /// starting with `#` are not searched.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t$(CC) -o $@ $(addprefix -I,$(DIRS)) $$HOME\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// let refs: Vec<_> = recipe.references().map(|r| r.to_string()).collect();
+    /// assert_eq!(refs, vec!["$(CC)", "$@", "$(addprefix -I,$(DIRS))", "$(DIRS)"]);
+    /// ```
+    pub fn references(&self) -> impl Iterator<Item = VariableReference> {
+        self.syntax()
+            .descendants()
+            .filter_map(VariableReference::cast)
     }
 
     /// Get the indentation string of this recipe line.
@@ -170,18 +226,16 @@ impl Recipe {
     /// ```
     pub fn full(&self) -> String {
         self.syntax()
-            .children_with_tokens()
-            .filter_map(|it| {
-                if let Some(token) = it.as_token() {
-                    // Include TEXT and COMMENT tokens, but skip INDENT and NEWLINE
-                    if token.kind() == TEXT || token.kind() == COMMENT {
-                        return Some(token.text().to_string());
-                    }
-                }
-                None
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|token| match token.kind() {
+                INDENT | NEWLINE => false,
+                TEXT | COMMENT => true,
+                // Anything in a reference is text.
+                _ => token.parent().as_ref() != Some(self.syntax()),
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .map(|token| token.text().to_string())
+            .collect()
     }
 
     /// Get the parent rule containing this recipe
@@ -289,38 +343,42 @@ impl Recipe {
         let node_index = node.index();
 
         // Build a new RECIPE node with the new text
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-
+        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
         let inline_prefix = self.inline_prefix();
         if !inline_prefix.is_empty() {
             for token in &inline_prefix {
-                builder.token(token.kind().into(), token.text());
+                tokens.push((token.kind(), token.text().to_string()));
             }
         } else if let Some(indent_token) = node
             .children_with_tokens()
             .find(|it| it.as_token().map(|t| t.kind() == INDENT).unwrap_or(false))
         {
             // Preserve the existing INDENT token
-            builder.token(INDENT.into(), indent_token.as_token().unwrap().text());
+            tokens.push((INDENT, indent_token.as_token().unwrap().text().to_string()));
         } else {
-            builder.token(INDENT.into(), "\t");
+            tokens.push((INDENT, "\t".to_string()));
         }
 
-        builder.token(TEXT.into(), new_text);
+        tokens.push((TEXT, new_text.to_string()));
 
         // Preserve the existing NEWLINE token if present
         if let Some(newline_token) = node
             .children_with_tokens()
             .find(|it| it.as_token().map(|t| t.kind() == NEWLINE).unwrap_or(false))
         {
-            builder.token(NEWLINE.into(), newline_token.as_token().unwrap().text());
+            tokens.push((
+                NEWLINE,
+                newline_token.as_token().unwrap().text().to_string(),
+            ));
         } else {
-            builder.token(NEWLINE.into(), &line_ending(node));
+            tokens.push((NEWLINE, line_ending(node)));
         }
 
-        builder.finish_node();
-        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+        let tokens: Vec<_> = tokens
+            .iter()
+            .map(|(kind, text)| (*kind, text.as_str()))
+            .collect();
+        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&tokens));
 
         // Replace the old node with the new one
         parent.splice_children(node_index..node_index + 1, vec![new_syntax.into()]);
@@ -355,14 +413,11 @@ impl Recipe {
         let parent = node.parent().expect("Recipe node must have a parent");
         let node_index = node.index();
 
-        // Build a new RECIPE node
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), text);
-        builder.token(NEWLINE.into(), &line_ending(node));
-        builder.finish_node();
-        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&[
+            (INDENT, "\t"),
+            (TEXT, text),
+            (NEWLINE, &line_ending(node)),
+        ]));
 
         // Insert before this recipe
         parent.splice_children(node_index..node_index, vec![new_syntax.into()]);
@@ -385,14 +440,11 @@ impl Recipe {
         let parent = node.parent().expect("Recipe node must have a parent");
         let eol = line_ending(node);
 
-        // Build a new RECIPE node
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), text);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-        let new_syntax = SyntaxNode::new_root_mut(builder.finish());
+        let new_syntax = SyntaxNode::new_root_mut(recipe_green(&[
+            (INDENT, "\t"),
+            (TEXT, text),
+            (NEWLINE, &eol),
+        ]));
 
         // Insert after this recipe
         let index = terminate_line_before(&parent, node.index() + 1, &eol);
@@ -451,7 +503,7 @@ impl Recipe {
         }
         self.syntax()
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
+            .map_while(|it| it.into_token())
             .enumerate()
             .take_while(|(i, t)| *i == 0 || t.kind() == WHITESPACE)
             .map(|(_, t)| t)
@@ -492,16 +544,18 @@ impl Recipe {
         let skip = self.inline_prefix().len();
         self.trim_preceding_whitespace();
 
-        let body: Vec<(SyntaxKind, String)> = node
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .skip(skip)
-            .map(|t| (t.kind(), t.text().to_string()))
-            .collect();
+        let mut recipe = vec![GreenToken::new(INDENT.into(), "\t").into()];
+        recipe.extend(
+            node.green()
+                .children()
+                .skip(skip)
+                .map(|child| child.to_owned()),
+        );
         let newline = line_ending(node);
-        let mut recipe = vec![(INDENT, "\t")];
-        recipe.extend(body.iter().map(|(kind, text)| (*kind, text.as_str())));
-        let elements = detached_elements(&[(NEWLINE, &newline)], Some(&recipe));
+        let elements = detached_elements(
+            &[(NEWLINE, &newline)],
+            Some(GreenNode::new(RECIPE.into(), recipe)),
+        );
 
         let node_index = node.index();
         parent.splice_children(node_index..node_index + 1, elements);
@@ -514,9 +568,10 @@ impl Recipe {
 
     /// Iterate `$(VAR)` and `${VAR}` variable references inside this recipe.
     ///
-    /// Recipe bodies are stored as raw text, so [`Makefile::variable_references`]
-    /// does not descend into them. This method scans the recipe's text directly
-    /// and yields each reference with its absolute source range.
+    /// This scans the text of each line of the recipe and yields each
+    /// reference with the source range of its name. [`Recipe::references`]
+    /// gives the reference nodes in the syntax tree instead, which also cover
+    /// references continued on the next line.
     ///
     /// Function calls (`$(shell ...)`, anything with whitespace or commas after
     /// the name) and automatic variables (`$@`, `$<`, numeric `$1`) are skipped;
@@ -538,16 +593,13 @@ impl Recipe {
     ///     .collect();
     /// assert_eq!(names, vec!["FOO", "BAR"]);
     /// ```
+    #[deprecated(
+        note = "use Recipe::references, which also finds function calls, automatic variables and references continued on the next line"
+    )]
     pub fn variable_references(&self) -> Vec<RecipeVariableReference> {
         let mut out = Vec::new();
-        for token in self
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|t| t.kind() == TEXT)
-        {
-            let base: u32 = token.text_range().start().into();
-            scan_recipe_variable_refs(token.text(), base, &mut out);
+        for (start, text) in self.text_lines() {
+            scan_recipe_variable_refs(&text, start.into(), &mut out);
         }
         out
     }
@@ -555,9 +607,8 @@ impl Recipe {
 
 /// A `$(VAR)` or `${VAR}` reference found inside a recipe or `define` body.
 ///
-/// Recipes and `define` bodies are stored as raw text, so these references
-/// have no backing syntax node; this type carries just the variable name and
-/// its absolute source range.
+/// These are found by scanning text rather than in the syntax tree, so this
+/// type carries just the variable name and its absolute source range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeVariableReference {
     name: String,

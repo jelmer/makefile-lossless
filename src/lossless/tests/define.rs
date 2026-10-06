@@ -288,10 +288,11 @@ fn test_define_name_reference_tree() {
     OPERATOR@23..25 ":="
     NEWLINE@25..26 "\n"
     EXPR@26..31
-      DOLLAR@26..27 "$"
-      LPAREN@27..28 "("
-      IDENTIFIER@28..29 "B"
-      RPAREN@29..30 ")"
+      EXPR@26..30
+        DOLLAR@26..27 "$"
+        LPAREN@27..28 "("
+        IDENTIFIER@28..29 "B"
+        RPAREN@29..30 ")"
       NEWLINE@30..31 "\n"
     IDENTIFIER@31..36 "endef"
     NEWLINE@36..37 "\n"

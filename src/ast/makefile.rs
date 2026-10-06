@@ -815,14 +815,11 @@ impl Makefile {
 
     /// Get all variable references in the makefile.
     ///
-    /// Walks the entire syntax tree to find all `$(VAR)` and `${VAR}` references
-    /// in variable values, prerequisites, and targets.
-    ///
-    /// Note: Variable references inside recipes and `define` bodies are not
-    /// included, since those are stored as raw text in the syntax tree. Use
-    /// [`Recipe::variable_references`](crate::Recipe::variable_references) and
-    /// [`VariableDefinition::define_variable_references`](crate::VariableDefinition::define_variable_references)
-    /// for them.
+    /// Walks the entire syntax tree to find all references, such as `$(VAR)`,
+    /// `${VAR}`, `$@` and function calls, in variable values including
+    /// `define` bodies, prerequisites, targets and recipes. References nested
+    /// in others are included, after the one containing them. A `$$` is not
+    /// a reference.
     ///
     /// # Example
     /// ```

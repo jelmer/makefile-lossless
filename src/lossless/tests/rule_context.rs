@@ -430,7 +430,7 @@ fn test_tab_indented_expression_outside_rule_is_recipe() {
     );
     assert_eq!(
         node_kinds(&parsed.syntax()),
-        "RECIPE\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n"
+        "RECIPE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n"
     );
     assert_eq!(parsed.root().to_string(), input);
 }
@@ -695,7 +695,7 @@ fn test_statements_after_conditional_ending_rule_on_some_paths() {
     // X is undefined, or "recipe commences before first target".
     let prefix = "all:\n\t@echo a\nifdef X\nY=1\nendif\n";
     for (line, kinds) in [
-        ("\t$(info x)\n", "RECIPE\n"),
+        ("\t$(info x)\n", "RECIPE\n  EXPR\n"),
         ("\tfoo: bar\n", "RECIPE\n"),
         ("\tinclude foo.mk\n", "INCLUDE\n  EXPR\n"),
         ("\t# comment\n", ""),
@@ -927,7 +927,7 @@ fn test_bsd_tab_line_in_for_loop_in_conditional_outside_rule() {
     assert_eq!(parsed.errors, vec![]);
     assert_eq!(
             node_kinds(&parsed.syntax()),
-            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n      EXPR\n  FOR_LOOP\n    FOR_HEADER\n      EXPR\n    CONDITIONAL\n      CONDITIONAL_IF\n        EXPR\n          EXPR\n      RECIPE\n      CONDITIONAL_ENDIF\n    RECIPE\n    FOR_END\n  CONDITIONAL_ENDIF\n"
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n      EXPR\n  FOR_LOOP\n    FOR_HEADER\n      EXPR\n    CONDITIONAL\n      CONDITIONAL_IF\n        EXPR\n          EXPR\n      RECIPE\n        EXPR\n        EXPR\n      CONDITIONAL_ENDIF\n    RECIPE\n      EXPR\n      EXPR\n    FOR_END\n  CONDITIONAL_ENDIF\n"
         );
     assert_eq!(parsed.root().to_string(), code);
 }
@@ -960,7 +960,7 @@ fn test_bsd_tab_line_in_for_loop_outside_rule() {
     );
     assert_eq!(
         node_kinds(&parsed.syntax()),
-        "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RECIPE\n  FOR_END\n"
+        "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RECIPE\n    EXPR\n  FOR_END\n"
     );
     assert_eq!(parsed.root().to_string(), code);
 }
@@ -985,7 +985,7 @@ fn test_bsd_rule_context_in_for_loop() {
     assert_eq!(parsed.errors, vec![]);
     assert_eq!(
             node_kinds(&parsed.syntax()),
-            "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n  FOR_END\nRECIPE\n"
+            "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n      EXPR\n  FOR_END\nRECIPE\n"
         );
     assert_eq!(parsed.root().to_string(), code);
 }
@@ -1248,7 +1248,7 @@ fn test_tab_indented_assignment_at_top_level() {
     assert_eq!(parsed.errors, vec![]);
     assert_eq!(
         node_kinds(&parsed.syntax()),
-        "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n"
+        "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n    EXPR\n"
     );
     assert_eq!(parsed.root().to_string(), code);
 }
