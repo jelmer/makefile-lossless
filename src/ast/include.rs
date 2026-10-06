@@ -1,12 +1,14 @@
 use super::bsd::{directive_keyword, keyword_token};
 use super::makefile::MakefileItem;
-use super::{collapse_continuations, escape_hashes, logical_text, LineSyntax};
+use super::{collapse_continuations, escape_hashes, is_continuation, logical_text, LineSyntax};
 use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{
     parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
 use crate::MakefileVariant;
-use crate::SyntaxKind::{COMMENT, EXPR, IDENTIFIER, INCLUDE, NEWLINE, OPERATOR, WHITESPACE};
+use crate::SyntaxKind::{
+    BACKSLASH, COMMENT, EXPR, IDENTIFIER, INCLUDE, NEWLINE, OPERATOR, WHITESPACE,
+};
 use rowan::ast::AstNode;
 use rowan::{GreenNodeBuilder, SyntaxNode, SyntaxToken};
 
@@ -191,6 +193,118 @@ impl Include {
     /// ```
     pub fn path_range(&self) -> Option<rowan::TextRange> {
         self.path_expr().map(|it| it.text_range())
+    }
+
+    /// The file names of this directive with their source ranges.
+    fn path_words(&self) -> Vec<(rowan::TextRange, String)> {
+        let Some(expr) = self.path_expr() else {
+            return vec![];
+        };
+        if self.has_delimited_path() {
+            let Some(path) = self.path().filter(|p| !p.is_empty()) else {
+                return vec![];
+            };
+            let range = expr.text_range();
+            let raw = expr.text().to_string();
+            let range = match strip_delimiters(&raw) {
+                Some(inner) => {
+                    let start = range.start() + rowan::TextSize::from(1);
+                    rowan::TextRange::at(start, rowan::TextSize::of(inner))
+                }
+                None => range,
+            };
+            return vec![(range, path)];
+        }
+        let mut words = vec![];
+        let mut current: Vec<SyntaxToken<Lang>> = vec![];
+        let mut backslashes = 0;
+        for element in expr.children_with_tokens() {
+            let escaped = backslashes % 2 == 1;
+            backslashes = if element.kind() == BACKSLASH {
+                backslashes + 1
+            } else {
+                0
+            };
+            if (element.kind() == WHITESPACE && !escaped) || is_continuation(&element) {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                continue;
+            }
+            match element {
+                rowan::NodeOrToken::Token(token) => current.push(token),
+                rowan::NodeOrToken::Node(n) => {
+                    current.extend(n.descendants_with_tokens().filter_map(|it| it.into_token()))
+                }
+            }
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
+            .into_iter()
+            .map(|tokens| {
+                let range = tokens[0]
+                    .text_range()
+                    .cover(tokens[tokens.len() - 1].text_range());
+                (range, logical_text(&expr, tokens, LineSyntax::Gnu, true))
+            })
+            .collect()
+    }
+
+    /// Get the file names of the include directive as make reads them,
+    /// before expansion, one per file.
+    ///
+    /// Unlike [`Self::path`], which returns the whole list, this splits the
+    /// path at whitespace outside variable references, as GNU make does
+    /// after expanding it. Each name is read as for [`Self::path`]: `\#` is
+    /// unescaped and a backslash-escaped space is kept as written, without
+    /// splitting the name. A BSD make `.include` or nmake `!INCLUDE` names a
+    /// single file, so it gives at most one name.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "include a.mk $(DIR)/b\\#.mk \\\n  c.mk\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(inc.path(), Some("a.mk $(DIR)/b#.mk c.mk".to_string()));
+    /// assert_eq!(inc.paths().collect::<Vec<_>>(), vec!["a.mk", "$(DIR)/b#.mk", "c.mk"]);
+    /// ```
+    pub fn paths(&self) -> impl Iterator<Item = String> + '_ {
+        self.path_words().into_iter().map(|(_, path)| path)
+    }
+
+    /// The source ranges of the file names of the include directive, in the
+    /// same order as [`Self::paths`].
+    ///
+    /// Each range covers the name as written, including any escapes and
+    /// variable references. For a BSD make or nmake path delimited by
+    /// `<...>` or `"..."`, the range excludes the delimiters.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant, TextRange};
+    /// let makefile: Makefile = "include a.mk  $(B)\n".parse().unwrap();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(
+    ///     inc.path_ranges().collect::<Vec<_>>(),
+    ///     vec![
+    ///         TextRange::new(8.into(), 12.into()),
+    ///         TextRange::new(14.into(), 18.into()),
+    ///     ]
+    /// );
+    ///
+    /// let makefile =
+    ///     Makefile::parse_with_variant(".include <a b.mk>\n", MakefileVariant::BSDMake).tree();
+    /// let inc = makefile.includes().next().unwrap();
+    /// assert_eq!(inc.paths().collect::<Vec<_>>(), vec!["a b.mk"]);
+    /// assert_eq!(
+    ///     inc.path_ranges().collect::<Vec<_>>(),
+    ///     vec![TextRange::new(10.into(), 16.into())]
+    /// );
+    /// ```
+    pub fn path_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.path_words().into_iter().map(|(range, _)| range)
     }
 
     /// Check if this is an optional include (-include or sinclude)
@@ -663,6 +777,151 @@ mod tests {
         assert_eq!(
             &makefile.to_string()[std::ops::Range::from(range)],
             "silent.mk"
+        );
+    }
+
+    /// The paths of each include in `text`, paired with the text of their
+    /// ranges.
+    fn include_paths(text: &str, variant: MakefileVariant) -> Vec<Vec<(String, &str)>> {
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        makefile
+            .includes()
+            .map(|inc| {
+                let paths: Vec<_> = inc.paths().collect();
+                let ranges: Vec<_> = inc.path_ranges().map(|r| &text[r]).collect();
+                assert_eq!(paths.len(), ranges.len());
+                paths.into_iter().zip(ranges).collect()
+            })
+            .collect()
+    }
+
+    fn pairs<'a>(items: &[(&str, &'a str)]) -> Vec<(String, &'a str)> {
+        items.iter().map(|(p, r)| (p.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn test_include_paths() {
+        assert_eq!(
+            include_paths(
+                "include a.mk  $(subst a b,c,d) ${X}/y.mk # comment\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![pairs(&[
+                ("a.mk", "a.mk"),
+                ("$(subst a b,c,d)", "$(subst a b,c,d)"),
+                ("${X}/y.mk", "${X}/y.mk"),
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_optional() {
+        assert_eq!(
+            include_paths(
+                "-include a.mk b.mk\nsinclude c.mk\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![
+                pairs(&[("a.mk", "a.mk"), ("b.mk", "b.mk")]),
+                pairs(&[("c.mk", "c.mk")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_continuation() {
+        assert_eq!(
+            include_paths(
+                "include a.mk \\\n  b.mk\\\n\tc.mk\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![pairs(&[
+                ("a.mk", "a.mk"),
+                ("b.mk", "b.mk"),
+                ("c.mk", "c.mk")
+            ])]
+        );
+        assert_eq!(
+            include_paths(
+                "include $(subst a \\\n  b,c,x) d.mk\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![pairs(&[
+                ("$(subst a b,c,x)", "$(subst a \\\n  b,c,x)"),
+                ("d.mk", "d.mk"),
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_crlf() {
+        assert_eq!(
+            include_paths("include a.mk \\\r\n  b.mk\r\n", MakefileVariant::GNUMake),
+            vec![pairs(&[("a.mk", "a.mk"), ("b.mk", "b.mk")])]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_escapes() {
+        assert_eq!(
+            include_paths(
+                "include a\\#b.mk c\\ d.mk e\\\\ f.mk\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![pairs(&[
+                ("a#b.mk", "a\\#b.mk"),
+                ("c\\ d.mk", "c\\ d.mk"),
+                ("e\\\\", "e\\\\"),
+                ("f.mk", "f.mk"),
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_empty() {
+        assert_eq!(
+            include_paths("include\ninclude  # c\n", MakefileVariant::GNUMake),
+            vec![vec![], vec![]]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_conditional() {
+        assert_eq!(
+            include_paths(
+                "ifdef X\ninclude a.mk b.mk\nendif\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![pairs(&[("a.mk", "a.mk"), ("b.mk", "b.mk")])]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_bsd() {
+        assert_eq!(
+            include_paths(
+                ".include <a b.mk> # c\n.include \"${X}/c.mk\"\n.-include \"d.mk\"\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![
+                pairs(&[("a b.mk", "a b.mk")]),
+                pairs(&[("${X}/c.mk", "${X}/c.mk")]),
+                pairs(&[("d.mk", "d.mk")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_nmake() {
+        assert_eq!(
+            include_paths(
+                "!INCLUDE <win32.mak>\n!INCLUDE a.mak\n",
+                MakefileVariant::NMake
+            ),
+            vec![
+                pairs(&[("win32.mak", "win32.mak")]),
+                pairs(&[("a.mak", "a.mak")]),
+            ]
         );
     }
 
