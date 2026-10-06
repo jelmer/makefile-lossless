@@ -2491,6 +2491,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 } else {
                     self.bump();
                 }
+                // The backslash in `$\` is a name, so it doesn't escape
+                // what follows.
+                self.pending_backslash_escape = false;
             }
             // A `$` at the end of a line is accepted by both GNU and BSD
             // make; it expands to nothing. Make joins continued lines before
