@@ -23,6 +23,75 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
     }
 }
 
+/// Check that a conditional of `conditional_type` with `condition` and the
+/// given bodies reads back as a single conditional, without errors and with
+/// an else branch only if there is an `else_body`. Make rejects e.g.
+/// `ifeq ()`, and an `else` line in a body would start another branch.
+fn check_conditional(
+    (conditional_type, else_keyword, endif_keyword): (&str, &str, &str),
+    condition: &str,
+    if_body: &str,
+    else_body: Option<&str>,
+    context: &str,
+) -> Result<(), Error> {
+    let error = |message: String| {
+        Error::Parse(ParseError {
+            errors: vec![ErrorInfo {
+                kind: crate::ParseErrorKind::Other,
+                message,
+                line: 1,
+                context: context.to_string(),
+            }],
+        })
+    };
+    // GNU make reads `ifdef` without a name as testing an empty variable
+    // name, but no caller means that.
+    if condition.trim().is_empty() {
+        return Err(error(format!("Empty condition for {conditional_type}")));
+    }
+    let if_line = format!("{conditional_type} {condition}");
+    let mut lines = vec![if_line.as_str()];
+    lines.extend(if_body.lines());
+    if let Some(else_body) = else_body {
+        lines.push(else_keyword);
+        lines.extend(else_body.lines());
+    }
+    lines.push(endif_keyword);
+    let text: String = lines.iter().flat_map(|line| [*line, "\n"]).collect();
+
+    let parsed = parse(&text, None);
+    if !parsed.errors.is_empty() {
+        return Err(Error::Parse(ParseError {
+            errors: parsed.errors,
+        }));
+    }
+    let root = parsed.root();
+    let mut items = root.syntax().children();
+    let conditional = items
+        .next()
+        .and_then(Conditional::cast)
+        .filter(|_| items.next().is_none())
+        .ok_or_else(|| error(format!("{text:?} does not parse as a single conditional")))?;
+    let else_branches = conditional
+        .syntax()
+        .children()
+        .filter(|n| n.kind() == CONDITIONAL_ELSE)
+        .count();
+    if else_branches != usize::from(else_body.is_some()) {
+        return Err(error(format!(
+            "A body of {text:?} starts another branch of the conditional"
+        )));
+    }
+    // The parser accepts these, but make reports "invalid syntax in
+    // conditional".
+    if matches!(conditional_type, "ifeq" | "ifneq") && conditional.ifeq_args().is_none() {
+        return Err(error(format!(
+            "Invalid condition for {conditional_type}: {condition:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether an item appended to `root` needs a blank line before it, i.e.
 /// the makefile is neither empty nor already ends in a blank line. The
 /// text must end in a line ending unless empty; see
@@ -1182,6 +1251,10 @@ impl Makefile {
     /// The conditional is separated from any preceding content by a blank
     /// line, unless the makefile already ends in one.
     ///
+    /// Returns an error if the condition is empty or invalid, as in
+    /// `ifeq ()`, or if a body does not read back as part of its branch,
+    /// for example because it contains an `else` or `endif` line.
+    ///
     /// # Arguments
     /// * `conditional_type` - The type of conditional: "ifdef", "ifndef", "ifeq", or "ifneq",
     ///   or for BSD make ".if", ".ifdef", ".ifndef", ".ifmake" or ".ifnmake"
@@ -1217,6 +1290,13 @@ impl Makefile {
                 }],
             }));
         };
+        check_conditional(
+            (conditional_type, else_keyword, endif_keyword),
+            condition,
+            if_body,
+            else_body,
+            "add_conditional",
+        )?;
 
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
@@ -1328,6 +1408,15 @@ impl Makefile {
                 }],
             }));
         };
+        // Items can't start another branch, so only the condition needs
+        // checking.
+        check_conditional(
+            (conditional_type, else_keyword, endif_keyword),
+            condition,
+            "",
+            else_items.as_ref().map(|_| ""),
+            "add_conditional_with_items",
+        )?;
 
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
@@ -4164,6 +4253,98 @@ VAR3 = value3
         let mut makefile = Makefile::new();
         let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_conditional_rejects_invalid_condition() {
+        let cases = [
+            ("ifdef", ""),
+            ("ifndef", " "),
+            ("ifdef", "A B"),
+            ("ifeq", ""),
+            ("ifeq", "()"),
+            ("ifneq", "(a)"),
+            ("ifeq", "a,b"),
+            (".if", ""),
+            (".ifdef", ""),
+        ];
+        for (conditional_type, condition) in cases {
+            let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+            assert!(
+                makefile
+                    .add_conditional(conditional_type, condition, "Y = 1\n", None)
+                    .is_err(),
+                "{conditional_type} {condition:?}"
+            );
+            let items: Makefile = "Y = 1\n".parse().unwrap();
+            assert!(
+                makefile
+                    .add_conditional_with_items(
+                        conditional_type,
+                        condition,
+                        items.items(),
+                        None::<Vec<MakefileItem>>
+                    )
+                    .is_err(),
+                "{conditional_type} {condition:?}"
+            );
+            assert_eq!(makefile.to_string(), "X = 1\n");
+        }
+    }
+
+    #[test]
+    fn test_add_conditional_empty_condition_error() {
+        let mut makefile = Makefile::new();
+        let Err(error) = makefile.add_conditional("ifdef", "", "Y = 1\n", None) else {
+            panic!("empty condition accepted");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Parse error: Error at line 1: Empty condition for ifdef\n1| add_conditional\n"
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_rejects_invalid_branches() {
+        let cases = [
+            ("ifdef", "else\nX = 1\n", None),
+            ("ifdef", "X = 1\n", Some("else\nY = 2\n")),
+            ("ifdef", "else\nX = 1\n", Some("Y = 2\n")),
+            ("ifdef", "X = 1\nelse ifdef B\nY = 1\n", None),
+            ("ifdef", "endif\n", None),
+            ("ifdef", "ifdef B\n", None),
+            ("ifdef", "define V\n", None),
+            (".if", "X = 1\n.else\nY = 2\n", None),
+            (".if", "X = 1\n.elif defined(B)\nY = 2\n", None),
+        ];
+        for (conditional_type, if_body, else_body) in cases {
+            let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+            let condition = if conditional_type == ".if" {
+                "defined(A)"
+            } else {
+                "A"
+            };
+            assert!(
+                makefile
+                    .add_conditional(conditional_type, condition, if_body, else_body)
+                    .is_err(),
+                "{if_body:?} {else_body:?}"
+            );
+            assert_eq!(makefile.to_string(), "X = 1\n");
+        }
+    }
+
+    #[test]
+    fn test_add_conditional_nested_else() {
+        let mut makefile = Makefile::new();
+        let body = "ifdef B\nX = 1\nelse\nX = 2\nendif\n";
+        makefile
+            .add_conditional("ifeq", "(,)", body, Some(body))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            format!("ifeq (,)\n{body}else\n{body}endif\n")
+        );
     }
 
     #[test]
