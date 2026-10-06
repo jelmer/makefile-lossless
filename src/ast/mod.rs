@@ -177,6 +177,59 @@ pub(crate) fn terminate_line_before(parent: &SyntaxNode, index: usize, eol: &str
     }
 }
 
+/// The index in the parent of `node` before the comment lines directly
+/// above it: consecutive whole-line comments, other than a shebang, with no
+/// blank line between them and `node`. Such comments document `node`, so
+/// anything inserted before it should go before them.
+///
+/// The parser puts comments that follow a recipe in the preceding rule, so
+/// they are moved out of it to the parent of `node` first.
+pub(crate) fn index_before_doc_comment(node: &SyntaxNode) -> usize {
+    let parent = node.parent().expect("node must have a parent");
+    let mut start = None;
+    let mut token = node
+        .descendants_with_tokens()
+        .find_map(|it| it.into_token())
+        .and_then(|t| t.prev_token());
+    while let Some(newline) = token.filter(|t| t.kind() == NEWLINE) {
+        let Some(comment) = newline.prev_token().filter(|t| {
+            t.kind() == COMMENT
+                && !t.text().starts_with("#!")
+                && t.parent_ancestors().any(|a| a == parent)
+        }) else {
+            break;
+        };
+        // Only whole-line comments count, not trailing ones like `X = 1 # x`
+        let before = comment.prev_token();
+        if before.as_ref().is_some_and(|t| t.kind() != NEWLINE) {
+            break;
+        }
+        start = Some(comment);
+        token = before;
+    }
+    let Some(start) = start else {
+        return node.index();
+    };
+    let mut element = SyntaxElement::Token(start);
+    loop {
+        let container = element.parent().expect("element is below parent");
+        if container == parent {
+            return element.index();
+        }
+        let index = element.index();
+        let tail: Vec<_> = container.children_with_tokens().skip(index).collect();
+        container.splice_children(index..index + tail.len(), vec![]);
+        let after = container.index() + 1;
+        container
+            .parent()
+            .expect("container is below parent")
+            .splice_children(after..after, tail);
+        element = container
+            .next_sibling_or_token()
+            .expect("tail was moved after container");
+    }
+}
+
 /// How a make implementation forms a logical line from physical lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LineSyntax {

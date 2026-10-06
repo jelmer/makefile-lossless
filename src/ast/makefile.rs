@@ -1,5 +1,5 @@
 use super::rule::build_targets_node;
-use super::{line_ending, terminate_line_before, with_trailing_newline};
+use super::{index_before_doc_comment, line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
     line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Include, Load, Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition,
@@ -439,7 +439,10 @@ impl MakefileItem {
     /// Insert a new MakefileItem before this item
     ///
     /// This inserts the new item immediately before the current item in the makefile.
-    /// The new item is inserted at the same level as the current item.
+    /// The new item is inserted at the same level as the current item. If
+    /// the current item has comment lines directly above it, with no blank
+    /// line in between, the new item is inserted before them, since they
+    /// document the current item.
     ///
     /// # Example
     /// ```
@@ -454,10 +457,9 @@ impl MakefileItem {
     /// ```
     pub fn insert_before(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert before", "insert_before")?;
-        let current_index = self.syntax().index();
+        let current_index = index_before_doc_comment(self.syntax());
         let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
 
-        // Insert the new item before the current item
         parent.splice_children(current_index..current_index, vec![new_node.into()]);
 
         Ok(())
@@ -466,7 +468,8 @@ impl MakefileItem {
     /// Insert a new MakefileItem after this item
     ///
     /// This inserts the new item immediately after the current item in the makefile.
-    /// The new item is inserted at the same level as the current item.
+    /// The new item is inserted at the same level as the current item, and
+    /// before any comment lines documenting the next item.
     ///
     /// # Example
     /// ```
@@ -483,13 +486,23 @@ impl MakefileItem {
         let parent = self.get_parent_or_error("insert after", "insert_after")?;
         let eol = line_ending(&parent);
         let new_node = with_trailing_newline(new_item.syntax(), &eol);
-        let index = terminate_line_before(&parent, self.syntax().index() + 1, &eol);
+        let index = terminate_line_before(&parent, index_after(self.syntax()), &eol);
 
         // Insert the new item after the current item
         parent.splice_children(index..index, vec![new_node.into()]);
 
         Ok(())
     }
+}
+
+/// The index in the parent of `node` just after it. A comment that the
+/// parser put at the end of `node` but that documents the next item is moved
+/// out of `node` first, so that it stays with that item.
+fn index_after(node: &SyntaxNode) -> usize {
+    if let Some(next) = node.next_sibling() {
+        index_before_doc_comment(&next);
+    }
+    node.index() + 1
 }
 
 // Internal trait for extracting specific item types from MakefileItem
@@ -1705,6 +1718,9 @@ impl Makefile {
     /// Insert an include directive at a specific position
     ///
     /// The position is relative to other top-level items (rules, variables, includes, conditionals).
+    /// If the item at `index` has comment lines directly above it, with no
+    /// blank line in between, the include is inserted before them, since
+    /// they document that item.
     ///
     /// # Arguments
     /// * `index` - The position to insert at (0 = beginning, items().count() = end)
@@ -1743,8 +1759,9 @@ impl Makefile {
             // Insert at the end
             self.syntax().children_with_tokens().count()
         } else {
-            // Insert before the item at the given index
-            items[index].index()
+            // Insert before the item at the given index, and any comment
+            // documenting it
+            index_before_doc_comment(&items[index])
         };
 
         // Insert the include node
@@ -1788,7 +1805,7 @@ impl Makefile {
 
         // Find the position of the item to insert after
         let after_syntax = after.syntax();
-        let target_index = terminate_line_before(self.syntax(), after_syntax.index() + 1, &eol);
+        let target_index = terminate_line_before(self.syntax(), index_after(after_syntax), &eol);
 
         // Insert the include node after the target item
         self.syntax()
@@ -2136,6 +2153,89 @@ mod tests {
         assert_eq!(result, "# Comment for VAR1\nVAR2 = new\nrule:\n\tcommand\n");
     }
 
+    fn new_variable() -> MakefileItem {
+        let temp: Makefile = "N = 1\n".parse().unwrap();
+        let item = temp.items().next().unwrap();
+        item
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_doc_comment() {
+        let cases = [
+            ("a:\n\techo\n# doc\nc:\n", "a:\n\techo\nN = 1\n# doc\nc:\n"),
+            ("a:\n# doc\n# more\nc:\n", "a:\nN = 1\n# doc\n# more\nc:\n"),
+            ("X = 1\n# doc\nc:\n", "X = 1\nN = 1\n# doc\nc:\n"),
+            ("X = 1\n# x\n\nc:\n", "X = 1\n# x\n\nN = 1\nc:\n"),
+            ("X = 1 # x\nc:\n", "X = 1 # x\nN = 1\nc:\n"),
+            (
+                "#!/usr/bin/make -f\nc:\n",
+                "#!/usr/bin/make -f\nN = 1\nc:\n",
+            ),
+        ];
+        for (text, expected) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut item = makefile.items().last().unwrap();
+            item.insert_before(new_variable()).unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_doc_comment_in_conditional() {
+        let makefile: Makefile = "ifdef X\n# doc\nc:\nendif\n".parse().unwrap();
+        let mut item = makefile
+            .conditionals()
+            .next()
+            .unwrap()
+            .if_items()
+            .next()
+            .unwrap();
+        item.insert_before(new_variable()).unwrap();
+        assert_eq!(makefile.to_string(), "ifdef X\nN = 1\n# doc\nc:\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_makefile_item_insert_after_before_doc_comment() {
+        for (text, expected) in [
+            ("a:\n\techo\n# doc\nc:\n", "a:\n\techo\nN = 1\n# doc\nc:\n"),
+            ("X = 1\n# doc\nc:\n", "X = 1\nN = 1\n# doc\nc:\n"),
+            ("a:\n\techo\n# a\n\nc:\n", "a:\n\techo\n# a\n\nN = 1\nc:\n"),
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut item = makefile.items().next().unwrap();
+            item.insert_after(new_variable()).unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_insert_include_before_doc_comment() {
+        let mut makefile: Makefile = "a:\n\techo\n# doc\nc:\n".parse().unwrap();
+        let include = makefile.insert_include(1, "x.mk").unwrap();
+        assert_eq!(include.path(), Some("x.mk".to_string()));
+        assert_eq!(
+            makefile.to_string(),
+            "a:\n\techo\ninclude x.mk\n# doc\nc:\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_after_before_doc_comment() {
+        let mut makefile: Makefile = "a:\n\techo\n# doc\nc:\n".parse().unwrap();
+        let a = makefile.items().next().unwrap();
+        let include = makefile.insert_include_after(&a, "x.mk").unwrap();
+        assert_eq!(include.path(), Some("x.mk".to_string()));
+        assert_eq!(
+            makefile.to_string(),
+            "a:\n\techo\ninclude x.mk\n# doc\nc:\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
     #[test]
     fn test_makefile_item_insert_before_variable() {
         let makefile: Makefile = "VAR1 = first\nVAR2 = second\n".parse().unwrap();
@@ -2267,11 +2367,10 @@ mod tests {
             .unwrap();
 
         let result = makefile.to_string();
-        // The new variable should be inserted before Comment 2 (which precedes VAR2)
-        // This is correct because insert_before inserts before the item and its preceding comments
+        // The new variable is inserted before Comment 2, which documents VAR2
         assert_eq!(
             result,
-            "# Comment 1\nVAR1 = first\n# Comment 2\nVAR_NEW = inserted\nVAR2 = second\n"
+            "# Comment 1\nVAR1 = first\nVAR_NEW = inserted\n# Comment 2\nVAR2 = second\n"
         );
     }
 
