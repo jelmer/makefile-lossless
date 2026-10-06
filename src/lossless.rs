@@ -15274,6 +15274,121 @@ test:
         assert_eq!(parsed.root().to_string(), code);
     }
 
+    /// The text of the last item of a makefile, which must be a recipe line.
+    fn last_recipe_text(makefile: &Makefile) -> String {
+        let crate::ast::makefile::MakefileItem::Recipe(recipe) = makefile.items().last().unwrap()
+        else {
+            panic!("expected recipe");
+        };
+        recipe.text()
+    }
+
+    #[test]
+    fn test_nmake_rule_context_after_conditional_branch() {
+        // The !ELSE branch is only taken if the rule wasn't defined, so the
+        // command line in it is never part of a rule. Whether that is
+        // reported as an error is up to the policy for command lines in
+        // conditionals outside rules, so only the structure is checked here.
+        for indent in ["\t", "  "] {
+            let code = format!("!IFDEF A\nt:\n!ELSE\n{}X = 1\n!ENDIF\n", indent);
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_with_rule_on_some_paths() {
+        for (conditional, kinds) in [
+            (
+                "!IFDEF A\nt:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\nt:\n!ELSEIFDEF B\nu:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\nt:\n!ELSE IFDEF B\nu:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\n!IFDEF B\nt:\n!ENDIF\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RULE\n      TARGETS\n      PREREQUISITES\n    CONDITIONAL_ENDIF\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+        ] {
+            for indent in ["\t", "  "] {
+                let code = format!("{}{}X = 1\n", conditional, indent);
+                let parsed = parse(&code, Some(MakefileVariant::NMake));
+                assert_eq!(parsed.errors, vec![], "{:?}", code);
+                assert_eq!(node_kinds(&parsed.syntax()), kinds, "{:?}", code);
+                let makefile = parsed.root();
+                assert_eq!(makefile.to_string(), code);
+                assert_eq!(last_recipe_text(&makefile), "X = 1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_ending_rule_on_some_paths() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "all:\n{0}echo a\n!IFDEF X\nY=1\n!ENDIF\n{0}echo b\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
+            );
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(last_recipe_text(&makefile), "echo b");
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_ending_rule_on_all_paths() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "all:\n{0}echo a\n!IFDEF X\nY=1\n!ELSE\nZ=1\n!ENDIF\n{0}echo b\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(
+                parsed.errors,
+                vec![ErrorInfo {
+                    message: "indented line not part of a rule".to_string(),
+                    line: 8,
+                    context: format!("{}echo b", indent),
+                    kind: ParseErrorKind::RecipeBeforeFirstTarget,
+                }]
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_nmake_rule_context_continues_after_conditional() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "t:\n!IF \"$(A)\" == \"1\"\n{0}echo a\n!ELSEIF \"$(B)\" == \"1\"\n{0}echo b\n!ELSE\n{0}echo c\n!ENDIF\n{0}echo d\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\n  RECIPE\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
     #[test]
     fn test_bsd_directives_in_rule() {
         // BSD make only ends a rule's commands at a dependency line or a
