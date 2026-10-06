@@ -283,10 +283,14 @@ pub enum Modifier {
     Range(Option<usize>),
     /// `:gmtime` or `:gmtime=T`: the value as a strftime(3) format for the
     /// current time or time T, in UTC.
-    GmTime(Option<u64>),
+    ///
+    /// make expands T before checking that it is a number of seconds, and
+    /// only does so when the expression is evaluated, so T is not checked
+    /// here.
+    GmTime(Option<ModifierArg>),
     /// `:localtime` or `:localtime=T`: like [`Modifier::GmTime`] but in the
     /// local time zone.
-    LocalTime(Option<u64>),
+    LocalTime(Option<ModifierArg>),
     /// `:mtime` or `:mtime=arg`: the modification time of each word, where
     /// `arg` is either a timestamp to use for missing files or `error`.
     Mtime(Option<String>),
@@ -318,9 +322,10 @@ pub enum Modifier {
 ///
 /// - A [`ModifierArg`] is used where make expands nested expressions while
 ///   parsing the modifier (`:S`, `:C`, `:U`, `:D`, `:?`, `:!cmd!`, the
-///   assignment modifiers, `:[...]` and the SysV substitution). Escapes are
-///   already removed from its literal parts, and nested expressions are kept
-///   as separate parts so that escaped text is never expanded again.
+///   assignment modifiers, `:[...]`, `:gmtime=`, `:localtime=` and the SysV
+///   substitution). Escapes are already removed from its literal parts, and
+///   nested expressions are kept as separate parts so that escaped text is
+///   never expanded again.
 /// - A raw [`String`] is used where make expands the argument as a whole
 ///   after parsing it (the pattern of `:M` and `:N` and the body of `:@`).
 ///   The evaluator should expand it like any other value, so `$$` stands for
@@ -334,7 +339,8 @@ pub enum Modifier {
 ///   `\&` stands for `&` as well, and an unescaped `&` is replaced with the
 ///   (unescaped) text to match. Other backslashes, such as those in regular
 ///   expressions for `:C`, are kept.
-/// - `:U` and `:D`: `\` followed by `:`, the closing brace, `$` or `\`.
+/// - `:U`, `:D`, `:gmtime=` and `:localtime=`: `\` followed by `:`, the
+///   closing brace, `$` or `\`.
 /// - `:M` and `:N`: `\` followed by `:` or the closing brace, but only if
 ///   an escaped `:`, closing brace or opening brace comes before the first
 ///   `$`. These escapes are then removed from the whole pattern, including
@@ -941,11 +947,11 @@ impl<'a> Parser<'a> {
             'u' => simple(self, Modifier::Unique),
             'g' if self.at_word_or_eq("gmtime", delims) => {
                 self.bump_n("gmtime".len());
-                Some(Modifier::GmTime(self.parse_time_arg()?))
+                Some(Modifier::GmTime(self.parse_time_arg(delims)?))
             }
             'l' if self.at_word_or_eq("localtime", delims) => {
                 self.bump_n("localtime".len());
-                Some(Modifier::LocalTime(self.parse_time_arg()?))
+                Some(Modifier::LocalTime(self.parse_time_arg(delims)?))
             }
             'h' if self.at_word("hash", delims) => {
                 self.bump_n("hash".len());
@@ -1287,18 +1293,35 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// Parse the digits of the argument of `:gmtime=` or `:localtime=`, if
-    /// any.
-    fn parse_time_arg(&mut self) -> Result<Option<u64>, ReferenceError> {
+    /// Parse the argument of `:gmtime=` or `:localtime=`, if any, up to the
+    /// next delimiter.
+    fn parse_time_arg(&mut self, delims: Delims) -> Result<Option<ModifierArg>, ReferenceError> {
         if self.peek() != Some('=') {
             return Ok(None);
         }
         self.bump();
-        let digits = self.take_digits();
-        digits
-            .parse()
-            .map(Some)
-            .map_err(|_| syntax_error(self.pos, format!("invalid time value '{}'", digits)))
+        let mut arg = ModifierArg::default();
+        while !delims.is_delimiter(self.peek()) {
+            let c = self.peek().expect("end of text is a delimiter");
+            let next = self.peek_nth(1);
+            if c == '\\' {
+                if let Some(next) =
+                    next.filter(|&n| delims.is_delimiter(Some(n)) || n == '$' || n == '\\')
+                {
+                    arg.push_char(next);
+                    self.bump_n(2);
+                    continue;
+                }
+            }
+            // As in make, a `$` just before the closing brace is literal.
+            if c == '$' && next != delims.endc {
+                self.parse_nested_expr(&mut arg)?;
+                continue;
+            }
+            arg.push_char(c);
+            self.bump();
+        }
+        Ok(Some(arg))
     }
 
     fn parse_range_arg(&mut self) -> Result<Option<usize>, ReferenceError> {
@@ -2455,10 +2478,29 @@ mod tests {
                 Modifier::Range(None),
                 Modifier::Range(Some(3)),
                 Modifier::GmTime(None),
-                Modifier::GmTime(Some(1)),
+                Modifier::GmTime(Some(lit("1"))),
                 Modifier::LocalTime(None),
-                Modifier::LocalTime(Some(2)),
+                Modifier::LocalTime(Some(lit("2"))),
             ]
+        );
+        assert_eq!(
+            mods("${X:gmtime=${T}:localtime=1${T}2}"),
+            vec![
+                Modifier::GmTime(Some(ModifierArg::new([expr("${T}")]))),
+                Modifier::LocalTime(Some(ModifierArg::new([text("1"), expr("${T}"), text("2")]))),
+            ]
+        );
+        // make only checks the time value when evaluating the expression.
+        assert_eq!(
+            mods("${X:gmtime=x:gmtime=}"),
+            vec![
+                Modifier::GmTime(Some(lit("x"))),
+                Modifier::GmTime(Some(lit("")))
+            ]
+        );
+        assert_eq!(
+            mods(r"${X:gmtime=1\:2\}\$$}"),
+            vec![Modifier::GmTime(Some(lit("1:2}$$")))]
         );
         assert_eq!(
             mods("${X:mtime:mtime=5:mtime=error}"),
@@ -2481,8 +2523,11 @@ mod tests {
             (10, "invalid number '' for ':range' modifier".to_string())
         );
         assert_eq!(
-            syntax("${X:gmtime=x}"),
-            (11, "invalid time value ''".to_string())
+            syntax("${X:mtime=${T}}"),
+            (
+                10,
+                "invalid argument '${T}}' for modifier ':mtime'".to_string()
+            )
         );
     }
 
