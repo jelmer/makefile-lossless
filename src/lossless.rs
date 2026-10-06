@@ -2386,7 +2386,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                     }
 
-                    if is_function {
+                    if self.at_nmake_substitution() {
+                        // nmake's substitution strings can't invoke macros,
+                        // so the reference ends at the first `)`.
+                        loop {
+                            match self.current() {
+                                Some(RPAREN) => {
+                                    self.bump();
+                                    break;
+                                }
+                                Some(NEWLINE) | None => {
+                                    self.record_error(
+                                        ParseErrorKind::UnclosedReference,
+                                        "unclosed variable reference".to_string(),
+                                    );
+                                    break;
+                                }
+                                Some(_) => self.bump(),
+                            }
+                        }
+                    } else if is_function {
                         // Preserve the function name
                         self.bump();
 
@@ -2424,6 +2443,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
+        }
+
+        /// Whether the tokens after `$(` are an nmake macro substitution,
+        /// `name:string1=string2`.
+        fn at_nmake_substitution(&self) -> bool {
+            let n = self.tokens.len();
+            self.variant == Some(MakefileVariant::NMake)
+                && n >= 2
+                && matches!(self.tokens[n - 1].0, IDENTIFIER | TEXT)
+                && self.tokens[n - 2].0 == OPERATOR
+                && self.tokens[n - 2].1.starts_with(':')
         }
 
         // Helper method to parse a conditional comparison (ifeq/ifneq)
@@ -18514,5 +18544,32 @@ x: y
         let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, vec!["unterminated inline file (missing <<)"]);
         assert_eq!(parsed.tree().to_string(), code);
+    }
+
+    #[test]
+    fn test_substitution_strings_are_literal() {
+        // nmake's "string1 and string2 can't invoke macros", so a
+        // substitution ends at the first `)`, as in c-ares' Makefile.msvc.
+        let makefile = parse_nmake("X = $(SRCS: = $(DIR)\\)\nY = $(SRCS:.c=.obj)\n");
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+        let references = |v: &VariableDefinition| -> Vec<String> {
+            v.syntax()
+                .descendants()
+                .filter(|n| {
+                    n.kind() == EXPR
+                        && n.parent().is_some_and(|p| p.kind() == EXPR)
+                        && n.first_token().is_some_and(|t| t.kind() == DOLLAR)
+                })
+                .map(|n| n.text().to_string())
+                .collect()
+        };
+        assert_eq!(references(&vars[0]), vec!["$(SRCS: = $(DIR)"]);
+        assert_eq!(references(&vars[1]), vec!["$(SRCS:.c=.obj)"]);
+
+        // Functions may contain references.
+        let makefile = parse_nmake("X = $(subst $(A),b,c)\n");
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(references(&var), vec!["$(subst $(A),b,c)", "$(A)"]);
     }
 }
