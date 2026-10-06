@@ -243,7 +243,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     ///
     /// let rule = Rule::new(&["all"], &["build", "test"], &["echo Done"]);
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
@@ -280,7 +280,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "ifdef DEBUG\nall:\n\techo \"test\"\nendif\n"
     ///     .parse()
@@ -289,7 +289,7 @@ impl Rule {
     /// let cond = makefile.conditionals().next().unwrap();
     /// let rule = cond.if_items().next().unwrap();
     /// // Rule's parent is the conditional
-    /// assert!(matches!(rule, makefile_lossless::MakefileItem::Rule(_)));
+    /// assert!(matches!(rule, makefile_edit::MakefileItem::Rule(_)));
     /// ```
     pub fn parent(&self) -> Option<MakefileItem> {
         self.syntax().parent().and_then(MakefileItem::cast)
@@ -300,7 +300,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "foo.h foo.c &: foo.y\n\tbison --defines=foo.h -o foo.c foo.y\n"
     ///     .parse()
     ///     .unwrap();
@@ -322,7 +322,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "all:: dep1\n\techo first\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
     /// assert!(rule.is_double_colon());
@@ -339,7 +339,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant, RuleOperator};
+    /// use makefile_edit::{Makefile, MakefileVariant, RuleOperator};
     /// let makefile: Makefile = "a b &:: c\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
     /// assert_eq!(rule.operator(), Some(RuleOperator::GroupedDoubleColon));
@@ -470,7 +470,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Rule, TextRange};
+    /// use makefile_edit::{Rule, TextRange};
     ///
     /// let rule: Rule = "a  $(B): c\n".parse().unwrap();
     /// assert_eq!(
@@ -506,7 +506,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     ///
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
@@ -530,7 +530,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     ///
     /// let rule: Rule = "$(subst a \\\n  b,c,a  b): x\n".parse().unwrap();
     /// assert_eq!(
@@ -714,7 +714,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Rule, TextRange};
+    /// use makefile_edit::{Rule, TextRange};
     ///
     /// let rule: Rule = "all: a\\ b $(C) | d\n".parse().unwrap();
     /// assert_eq!(
@@ -737,7 +737,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Rule, TextRange};
+    /// use makefile_edit::{Rule, TextRange};
     ///
     /// let rule: Rule = "all: a | b c\n".parse().unwrap();
     /// assert_eq!(
@@ -767,7 +767,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Rule, TextRange};
+    /// use makefile_edit::{Rule, TextRange};
     ///
     /// let rule: Rule = "all: a b ; cmd\n".parse().unwrap();
     /// assert_eq!(
@@ -807,7 +807,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "rule: dependency | dir\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
     /// ```
@@ -821,7 +821,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = "all: $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
     /// assert_eq!(
     ///     rule.prerequisites_for(MakefileVariant::POSIXMake).collect::<Vec<_>>(),
@@ -838,7 +838,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "foo.o: foo.c | build\n\tcc -c foo.c".parse().unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["foo.c"]);
     /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["build"]);
@@ -853,7 +853,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = "all: | $(subst a \\\n  b,c,a  b)\n".parse().unwrap();
     /// assert_eq!(
     ///     rule.order_only_prerequisites_for(MakefileVariant::POSIXMake)
@@ -878,7 +878,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "$(OBJS): %.o: %.c | build\n\t$(CC) -c $<\n".parse().unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(OBJS)"]);
     /// assert_eq!(rule.static_pattern(), Some("%.o".to_string()));
@@ -898,7 +898,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = "$(OBJS): $(X:a \\\n  b=%.o): %.c\n".parse().unwrap();
     /// assert_eq!(
     ///     rule.static_pattern_for(MakefileVariant::POSIXMake),
@@ -924,7 +924,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
     ///
@@ -947,7 +947,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "all: CFLAGS = -O2\n".parse().unwrap();
     /// let var = rule.scoped_assignment().unwrap();
     /// assert_eq!(var.name(), Some("CFLAGS".to_string()));
@@ -973,7 +973,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     ///
     /// let rule_text = "test:\n\techo line1\n\techo line2\n";
     /// let rule: Rule = rule_text.parse().unwrap();
@@ -1042,7 +1042,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Rule, RuleItem};
+    /// use makefile_edit::{Rule, RuleItem};
     ///
     /// let rule_text = r#"test:
     /// 	echo "before"
@@ -1095,7 +1095,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{ConditionalItem, MakefileItem, Rule};
+    /// use makefile_edit::{ConditionalItem, MakefileItem, Rule};
     ///
     /// let rule: Rule = "test: ; @echo start\nifdef V\n\techo verbose\nendif\n".parse().unwrap();
     /// let items: Vec<_> = rule.body_items().collect();
@@ -1124,7 +1124,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// rule.replace_command(0, "new command");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
@@ -1185,7 +1185,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "rule: dependency\n\tcommand".parse().unwrap();
     /// rule.push_command("command2");
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
@@ -1225,7 +1225,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
     /// rule.remove_command(0);
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command2"]);
@@ -1246,7 +1246,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
     /// rule.insert_command(1, "inserted_command");
     /// let recipes: Vec<_> = rule.recipes().collect();
@@ -1283,7 +1283,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
     /// assert_eq!(rule.recipe_count(), 2);
     /// ```
@@ -1298,7 +1298,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
     /// rule.clear_commands();
     /// assert_eq!(rule.recipe_count(), 0);
@@ -1319,7 +1319,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "target: dep1 dep2 dep3\n".parse().unwrap();
     /// assert!(rule.remove_prerequisite("dep2").unwrap());
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1", "dep3"]);
@@ -1347,7 +1347,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "target: dep1 | dir\n".parse().unwrap();
     /// rule.add_prerequisite("dep2").unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1", "dep2"]);
@@ -1371,7 +1371,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "target: old_dep | dir\n".parse().unwrap();
     /// rule.set_prerequisites(vec!["new_dep1", "new_dep2"]).unwrap();
     /// assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["new_dep1", "new_dep2"]);
@@ -1477,7 +1477,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "old_target: dependency\n\tcommand".parse().unwrap();
     /// rule.rename_target("old_target", "new_target").unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target"]);
@@ -1541,7 +1541,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "target1: dependency\n\tcommand".parse().unwrap();
     /// rule.add_target("target2").unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target1", "target2"]);
@@ -1562,7 +1562,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "old_target: dependency\n\tcommand".parse().unwrap();
     /// rule.set_targets(vec!["new_target1", "new_target2"]).unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target1", "new_target2"]);
@@ -1621,7 +1621,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "target1 target2: dependency\n\tcommand".parse().unwrap();
     /// assert!(rule.has_target("target1"));
     /// assert!(rule.has_target("target2"));
@@ -1638,7 +1638,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let mut rule: Rule = "target1 target2: dependency\n\tcommand".parse().unwrap();
     /// rule.remove_target("target1").unwrap();
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target2"]);
@@ -1708,7 +1708,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
     /// rule.remove().unwrap();

@@ -58,7 +58,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "CFLAGS = $(BASE_FLAGS) -Wall\n".parse().unwrap();
     /// let refs: Vec<_> = makefile.variable_references().collect();
     /// assert_eq!(refs[0].name(), Some("BASE_FLAGS".to_string()));
@@ -116,7 +116,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "X = ${SRCS:.c=.o} $(FOO.$(BAR)) $@\n".parse().unwrap();
     /// let ranges: Vec<_> = makefile
     ///     .variable_references()
@@ -152,7 +152,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "X = $(dir $(FILE)) $(Y)\n".parse().unwrap();
     /// let parents: Vec<_> = makefile
     ///     .variable_references()
@@ -173,7 +173,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, ReferenceLocation};
+    /// use makefile_edit::{Makefile, ReferenceLocation};
     /// let makefile: Makefile = "$(OBJS): $(SRCS)\nX := $(dir $(FILE))\n".parse().unwrap();
     /// let locations: Vec<_> = makefile
     ///     .variable_references()
@@ -272,7 +272,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "FILES = $(wildcard *.c)\n".parse().unwrap();
     /// let refs: Vec<_> = makefile.variable_references().collect();
     /// assert!(refs[0].is_function_call());
@@ -319,7 +319,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
     /// let refs: Vec<_> = makefile.variable_references().collect();
     /// assert_eq!(refs[0].argument_count(), 3);
@@ -364,7 +364,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
     /// let refs: Vec<_> = makefile.variable_references().collect();
     /// // offset 12 is 'a' (first arg), offset 14 is 'b' (second arg), offset 16 is 't' (third arg)
@@ -427,7 +427,7 @@ impl VariableReference {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant, Modifier, ModifierArg};
+    /// use makefile_edit::{Makefile, MakefileVariant, Modifier, ModifierArg};
     /// let makefile = Makefile::parse_with_variant(
     ///     "OBJS = ${SRCS:M*.c:.c=.o}\n",
     ///     MakefileVariant::BSDMake,

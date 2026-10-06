@@ -11,7 +11,7 @@ impl Vpath {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem, TextRange};
+    /// use makefile_edit::{Makefile, MakefileItem, TextRange};
     /// let makefile: Makefile = "vpath %.c src\n".parse().unwrap();
     /// let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else { panic!() };
     /// assert_eq!(vpath.keyword_range(), Some(TextRange::new(0.into(), 5.into())));
@@ -70,7 +70,7 @@ impl Vpath {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileItem, MakefileVariant};
     /// let makefile: Makefile = "vpath %.c a \\\n  b\n".parse().unwrap();
     /// let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else {
     ///     panic!("expected a vpath directive");

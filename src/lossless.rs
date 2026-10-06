@@ -141,7 +141,7 @@ macro_rules! ast_node {
             ///
             /// # Example
             /// ```
-            /// use makefile_lossless::{Makefile, TextRange};
+            /// use makefile_edit::{Makefile, TextRange};
             ///
             /// let makefile: Makefile = "VAR = 1\nall:\n\techo hi\n".parse().unwrap();
             /// let rule = makefile.rules().next().unwrap();
@@ -212,7 +212,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     ///
     /// let makefile: Makefile = "A = a \\\n  b\nall:\n\techo \\\\\n".parse().unwrap();
     /// assert_eq!(

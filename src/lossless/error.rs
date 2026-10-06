@@ -162,7 +162,7 @@ impl PositionedParseError {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     ///
     /// let parsed = Makefile::parse("all:\n\nfoo \\\n  bar\n");
     /// let error = &parsed.positioned_errors()[0];
@@ -180,7 +180,7 @@ impl PositionedParseError {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, ParseErrorKind, TextRange};
+    /// use makefile_edit::{Makefile, ParseErrorKind, TextRange};
     ///
     /// let parsed = Makefile::parse("all:\n\n  echo hi\n");
     /// let error = &parsed.positioned_errors()[0];
