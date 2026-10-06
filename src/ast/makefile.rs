@@ -172,6 +172,40 @@ impl MakefileItem {
         self.syntax().text_range()
     }
 
+    /// The branches of the conditionals this item is in, outermost first.
+    ///
+    /// This covers conditionals at any depth, including conditionals in a
+    /// rule body and BSD make `.elif` chains. Two items can never both take
+    /// effect if any of their branches are exclusive, as checked by
+    /// [`ConditionalBranch::is_exclusive_with`](crate::ConditionalBranch::is_exclusive_with).
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile =
+    ///     "ifdef A\nifdef B\nX = 1\nendif\nelse\nX = 2\nendif\nX = 3\n".parse().unwrap();
+    /// let branches: Vec<_> = makefile
+    ///     .variable_definitions()
+    ///     .map(|v| v.enclosing_branches())
+    ///     .collect();
+    /// let indexes: Vec<Vec<usize>> = branches
+    ///     .iter()
+    ///     .map(|b| b.iter().map(|b| b.index()).collect())
+    ///     .collect();
+    /// assert_eq!(indexes, vec![vec![0, 0], vec![1], vec![]]);
+    ///
+    /// let exclusive = |a: &[_], b: &[_]| {
+    ///     a.iter().any(|x: &makefile_lossless::ConditionalBranch| {
+    ///         b.iter().any(|y| x.is_exclusive_with(y))
+    ///     })
+    /// };
+    /// assert!(exclusive(&branches[0], &branches[1]));
+    /// assert!(!exclusive(&branches[0], &branches[2]));
+    /// ```
+    pub fn enclosing_branches(&self) -> Vec<crate::ConditionalBranch> {
+        super::conditional::enclosing_branches(self.syntax())
+    }
+
     /// Get the line number (0-indexed) where this item starts.
     ///
     /// # Example
