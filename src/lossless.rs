@@ -1055,18 +1055,28 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 "missing separator (recipe lines must start with a tab)".to_string(),
             );
             self.bump_as(INDENT);
-            let mut text = String::new();
-            while let Some((kind, _)) = self.tokens.last() {
-                if *kind == NEWLINE {
+            // Continuation lines belong to the recipe, as they would if it
+            // were indented with a tab.
+            loop {
+                let mut text = String::new();
+                while let Some((kind, _)) = self.tokens.last() {
+                    if *kind == NEWLINE {
+                        break;
+                    }
+                    text.push_str(&self.tokens.pop().unwrap().1);
+                }
+                let continued = (text.len() - text.trim_end_matches('\\').len()) % 2 == 1;
+                if !text.is_empty() {
+                    self.builder.token(TEXT.into(), &text);
+                }
+                self.pending_backslash_escape = false;
+                if self.current() != Some(NEWLINE) {
                     break;
                 }
-                text.push_str(&self.tokens.pop().unwrap().1);
-            }
-            if !text.is_empty() {
-                self.builder.token(TEXT.into(), &text);
-            }
-            if self.current() == Some(NEWLINE) {
                 self.bump();
+                if !continued {
+                    break;
+                }
             }
             self.builder.finish_node();
         }
@@ -16759,6 +16769,29 @@ test:
         assert_eq!(
             rule.recipes().collect::<Vec<_>>(),
             vec!["echo a", "echo b", "echo c"]
+        );
+    }
+
+    #[test]
+    fn test_space_indented_recipe_with_continuation_recovered() {
+        let code = "all:\n    echo a \\\n    b\n\techo c\n";
+        let parsed = parse(code, None);
+        assert_eq!(parsed.root().to_string(), code);
+        assert_eq!(
+            parsed
+                .positioned_errors
+                .iter()
+                .map(|e| (e.kind(), e.range))
+                .collect::<Vec<_>>(),
+            vec![(
+                ParseErrorKind::MissingSeparator,
+                rowan::TextRange::new(5.into(), 9.into())
+            )]
+        );
+        let rule = parsed.root().rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a \\\n    b", "echo c"]
         );
     }
 
