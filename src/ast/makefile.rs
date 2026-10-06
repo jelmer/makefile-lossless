@@ -1312,6 +1312,9 @@ impl Makefile {
 
     /// Replace rule at given index with a new rule
     ///
+    /// `index` is a position in [`Makefile::rules`], so it can refer to a
+    /// rule inside a conditional or loop.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1321,11 +1324,7 @@ impl Makefile {
     /// assert!(makefile.rules().any(|r| r.targets().any(|t| t == "new_rule")));
     /// ```
     pub fn replace_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
-        let rules: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RULE)
-            .collect();
+        let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if rules.is_empty() {
             return Err(Error::Parse(ParseError {
@@ -1358,13 +1357,17 @@ impl Makefile {
 
         let new_node = with_trailing_newline(new_rule.syntax(), &line_ending(self.syntax()));
 
-        // Replace the rule at the target index
-        self.syntax()
+        target_node
+            .parent()
+            .unwrap()
             .splice_children(target_index..target_index + 1, vec![new_node.into()]);
         Ok(())
     }
 
     /// Remove rule at given index
+    ///
+    /// `index` is a position in [`Makefile::rules`], so it can refer to a
+    /// rule inside a conditional or loop.
     ///
     /// # Example
     /// ```
@@ -1375,11 +1378,7 @@ impl Makefile {
     /// assert_eq!(makefile.rules().count(), 1);
     /// ```
     pub fn remove_rule(&mut self, index: usize) -> Result<Rule, Error> {
-        let rules: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RULE)
-            .collect();
+        let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if rules.is_empty() {
             return Err(Error::Parse(ParseError {
@@ -1410,13 +1409,21 @@ impl Makefile {
         let target_node = rules[index].clone();
         let target_index = target_node.index();
 
-        // Remove the rule at the target index
-        self.syntax()
+        target_node
+            .parent()
+            .unwrap()
             .splice_children(target_index..target_index + 1, vec![]);
         Ok(Rule::cast(target_node).unwrap())
     }
 
     /// Insert rule at given position
+    ///
+    /// `index` is a position in [`Makefile::rules`], which includes rules
+    /// inside conditionals and loops. The new rule is inserted directly
+    /// before the rule at `index`, in the same conditional branch or loop
+    /// body if that rule is in one, so that it applies under the same
+    /// conditions. If `index` is `rules().count()`, the new rule is
+    /// appended to the end of the makefile.
     ///
     /// # Example
     /// ```
@@ -1428,11 +1435,7 @@ impl Makefile {
     /// assert_eq!(targets, vec!["rule1", "inserted_rule", "rule2"]);
     /// ```
     pub fn insert_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
-        let rules: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RULE)
-            .collect();
+        let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if index > rules.len() {
             return Err(Error::Parse(ParseError {
@@ -1445,12 +1448,12 @@ impl Makefile {
             }));
         }
 
-        let target_index = if index == rules.len() {
-            // Insert at the end
-            self.syntax().children_with_tokens().count()
-        } else {
-            // Insert before the rule at the given index
-            rules[index].index()
+        let (parent, target_index) = match rules.get(index) {
+            Some(rule) => (rule.parent().unwrap(), rule.index()),
+            None => (
+                self.syntax().clone(),
+                self.syntax().children_with_tokens().count(),
+            ),
         };
 
         // Build the nodes to insert
@@ -1486,7 +1489,7 @@ impl Makefile {
 
             // Check if there's a blank line immediately before target_index
             let has_blank_before = if target_index > 0 {
-                self.syntax()
+                parent
                     .children_with_tokens()
                     .nth(target_index - 1)
                     .and_then(|n| n.as_node().map(|node| node.kind() == BLANK_LINE))
@@ -1495,8 +1498,13 @@ impl Makefile {
                 false
             };
 
+            // No blank line directly after a conditional or loop header
+            let at_block_start = rules[index].prev_sibling().is_some_and(|n| {
+                matches!(n.kind(), CONDITIONAL_IF | CONDITIONAL_ELSE | FOR_HEADER)
+            });
+
             // Only add a blank before if there isn't one already and we're not at the start
-            if !has_blank_before && index > 0 {
+            if !has_blank_before && index > 0 && !at_block_start {
                 let mut bl_builder = GreenNodeBuilder::new();
                 bl_builder.start_node(BLANK_LINE.into());
                 bl_builder.token(NEWLINE.into(), &eol);
@@ -1530,9 +1538,8 @@ impl Makefile {
         }
 
         // Insert all nodes at the target index
-        let target_index = terminate_line_before(self.syntax(), target_index, &eol);
-        self.syntax()
-            .splice_children(target_index..target_index, nodes_to_insert);
+        let target_index = terminate_line_before(&parent, target_index, &eol);
+        parent.splice_children(target_index..target_index, nodes_to_insert);
         Ok(())
     }
 
@@ -2690,6 +2697,89 @@ override_dh_auto_configure:
         let new_rule: Rule = "new:\n\tz\n".parse().unwrap();
         makefile.insert_rule(1, new_rule).unwrap();
         assert_eq!(makefile.to_string(), "a:\n\tx\n\nnew:\n\tz\n");
+    }
+
+    fn rule_targets(makefile: &Makefile) -> Vec<String> {
+        makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn test_insert_rule_in_conditional() {
+        let cases = [
+            ("ifdef X\nall:\nendif\n", 0, "ifdef X\nb:\n\nall:\nendif\n"),
+            ("ifdef X\nall:\nendif\n", 1, "ifdef X\nall:\nendif\n\nb:\n"),
+            (
+                "a:\nifdef X\nc:\nelse\nd:\nendif\n",
+                2,
+                "a:\nifdef X\nc:\nelse\nb:\n\nd:\nendif\n",
+            ),
+            (
+                "a:\nifdef X\nc:\nd:\nendif\ne:\n",
+                2,
+                "a:\nifdef X\nc:\n\nb:\n\nd:\nendif\ne:\n",
+            ),
+            (
+                "a:\nifdef X\nc:\nendif\ne:\n",
+                2,
+                "a:\nifdef X\nc:\nendif\n\nb:\n\ne:\n",
+            ),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .insert_rule(index, "b:\n".parse().unwrap())
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            let reparsed: Makefile = expected.parse().unwrap();
+            assert_eq!(rule_targets(&reparsed), rule_targets(&makefile));
+            assert_eq!(rule_targets(&reparsed)[index], "b", "{text:?} at {index}");
+        }
+    }
+
+    #[test]
+    fn test_insert_rule_in_for_loop() {
+        let (mut makefile, _) = Makefile::from_str_relaxed(".for x in a b\nfoo:\n.endfor\n");
+        makefile.insert_rule(0, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), ".for x in a b\nb:\n\nfoo:\n.endfor\n");
+    }
+
+    #[test]
+    fn test_insert_rule_in_conditional_out_of_bounds() {
+        let mut makefile: Makefile = "ifdef X\nall:\nendif\n".parse().unwrap();
+        let err = makefile
+            .insert_rule(2, "b:\n".parse().unwrap())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parse error: Error at line 1: Rule index 2 out of bounds (max 1)\n1| insert_rule\n"
+        );
+    }
+
+    #[test]
+    fn test_remove_rule_in_conditional() {
+        let mut makefile: Makefile = "a:\nifdef X\nc:\nendif\ne:\n".parse().unwrap();
+        let removed = makefile.remove_rule(1).unwrap();
+        assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["c"]);
+        assert_eq!(makefile.to_string(), "a:\nifdef X\nendif\ne:\n");
+        let removed = makefile.remove_rule(1).unwrap();
+        assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["e"]);
+        assert_eq!(makefile.to_string(), "a:\nifdef X\nendif\n");
+        let reparsed: Makefile = makefile.to_string().parse().unwrap();
+        assert_eq!(rule_targets(&reparsed), vec!["a"]);
+    }
+
+    #[test]
+    fn test_replace_rule_in_conditional() {
+        let mut makefile: Makefile = "a:\nifdef X\nc:\nendif\ne:\n".parse().unwrap();
+        makefile.replace_rule(1, "z:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\nifdef X\nz:\nendif\ne:\n");
+        makefile.replace_rule(2, "y:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\nifdef X\nz:\nendif\ny:\n");
+        let reparsed: Makefile = makefile.to_string().parse().unwrap();
+        assert_eq!(rule_targets(&reparsed), vec!["a", "z", "y"]);
     }
 
     #[test]
