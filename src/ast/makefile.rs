@@ -35,6 +35,47 @@ fn needs_blank_line_at_end(root: &SyntaxNode) -> bool {
     !last_line.trim().is_empty()
 }
 
+/// Whether the parser puts the blank lines after `node` in it: a rule's
+/// recipe continues after blank lines, unless the rule is a target-specific
+/// assignment.
+// TODO: BSD make target-local assignments, as in `a: X=1`, can be followed
+// by commands, so the parser puts blank lines after them in the rule too,
+// but the tree doesn't say which make it was parsed for.
+fn takes_blank_lines(node: &SyntaxNode) -> bool {
+    node.kind() == RULE
+        && node
+            .last_child_or_token()
+            .is_none_or(|it| it.kind() != VARIABLE)
+}
+
+/// Insert `elements` before child `index` of `parent`. A BLANK_LINE node
+/// directly after a rule goes in the rule instead, where the parser puts
+/// it.
+fn insert_items(parent: &SyntaxNode, index: usize, elements: Vec<crate::lossless::SyntaxElement>) {
+    let mut index = index;
+    let mut prev = index
+        .checked_sub(1)
+        .and_then(|i| parent.children_with_tokens().nth(i))
+        .and_then(|it| it.into_node());
+    for element in elements {
+        if let (Some(rule), Some(blank)) = (
+            prev.as_ref().filter(|n| takes_blank_lines(n)),
+            element.as_node().filter(|n| n.kind() == BLANK_LINE),
+        ) {
+            let tokens: Vec<_> = blank.children_with_tokens().collect();
+            for token in &tokens {
+                token.detach();
+            }
+            let len = rule.children_with_tokens().count();
+            rule.splice_children(len..len, tokens);
+            continue;
+        }
+        prev = element.as_node().cloned();
+        parent.splice_children(index..index, vec![element]);
+        index += 1;
+    }
+}
+
 /// Append `node` to the end of `root`, terminating any unterminated last
 /// line and separating it from preceding content by a blank line as
 /// described by [`needs_blank_line_at_end`].
@@ -49,7 +90,7 @@ fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
         nodes.push(SyntaxNode::new_root_mut(bl_builder.finish()).into());
     }
     nodes.push(node.into());
-    root.splice_children(pos..pos, nodes);
+    insert_items(root, pos, nodes);
 }
 
 /// Represents different types of items that can appear in a Makefile
@@ -1539,7 +1580,7 @@ impl Makefile {
 
         // Insert all nodes at the target index
         let target_index = terminate_line_before(&parent, target_index, &eol);
-        parent.splice_children(target_index..target_index, nodes_to_insert);
+        insert_items(&parent, target_index, nodes_to_insert);
         Ok(())
     }
 
@@ -3763,6 +3804,59 @@ VAR3 = value3
             makefile.to_string(),
             "ifdef DEBUG\nY = 1\n\nelse\nY = 2\n\nendif\n"
         );
+    }
+
+    #[test]
+    fn test_insert_rule_blank_line_in_rule() {
+        // The parser puts blank lines after a rule in the rule, as they
+        // don't end its recipe.
+        let cases = [
+            ("a:\n", 1, "a:\n\nb:\n"),
+            ("a:\n\techo\n", 1, "a:\n\techo\n\nb:\n"),
+            ("a: c\n# x\n", 1, "a: c\n# x\n\nb:\n"),
+            ("a:\n", 0, "b:\n\na:\n"),
+            ("a:\nc:\n", 1, "a:\n\nb:\n\nc:\n"),
+            (
+                "ifdef X\na:\nc:\nendif\n",
+                1,
+                "ifdef X\na:\n\nb:\n\nc:\nendif\n",
+            ),
+            ("a: X = 1\n", 1, "a: X = 1\n\nb:\n"),
+        ];
+        for (text, index, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile
+                .insert_rule(index, "b:\n".parse().unwrap())
+                .unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?} at {index}");
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_add_conditional_after_rule_matches_reparse() {
+        for text in [
+            "a:\n",
+            "a:\n\techo\n",
+            "a: b\n# c\n",
+            "a:\n\techo \\",
+            "a: X = 1\n",
+        ] {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.add_conditional("ifdef", "X", "", None).unwrap();
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_add_rule_after_rule() {
+        let mut makefile: Makefile = "a:\n\techo\n".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "a:\n\techo\n\nb:\n");
+        // TODO: compare with a reparse once add_rule creates the
+        // PREREQUISITES node the parser does.
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.syntax().to_string(), "a:\n\techo\n\n");
     }
 
     #[test]

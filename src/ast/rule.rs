@@ -68,7 +68,6 @@ fn parse_rule_line(line: &str) -> Option<Rule> {
 /// [`Rule::prerequisites`] would not read them back.
 fn build_prerequisites_node(
     prereqs: &[String],
-    include_leading_space: bool,
     trailing_space: Option<&str>,
     before_comment: bool,
 ) -> Result<SyntaxNode, Error> {
@@ -98,7 +97,7 @@ fn build_prerequisites_node(
             .filter(|n| n.kind() == PREREQUISITE)
             .enumerate()
         {
-            if i > 0 || include_leading_space {
+            if i > 0 {
                 children.push(GreenToken::new(WHITESPACE.into(), " ").into());
             }
             children.push(node.green().into_owned().into());
@@ -259,7 +258,7 @@ impl Rule {
             GreenToken::new(OPERATOR.into(), ":").into(),
         ];
         if !prerequisites.is_empty() {
-            let prerequisites = build_prerequisites_node(&owned(prerequisites), false, None, false)
+            let prerequisites = build_prerequisites_node(&owned(prerequisites), None, false)
                 .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
             children.push(GreenToken::new(WHITESPACE.into(), " ").into());
             children.push(prerequisites.green().into_owned().into());
@@ -1357,12 +1356,7 @@ impl Rule {
             } else {
                 None
             };
-            let fresh = build_prerequisites_node(
-                &prereqs,
-                !has_external_whitespace,
-                separator,
-                next_kind == Some(COMMENT),
-            )?;
+            let fresh = build_prerequisites_node(&prereqs, separator, next_kind == Some(COMMENT))?;
             let old_green = node.green();
             let rest = old_green.children().skip(keep).map(|c| c.to_owned());
             let green = rowan::GreenNode::new(
@@ -1375,14 +1369,17 @@ impl Rule {
                     .collect::<Vec<_>>(),
             );
             let index = node.index();
-            self.syntax().splice_children(
-                index..index + 1,
-                vec![SyntaxNode::new_root_mut(green).into()],
-            );
+            let mut elements = if !has_external_whitespace && !prereqs.is_empty() {
+                crate::lossless::detached_elements(&[(WHITESPACE, " ")], None)
+            } else {
+                vec![]
+            };
+            elements.push(SyntaxNode::new_root_mut(green).into());
+            self.syntax().splice_children(index..index + 1, elements);
             return Ok(());
         }
 
-        // Insert new PREREQUISITES (need leading space inside node)
+        // Insert new PREREQUISITES, after a space as the parser has it
         let insert_pos = self
             .syntax()
             .children_with_tokens()
@@ -1404,9 +1401,15 @@ impl Rule {
             .children_with_tokens()
             .nth(insert_pos)
             .is_some_and(|e| e.kind() == COMMENT);
-        let new_prereqs = build_prerequisites_node(&prereqs, true, None, before_comment)?;
+        let new_prereqs = build_prerequisites_node(&prereqs, None, before_comment)?;
+        let mut elements = if prereqs.is_empty() {
+            vec![]
+        } else {
+            crate::lossless::detached_elements(&[(WHITESPACE, " ")], None)
+        };
+        elements.push(new_prereqs.into());
         self.syntax()
-            .splice_children(insert_pos..insert_pos, vec![new_prereqs.into()]);
+            .splice_children(insert_pos..insert_pos, elements);
 
         Ok(())
     }
@@ -2866,6 +2869,38 @@ mod tests {
         rule.clear_commands();
         assert_eq!(rule.to_string(), "all: dep\n");
         assert_eq!(rule.recipe_count(), 0);
+    }
+
+    #[test]
+    fn test_set_prerequisites_matches_reparse() {
+        // The parser puts the whitespace after the operator before the
+        // PREREQUISITES node.
+        let cases = [
+            ("a:\n", "a: x y\n"),
+            ("a::\n", "a:: x y\n"),
+            ("a:b\n", "a: x y\n"),
+            ("a: \n", "a: x y\n"),
+            ("a:# c\n", "a: x y # c\n"),
+            ("a:|c\n", "a: x y |c\n"),
+            ("a:;echo\n", "a: x y ;echo\n"),
+            ("a:\n\techo\n", "a: x y\n\techo\n"),
+        ];
+        for (text, expected) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut rule = makefile.rules().next().unwrap();
+            rule.set_prerequisites(vec!["x", "y"]).unwrap();
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_set_prerequisites_without_node_matches_reparse() {
+        let mut makefile = Makefile::new();
+        let mut rule = makefile.add_rule("a");
+        rule.set_prerequisites(vec!["b"]).unwrap();
+        assert_eq!(makefile.to_string(), "a: b\n");
+        assert_matches_reparse(&makefile);
     }
 
     #[test]
