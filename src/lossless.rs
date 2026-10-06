@@ -199,6 +199,12 @@ pub(crate) struct Parse {
 
 pub(crate) const ASSIGNMENT_OPERATORS: &[&str] = &["=", ":=", "::=", ":::=", "+=", "?=", "!="];
 
+/// Whether `op` is `::=` or `:::=`, which BSD make does not have: it reads
+/// the leading colons as part of the variable name, followed by `:=`.
+fn is_colons_before_subst(op: &str) -> bool {
+    matches!(op, "::=" | ":::=")
+}
+
 /// Whether `text` is BSD make's `:sh=` shell assignment operator, which may
 /// contain whitespace and repeat the modifier, as in `:sh :sh =`.
 pub(crate) fn is_sunsh_operator(text: &str) -> bool {
@@ -1948,6 +1954,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // the line.
                     Some(BACKSLASH) if self.is_line_continuation() => return true,
                     Some(WHITESPACE) if level == 0 => return true,
+                    Some(OPERATOR)
+                        if level == 0
+                            && self.is_bsd_make()
+                            && is_colons_before_subst(&self.tokens.last().unwrap().1) =>
+                    {
+                        let len = self.tokens.last().unwrap().1.len();
+                        self.bump_token_head(len - ":=".len());
+                        return true;
+                    }
                     Some(OPERATOR) if level == 0 && self.at_assignment_operator() => return true,
                     Some(OPERATOR)
                         if level == 0 && self.sunsh_modifier().is_some_and(|(_, shell)| shell) =>
@@ -4119,6 +4134,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ if level != 0 => {}
                     TEXT if stop_at_semicolon && text == ";" => return false,
                     WHITESPACE => seen_space = seen_name,
+                    OPERATOR if self.is_bsd_make() && is_colons_before_subst(text) => {
+                        return !seen_space
+                    }
                     OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
                     _ if seen_space => return false,
                     _ => seen_name = true,
@@ -9261,6 +9279,100 @@ all: $(OBJS)
         let root = parsed.root();
         assert_eq!(top_level_kinds(root.syntax()), vec![RULE, RULE]);
         assert_eq!(root.to_string(), text);
+    }
+
+    #[test]
+    fn test_bsd_double_colon_assignment() {
+        // BSD make has no `::=` or `:::=` operator: the colons before `:=`
+        // are part of the variable name, as in posix-varassign.mk.
+        for (text, name, op, value) in [
+            ("VAR::=x\n", "VAR:", ":=", "x"),
+            ("VAR:::= x\n", "VAR::", ":=", "x"),
+            ("VAR::+= x\n", "VAR::", "+=", "x"),
+            ("VAR::?= x\n", "VAR::", "?=", "x"),
+            ("VAR::!= x\n", "VAR::", "!=", "x"),
+            ("X::==y\n", "X:", ":=", "=y"),
+            ("::=x\n", ":", ":=", "x"),
+        ] {
+            let parsed = parse(text, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![], "{text:?}");
+            let root = parsed.root();
+            assert_eq!(root.rules().count(), 0, "{text:?}");
+            let vars: Vec<_> = root
+                .variable_definitions()
+                .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+                .collect();
+            assert_eq!(
+                vars,
+                vec![(
+                    Some(name.to_string()),
+                    Some(op.to_string()),
+                    Some(value.to_string())
+                )],
+                "{text:?}"
+            );
+            assert_eq!(root.to_string(), text);
+        }
+
+        // As a target-local assignment.
+        let text = "t: VAR::=x\n";
+        let parsed = parse(text, Some(MakefileVariant::BSDMake));
+        assert_eq!(parsed.errors, vec![]);
+        let rule = parsed.root().rules().next().unwrap();
+        let var = rule.scoped_assignment().unwrap();
+        assert_eq!(var.name(), Some("VAR:".to_string()));
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("x".to_string()));
+        assert_eq!(parsed.root().to_string(), text);
+
+        // With whitespace before the colons, the line is a dependency line
+        // with the operator `::`, followed by a target-local assignment
+        // with an empty name, which BSD make ignores.
+        for (text, op) in [("VAR ::= x\n", "="), ("VAR :::= x\n", ":=")] {
+            let parsed = parse(text, Some(MakefileVariant::BSDMake));
+            assert_eq!(parsed.errors, vec![], "{text:?}");
+            let root = parsed.root();
+            let rules: Vec<_> = root.rules().collect();
+            assert_eq!(rules.len(), 1, "{text:?}");
+            assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["VAR"]);
+            assert!(rules[0].is_double_colon(), "{text:?}");
+            let var = rules[0].scoped_assignment().unwrap();
+            assert_eq!(var.name(), None, "{text:?}");
+            assert_eq!(var.assignment_operator(), Some(op.to_string()));
+            assert_eq!(var.raw_value(), Some("x".to_string()), "{text:?}");
+            assert_eq!(root.to_string(), text);
+        }
+
+        // GNU and POSIX make have the `::=` and `:::=` operators.
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            for (text, op) in [
+                ("VAR::=x\n", "::="),
+                ("VAR ::= x\n", "::="),
+                ("VAR:::= x\n", ":::="),
+            ] {
+                let parsed = parse(text, variant);
+                assert_eq!(parsed.errors, vec![], "{variant:?} {text:?}");
+                let root = parsed.root();
+                let vars: Vec<_> = root
+                    .variable_definitions()
+                    .map(|v| (v.name(), v.assignment_operator(), v.raw_value()))
+                    .collect();
+                assert_eq!(
+                    vars,
+                    vec![(
+                        Some("VAR".to_string()),
+                        Some(op.to_string()),
+                        Some("x".to_string())
+                    )],
+                    "{variant:?} {text:?}"
+                );
+                assert_eq!(root.to_string(), text);
+            }
+        }
     }
 
     #[test]
