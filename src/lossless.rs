@@ -16455,11 +16455,11 @@ mod test_crlf {
         let MakefileItem::ForLoop(for_loop) = &items[0] else {
             panic!("expected a for loop");
         };
-        assert_eq!(for_loop.list(), Some("a \\\n  b".to_string()));
+        assert_eq!(for_loop.list(), Some("a  b".to_string()));
         let MakefileItem::Directive(directive) = &items[1] else {
             panic!("expected a directive");
         };
-        assert_eq!(directive.argument(), Some("bad \\\n  thing".to_string()));
+        assert_eq!(directive.argument(), Some("bad  thing".to_string()));
     }
 
     #[test]

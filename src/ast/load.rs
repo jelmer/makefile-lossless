@@ -1,13 +1,16 @@
 //! Accessors for GNU make `load` directives.
 
-use super::is_continuation;
 use super::makefile::MakefileItem;
-use crate::lossless::{node_text, Load};
+use super::{is_continuation, logical_text, LineSyntax};
+use crate::lossless::Load;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
 impl Load {
     /// The unexpanded words naming the objects to load.
+    ///
+    /// As in GNU make, line continuations are collapsed and `\#` outside
+    /// variable references is unescaped to `#`.
     ///
     /// An entry point given in parentheses after an object, as in
     /// `foo.so(init)`, is kept as part of its word, since a word may only
@@ -26,25 +29,31 @@ impl Load {
         let Some(expr) = self.syntax().children().find(|it| it.kind() == EXPR) else {
             return vec![];
         };
-        let mut objects = vec![];
-        let mut word = String::new();
+        let mut words = vec![];
+        let mut word = vec![];
         for element in expr.children_with_tokens() {
             match element {
-                rowan::NodeOrToken::Node(node) => word.push_str(&node_text(&node)),
+                rowan::NodeOrToken::Node(node) => word.extend(
+                    node.descendants_with_tokens()
+                        .filter_map(|it| it.into_token()),
+                ),
                 rowan::NodeOrToken::Token(token)
                     if token.kind() == WHITESPACE || is_continuation(&token.clone().into()) =>
                 {
                     if !word.is_empty() {
-                        objects.push(std::mem::take(&mut word));
+                        words.push(std::mem::take(&mut word));
                     }
                 }
-                rowan::NodeOrToken::Token(token) => word.push_str(token.text()),
+                rowan::NodeOrToken::Token(token) => word.push(token),
             }
         }
         if !word.is_empty() {
-            objects.push(word);
+            words.push(word);
         }
-        objects
+        words
+            .into_iter()
+            .map(|word| logical_text(&expr, word, LineSyntax::Gnu, true))
+            .collect()
     }
 
     /// Whether this is a `-load` directive, for which make ignores objects
@@ -112,6 +121,20 @@ mod tests {
     fn test_load_reference() {
         let load = parse_load("load $(DIR)/$(call obj, x).so\n");
         assert_eq!(load.objects(), vec!["$(DIR)/$(call obj, x).so"]);
+    }
+
+    #[test]
+    fn test_load_logical_line() {
+        // GNU make unescapes `\#` outside references, halves the
+        // backslashes before a comment and collapses continuations inside
+        // references.
+        let load = parse_load("load ./a\\#b.so $(subst x,y,c\\#d) e\\\\# f\n");
+        assert_eq!(
+            load.objects(),
+            vec!["./a#b.so", "$(subst x,y,c\\#d)", "e\\"]
+        );
+        let load = parse_load("load ./$(subst a b,X,a \\\n   b).so\n");
+        assert_eq!(load.objects(), vec!["./$(subst a b,X,a b).so"]);
     }
 
     #[test]
