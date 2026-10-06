@@ -93,6 +93,9 @@ pub enum ParseErrorKind {
     UnclosedIncludePath,
     /// A BSD make `.include` path not delimited by `<...>` or `"..."`.
     UndelimitedIncludePath,
+    /// A BSD make line starting with `.` that is neither a known directive
+    /// nor a dependency line or variable assignment, such as `.iff`.
+    UnknownDirective,
     /// Unexpected text where the end of the line was expected. GNU make
     /// only warns about text after a directive such as `else junk` or
     /// `endef junk`, while BSD make treats it as an error.
@@ -1217,10 +1220,58 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     .all(|c| c == ' ' || c == '\t')
         }
 
+        /// The error BSD make reports for the line starting at the current
+        /// token if it has no dependency operator. As BSD make tries
+        /// directives first, a line starting with `.` is then an unknown
+        /// directive, or an include with junk after the keyword such as
+        /// `.includex "file"`.
+        fn bsd_unknown_directive_error(&self) -> Option<(ParseErrorKind, String)> {
+            if !self.is_bsd_make() {
+                return None;
+            }
+            let start = usize::from(self.current_range().start());
+            if start > 0 && !self.original_text[..start].ends_with('\n') {
+                return None;
+            }
+            let mut rest = self.original_text[start..].strip_prefix('.')?;
+            loop {
+                let trimmed = rest.trim_start_matches([' ', '\t']);
+                match trimmed.strip_prefix("\\\n") {
+                    Some(r) => rest = r,
+                    None => {
+                        rest = trimmed;
+                        break;
+                    }
+                }
+            }
+            if rest
+                .strip_prefix(['s', '-', 'd'])
+                .unwrap_or(rest)
+                .starts_with("include")
+            {
+                return Some((
+                    ParseErrorKind::UndelimitedIncludePath,
+                    ".include filename must be delimited by \"\" or <>".to_string(),
+                ));
+            }
+            let len = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .unwrap_or(rest.len());
+            Some((
+                ParseErrorKind::UnknownDirective,
+                format!("Unknown directive \"{}\"", &rest[..len]),
+            ))
+        }
+
         /// `tab_indented` is whether the rule line starts with a tab, which
         /// GNU make reports as "recipe commences before first target"
-        /// rather than "missing separator".
-        fn find_and_consume_colon(&mut self, tab_indented: bool) -> bool {
+        /// rather than "missing separator". `unknown_directive` is the error
+        /// to report instead of a missing separator, if any.
+        fn find_and_consume_colon(
+            &mut self,
+            tab_indented: bool,
+            unknown_directive: Option<(ParseErrorKind, String)>,
+        ) -> bool {
             // Skip whitespace before colon
             self.skip_ws();
 
@@ -1242,12 +1293,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             let at_eol = self.current() == Some(NEWLINE);
-            let kind = if tab_indented {
-                ParseErrorKind::RecipeBeforeFirstTarget
+            let (kind, message) = if tab_indented {
+                (
+                    ParseErrorKind::RecipeBeforeFirstTarget,
+                    "expected ':'".to_string(),
+                )
             } else {
-                ParseErrorKind::MissingSeparator
+                unknown_directive
+                    .unwrap_or((ParseErrorKind::MissingSeparator, "expected ':'".to_string()))
             };
-            self.error(kind, "expected ':'".to_string());
+            self.error(kind, message);
             if !at_eol {
                 self.skip_logical_line();
             }
@@ -1258,6 +1313,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.in_rule = RuleContext::Outside;
             self.builder.start_node(RULE.into());
             let tab_indented = self.at_tab_indented_line_start();
+            let unknown_directive = self.bsd_unknown_directive_error();
 
             // Parse targets in a TARGETS node
             self.skip_ws();
@@ -1301,7 +1357,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Find and consume the colon
             let has_colon = if has_target {
-                self.find_and_consume_colon(tab_indented)
+                self.find_and_consume_colon(tab_indented, unknown_directive)
             } else {
                 false
             };
@@ -14991,6 +15047,134 @@ test:
             assert_eq!(error_kinds("include \"a\n", variant), vec![]);
             assert_eq!(error_kinds("include <a\n", variant), vec![]);
         }
+    }
+
+    #[test]
+    fn test_bsd_unknown_directive() {
+        // From NetBSD make's unit-tests/directive-misspellings.mk and
+        // directive-*.mk. A name of `None` is for an include keyword followed
+        // by junk, as in `.includex`.
+        for (code, line, name) in [
+            (".dinclud \"file\"\n", 1, Some("dinclud")),
+            (".dincludx \"file\"\n", 1, Some("dincludx")),
+            (".dincludes \"file\"\n", 1, None),
+            (".erro msg\n", 1, Some("erro")),
+            (".errox msg\n", 1, Some("errox")),
+            (".expor varname\n", 1, Some("expor")),
+            (".exporx varname\n", 1, Some("exporx")),
+            (".exports varname\n", 1, Some("exports")),
+            (".export-en\n", 1, Some("export-en")),
+            (".export-environment\n", 1, Some("export-environment")),
+            (".export-litera varname\n", 1, Some("export-litera")),
+            (".export-literax varname\n", 1, Some("export-literax")),
+            (".export-literally varname\n", 1, Some("export-literally")),
+            (".-includ \"file\"\n", 1, Some("-includ")),
+            (".-includx \"file\"\n", 1, Some("-includx")),
+            (".-includes \"file\"\n", 1, None),
+            (".includ \"file\"\n", 1, Some("includ")),
+            (".includx \"file\"\n", 1, Some("includx")),
+            (".includex \"file\"\n", 1, None),
+            (".inf msg\n", 1, Some("inf")),
+            (".infx msg\n", 1, Some("infx")),
+            (".infos msg\n", 1, Some("infos")),
+            (".sinclud \"file\"\n", 1, Some("sinclud")),
+            (".sincludx \"file\"\n", 1, Some("sincludx")),
+            (".sincludes \"file\"\n", 1, None),
+            (".unde varname\n", 1, Some("unde")),
+            (".undex varname\n", 1, Some("undex")),
+            (".undefs varname\n", 1, Some("undefs")),
+            (".unexpor varname\n", 1, Some("unexpor")),
+            (".unexporx varname\n", 1, Some("unexporx")),
+            (".unexports varname\n", 1, Some("unexports")),
+            (".unexport-en\n", 1, Some("unexport-en")),
+            (".unexport-enx\n", 1, Some("unexport-enx")),
+            (".unexport-envs\n", 1, Some("unexport-envs")),
+            (".warn msg\n", 1, Some("warn")),
+            (".warnin msg\n", 1, Some("warnin")),
+            (".warninx msg\n", 1, Some("warninx")),
+            (".warnings msg\n", 1, Some("warnings")),
+            (".undefinex varname\n", 1, Some("undefinex")),
+            (".indented none\n", 1, Some("indented")),
+            (".  indented 2 spaces\n", 1, Some("indented")),
+            (".\tindented tab\n", 1, Some("indented")),
+            (".${:Uinfo} directives cannot be indirect\n", 1, Some("")),
+            (".iff 1\n", 1, Some("iff")),
+            (".ifx 1\n", 1, Some("ifx")),
+            (".ifn 1\n", 1, Some("ifn")),
+            (".ifdefx X\n", 1, Some("ifdefx")),
+            (".if 1\n.endfi\n.endif\n", 2, Some("endfi")),
+            (".if 1\n.endifx\n.endif\n", 2, Some("endifx")),
+            (".if 1\n.elsif 1\n.endif\n", 2, Some("elsif")),
+            ("all:\n.elsif 1\n", 2, Some("elsif")),
+        ] {
+            let (kind, message) = match name {
+                Some(name) => (
+                    ParseErrorKind::UnknownDirective,
+                    format!("Unknown directive \"{name}\""),
+                ),
+                None => (
+                    ParseErrorKind::UndelimitedIncludePath,
+                    ".include filename must be delimited by \"\" or <>".to_string(),
+                ),
+            };
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.kind(), e.message.as_str(), e.line))
+                    .collect::<Vec<_>>(),
+                vec![(kind, message.as_str(), line)],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+            // Without knowing which make reads it, it may be meant for GNU
+            // make, which reports a missing separator.
+            for variant in [
+                None,
+                Some(MakefileVariant::GNUMake),
+                Some(MakefileVariant::POSIXMake),
+                Some(MakefileVariant::NMake),
+            ] {
+                assert!(
+                    !error_kinds(code, variant).contains(&ParseErrorKind::UnknownDirective),
+                    "{code:?} {variant:?}"
+                );
+            }
+            assert_eq!(
+                error_kinds(code, None),
+                vec![ParseErrorKind::MissingSeparator],
+                "{code:?}"
+            );
+        }
+        for code in [
+            ".PHONY: all\n",
+            ".MAIN:\n",
+            ".target target: source\n",
+            ".info:=\tvalue\n",
+            ".foo = bar\n",
+            ".c.o:\n\techo\n",
+            ".${:Uinfo} : source\n",
+            ".ifmake all\n.elifnmake x\n.elifdef X\n.elifndef Y\n.elifmake z\n.else\n.endif\n",
+            ".ifnmake all\n.endif\n",
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            assert_eq!(
+                error_kinds(code, Some(MakefileVariant::BSDMake)),
+                vec![],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+        }
+        // A line that does not start with a dot is not a directive.
+        assert_eq!(
+            parse("target-without-colon\n", Some(MakefileVariant::BSDMake))
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(ParseErrorKind::MissingSeparator, "expected ':'")]
+        );
     }
 
     #[test]
