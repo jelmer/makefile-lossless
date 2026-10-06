@@ -295,6 +295,30 @@ pub(crate) fn lf_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
+/// The comment that starts at `token`, a COMMENT token, if it starts one.
+///
+/// Where references are parsed in comments, in recipe lines and `define`
+/// bodies, a comment is split into COMMENT tokens around the EXPR nodes of
+/// the references, which all belong to the comment started by the first
+/// token.
+pub(crate) fn comment_elements(token: &SyntaxToken) -> Option<Vec<SyntaxElement>> {
+    let continues = std::iter::successors(token.prev_sibling_or_token(), |it| {
+        it.prev_sibling_or_token()
+    })
+    .find(|it| it.kind() != EXPR)
+    .is_some_and(|it| it.kind() == COMMENT);
+    if continues {
+        return None;
+    }
+    Some(
+        std::iter::successors(Some(SyntaxElement::Token(token.clone())), |it| {
+            it.next_sibling_or_token()
+        })
+        .take_while(|it| matches!(it.kind(), COMMENT | EXPR))
+        .collect(),
+    )
+}
+
 /// The text of `node`, with CRLF line endings converted to LF.
 pub(crate) fn node_text(node: &SyntaxNode) -> String {
     lf_line_endings(&node.text().to_string())

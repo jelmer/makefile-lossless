@@ -236,9 +236,17 @@ fn test_recipe_hash_in_reference() {
 }
 
 #[test]
-fn test_recipe_comment_line_not_searched() {
+fn test_recipe_comment_line() {
+    // GNU make expands a line starting with `#` before passing it to the
+    // shell; BSD make and nmake skip it.
     let code = "all:\n\t# $(X)\n\techo\n";
-    assert_eq!(references(code, None), vec![]);
+    assert_eq!(references(code, None), vec![r("$(X)", "X")]);
+    assert_eq!(
+        references(code, Some(MakefileVariant::POSIXMake)),
+        vec![r("$(X)", "X")]
+    );
+    assert_eq!(references(code, Some(MakefileVariant::BSDMake)), vec![]);
+    assert_eq!(references(code, Some(MakefileVariant::NMake)), vec![]);
     assert_eq!(recipe(code, None).shell_text(), "# $(X)");
 }
 
