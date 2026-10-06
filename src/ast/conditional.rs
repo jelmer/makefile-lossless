@@ -1554,6 +1554,19 @@ endif
     }
 
     #[test]
+    fn test_ifeq_line_continuation_in_quotes() {
+        let code = "ifeq \"a \\\n   b\" \"a b\"\nA = 1\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.condition(), Some("\"a b\" \"a b\"".to_string()));
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("a b".to_string(), "a b".to_string()))
+        );
+    }
+
+    #[test]
     fn test_ifeq_parenthesized_line_continuation() {
         let code = "ifeq ($(A),\\\n  b)\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();

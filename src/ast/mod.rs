@@ -14,7 +14,7 @@ use crate::MakefileVariant;
 use crate::SyntaxKind::{
     self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
     DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
-    LBRACE, LOAD, LPAREN, NEWLINE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
+    LBRACE, LOAD, LPAREN, NEWLINE, QUOTE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
 };
 
 /// Whether `token` is the backslash of a backslash-newline line
@@ -206,11 +206,87 @@ impl From<MakefileVariant> for LineSyntax {
     }
 }
 
+/// A token, or part of a quoted string, as [`logical_text`] sees it.
+struct Piece {
+    kind: SyntaxKind,
+    text: String,
+    /// Whether this is part of a line continuation.
+    continuation: bool,
+    /// Whether this is inside a variable reference delimited by
+    /// parentheses or braces. Outside quoted strings, only set for `#`
+    /// and `\#`.
+    in_reference: bool,
+    /// Whether this directly follows a `[`.
+    after_lbracket: bool,
+}
+
+/// The pieces of `token` that [`logical_text`] works with.
+///
+/// A balanced quoted string is lexed as a single QUOTE token, but make
+/// ignores quotes when reading a line, so the string is split up into
+/// single characters, with each line continuation and `\#` marked as such.
+fn pieces(token: &SyntaxToken, root: &SyntaxNode) -> Vec<Piece> {
+    let after_lbracket = token.prev_token().is_some_and(|t| t.text().ends_with('['));
+    if token.kind() != QUOTE {
+        let hash = token.kind() == TEXT && matches!(token.text(), "#" | "\\#");
+        return vec![Piece {
+            kind: token.kind(),
+            text: token.text().to_string(),
+            continuation: is_continuation(&token.clone().into()),
+            in_reference: hash && in_reference(token, root),
+            after_lbracket,
+        }];
+    }
+    let in_reference = in_reference(token, root);
+    let mut pieces: Vec<Piece> = Vec::new();
+    // Number of backslashes directly before the current character.
+    let mut backslashes = 0;
+    let mut prev = None;
+    let mut chars = token.text().chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut text = c.to_string();
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            text.extend(chars.next());
+        }
+        let kind = match text.as_str() {
+            "\\" => BACKSLASH,
+            "\n" | "\r\n" => NEWLINE,
+            " " | "\t" => WHITESPACE,
+            _ => TEXT,
+        };
+        let escaped = backslashes % 2 == 1;
+        let mut continuation = false;
+        if escaped && kind == NEWLINE {
+            let backslash = pieces.last_mut().expect("backslash before newline");
+            backslash.continuation = true;
+            continuation = true;
+        } else if escaped && c == '#' {
+            pieces.pop();
+            text.insert(0, '\\');
+        }
+        backslashes = if kind == BACKSLASH {
+            backslashes + 1
+        } else {
+            0
+        };
+        pieces.push(Piece {
+            kind,
+            text,
+            continuation,
+            in_reference,
+            after_lbracket: prev.map_or(after_lbracket, |p| p == '['),
+        });
+        prev = Some(c);
+    }
+    pieces
+}
+
 /// The text of `tokens` (all within `root`) as make sees it after reading a
 /// logical line, before expansion.
 ///
 /// Each line continuation is collapsed into a single space as described by
-/// `syntax`, and CRLF line endings are converted to LF.
+/// `syntax`, and CRLF line endings are converted to LF. Like make, this
+/// ignores quotes.
 ///
 /// With `comments`, the text is also treated as a line from which a
 /// trailing comment has been removed, which makes a difference for `\#`
@@ -231,68 +307,77 @@ pub(crate) fn logical_text(
     // whitespace; this is the length of the text up to such a space.
     let mut keep = 0;
     let mut last = None;
-    for token in tokens {
-        match token.kind() {
-            COMMENT if comments && syntax == LineSyntax::Bsd => break,
-            // The tree may come from a variant in which `#` inside a
-            // reference is literal, but BSD make only exempts `[#`.
-            TEXT if comments
-                && syntax == LineSyntax::Bsd
-                && token.text() == "#"
-                && !token.prev_token().is_some_and(|t| t.text().ends_with('[')) =>
-            {
-                break
-            }
-            BACKSLASH if is_continuation_backslash(&token) => {
-                let kept = halve(backslashes);
-                backslashes = 0;
-                if kept == 0 && syntax == LineSyntax::Gnu {
-                    text.truncate(text.trim_end_matches([' ', '\t']).len());
+    // Whether a `#` that the tree does not hold as a comment, such as one
+    // in a quoted string, ends the line.
+    let mut at_comment = false;
+    'tokens: for token in tokens {
+        for piece in pieces(&token, root) {
+            match piece.kind {
+                COMMENT if comments && syntax == LineSyntax::Bsd => break 'tokens,
+                // The tree may come from a variant in which `#` inside a
+                // reference is literal, but BSD make only exempts `[#`.
+                TEXT if comments
+                    && piece.text == "#"
+                    && match syntax {
+                        LineSyntax::Bsd => !piece.after_lbracket,
+                        _ => !piece.in_reference,
+                    } =>
+                {
+                    at_comment = true;
+                    break 'tokens;
                 }
-                text.push_str(&"\\".repeat(kept));
-                text.push(' ');
-                in_continuation = true;
-            }
-            BACKSLASH => {
-                backslashes += 1;
-                in_continuation = false;
-            }
-            NEWLINE | INDENT if is_continuation(&token.clone().into()) => {}
-            WHITESPACE if in_continuation => {}
-            TEXT if comments && token.text() == "\\#" => match syntax {
-                LineSyntax::NMake => {
-                    text.push_str(&"\\".repeat(backslashes + 1));
+                BACKSLASH if piece.continuation => {
+                    let kept = halve(backslashes);
                     backslashes = 0;
-                    break;
+                    if kept == 0 && syntax == LineSyntax::Gnu {
+                        text.truncate(text.trim_end_matches([' ', '\t']).len());
+                    }
+                    text.push_str(&"\\".repeat(kept));
+                    text.push(' ');
+                    in_continuation = true;
                 }
-                LineSyntax::Gnu | LineSyntax::Posix if in_reference(&token, root) => {
+                BACKSLASH => {
+                    backslashes += 1;
+                    in_continuation = false;
+                }
+                NEWLINE | INDENT if piece.continuation => {}
+                WHITESPACE if in_continuation => {}
+                TEXT if comments && piece.text == "\\#" => match syntax {
+                    LineSyntax::NMake => {
+                        text.push_str(&"\\".repeat(backslashes + 1));
+                        backslashes = 0;
+                        break 'tokens;
+                    }
+                    LineSyntax::Gnu | LineSyntax::Posix if piece.in_reference => {
+                        text.push_str(&"\\".repeat(backslashes));
+                        text.push_str(&piece.text);
+                        backslashes = 0;
+                        in_continuation = false;
+                    }
+                    _ => {
+                        text.push_str(&"\\".repeat(halve(backslashes)));
+                        text.push('#');
+                        backslashes = 0;
+                        in_continuation = false;
+                    }
+                },
+                kind => {
                     text.push_str(&"\\".repeat(backslashes));
-                    text.push_str(token.text());
+                    if backslashes % 2 == 1 && kind == WHITESPACE {
+                        keep = text.len() + 1;
+                    }
                     backslashes = 0;
                     in_continuation = false;
+                    text.push_str(if kind == NEWLINE { "\n" } else { &piece.text });
                 }
-                _ => {
-                    text.push_str(&"\\".repeat(halve(backslashes)));
-                    text.push('#');
-                    backslashes = 0;
-                    in_continuation = false;
-                }
-            },
-            kind => {
-                text.push_str(&"\\".repeat(backslashes));
-                if backslashes % 2 == 1 && kind == WHITESPACE {
-                    keep = text.len() + 1;
-                }
-                backslashes = 0;
-                in_continuation = false;
-                text.push_str(if kind == NEWLINE { "\n" } else { token.text() });
             }
         }
         last = Some(token);
     }
-    let before_comment = last
-        .and_then(|t| t.next_token())
-        .is_some_and(|t| t.kind() == COMMENT);
+    let before_comment = at_comment
+        || last
+            .and_then(|t| t.next_token())
+            .is_some_and(|t| t.kind() == COMMENT);
     if comments && before_comment {
         backslashes = halve(backslashes);
     }
