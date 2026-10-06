@@ -110,7 +110,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".PRECIOUS: a.o\nall:\n.PRECIOUS: %.c\n".parse().unwrap();
     /// assert_eq!(
     ///     makefile.special_target_prerequisites(".PRECIOUS").collect::<Vec<_>>(),
@@ -129,7 +129,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".SECONDARY: a.c b.c\n".parse().unwrap();
     /// assert_eq!(
     ///     makefile
@@ -153,7 +153,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".ONESHELL:\nall:\n".parse().unwrap();
     /// assert!(makefile.has_special_target(".ONESHELL"));
     /// assert!(!makefile.has_special_target(".POSIX"));
@@ -171,7 +171,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "all:\n".parse().unwrap();
     /// makefile.add_special_target(".ONESHELL").unwrap();
     /// makefile.add_special_target(".ONESHELL").unwrap();
@@ -191,7 +191,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = ".NOTPARALLEL:\nall:\n".parse().unwrap();
     /// assert!(makefile.remove_special_target(".NOTPARALLEL").unwrap());
     /// assert!(!makefile.remove_special_target(".NOTPARALLEL").unwrap());
@@ -218,7 +218,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = ".PRECIOUS .SECONDARY: a.o\n".parse().unwrap();
     /// makefile.add_special_target_prerequisite(".PRECIOUS", "b.o").unwrap();
     /// makefile.add_special_target_prerequisite(".PRECIOUS", "b.o").unwrap();
@@ -261,7 +261,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = ".SUFFIXES: .c\nall:\n.SUFFIXES: .o .c\n".parse().unwrap();
     /// assert!(makefile.remove_special_target_prerequisite(".SUFFIXES", ".c").unwrap());
     /// assert_eq!(makefile.to_string(), "all:\n.SUFFIXES: .o\n");
@@ -305,7 +305,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".PHONY: all\nall:\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.rules().collect();
     /// assert!(rules[0].is_special());
@@ -323,7 +323,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = ".BEGIN:\n\techo start\n".parse().unwrap();
     /// assert!(rule.is_special_for(MakefileVariant::BSDMake));
     /// assert!(!rule.is_special_for(MakefileVariant::GNUMake));

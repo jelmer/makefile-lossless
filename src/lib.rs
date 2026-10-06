@@ -35,7 +35,7 @@
 //! # Example
 //!
 //! ```rust
-//! use makefile_lossless::Makefile;
+//! use makefile_edit::Makefile;
 //!
 //! let contents = r#"PYTHON = python3
 //!
@@ -74,7 +74,7 @@
 //! Errors are recorded rather than raised:
 //!
 //! ```rust
-//! use makefile_lossless::Makefile;
+//! use makefile_edit::Makefile;
 //!
 //! let contents = "all: build\nthis is not valid\n";
 //! let parsed = Makefile::parse(contents);
@@ -192,7 +192,7 @@ impl std::fmt::Display for MakefileVariant {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::MakefileVariant;
+/// use makefile_edit::MakefileVariant;
 /// assert_eq!("bsd".parse(), Ok(MakefileVariant::BSDMake));
 /// assert_eq!("GNU make".parse(), Ok(MakefileVariant::GNUMake));
 /// assert!("gmake".parse::<MakefileVariant>().is_err());

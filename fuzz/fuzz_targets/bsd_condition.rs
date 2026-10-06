@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::{parse_bsd_condition, parse_bsd_if_else_condition};
+use makefile_edit::{parse_bsd_condition, parse_bsd_if_else_condition};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {

@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo bench`; `cargo test --benches` runs each one once.
 
-use makefile_lossless::{Makefile, Parse, TextEdit, TextRange, TextSize};
+use makefile_edit::{Makefile, Parse, TextEdit, TextRange, TextSize};
 
 mod common;
 

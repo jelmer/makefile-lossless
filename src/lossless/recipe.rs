@@ -254,7 +254,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t# note\n\t@echo a \\\n\t\tb # c\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -280,7 +280,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     ///
     /// let makefile: Makefile = "all:\n\techo a \\\n\t\tb\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -509,7 +509,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t$(CC) -o $@ $(addprefix -I,$(DIRS)) $$HOME\n"
     ///     .parse()
@@ -533,7 +533,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -561,7 +561,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t# This is a comment\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -582,7 +582,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\techo hello # inline comment\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -610,7 +610,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -639,7 +639,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t@echo hello\n\techo world\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -659,7 +659,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     ///
     /// let makefile: Makefile = "all:\n\t- @echo hello\n".parse().unwrap();
     /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
@@ -678,7 +678,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t-echo hello\n\techo world\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -697,7 +697,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     ///
     /// let makefile: Makefile = "all:\n\t@ -false\n".parse().unwrap();
     /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
@@ -717,7 +717,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\t+$(MAKE) -C sub\n\techo done\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -736,7 +736,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     ///
     /// let makefile: Makefile = "all:\n\t@ +$(MAKE)\n".parse().unwrap();
     /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
@@ -759,7 +759,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -780,7 +780,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -814,7 +814,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     ///
     /// let makefile = Makefile::parse_with_variant("all:\n\t@echo hello\n", MakefileVariant::NMake).tree();
     /// let rule = makefile.rules().next().unwrap();
@@ -839,7 +839,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     ///
     /// let makefile = Makefile::parse_with_variant("all:\n\techo hello\n", MakefileVariant::NMake).tree();
     /// let rule = makefile.rules().next().unwrap();
@@ -965,7 +965,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -988,7 +988,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
@@ -1051,7 +1051,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo world\n".parse().unwrap();
     /// let mut rule = makefile.rules().next().unwrap();
@@ -1099,7 +1099,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
     /// let mut rule = makefile.rules().next().unwrap();
@@ -1137,7 +1137,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let mut makefile: Makefile = "all:\n\techo hello\n\techo world\n".parse().unwrap();
     /// let mut rule = makefile.rules().next().unwrap();
@@ -1270,7 +1270,7 @@ impl Recipe {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = "all:\n\techo $(FOO) ${BAR}\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();

@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo bench`; `cargo test --benches` runs each one once.
 
-use makefile_lossless::Makefile;
+use makefile_edit::Makefile;
 
 mod common;
 
