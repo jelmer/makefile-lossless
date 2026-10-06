@@ -52,6 +52,18 @@ fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
     root.splice_children(pos..pos, nodes);
 }
 
+/// Add a copy of `node` to `builder`.
+fn build_copy(builder: &mut GreenNodeBuilder, node: &SyntaxNode) {
+    builder.start_node(node.kind().into());
+    for child in node.children_with_tokens() {
+        match child {
+            rowan::NodeOrToken::Node(n) => build_copy(builder, &n),
+            rowan::NodeOrToken::Token(t) => builder.token(t.kind().into(), t.text()),
+        }
+    }
+    builder.finish_node();
+}
+
 /// Represents different types of items that can appear in a Makefile
 #[derive(Clone)]
 #[non_exhaustive]
@@ -1256,13 +1268,8 @@ impl Makefile {
         builder.token(NEWLINE.into(), &eol);
         builder.finish_node();
 
-        // Add if branch items
         for item in if_items {
-            // Clone the item's syntax tree into our builder
-            let item_text = item.syntax().to_string();
-            // Parse it again to get green nodes
-            builder.token(IDENTIFIER.into(), item_text.trim());
-            builder.token(NEWLINE.into(), &eol);
+            build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
         }
 
         // Add else clause if provided
@@ -1272,11 +1279,8 @@ impl Makefile {
             builder.token(NEWLINE.into(), &eol);
             builder.finish_node();
 
-            // Add else branch items
             for item in else_iter {
-                let item_text = item.syntax().to_string();
-                builder.token(IDENTIFIER.into(), item_text.trim());
-                builder.token(NEWLINE.into(), &eol);
+                build_copy(&mut builder, &with_trailing_newline(item.syntax(), &eol));
             }
         }
 

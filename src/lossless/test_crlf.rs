@@ -1,5 +1,6 @@
 use super::*;
 use crate::ast::makefile::MakefileItem;
+use crate::test_util::assert_matches_reparse;
 
 fn parse_crlf(src: &str) -> Makefile {
     let makefile: Makefile = src.parse().unwrap();
@@ -484,7 +485,7 @@ fn test_add_after_unterminated_line() {
 
     let mut makefile = parse_crlf("X = 1\r\na:");
     makefile.insert_rule(1, "b:\n".parse().unwrap()).unwrap();
-    assert_eq!(makefile.to_string(), "X = 1\r\na:\r\n\r\nb:\n");
+    assert_eq!(makefile.to_string(), "X = 1\r\na:\r\n\r\nb:\r\n");
 
     let mut makefile = parse_crlf("X = 1\r\nY = 1");
     makefile.insert_include(2, "a.mk").unwrap();
@@ -730,4 +731,111 @@ fn test_backslash_before_crlf_continues() {
             "{variant:?}"
         );
     }
+}
+
+fn lf_item(src: &str) -> MakefileItem {
+    src.parse::<Makefile>().unwrap().items().next().unwrap()
+}
+
+#[test]
+fn test_insert_rule_adopts_line_ending() {
+    let mut makefile = parse_crlf("all:\r\n");
+    makefile.insert_rule(1, "b:\n".parse().unwrap()).unwrap();
+    assert_eq!(makefile.to_string(), "all:\r\n\r\nb:\r\n");
+    makefile
+        .insert_rule(0, "a:\n\techo\n".parse().unwrap())
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "a:\r\n\techo\r\n\r\nall:\r\n\r\nb:\r\n"
+    );
+}
+
+#[test]
+fn test_replace_rule_adopts_line_ending() {
+    let mut makefile = parse_crlf("all:\r\nb:\r\n");
+    makefile
+        .replace_rule(0, "a:\n\techo\n".parse().unwrap())
+        .unwrap();
+    assert_eq!(makefile.to_string(), "a:\r\n\techo\r\nb:\r\n");
+    assert_matches_reparse(&makefile);
+
+    // The only line ending of the file is replaced, so the file's line
+    // ending is that of the old rule.
+    let mut makefile = parse_crlf("all:\r\n");
+    makefile.replace_rule(0, "a:\n".parse().unwrap()).unwrap();
+    assert_eq!(makefile.to_string(), "a:\r\n");
+}
+
+#[test]
+fn test_lf_file_adopts_line_ending() {
+    let mut makefile: Makefile = "all:\n".parse().unwrap();
+    makefile
+        .insert_rule(1, "b:\r\n\techo\r\n".parse().unwrap())
+        .unwrap();
+    assert_eq!(makefile.to_string(), "all:\n\nb:\n\techo\n");
+}
+
+#[test]
+fn test_item_replace_and_insert_adopt_line_ending() {
+    let makefile = parse_crlf("X = 1\r\nY = 1\r\n");
+    let mut first = makefile.items().next().unwrap();
+    first.insert_after(lf_item("b:\n\tcmd\n")).unwrap();
+    first.insert_before(lf_item("A = 1\n")).unwrap();
+    first.replace(lf_item("Z = 1\n")).unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "A = 1\r\nZ = 1\r\nb:\r\n\tcmd\r\nY = 1\r\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_add_if_and_else_item_adopt_line_ending() {
+    let makefile = parse_crlf("ifdef X\r\nendif\r\n");
+    let mut conditional = makefile.conditionals().next().unwrap();
+    conditional.add_if_item(lf_item("a:\n\tcmd\n"));
+    conditional.add_else_item(lf_item("B = 1\n"));
+    assert_eq!(
+        makefile.to_string(),
+        "ifdef X\r\na:\r\n\tcmd\r\nelse\r\nB = 1\r\nendif\r\n"
+    );
+}
+
+#[test]
+fn test_add_conditional_with_items_adopts_line_ending() {
+    let mut makefile = parse_crlf("all:\r\n");
+    makefile
+        .add_conditional_with_items(
+            "ifdef",
+            "X",
+            vec![lf_item("a:\n\tcmd\n")],
+            Some(vec![lf_item("B = 1\n")]),
+        )
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "all:\r\n\r\nifdef X\r\na:\r\n\tcmd\r\nelse\r\nB = 1\r\nendif\r\n"
+    );
+}
+
+#[test]
+fn test_inserted_continuation_line_endings_kept() {
+    // Whether a backslash before a CRLF continues the line depends on the
+    // make variant, so line continuations are left alone.
+    let mut makefile = parse_crlf("all:\r\n");
+    makefile
+        .insert_rule(
+            1,
+            "b: x \\\n y\n\techo \\\n\tz # c \\\n d\n".parse().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "all:\r\n\r\nb: x \\\n y\r\n\techo \\\n\tz # c \\\n d\r\n"
+    );
+    let reparsed: Makefile = makefile.to_string().parse().unwrap();
+    let rule = reparsed.rules().nth(1).unwrap();
+    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["x", "y"]);
+    assert_eq!(rule.recipe_nodes().count(), 1);
 }
