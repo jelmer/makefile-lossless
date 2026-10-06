@@ -3037,4 +3037,24 @@ mod tests {
             assert_eq!(makefile.to_string(), text);
         }
     }
+
+    #[test]
+    fn test_recipe_line_ending_in_escaped_backslash() {
+        // As in NetBSD make's escape.mk: both makes run two commands.
+        let text = "x:\n\techo two\\\\\n\techo three\\\\\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo two\\\\", "echo three\\\\"]
+        );
+
+        // A backslash followed by a space doesn't continue the line either.
+        let makefile: Makefile = "x:\n\techo a \\ \n\techo b\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a \\ ", "echo b"]
+        );
+    }
 }

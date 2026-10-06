@@ -554,10 +554,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
 
                 // Check if the last TEXT token ended with a backslash (continuation)
-                let is_continuation = last_text_content
-                    .as_ref()
-                    .map(|text| text.trim_end_matches([' ', '\t']).ends_with('\\'))
-                    .unwrap_or(false);
+                // Like the lexer, only an odd number of backslashes continues
+                // the line; `\\\\` is an escaped backslash.
+                let is_continuation = last_text_content.as_ref().is_some_and(|text| {
+                    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+                });
 
                 if is_continuation {
                     // This is a continuation line - consume the indent of the next line, if
