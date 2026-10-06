@@ -994,6 +994,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// preceding rule.
         fn recipe_continues(&self) -> bool {
             let bsd = self.bsd_directives_enabled();
+            let gnu = self.gnu_directives_enabled();
             let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
@@ -1050,17 +1051,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             None => return false,
                         }
                     }
-                    (IDENTIFIER, t) if Self::is_conditional_start(t) => {
+                    (IDENTIFIER, t) if gnu && Self::is_conditional_start(t) => {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
-                    (IDENTIFIER, "else") => match stack.last_mut() {
+                    (IDENTIFIER, "else") if gnu => match stack.last_mut() {
                         Some(context) => {
                             let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
                             in_rule = context.next_branch(in_rule, is_final);
                         }
                         None => return false,
                     },
-                    (IDENTIFIER, "endif") => match stack.pop() {
+                    (IDENTIFIER, "endif") if gnu => match stack.pop() {
                         Some(context) => in_rule = context.end(in_rule),
                         None => return false,
                     },
@@ -15281,6 +15282,52 @@ test:
             panic!("expected recipe");
         };
         recipe.text()
+    }
+
+    #[test]
+    fn test_gnu_conditional_keywords_end_rule_in_other_variants() {
+        // Outside GNU make, a line starting with `ifdef` or `else` is an
+        // ordinary line, here a variable assignment that ends the rule, so
+        // the comment or conditional before it isn't part of the rule.
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            for name in ["X", "ifdef", "ifndef", "ifeq", "ifneq"] {
+                let code = format!("all:\n\techo a\n\n# c\n{} = 1\n\techo b\n", name);
+                let parsed = parse(&code, Some(variant));
+                let makefile = parsed.root();
+                assert_eq!(makefile.to_string(), code);
+                assert_eq!(
+                    makefile.rules().next().unwrap().to_string(),
+                    "all:\n\techo a\n\n",
+                    "{:?} {:?}",
+                    variant,
+                    code
+                );
+            }
+        }
+        for (code, rule) in [
+            (
+                "all:\n\techo a\n.ifdef X\n.endif\nifdef = 1\n\techo b\n",
+                "all:\n\techo a\n",
+            ),
+            (
+                "all:\n\techo a\n\n# c\n.if 1\nelse = 1\n.endif\n\techo b\n",
+                "all:\n\techo a\n\n",
+            ),
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(
+                makefile.rules().next().unwrap().to_string(),
+                rule,
+                "{:?}",
+                code
+            );
+        }
     }
 
     #[test]
