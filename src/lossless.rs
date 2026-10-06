@@ -2918,6 +2918,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return;
             };
 
+            // GNU make rejects `ifeq(a,b)`, which is still read as a
+            // conditional for error recovery.
+            if matches!(token.as_str(), "ifeq" | "ifneq")
+                && matches!(self.current(), Some(LPAREN | QUOTE))
+            {
+                self.record_error(
+                    ParseErrorKind::MissingSeparator,
+                    format!("`{token}` must be followed by whitespace"),
+                );
+            }
+
             // Skip whitespace after keyword
             self.skip_ws_and_continuations();
 
@@ -8296,17 +8307,96 @@ rule: dependency
     #[test]
     fn test_conditional_keyword_forms() {
         for variant in [None, Some(MakefileVariant::GNUMake)] {
-            for code in [
-                "ifdef#c\nendif#c\n",
-                "ifdef\\\n  X\nelse\\\n\nendif\n",
-                "ifeq(a,b)\nendif\n",
-            ] {
+            for code in ["ifdef#c\nendif#c\n", "ifdef\\\n  X\nelse\\\n\nendif\n"] {
                 let parsed = parse(code, variant);
                 assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
                 let root = parsed.root();
                 assert_eq!(code, root.to_string());
                 assert_eq!(root.conditionals().count(), 1, "{variant:?} {code:?}");
                 assert_eq!(root.rules().count(), 0, "{variant:?} {code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_keyword_without_whitespace() {
+        // GNU make: "missing separator (ifeq/ifneq must be followed by
+        // whitespace)". The line is still read as a conditional.
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            for (code, keyword, offset, tree) in [
+                (
+                    "ifeq(a,b)\nendif\n",
+                    "ifeq",
+                    4,
+                    r#"ROOT@0..16
+  CONDITIONAL@0..16
+    CONDITIONAL_IF@0..10
+      IDENTIFIER@0..4 "ifeq"
+      EXPR@4..9
+        LPAREN@4..5 "("
+        IDENTIFIER@5..6 "a"
+        COMMA@6..7 ","
+        IDENTIFIER@7..8 "b"
+        RPAREN@8..9 ")"
+      NEWLINE@9..10 "\n"
+    CONDITIONAL_ENDIF@10..16
+      IDENTIFIER@10..15 "endif"
+      NEWLINE@15..16 "\n"
+"#,
+                ),
+                (
+                    "ifneq\"a\" \"b\"\nendif\n",
+                    "ifneq",
+                    5,
+                    r#"ROOT@0..19
+  CONDITIONAL@0..19
+    CONDITIONAL_IF@0..13
+      IDENTIFIER@0..5 "ifneq"
+      EXPR@5..12
+        QUOTE@5..6 "\""
+        IDENTIFIER@6..7 "a"
+        QUOTE@7..8 "\""
+        WHITESPACE@8..9 " "
+        QUOTE@9..10 "\""
+        IDENTIFIER@10..11 "b"
+        QUOTE@11..12 "\""
+      NEWLINE@12..13 "\n"
+    CONDITIONAL_ENDIF@13..19
+      IDENTIFIER@13..18 "endif"
+      NEWLINE@18..19 "\n"
+"#,
+                ),
+            ] {
+                let parsed = parse(code, variant);
+                let message = format!("`{keyword}` must be followed by whitespace");
+                assert_eq!(
+                    parsed.errors,
+                    vec![ErrorInfo {
+                        message: message.clone(),
+                        line: 1,
+                        context: code.lines().next().unwrap().to_string(),
+                        kind: ParseErrorKind::MissingSeparator,
+                    }],
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(
+                    parsed
+                        .positioned_errors
+                        .iter()
+                        .map(|e| (e.message.as_str(), e.range))
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        message.as_str(),
+                        rowan::TextRange::at(offset.into(), 1.into())
+                    )],
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(
+                    format!("{:#?}", parsed.syntax()),
+                    tree,
+                    "{variant:?} {code:?}"
+                );
+                assert_eq!(code, parsed.root().to_string());
             }
         }
     }
