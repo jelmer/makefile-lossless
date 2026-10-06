@@ -437,8 +437,8 @@ impl Rule {
         None
     }
 
-    // Helper method to extract targets from a TARGETS node
-    fn extract_targets_from_node(node: &SyntaxNode, syntax: LineSyntax) -> Vec<String> {
+    /// The tokens of each target in a TARGETS node, in order.
+    fn target_tokens(node: &SyntaxNode) -> Vec<Vec<SyntaxToken>> {
         let mut result = Vec::new();
         let mut current = Vec::new();
 
@@ -449,7 +449,7 @@ impl Rule {
             // parentheses is part of the nested ARCHIVE_MEMBERS node.
             if child.kind() == WHITESPACE || is_continuation(&child) {
                 if !current.is_empty() {
-                    result.push(name_text(node, current.drain(..), syntax));
+                    result.push(std::mem::take(&mut current));
                 }
                 continue;
             }
@@ -462,10 +462,53 @@ impl Rule {
         }
 
         if !current.is_empty() {
-            result.push(name_text(node, current, syntax));
+            result.push(current);
         }
 
         result
+    }
+
+    fn extract_targets_from_node(node: &SyntaxNode, syntax: LineSyntax) -> Vec<String> {
+        Self::target_tokens(node)
+            .into_iter()
+            .map(|tokens| name_text(node, tokens, syntax))
+            .collect()
+    }
+
+    fn targets_node(&self) -> Option<SyntaxNode> {
+        self.syntax().children().find(|n| n.kind() == TARGETS)
+    }
+
+    /// The source ranges of the targets of this rule, in the same order as
+    /// [`Self::targets`].
+    ///
+    /// Each range covers the target as written, including any escapes and
+    /// variable references. A target split by a line continuation inside a
+    /// variable reference has a range that spans the continuation.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Rule, TextRange};
+    ///
+    /// let rule: Rule = "a  $(B): c\n".parse().unwrap();
+    /// assert_eq!(
+    ///     rule.target_ranges().collect::<Vec<_>>(),
+    ///     vec![
+    ///         TextRange::new(0.into(), 1.into()),
+    ///         TextRange::new(3.into(), 7.into()),
+    ///     ]
+    /// );
+    /// ```
+    pub fn target_ranges(&self) -> impl Iterator<Item = rowan::TextRange> + '_ {
+        self.targets_node()
+            .map(|node| Self::target_tokens(&node))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tokens| {
+                let first = tokens.first()?.text_range();
+                let last = tokens.last()?.text_range();
+                Some(first.cover(last))
+            })
     }
 
     /// Targets of this rule
@@ -1637,6 +1680,57 @@ mod tests {
     fn test_targets_variable_reference() {
         let rule: Rule = "$(VAR): dep\n\tcmd".parse().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["$(VAR)"]);
+    }
+
+    fn target_range_texts(text: &str) -> Vec<String> {
+        let rule: Rule = text.parse().unwrap();
+        rule.target_ranges()
+            .map(|range| text[range].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_target_ranges_multiple() {
+        let rule: Rule = "a bb  ccc: dep\n".parse().unwrap();
+        assert_eq!(
+            rule.target_ranges().collect::<Vec<_>>(),
+            vec![
+                rowan::TextRange::new(0.into(), 1.into()),
+                rowan::TextRange::new(2.into(), 4.into()),
+                rowan::TextRange::new(6.into(), 9.into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_target_ranges_texts() {
+        assert_eq!(
+            target_range_texts("$(VAR) x$(Y)z lib.a(a.o b.o) a\\ b: dep\n"),
+            vec!["$(VAR)", "x$(Y)z", "lib.a(a.o b.o)", "a\\ b"]
+        );
+    }
+
+    #[test]
+    fn test_target_ranges_continuation() {
+        assert_eq!(target_range_texts("a \\\n  b: dep\n"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_target_ranges_continuation_in_reference() {
+        assert_eq!(
+            target_range_texts("$(subst a \\\n  b,c,x) y: dep\n"),
+            vec!["$(subst a \\\n  b,c,x)", "y"]
+        );
+    }
+
+    #[test]
+    fn test_target_ranges_escaped_hash() {
+        assert_eq!(target_range_texts("a\\#b c: dep\n"), vec!["a\\#b", "c"]);
+    }
+
+    #[test]
+    fn test_target_ranges_empty() {
+        assert_eq!(target_range_texts(": dep\n"), Vec::<String>::new());
     }
 
     #[test]
