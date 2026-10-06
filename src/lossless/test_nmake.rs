@@ -356,3 +356,67 @@ fn test_substitution_strings_are_literal() {
     let var = makefile.variable_definitions().next().unwrap();
     assert_eq!(references(&var), vec!["$(subst $(A),b,c)", "$(A)"]);
 }
+
+#[test]
+fn test_all_dependents_reference() {
+    // `$**` stands for all dependents, so the reference covers both `*`s.
+    let code = "X = $**\na.exe: a.obj b.obj\n    link $** $***x\n    echo $(**F) $(@D) $(*B) $(?R) $(<F) $* $? $<\n";
+    let makefile = parse_nmake(code);
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.name()))
+        .collect();
+    let r = |text: &str, name: &str| (text.to_string(), Some(name.to_string()));
+    assert_eq!(
+        references,
+        vec![
+            r("$**", "**"),
+            r("$**", "**"),
+            r("$**", "**"),
+            r("$(**F)", "**F"),
+            r("$(@D)", "@D"),
+            r("$(*B)", "*B"),
+            r("$(?R)", "?R"),
+            r("$(<F)", "<F"),
+            r("$*", "*"),
+            r("$?", "?"),
+            r("$<", "<"),
+        ]
+    );
+    let ranges: Vec<_> = makefile
+        .variable_references()
+        .take(3)
+        .map(|r| r.name_range().unwrap())
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            rowan::TextRange::new(5.into(), 7.into()),
+            rowan::TextRange::new(37.into(), 39.into()),
+            rowan::TextRange::new(41.into(), 43.into()),
+        ]
+    );
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(
+        format!("{:#?}", var.syntax()),
+        r#"VARIABLE@0..8
+  IDENTIFIER@0..1 "X"
+  WHITESPACE@1..2 " "
+  OPERATOR@2..3 "="
+  WHITESPACE@3..4 " "
+  EXPR@4..7
+    EXPR@4..7
+      DOLLAR@4..5 "$"
+      TEXT@5..7 "**"
+  NEWLINE@7..8 "\n"
+"#
+    );
+
+    // Other makes take `$**` as `$*` followed by `*`.
+    let makefile: Makefile = "X = $**\n".parse().unwrap();
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.name()))
+        .collect();
+    assert_eq!(references, vec![r("$*", "*")]);
+}

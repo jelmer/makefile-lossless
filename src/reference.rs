@@ -524,7 +524,9 @@ impl ParsedReference {
     /// `$(VAR:from=to)`, and a reference without `=` after the colon refers to
     /// a variable whose name contains the colon. For
     /// [`MakefileVariant::GNUMake`] a function call such as `$(wildcard *.c)`
-    /// gives [`ReferenceError::FunctionCall`].
+    /// gives [`ReferenceError::FunctionCall`]. For [`MakefileVariant::NMake`]
+    /// `$**`, all dependents of the target, refers to `**`; a filename part
+    /// such as `$(@D)` or `$(**F)` is part of the name, as in GNU make.
     pub fn parse(text: &str, variant: MakefileVariant) -> Result<Self, ReferenceError> {
         let (parsed, end) = Self::parse_prefix(text, variant)?;
         if end != text.len() {
@@ -1896,6 +1898,8 @@ impl<'a> Parser<'a> {
         let endc = match self.peek() {
             Some('(') => ')',
             Some('{') => '}',
+            // TODO: In an nmake dependency line, `$$@` is the target and
+            // `$$(@F)` a part of it, rather than an escaped dollar.
             Some('$') => {
                 return Err(syntax_error(
                     start,
@@ -1912,8 +1916,14 @@ impl<'a> Parser<'a> {
             }
             Some(c) => {
                 self.bump();
+                let mut name = c.to_string();
+                // nmake's `$**` is all dependents of the target.
+                if variant == MakefileVariant::NMake && c == '*' && self.peek() == Some('*') {
+                    self.bump();
+                    name.push('*');
+                }
                 return Ok(ParsedReference {
-                    name: c.to_string(),
+                    name,
                     modifiers: vec![],
                 });
             }
@@ -3325,6 +3335,42 @@ mod tests {
             assert_eq!(
                 ParsedReference::parse("$(shell ls)", variant),
                 Ok(reference("shell ls", vec![]))
+            );
+        }
+    }
+
+    #[test]
+    fn test_nmake_all_dependents() {
+        // `$**` is nmake's list of all dependents of the target.
+        assert_eq!(
+            ParsedReference::parse("$**", NMake),
+            Ok(reference("**", vec![]))
+        );
+        assert_eq!(
+            ParsedReference::parse_prefix("$***", NMake),
+            Ok((reference("**", vec![]), 3))
+        );
+        assert_eq!(
+            ParsedReference::parse("$(**F)", NMake),
+            Ok(reference("**F", vec![]))
+        );
+        assert_eq!(
+            split("$** $(**D) $*.c $@", NMake),
+            vec![
+                ('R', "$**"),
+                ('L', " "),
+                ('R', "$(**D)"),
+                ('L', " "),
+                ('R', "$*"),
+                ('L', ".c "),
+                ('R', "$@"),
+            ]
+        );
+        // Other makes take `$**` as `$*` followed by `*`.
+        for variant in [GNUMake, POSIXMake] {
+            assert_eq!(
+                ParsedReference::parse_prefix("$**", variant),
+                Ok((reference("*", vec![]), 2))
             );
         }
     }

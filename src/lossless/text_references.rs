@@ -288,6 +288,15 @@ impl<'a> Finder<'a> {
                 '\n' | '\r' | ')' | '}' => continue,
                 '\\' if self.text[start + 2..hi].starts_with(['\n', '\r']) => continue,
                 ':' if self.bsd_line.is_some() => continue,
+                '*' if self.variant == Some(MakefileVariant::NMake)
+                    && self.text[start + 2..hi].starts_with('*') =>
+                {
+                    Reference {
+                        range: start..start + 3,
+                        shape: Shape::Single,
+                        nested: vec![],
+                    }
+                }
                 c => Reference {
                     range: start..start + 1 + c.len_utf8(),
                     shape: Shape::Single,
@@ -390,6 +399,9 @@ impl Emitter<'_, '_, '_> {
         self.token(DOLLAR, start, start + 1);
         match reference.shape {
             Shape::EscapedDollar => self.token(DOLLAR, start + 1, end),
+            // As the lexer does on other lines, take nmake's `$**` as one
+            // token.
+            Shape::Single if &self.text[start + 1..end] == "**" => self.token(TEXT, start + 1, end),
             Shape::Single => self.plain(start + 1, end, true),
             Shape::Delimited => {
                 let (open, close) = if self.text.as_bytes()[start + 1] == b'(' {

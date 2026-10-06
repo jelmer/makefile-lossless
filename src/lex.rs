@@ -544,6 +544,16 @@ impl<'a> Lexer<'a> {
                         self.pending_backslash_escape = !escaped;
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
+                    // nmake's `$**`, all dependents of the target.
+                    '*' if self.nmake && self.dollars % 2 == 1 && {
+                        let mut probe = self.input.clone();
+                        probe.next();
+                        probe.peek() == Some(&'*')
+                    } =>
+                    {
+                        let text = self.input.by_ref().take(2).collect();
+                        Some((SyntaxKind::TEXT, text))
+                    }
                     // Any other character is plain text to make.
                     _ => {
                         self.input.next();
