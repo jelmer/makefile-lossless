@@ -823,6 +823,8 @@ impl Rule {
     /// Get the commands in the rule
     ///
     /// A recipe given on the rule line after a `;` is the first command.
+    /// Commands inside conditionals and BSD `.for` loops in the rule's body
+    /// are included, see [`Rule::recipe_nodes`].
     ///
     /// # Example
     /// ```
@@ -867,6 +869,12 @@ impl Rule {
     /// Returns an iterator over `Recipe` AST nodes, which support the `line()`, `column()`,
     /// and `line_col()` methods to get position information.
     ///
+    /// Like [`Makefile::rules`], this descends into conditionals, so recipe
+    /// lines inside conditionals and BSD `.for` loops in the rule's body are
+    /// included, in source order, whichever branch they are in. Recipes of
+    /// other rules inside such a conditional are not. Use [`Rule::body_items`]
+    /// to see the structure of the body.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -880,12 +888,46 @@ impl Rule {
     /// assert_eq!(recipe_nodes[0].line(), 1); // 0-indexed
     /// assert_eq!(recipe_nodes[1].text(), "echo line2");
     /// assert_eq!(recipe_nodes[1].line(), 2);
+    ///
+    /// let rule: Rule = "test:\nifdef V\n\techo verbose\nelse\n\techo quiet\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let texts: Vec<_> = rule.recipe_nodes().map(|r| r.text()).collect();
+    /// assert_eq!(texts, vec!["echo verbose", "echo quiet"]);
     /// ```
     pub fn recipe_nodes(&self) -> impl Iterator<Item = Recipe> {
+        let root = self.syntax().clone();
+        let mut preorder = self.syntax().preorder();
+        std::iter::from_fn(move || {
+            while let Some(event) = preorder.next() {
+                let rowan::WalkEvent::Enter(node) = event else {
+                    continue;
+                };
+                match node.kind() {
+                    RECIPE => {
+                        preorder.skip_subtree();
+                        return Recipe::cast(node);
+                    }
+                    CONDITIONAL | FOR_LOOP => {}
+                    _ if node == root => {}
+                    _ => preorder.skip_subtree(),
+                }
+            }
+            None
+        })
+    }
+
+    /// The index in the rule's children at which to append a recipe line:
+    /// after the last recipe line or conditional in the body.
+    fn recipe_end_index(&self) -> usize {
         self.syntax()
             .children()
-            .filter(|it| it.kind() == RECIPE)
-            .filter_map(Recipe::cast)
+            .filter(|n| matches!(n.kind(), RECIPE | CONDITIONAL | FOR_LOOP))
+            .last()
+            .map_or_else(
+                || self.syntax().children_with_tokens().count(),
+                |n| n.index() + 1,
+            )
     }
 
     /// Get all items (recipe lines and conditionals) in the rule's body
@@ -894,10 +936,10 @@ impl Rule {
     /// and any conditionals that appear within the rule.
     ///
     /// A conditional is part of the rule if a recipe line comes first in one of
-    /// its branches. Recipe lines inside it are not returned by [`Rule::recipes`],
-    /// and any other items in it (such as variable definitions) are not part of
-    /// the rule, though `Makefile::rules()` and `Makefile::variable_definitions()`
-    /// do include them.
+    /// its branches. Recipe lines inside it are returned by [`Rule::recipes`],
+    /// but not as items here. Any other items in it (such as variable
+    /// definitions) are not part of the rule, though `Makefile::rules()` and
+    /// `Makefile::variable_definitions()` do include them.
     ///
     /// Use [`Rule::body_items`] to get the [`Recipe`] nodes rather than just
     /// their text, as well as BSD `.for` loops, which this skips.
@@ -982,6 +1024,8 @@ impl Rule {
 
     /// Replace the command at index i with a new line
     ///
+    /// Commands are indexed as returned by [`Rule::recipe_nodes`].
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -990,25 +1034,18 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["new command"]);
     /// ```
     pub fn replace_command(&mut self, i: usize, line: &str) -> bool {
-        // Collect all RECIPE nodes (matching the indexing used by recipe_nodes())
-        let recipes: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RECIPE)
-            .collect();
-
-        if i >= recipes.len() {
+        let Some(mut recipe) = self.recipe_nodes().nth(i) else {
             return false;
-        }
-
-        // Get the target RECIPE node and its index among all siblings
-        let target_node = &recipes[i];
-        let target_index = target_node.index();
-
-        if let Some(mut recipe) = Recipe::cast(target_node.clone()).filter(|r| r.is_inline()) {
+        };
+        if recipe.is_inline() {
             recipe.replace_text(line);
             return true;
         }
+        let target_node = recipe.syntax();
+        let target_index = target_node.index();
+        let parent = target_node
+            .parent()
+            .expect("Recipe node must have a parent");
 
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
@@ -1020,8 +1057,7 @@ impl Rule {
 
         let syntax = SyntaxNode::new_root_mut(builder.finish());
 
-        self.syntax()
-            .splice_children(target_index..target_index + 1, vec![syntax.into()]);
+        parent.splice_children(target_index..target_index + 1, vec![syntax.into()]);
 
         true
     }
@@ -1036,18 +1072,7 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command", "command2"]);
     /// ```
     pub fn push_command(&mut self, line: &str) {
-        // Find the latest RECIPE entry, then append the new line after it.
-        let index = self
-            .syntax()
-            .children_with_tokens()
-            .filter(|it| it.kind() == RECIPE)
-            .last();
-
-        let index = index.map_or_else(
-            || self.syntax().children_with_tokens().count(),
-            |it| it.index() + 1,
-        );
-
+        let index = self.recipe_end_index();
         let eol = line_ending(self.syntax());
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(RECIPE.into());
@@ -1064,6 +1089,8 @@ impl Rule {
 
     /// Remove command at given index
     ///
+    /// Commands are indexed as returned by [`Rule::recipe_nodes`].
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -1072,23 +1099,18 @@ impl Rule {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command2"]);
     /// ```
     pub fn remove_command(&mut self, index: usize) -> bool {
-        let recipes: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RECIPE)
-            .collect();
-
-        if index >= recipes.len() {
+        let Some(recipe) = self.recipe_nodes().nth(index) else {
             return false;
-        }
-
-        if let Some(recipe) = Recipe::cast(recipes[index].clone()) {
-            recipe.remove();
-        }
+        };
+        recipe.remove();
         true
     }
 
     /// Insert command at given index
+    ///
+    /// Commands are indexed as returned by [`Rule::recipe_nodes`]. An index
+    /// equal to the number of commands appends the command, as
+    /// [`Rule::push_command`] does.
     ///
     /// # Example
     /// ```
@@ -1099,43 +1121,18 @@ impl Rule {
     /// assert_eq!(recipes, vec!["command1", "inserted_command", "command2"]);
     /// ```
     pub fn insert_command(&mut self, index: usize, line: &str) -> bool {
-        let recipes: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RECIPE)
-            .collect();
-
-        if index > recipes.len() {
-            return false;
+        let recipes: Vec<_> = self.recipe_nodes().collect();
+        match recipes.get(index) {
+            Some(recipe) => recipe.insert_before(line),
+            None if index == recipes.len() => self.push_command(line),
+            None => return false,
         }
-
-        if let Some(recipe) = recipes.get(index).cloned().and_then(Recipe::cast) {
-            recipe.insert_before(line);
-            return true;
-        }
-
-        // Insert at the end - find position after last recipe
-        let target_index = recipes.last().map(|n| n.index() + 1).unwrap_or_else(|| {
-            // No recipes exist, insert after the rule header
-            self.syntax().children_with_tokens().count()
-        });
-
-        let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
-
-        let target_index = terminate_line_before(self.syntax(), target_index, &eol);
-        self.syntax()
-            .splice_children(target_index..target_index, vec![syntax.into()]);
         true
     }
 
     /// Get the number of commands/recipes in this rule
+    ///
+    /// This counts the commands returned by [`Rule::recipe_nodes`].
     ///
     /// # Example
     /// ```
@@ -1144,13 +1141,13 @@ impl Rule {
     /// assert_eq!(rule.recipe_count(), 2);
     /// ```
     pub fn recipe_count(&self) -> usize {
-        self.syntax()
-            .children()
-            .filter(|n| n.kind() == RECIPE)
-            .count()
+        self.recipe_nodes().count()
     }
 
     /// Clear all commands from this rule
+    ///
+    /// This removes the commands returned by [`Rule::recipe_nodes`], so
+    /// conditionals in the rule's body are kept, without their commands.
     ///
     /// # Example
     /// ```
@@ -1160,18 +1157,9 @@ impl Rule {
     /// assert_eq!(rule.recipe_count(), 0);
     /// ```
     pub fn clear_commands(&mut self) {
-        let recipes: Vec<_> = self
-            .syntax()
-            .children()
-            .filter(|n| n.kind() == RECIPE)
-            .collect();
-
-        if recipes.is_empty() {
-            return;
-        }
-
+        let recipes: Vec<_> = self.recipe_nodes().collect();
         // Remove all recipes in reverse order to maintain correct indices
-        for recipe in recipes.into_iter().rev().filter_map(Recipe::cast) {
+        for recipe in recipes.into_iter().rev() {
             recipe.remove();
         }
     }
@@ -2234,6 +2222,82 @@ mod tests {
 
     fn recipes(rule: &Rule) -> Vec<String> {
         rule.recipes().collect()
+    }
+
+    #[test]
+    fn test_recipe_nodes_in_conditional() {
+        let text = "all:\nifdef X\n\techo $(FOO)\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipe_nodes()
+                .map(|r| (r.text(), r.text_range().into()))
+                .collect::<Vec<(String, std::ops::Range<usize>)>>(),
+            vec![("echo $(FOO)".to_string(), 13..26)]
+        );
+    }
+
+    const NESTED: &str =
+        "all:\n\ta\nifdef X\n\tb\nelse\nifdef Y\n\tc\nendif\nfoo:\n\td\nendif\n\te\n";
+
+    #[test]
+    fn test_recipes_in_nested_conditionals() {
+        let makefile: Makefile = NESTED.parse().unwrap();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(recipes(&rules[0]), vec!["a", "b", "c", "e"]);
+        assert_eq!(rules[0].recipe_count(), 4);
+        assert_eq!(recipes(&rules[1]), vec!["d"]);
+        assert_eq!(
+            rules[0]
+                .recipe_nodes()
+                .map(|r| r.parent().unwrap().targets().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec!["all"]; 4]
+        );
+        assert_eq!(
+            rules[1]
+                .recipe_nodes()
+                .next()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .targets()
+                .collect::<Vec<_>>(),
+            vec!["foo"]
+        );
+    }
+
+    #[test]
+    fn test_commands_in_conditional() {
+        let text = "all:\n\ta\nifdef X\n\tb\nendif\n";
+
+        let mut rule: Rule = text.parse().unwrap();
+        assert!(rule.replace_command(1, "B"));
+        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\n\tB\nendif\n");
+
+        let mut rule: Rule = text.parse().unwrap();
+        assert!(rule.remove_command(1));
+        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\nendif\n");
+        assert!(!rule.remove_command(1));
+
+        let mut rule: Rule = text.parse().unwrap();
+        assert!(rule.insert_command(1, "x"));
+        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\n\tx\n\tb\nendif\n");
+
+        let mut rule: Rule = text.parse().unwrap();
+        assert!(rule.insert_command(2, "c"));
+        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\n\tb\nendif\n\tc\n");
+        assert!(!rule.insert_command(4, "d"));
+
+        let mut rule: Rule = text.parse().unwrap();
+        rule.push_command("c");
+        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\n\tb\nendif\n\tc\n");
+        assert_eq!(recipes(&rule), vec!["a", "b", "c"]);
+
+        let mut rule: Rule = text.parse().unwrap();
+        rule.clear_commands();
+        assert_eq!(rule.to_string(), "all:\nifdef X\nendif\n");
+        assert_eq!(rule.recipe_count(), 0);
     }
 
     fn describe_body_item(item: ConditionalItem) -> String {

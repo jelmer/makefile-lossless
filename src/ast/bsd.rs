@@ -505,7 +505,7 @@ mod tests {
     fn test_conditional_in_recipe() {
         let makefile = parse_ok("all:\n.if defined(X)\n\techo x\n.endif\n\techo y\n");
         let rule = makefile.rules().next().unwrap();
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo y"]);
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo x", "echo y"]);
         assert_eq!(makefile.rules().count(), 1);
     }
 
@@ -522,6 +522,8 @@ mod tests {
     fn test_for_loop_in_recipe() {
         let makefile = parse_ok("all:\n.  for d in a b\n\techo ${d}\n.  endfor\n");
         assert_eq!(makefile.items().count(), 1);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo ${d}"]);
     }
 
     #[test]

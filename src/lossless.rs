@@ -5475,6 +5475,9 @@ impl Recipe {
 
     /// Get the parent rule containing this recipe
     ///
+    /// For a recipe inside a conditional or BSD `.for` loop in a rule's body,
+    /// this is that rule.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -5486,7 +5489,8 @@ impl Recipe {
     /// assert_eq!(parent.targets().collect::<Vec<_>>(), vec!["all"]);
     /// ```
     pub fn parent(&self) -> Option<Rule> {
-        self.syntax().parent().and_then(Rule::cast)
+        // A recipe can be inside a conditional or `.for` loop in the rule.
+        self.syntax().ancestors().find_map(Rule::cast)
     }
 
     /// Get the source range of this recipe node.
