@@ -1154,21 +1154,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
-        /// Whether the rest of the logical line has a quoted string lexed
-        /// as a single QUOTE token.
-        fn line_has_quoted_string(&self) -> bool {
-            let mut prev = None;
-            for (kind, text) in self.tokens.iter().rev() {
-                match kind {
-                    NEWLINE if prev != Some(BACKSLASH) => return false,
-                    QUOTE if text.len() > 1 => return true,
-                    _ => {}
-                }
-                prev = Some(*kind);
-            }
-            false
-        }
-
         /// Whether the rest of the physical line has a dependency operator.
         /// A backslash escapes the first character of an operator, so `\:`
         /// is not one.
@@ -2120,7 +2105,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if !tail.starts_with('$') {
                 return;
             }
-            let pieces = lex_non_recipe_line(tail, self.variant, true).0;
+            let pieces = lex_non_recipe_line(tail, self.variant).0;
             // Keep token_positions in step with the new tokens.
             let mut position = self.token_positions[consumed].0;
             let positions: Vec<_> = pieces
@@ -2323,10 +2308,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             open_nested -= 1;
                         }
                     }
-                    Some(QUOTE) => {
-                        // Handle quoted strings
-                        self.parse_quoted_string();
-                    }
                     Some(DOLLAR) => {
                         // Handle variable references
                         self.parse_variable_reference();
@@ -2356,39 +2337,51 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        // Helper method to parse quoted comparison for ifeq/ifneq
-        // Handles: "arg1" "arg2" or 'arg1' 'arg2'
+        /// Parse the arguments of `ifeq "a" "b"`. Each argument ends at the
+        /// next quote of the kind that opened it; GNU make looks for it
+        /// after stripping comments, and backslashes do not escape it.
         fn parse_quoted_comparison(&mut self) {
-            // First quoted string - lexer already tokenized the entire string
-            if self.current() == Some(QUOTE) {
-                self.bump(); // Consume the entire first quoted string token
-            } else {
-                self.error(
-                    ParseErrorKind::InvalidConditional,
-                    "expected first quoted argument".to_string(),
-                );
-            }
-
-            // Skip whitespace between the two arguments
-            self.skip_ws_and_continuations();
-
-            // Second quoted string - lexer already tokenized the entire string
-            if self.current() == Some(QUOTE) {
-                self.bump(); // Consume the entire second quoted string token
-            } else {
-                self.error(
-                    ParseErrorKind::InvalidConditional,
-                    "expected second quoted argument".to_string(),
-                );
+            for (i, which) in ["first", "second"].into_iter().enumerate() {
+                if i > 0 {
+                    self.skip_ws_and_continuations();
+                }
+                if self.current() != Some(QUOTE) {
+                    self.error(
+                        ParseErrorKind::InvalidConditional,
+                        format!("expected {which} quoted argument"),
+                    );
+                    return;
+                }
+                if !self.parse_quoted_argument() {
+                    self.record_error(
+                        ParseErrorKind::InvalidConditional,
+                        "invalid syntax in conditional: unterminated quoted argument".to_string(),
+                    );
+                    return;
+                }
             }
         }
 
-        // Handle parsing a quoted string. The lexer emits the entire quoted
-        // string (including both delimiters) as a single QUOTE token, so we
-        // just consume that one token.
-        fn parse_quoted_string(&mut self) {
-            if self.current() == Some(QUOTE) {
-                self.bump();
+        /// Parse a quoted argument of `ifeq`, starting at its opening quote.
+        /// Returns whether the closing quote was found on the logical line.
+        // TODO: GNU make ends the argument at a quote inside a variable
+        // reference too, leaving the reference unterminated.
+        fn parse_quoted_argument(&mut self) -> bool {
+            let quote = self.tokens.last().unwrap().1.clone();
+            self.bump();
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                match self.tokens.last() {
+                    Some((QUOTE, text)) if *text == quote => {
+                        self.bump();
+                        return true;
+                    }
+                    None | Some((NEWLINE | COMMENT, _)) => return false,
+                    Some((DOLLAR, _)) => self.parse_variable_reference(),
+                    Some(_) => self.bump(),
+                }
             }
         }
 
@@ -2696,7 +2689,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(BACKSLASH) if self.is_variable_assignment_line() => {
                         self.parse_assignment()
                     }
-                    Some(QUOTE) => self.parse_quoted_string(),
                     Some(_) => {
                         // Be more tolerant of unexpected tokens in conditionals
                         self.bump();
@@ -2861,12 +2853,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.builder.finish_node();
                 return;
             };
-            // Make does not group the quotes around a path: BSD make reads
-            // them as delimiters and GNU make as part of the file name, so
-            // what is between them is an ordinary expression.
-            if self.line_has_quoted_string() {
-                self.relex_as_non_recipe_line(false);
-            }
             self.skip_ws_and_continuations();
             // nmake does not require delimiters.
             // TODO: Check nmake's handling of an unclosed `<` or `"`.
@@ -3890,7 +3876,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 self.parse_recipe_line();
             } else {
-                self.relex_as_non_recipe_line(true);
+                self.relex_as_non_recipe_line();
             }
         }
 
@@ -3913,7 +3899,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 RuleContext::Varies
                     if !self.indented_lines_are_commands() && self.indented_line_is_statement() =>
                 {
-                    self.relex_as_non_recipe_line(true)
+                    self.relex_as_non_recipe_line()
                 }
                 RuleContext::Varies => self.parse_recipe_line(),
             }
@@ -3950,7 +3936,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// ordinary line, is valid outside of rule context: anything but a
         /// line that can only be a rule and has no dependency operator.
         fn indented_line_is_statement(&mut self) -> bool {
-            let (mut line, _) = self.lex_as_non_recipe_line(true);
+            let (mut line, _) = self.lex_as_non_recipe_line();
             line.reverse();
             while matches!(line.last(), Some((WHITESPACE | INDENT, _))) {
                 line.pop();
@@ -4008,10 +3994,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Lex the rest of the current logical line as an ordinary makefile
-        /// line, with quoted strings grouped if `group_quotes` is set.
-        /// Returns the new tokens in forward order and the number of current
-        /// tokens they replace.
-        fn lex_as_non_recipe_line(&self, group_quotes: bool) -> (Vec<(SyntaxKind, String)>, usize) {
+        /// line. Returns the new tokens in forward order and the number of
+        /// current tokens they replace.
+        fn lex_as_non_recipe_line(&self) -> (Vec<(SyntaxKind, String)>, usize) {
             let mut text = String::new();
             let mut count = 0;
             let mut current = self.tokens.iter().rev();
@@ -4023,7 +4008,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         break;
                     }
                 }
-                let (tokens, continued) = lex_non_recipe_line(&text, self.variant, group_quotes);
+                let (tokens, continued) = lex_non_recipe_line(&text, self.variant);
                 if !continued || count == self.tokens.len() {
                     return (tokens, count);
                 }
@@ -4031,11 +4016,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Lex the rest of the current logical line again as an ordinary
-        /// makefile line, with quoted strings grouped if `group_quotes` is
-        /// set.
-        fn relex_as_non_recipe_line(&mut self, group_quotes: bool) {
+        /// makefile line.
+        fn relex_as_non_recipe_line(&mut self) {
             let consumed = self.token_positions.len() - self.tokens.len();
-            let (tokens, count) = self.lex_as_non_recipe_line(group_quotes);
+            let (tokens, count) = self.lex_as_non_recipe_line();
             self.tokens.truncate(self.tokens.len() - count);
 
             // Keep token_positions in step with the new tokens.
@@ -15223,7 +15207,7 @@ test:
         assert_eq!(parsed.errors, vec![]);
         assert_eq!(
             node_kinds(&parsed.syntax()),
-            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+            "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n      EXPR\n  RECIPE\n  CONDITIONAL_ENDIF\n"
         );
         assert_eq!(parsed.root().to_string(), code);
     }
@@ -16125,14 +16109,12 @@ mod test_continuation {
 
     #[test]
     fn test_parse_quoted_string_inside_function_call() {
-        // The lexer emits a balanced quoted string as one QUOTE token, so a
-        // quoted argument with embedded parentheses must not break paren
-        // balance tracking inside a $(...) expression. Lone or asymmetric
-        // quotes (it's, foo'bar) must not swallow the rest of the line.
+        // Make does not look at quotes, so parentheses inside them count
+        // towards closing the reference. Lone or asymmetric quotes (it's,
+        // foo'bar) must not swallow the rest of the line.
         let cases = [
             "X = $(if a,'foo')\n",
             "X = $(if a,'foo (bar)')\n",
-            "X = $(if a,'(')\n",
             "X = $(if a,')')\n",
             "X = $(if $(SKIP),-k 'not ($(call f,$(s),$(SKIP)))')\n",
             "X = foo'bar\nY = baz\n",
@@ -16146,6 +16128,14 @@ mod test_continuation {
             });
             assert_eq!(parsed.to_string(), src, "round-trip mismatch for {src:?}");
         }
+
+        let src = "X = $(if a,'(')\n";
+        let parsed = parse(src, None);
+        assert_eq!(parsed.root().to_string(), src);
+        assert_eq!(
+            parsed.errors.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            vec![ParseErrorKind::UnclosedReference]
+        );
     }
 
     #[test]

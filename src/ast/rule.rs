@@ -1590,6 +1590,21 @@ mod tests {
     }
 
     #[test]
+    fn test_quotes_in_rule() {
+        // Make does not group quoted words, and `#` starts a comment even
+        // inside quotes.
+        let code = "x\"y\": 'p q' \"r#s\"\n";
+        let makefile: Makefile = code.parse().unwrap();
+        assert_eq!(makefile.code(), code);
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["x\"y\""]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["'p", "q'", "\"r"]
+        );
+    }
+
+    #[test]
     fn test_order_only_prerequisites() {
         let rule: Rule = "foo: a b | c d\n".parse().unwrap();
         assert_eq!(
