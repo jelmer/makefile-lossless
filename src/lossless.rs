@@ -1024,6 +1024,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// preceding rule.
         fn recipe_continues(&self) -> bool {
             let bsd = self.bsd_directives_enabled();
+            let gnu = self.gnu_directives_enabled();
             let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
             let mut in_rule = self.in_rule;
@@ -1080,17 +1081,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             None => return false,
                         }
                     }
-                    (IDENTIFIER, t) if Self::is_conditional_start(t) => {
+                    (IDENTIFIER, t) if gnu && Self::is_conditional_start(t) => {
                         stack.push(ConditionalRuleContext::new(in_rule))
                     }
-                    (IDENTIFIER, "else") => match stack.last_mut() {
+                    (IDENTIFIER, "else") if gnu => match stack.last_mut() {
                         Some(context) => {
                             let is_final = !Self::is_else_if(tokens.clone().map(|(t, _, _)| t));
                             in_rule = context.next_branch(in_rule, is_final);
                         }
                         None => return false,
                     },
-                    (IDENTIFIER, "endif") => match stack.pop() {
+                    (IDENTIFIER, "endif") if gnu => match stack.pop() {
                         Some(context) => in_rule = context.end(in_rule),
                         None => return false,
                     },
@@ -15935,6 +15936,167 @@ test:
             "FOR_LOOP\n  FOR_HEADER\n    EXPR\n  RULE\n    TARGETS\n      EXPR\n    PREREQUISITES\n    RECIPE\n  FOR_END\nRECIPE\n"
         );
         assert_eq!(parsed.root().to_string(), code);
+    }
+
+    /// The text of the last item of a makefile, which must be a recipe line.
+    fn last_recipe_text(makefile: &Makefile) -> String {
+        let crate::ast::makefile::MakefileItem::Recipe(recipe) = makefile.items().last().unwrap()
+        else {
+            panic!("expected recipe");
+        };
+        recipe.text()
+    }
+
+    #[test]
+    fn test_gnu_conditional_keywords_end_rule_in_other_variants() {
+        // Outside GNU make, a line starting with `ifdef` or `else` is an
+        // ordinary line, here a variable assignment that ends the rule, so
+        // the comment or conditional before it isn't part of the rule.
+        for variant in [
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+            MakefileVariant::NMake,
+        ] {
+            for name in ["X", "ifdef", "ifndef", "ifeq", "ifneq"] {
+                let code = format!("all:\n\techo a\n\n# c\n{} = 1\n\techo b\n", name);
+                let parsed = parse(&code, Some(variant));
+                let makefile = parsed.root();
+                assert_eq!(makefile.to_string(), code);
+                assert_eq!(
+                    makefile.rules().next().unwrap().to_string(),
+                    "all:\n\techo a\n\n",
+                    "{:?} {:?}",
+                    variant,
+                    code
+                );
+            }
+        }
+        for (code, rule) in [
+            (
+                "all:\n\techo a\n.ifdef X\n.endif\nifdef = 1\n\techo b\n",
+                "all:\n\techo a\n",
+            ),
+            (
+                "all:\n\techo a\n\n# c\n.if 1\nelse = 1\n.endif\n\techo b\n",
+                "all:\n\techo a\n\n",
+            ),
+        ] {
+            let parsed = parse(code, Some(MakefileVariant::BSDMake));
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(
+                makefile.rules().next().unwrap().to_string(),
+                rule,
+                "{:?}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn test_nmake_rule_context_after_conditional_branch() {
+        // The !ELSE branch is only taken if the rule wasn't defined, so the
+        // command line in it is never part of a rule. Whether that is
+        // reported as an error is up to the policy for command lines in
+        // conditionals outside rules, so only the structure is checked here.
+        for indent in ["\t", "  "] {
+            let code = format!("!IFDEF A\nt:\n!ELSE\n{}X = 1\n!ENDIF\n", indent);
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RECIPE\n  CONDITIONAL_ENDIF\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_with_rule_on_some_paths() {
+        for (conditional, kinds) in [
+            (
+                "!IFDEF A\nt:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\nt:\n!ELSEIFDEF B\nu:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\nt:\n!ELSE IFDEF B\nu:\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+            (
+                "!IFDEF A\n!IFDEF B\nt:\n!ENDIF\n!ENDIF\n",
+                "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RULE\n      TARGETS\n      PREREQUISITES\n    CONDITIONAL_ENDIF\n  CONDITIONAL_ENDIF\nRECIPE\n",
+            ),
+        ] {
+            for indent in ["\t", "  "] {
+                let code = format!("{}{}X = 1\n", conditional, indent);
+                let parsed = parse(&code, Some(MakefileVariant::NMake));
+                assert_eq!(parsed.errors, vec![], "{:?}", code);
+                assert_eq!(node_kinds(&parsed.syntax()), kinds, "{:?}", code);
+                let makefile = parsed.root();
+                assert_eq!(makefile.to_string(), code);
+                assert_eq!(last_recipe_text(&makefile), "X = 1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_ending_rule_on_some_paths() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "all:\n{0}echo a\n!IFDEF X\nY=1\n!ENDIF\n{0}echo b\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
+            );
+            let makefile = parsed.root();
+            assert_eq!(makefile.to_string(), code);
+            assert_eq!(last_recipe_text(&makefile), "echo b");
+        }
+    }
+
+    #[test]
+    fn test_nmake_recipe_after_conditional_ending_rule_on_all_paths() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "all:\n{0}echo a\n!IFDEF X\nY=1\n!ELSE\nZ=1\n!ENDIF\n{0}echo b\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(
+                parsed.errors,
+                vec![ErrorInfo {
+                    message: "indented line not part of a rule".to_string(),
+                    line: 8,
+                    context: format!("{}echo b", indent),
+                    kind: ParseErrorKind::RecipeBeforeFirstTarget,
+                }]
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
+    }
+
+    #[test]
+    fn test_nmake_rule_context_continues_after_conditional() {
+        for indent in ["\t", "  "] {
+            let code = format!(
+                "t:\n!IF \"$(A)\" == \"1\"\n{0}echo a\n!ELSEIF \"$(B)\" == \"1\"\n{0}echo b\n!ELSE\n{0}echo c\n!ENDIF\n{0}echo d\n",
+                indent
+            );
+            let parsed = parse(&code, Some(MakefileVariant::NMake));
+            assert_eq!(parsed.errors, vec![]);
+            assert_eq!(
+                node_kinds(&parsed.syntax()),
+                "RULE\n  TARGETS\n  PREREQUISITES\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n      EXPR\n    RECIPE\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\n  RECIPE\n"
+            );
+            assert_eq!(parsed.root().to_string(), code);
+        }
     }
 
     #[test]
