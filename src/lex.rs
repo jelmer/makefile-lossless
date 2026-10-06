@@ -52,6 +52,9 @@ pub struct Lexer<'a> {
     // TODO: Check whether nmake starts a comment at a `#` in a quoted
     // string; its documentation doesn't say.
     nmake_quoted: bool,
+    /// For nmake, the number of inline files still to read, from the `<<`
+    /// in the last command line.
+    nmake_inline_files: usize,
     /// Whether no token has been read yet on the current logical line.
     line_start: bool,
     /// Whether the current logical line so far is a `.` at its start,
@@ -86,6 +89,7 @@ impl<'a> Lexer<'a> {
             line: Some(String::new()),
             nmake_definition: None,
             nmake_quoted: false,
+            nmake_inline_files: 0,
             line_start: true,
             after_directive_dot: false,
         }
@@ -182,6 +186,9 @@ impl<'a> Lexer<'a> {
         let text = self.read_line();
         let trailing_backslashes = text.chars().rev().take_while(|&c| c == '\\').count();
         self.recipe_continuation = trailing_backslashes % 2 == 1;
+        if self.nmake {
+            self.nmake_inline_files += text.matches("<<").count();
+        }
         (SyntaxKind::TEXT, text)
     }
 
@@ -298,6 +305,16 @@ impl<'a> Lexer<'a> {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
             match (c, self.line_type) {
+                (_, None) if self.nmake_inline_files > 0 && !self.at_newline() => {
+                    // A line of an nmake inline file, up to a line starting
+                    // with `<<`.
+                    self.line_type = Some(LineType::Recipe);
+                    let text = self.read_line();
+                    if text.starts_with("<<") {
+                        self.nmake_inline_files -= 1;
+                    }
+                    return Some((SyntaxKind::TEXT, text));
+                }
                 (c, None) if c == self.recipe_prefix && c != '\t' && !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);

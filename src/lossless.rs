@@ -534,6 +534,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.bump();
 
             // Parse the recipe content, handling line continuations (backslash at end of line)
+            let mut inline_files = 0;
             loop {
                 let mut last_text_content: Option<String> = None;
 
@@ -542,6 +543,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // Save the text content if this is a TEXT token
                     if self.current() == Some(TEXT) {
                         if let Some((_kind, text)) = self.tokens.last() {
+                            if self.variant == Some(MakefileVariant::NMake) {
+                                inline_files += text.matches("<<").count();
+                            }
                             last_text_content = Some(text.clone());
                         }
                     }
@@ -574,6 +578,31 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 } else {
                     // No continuation - we're done
                     break;
+                }
+            }
+
+            // Each `<<` in an nmake command starts an inline file, whose
+            // lines run up to a line starting with `<<`.
+            while inline_files > 0 {
+                match self.current() {
+                    Some(TEXT) => {
+                        if self.tokens.last().unwrap().1.starts_with("<<") {
+                            inline_files -= 1;
+                        }
+                        self.bump();
+                        if self.current() == Some(NEWLINE) {
+                            self.bump();
+                        }
+                    }
+                    Some(NEWLINE) => self.bump(),
+                    None => {
+                        self.record_error(
+                            ParseErrorKind::Other,
+                            "unterminated inline file (missing <<)".to_string(),
+                        );
+                        break;
+                    }
+                    _ => break,
                 }
             }
 
@@ -18447,5 +18476,43 @@ mod test_nmake {
         let mut out = String::new();
         walk(node, 0, &mut out);
         out
+    }
+
+    #[test]
+    fn test_inline_files() {
+        // As in libisc.mak: the lines after a command with `<<` up to a
+        // line starting with `<<` are the text of an inline file.
+        let code = "\
+a.dll : a.obj
+    link @<<
+  /out:a.dll a.obj
+<<
+    echo done
+
+a.rc : a.manifest
+    type <<$@ <<b.txt
+#include <winuser.h>
+1RT_MANIFEST \"a.manifest\"
+<< KEEP
+x: y
+<<NOKEEP
+";
+        let makefile = parse_nmake(code);
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec!["link @<<\n  /out:a.dll a.obj\n<<", "echo done"]
+        );
+        assert_eq!(
+            rules[1].recipes().collect::<Vec<_>>(),
+            vec!["type <<$@ <<b.txt\n#include <winuser.h>\n1RT_MANIFEST \"a.manifest\"\n<< KEEP\nx: y\n<<NOKEEP"]
+        );
+
+        let code = "a:\n    type <<\ntext\n";
+        let parsed = Makefile::parse_with_variant(code, MakefileVariant::NMake);
+        let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["unterminated inline file (missing <<)"]);
+        assert_eq!(parsed.tree().to_string(), code);
     }
 }
