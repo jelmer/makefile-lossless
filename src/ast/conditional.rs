@@ -1,8 +1,6 @@
 use super::bsd::keyword_token;
 use super::makefile::MakefileItem;
-use super::{
-    collapse_continuations, line_ending, terminate_line_before, with_trailing_newline, LineSyntax,
-};
+use super::{line_ending, logical_text, terminate_line_before, with_trailing_newline, LineSyntax};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
@@ -211,8 +209,10 @@ impl ConditionalBranch {
     /// `ifneq` it is the full argument text, e.g. `($(A),b)`; use
     /// [`Self::ifeq_args`] to get the two arguments.
     ///
-    /// Line continuations are collapsed as GNU make does; see
-    /// [`Self::condition_for`] for other variants.
+    /// Line continuations are collapsed as BSD make does for `.if` and
+    /// friends, nmake for `!IF` and friends and GNU make otherwise; see
+    /// [`Self::condition_for`] for other variants. BSD make also unescapes
+    /// `\#`.
     ///
     /// # Example
     /// ```
@@ -223,7 +223,12 @@ impl ConditionalBranch {
     /// assert_eq!(conditions, vec![Some("A".to_string()), Some("$(B)".to_string())]);
     /// ```
     pub fn condition(&self) -> Option<String> {
-        self.condition_with(LineSyntax::Gnu)
+        let syntax = match keyword_token(&self.header).map(|(_, keyword)| keyword) {
+            Some(keyword) if keyword.starts_with('.') => LineSyntax::Bsd,
+            Some(keyword) if keyword.starts_with('!') => LineSyntax::NMake,
+            _ => LineSyntax::Gnu,
+        };
+        self.condition_with(syntax)
     }
 
     /// The raw, unexpanded condition of this branch with line
@@ -233,7 +238,8 @@ impl ConditionalBranch {
     /// GNU make drops the whitespace before a line continuation, while
     /// POSIX make (and GNU make after `.POSIX:`) and BSD make keep it. This
     /// matters inside variable references, such as in function arguments
-    /// or BSD make modifiers.
+    /// or BSD make modifiers. BSD make also unescapes `\#`, which GNU make
+    /// keeps in conditionals.
     ///
     /// # Example
     /// ```
@@ -255,7 +261,16 @@ impl ConditionalBranch {
 
     fn condition_with(&self, syntax: LineSyntax) -> Option<String> {
         let expr = self.header.children().find(|it| it.kind() == EXPR)?;
-        Some(collapse_continuations(&expr, syntax).trim().to_string())
+        let tokens = expr
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token());
+        // GNU make does not unescape `\#` in conditionals.
+        let comments = matches!(syntax, LineSyntax::Bsd | LineSyntax::NMake);
+        Some(
+            logical_text(&expr, tokens, syntax, comments)
+                .trim()
+                .to_string(),
+        )
     }
 
     /// For an `ifeq` / `ifneq` branch, return the two argument strings
@@ -1612,8 +1627,12 @@ endif
         assert!(parsed.ok(), "{:?}", parsed.errors());
         let cond = parsed.tree().conditionals().next().unwrap();
         assert_eq!(
-            cond.condition(),
+            cond.condition_for(MakefileVariant::GNUMake),
             Some("${A:S/a/b/ :S/c/d/} == x".to_string())
+        );
+        assert_eq!(
+            cond.condition(),
+            Some("${A:S/a/b/  :S/c/d/} == x".to_string())
         );
         assert_eq!(
             cond.condition_for(MakefileVariant::BSDMake),

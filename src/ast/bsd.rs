@@ -3,7 +3,8 @@
 
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
-use crate::lossless::{node_text, Directive, ForLoop, SyntaxNode, SyntaxToken};
+use super::{logical_text, LineSyntax};
+use crate::lossless::{Directive, ForLoop, SyntaxNode, SyntaxToken};
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
@@ -44,11 +45,25 @@ pub(crate) fn directive_keyword(node: &SyntaxNode) -> Option<String> {
     keyword_token(node).map(|(_, keyword)| keyword)
 }
 
-/// Return the trimmed text of the first EXPR child of `node`.
+/// How the make implementation that reads the directive at the start of
+/// `node` forms its logical line: nmake for `!` directives and BSD make
+/// otherwise.
+fn directive_line_syntax(node: &SyntaxNode) -> LineSyntax {
+    match node.first_token() {
+        Some(t) if t.kind() == OPERATOR && t.text() == "!" => LineSyntax::NMake,
+        _ => LineSyntax::Bsd,
+    }
+}
+
+/// Return the trimmed logical text of the first EXPR child of `node`, as
+/// read by the make implementation of the directive.
 fn expr_text(node: &SyntaxNode) -> Option<String> {
-    node.children()
-        .find(|it| it.kind() == EXPR)
-        .map(|it| node_text(&it).trim().to_string())
+    let expr = node.children().find(|it| it.kind() == EXPR)?;
+    let tokens = expr
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token());
+    let text = logical_text(&expr, tokens, directive_line_syntax(node), true);
+    Some(text.trim().to_string())
 }
 
 impl ForLoop {
@@ -85,6 +100,10 @@ impl ForLoop {
     }
 
     /// The unexpanded list of values the loop iterates over.
+    ///
+    /// This is the text as BSD make reads it: line continuations are
+    /// collapsed, keeping the whitespace before them, `\#` is unescaped
+    /// and trailing whitespace is removed.
     pub fn list(&self) -> Option<String> {
         expr_text(&self.header()?)
     }
@@ -154,6 +173,17 @@ impl Directive {
     }
 
     /// The unexpanded argument of the directive, if any.
+    ///
+    /// Line continuations are collapsed and `\#` is unescaped the way BSD
+    /// make does, or nmake for `!` directives such as `!MESSAGE`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// let makefile: Makefile = ".info a \\\n\tb\\#c # comment\n".parse().unwrap();
+    /// let MakefileItem::Directive(d) = makefile.items().next().unwrap() else { panic!() };
+    /// assert_eq!(d.argument(), Some("a  b#c".to_string()));
+    /// ```
     pub fn argument(&self) -> Option<String> {
         expr_text(self.syntax()).filter(|s| !s.is_empty())
     }
@@ -319,6 +349,128 @@ mod tests {
                     Some("${PROG} is not supported".to_string())
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn test_directive_argument_logical_line() {
+        // As in bmake, whitespace before a continuation is kept, `\#` is
+        // unescaped and trailing whitespace is removed.
+        let text = ".info a \\\n\t\tb\\#c # comment\n.error \\\n  x  \\\n\n";
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            let parsed = match variant {
+                Some(v) => Makefile::parse_with_variant(text, v),
+                None => Makefile::parse(text),
+            };
+            assert_eq!(parsed.errors(), &[]);
+            let makefile = parsed.tree();
+            assert_eq!(makefile.to_string(), text);
+            let arguments: Vec<_> = makefile
+                .items()
+                .map(|item| match item {
+                    MakefileItem::Directive(d) => d.argument(),
+                    _ => panic!("expected directive"),
+                })
+                .collect();
+            assert_eq!(
+                arguments,
+                vec![Some("a  b#c".to_string()), Some("x".to_string())],
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nmake_directive_argument_logical_line() {
+        let text = "!MESSAGE a \\\n  b\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::NMake);
+        assert_eq!(parsed.errors(), &[]);
+        let makefile = parsed.tree();
+        assert_eq!(makefile.to_string(), text);
+        let Some(MakefileItem::Directive(d)) = makefile.items().next() else {
+            panic!("expected directive");
+        };
+        assert_eq!(d.argument(), Some("a  b".to_string()));
+    }
+
+    #[test]
+    fn test_for_loop_list_logical_line() {
+        let text = ".for x in a \\\n\t\tb\\#c # comment\n.endfor\n";
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            let parsed = match variant {
+                Some(v) => Makefile::parse_with_variant(text, v),
+                None => Makefile::parse(text),
+            };
+            assert_eq!(parsed.errors(), &[]);
+            let makefile = parsed.tree();
+            assert_eq!(makefile.to_string(), text);
+            let Some(MakefileItem::ForLoop(f)) = makefile.items().next() else {
+                panic!("expected for loop");
+            };
+            assert_eq!(f.variables(), vec!["x"], "{variant:?}");
+            assert_eq!(f.list(), Some("a  b#c".to_string()), "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_for_loop_list_continued_modifier() {
+        // From NetBSD's share/mk/bsd.clean.mk.
+        let makefile = parse_ok(concat!(
+            ".for _d in ${\"${.OBJDIR}\" == \"${.CURDIR}\" || \"${MKCLEANSRC}\" == \"no\" \\\n",
+            "\t\t:? ${.OBJDIR} \\\n",
+            "\t\t:  ${.OBJDIR} ${.CURDIR} }\n",
+            ".endfor\n"
+        ));
+        let Some(MakefileItem::ForLoop(f)) = makefile.items().next() else {
+            panic!("expected for loop");
+        };
+        assert_eq!(f.variables(), vec!["_d"]);
+        assert_eq!(
+            f.list(),
+            Some(
+                "${\"${.OBJDIR}\" == \"${.CURDIR}\" || \"${MKCLEANSRC}\" == \"no\"  \
+                 :? ${.OBJDIR}  :  ${.OBJDIR} ${.CURDIR} }"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_condition_logical_line() {
+        let makefile = parse_ok(".if ${X:Ua\\#b} == x \\\n\t|| ${Y}\n.endif\n");
+        let branch = makefile
+            .conditionals()
+            .next()
+            .unwrap()
+            .branches()
+            .next()
+            .unwrap();
+        assert_eq!(
+            branch.condition(),
+            Some("${X:Ua#b} == x  || ${Y}".to_string())
+        );
+        assert_eq!(
+            branch.condition_for(MakefileVariant::BSDMake),
+            Some("${X:Ua#b} == x  || ${Y}".to_string())
+        );
+        assert_eq!(
+            branch.bsd_condition(),
+            Some(Ok("${X:Ua#b} == x || ${Y}".parse().unwrap()))
+        );
+
+        // GNU make does not unescape `\#` in conditionals.
+        let makefile = parse_ok("ifeq (a\\#b,c)\nendif\n");
+        let branch = makefile
+            .conditionals()
+            .next()
+            .unwrap()
+            .branches()
+            .next()
+            .unwrap();
+        assert_eq!(branch.condition(), Some("(a\\#b,c)".to_string()));
+        assert_eq!(
+            branch.ifeq_args(),
+            Some(("a\\#b".to_string(), "c".to_string()))
         );
     }
 
