@@ -88,6 +88,54 @@ impl VariableDefinition {
         keywords
     }
 
+    /// The directive keywords on this line with their source ranges, in
+    /// source order: any of `export`, `unexport`, `override`, `private`,
+    /// `define` and `undefine` before the name, and the `endef` closing a
+    /// `define` block.
+    ///
+    /// A word only counts as a keyword in the same cases as for
+    /// [`Self::is_export`] and the like, so `export = 1` has none.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "override define X\nx\nendef\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// assert_eq!(
+    ///     var.keyword_ranges(),
+    ///     vec![
+    ///         ("override".to_string(), TextRange::new(0.into(), 8.into())),
+    ///         ("define".to_string(), TextRange::new(9.into(), 15.into())),
+    ///         ("endef".to_string(), TextRange::new(20.into(), 25.into())),
+    ///     ]
+    /// );
+    /// ```
+    pub fn keyword_ranges(&self) -> Vec<(String, rowan::TextRange)> {
+        let mut keywords: Vec<_> = self
+            .directive_keywords()
+            .into_iter()
+            .map(|t| (t.text().to_string(), t.text_range()))
+            .collect();
+        if self.is_define() {
+            let body = self
+                .syntax()
+                .children()
+                .filter(|it| it.kind() == EXPR)
+                .last();
+            let endef = body
+                .into_iter()
+                .flat_map(|body| {
+                    std::iter::successors(body.next_sibling_or_token(), |it| {
+                        it.next_sibling_or_token()
+                    })
+                })
+                .filter_map(|it| it.into_token())
+                .find(|t| t.kind() == IDENTIFIER && t.text() == "endef");
+            keywords.extend(endef.map(|t| (t.text().to_string(), t.text_range())));
+        }
+        keywords
+    }
+
     /// Internal: the elements making up the variable's name, i.e. the
     /// IDENTIFIER tokens and variable references that follow any directive
     /// keywords. A name usually is a single IDENTIFIER, but may contain
@@ -2040,5 +2088,67 @@ mod tests {
         assert!(code.contains("export"), "Should preserve export prefix");
         assert!(code.contains(":="), "Should preserve := operator");
         assert!(code.contains("new_value"), "Should have new value");
+    }
+
+    fn keywords(text: &str) -> Vec<Vec<(String, &str)>> {
+        let (makefile, _) = Makefile::from_str_relaxed(text);
+        makefile
+            .variable_definitions()
+            .map(|v| {
+                v.keyword_ranges()
+                    .into_iter()
+                    .map(|(keyword, range)| (keyword, &text[range]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn expected(v: &[&[&'static str]]) -> Vec<Vec<(String, &'static str)>> {
+        v.iter()
+            .map(|words| words.iter().map(|w| (w.to_string(), *w)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_keyword_ranges() {
+        assert_eq!(
+            keywords(
+                "X = 1\nexport Y := 2\noverride  private Z += 3\nunexport A B\nexport\nexport = 4\noverride undefine C\nall: private D = 5\n"
+            ),
+            expected(&[
+                &[],
+                &["export"],
+                &["override", "private"],
+                &["unexport"],
+                &["export"],
+                &[],
+                &["override", "undefine"],
+                &["private"],
+            ])
+        );
+    }
+
+    #[test]
+    fn test_keyword_ranges_define() {
+        assert_eq!(
+            keywords(
+                "export define A\ndefine B\nendef\n  endef # c\ndefine C =\r\nx\r\nendef\r\ndefine D\n"
+            ),
+            expected(&[&["export", "define", "endef"], &["define", "endef"], &["define"]])
+        );
+    }
+
+    #[test]
+    fn test_keyword_ranges_continuation() {
+        let text = "export \\\n  X = 1\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(
+            var.keyword_ranges(),
+            vec![(
+                "export".to_string(),
+                rowan::TextRange::new(0.into(), 6.into())
+            )]
+        );
     }
 }
