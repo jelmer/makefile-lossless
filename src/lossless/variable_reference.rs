@@ -231,6 +231,7 @@ impl VariableReference {
                         cond.branches().nth(index)
                     })
                     .map(ReferenceLocation::Condition),
+                RECIPE => Recipe::cast(ancestor).map(ReferenceLocation::Recipe),
                 INCLUDE => Include::cast(ancestor).map(ReferenceLocation::Include),
                 VPATH => Vpath::cast(ancestor).map(ReferenceLocation::Vpath),
                 LOAD => Load::cast(ancestor).map(ReferenceLocation::Load),
@@ -511,6 +512,10 @@ pub enum ReferenceLocation {
     TargetPattern(Rule),
     /// In the prerequisites of a rule, including order-only ones.
     Prerequisite(Rule),
+    /// In a recipe line, including one after the `;` of a rule line and
+    /// one outside any rule, as returned by
+    /// [`MakefileItem::Recipe`](crate::MakefileItem::Recipe).
+    Recipe(Recipe),
     /// In the condition of a conditional branch, such as `ifeq ($(A),b)`,
     /// `else ifdef $(B)`, `.if ${C}` or `!IF "$(D)" == "1"`.
     Condition(ConditionalBranch),
