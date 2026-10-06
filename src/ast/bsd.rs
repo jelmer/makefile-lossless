@@ -1192,4 +1192,26 @@ mod tests {
         assert_eq!(var.raw_value(), Some("c".to_string()));
         assert_ne!(errors_with(MakefileVariant::GNUMake, "a b != c\n"), 0);
     }
+
+    #[test]
+    fn test_variable_name_with_braces_in_expression() {
+        // From NetBSD make's cond-func.mk: bmake ends the expression at the
+        // first `}`, so the name is `VAR{value` followed by `}`, but like
+        // Parse_IsVar the name ends at the `=` as the braces balance.
+        for (code, name) in [
+            ("${:UVAR{value}}=\tx\n", "${:UVAR{value}}"),
+            ("${:UV{a}} = x\n", "${:UV{a}}"),
+        ] {
+            let makefile = parse_bsd(code);
+            let vars: Vec<_> = makefile.variable_definitions().collect();
+            assert_eq!(vars.len(), 1, "{code:?}");
+            assert_eq!(vars[0].name(), Some(name.to_string()), "{code:?}");
+            assert_eq!(vars[0].raw_value(), Some("x".to_string()), "{code:?}");
+        }
+        // The `(` leaves the level at 1, so this is not an assignment, and
+        // bmake reports an archive specification error.
+        let parsed = Makefile::parse_with_variant("A${:U(}= x\n", MakefileVariant::BSDMake);
+        assert!(!parsed.errors().is_empty());
+        assert_eq!(parsed.tree().variable_definitions().count(), 0);
+    }
 }

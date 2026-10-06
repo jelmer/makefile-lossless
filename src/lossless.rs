@@ -2063,7 +2063,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         return true
                     }
-                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(DOLLAR) => {
+                        // Parse_IsVar counts the parentheses and braces in
+                        // expressions too, although make may end an
+                        // expression before its braces balance, as in
+                        // `${:UVAR{value}}`.
+                        let start = usize::from(self.current_range().start());
+                        self.parse_variable_reference();
+                        let end = usize::from(self.current_range().start());
+                        level += self.original_text[start..end]
+                            .chars()
+                            .map(|c| match c {
+                                '(' | '{' => 1,
+                                ')' | '}' => -1,
+                                _ => 0,
+                            })
+                            .sum::<isize>();
+                    }
                     Some(kind) => {
                         match kind {
                             LPAREN | LBRACE => level += 1,
