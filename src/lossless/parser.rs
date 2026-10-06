@@ -185,6 +185,65 @@ impl ConditionalRuleContext {
     }
 }
 
+/// Set the line range and space indent range of each of `errors` in the
+/// tree `root`.
+pub(crate) fn locate_error_lines(root: &SyntaxNode, errors: &mut [PositionedParseError]) {
+    for error in errors {
+        error.line_range = logical_line_range(root, error.range.start());
+        error.space_indent_range = None;
+        if error.kind == ParseErrorKind::MissingSeparator {
+            let line = root.text().slice(error.line_range).to_string();
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            if spaces > 0 {
+                error.space_indent_range = Some(rowan::TextRange::at(
+                    error.line_range.start(),
+                    rowan::TextSize::from(spaces as u32),
+                ));
+            }
+        }
+    }
+}
+
+/// The range of the logical line containing `offset`, excluding its final
+/// line ending. At the end of the text, this is the line after the last
+/// line ending.
+fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::TextRange {
+    // In recipe text, a continuation backslash is part of a TEXT token.
+    let ends_in_backslash = |t: &SyntaxToken| {
+        t.kind() == TEXT && (t.text().len() - t.text().trim_end_matches('\\').len()) % 2 == 1
+    };
+    let is_line_end = |t: &SyntaxToken| {
+        t.kind() == NEWLINE
+            && !crate::ast::is_continuation(&t.clone().into())
+            && !t.prev_token().is_some_and(|p| ends_in_backslash(&p))
+    };
+    let text_end = root.text_range().end();
+    let (before, token) = match root.token_at_offset(offset).right_biased() {
+        Some(token) if offset < text_end => {
+            let before = if is_line_end(&token) {
+                token.prev_token()
+            } else {
+                Some(token.clone())
+            };
+            (before, Some(token))
+        }
+        _ => {
+            let last = root
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .last();
+            (last, None)
+        }
+    };
+    let start = std::iter::successors(before, |t| t.prev_token())
+        .find(is_line_end)
+        .map_or(0.into(), |t| t.text_range().end());
+    let end = std::iter::successors(token, |t| t.next_token())
+        .find(is_line_end)
+        .map_or(text_end, |t| t.text_range().start());
+    rowan::TextRange::new(start, end)
+}
+
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     struct Parser {
         /// input tokens, including whitespace,
@@ -306,6 +365,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 range,
                 code: None,
                 kind,
+                // Set by `Parser::parse` once the tree is complete.
+                line_range: rowan::TextRange::empty(range.start()),
+                space_indent_range: None,
             });
         }
 
@@ -4378,8 +4440,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             self.builder.finish_node();
 
+            let green_node = self.builder.finish();
+            locate_error_lines(
+                &SyntaxNode::new_root(green_node.clone()),
+                &mut self.positioned_errors,
+            );
+
             Parse {
-                green_node: self.builder.finish(),
+                green_node,
                 errors: self.errors,
                 positioned_errors: self.positioned_errors,
             }

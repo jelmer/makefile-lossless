@@ -1,5 +1,118 @@
 use super::*;
 
+/// For each positioned error in `text`: its kind, the text of its line
+/// range and its space indent range.
+fn error_line_texts(
+    text: &str,
+    variant: Option<MakefileVariant>,
+) -> Vec<(ParseErrorKind, &str, Option<rowan::TextRange>)> {
+    parse(text, variant)
+        .positioned_errors
+        .iter()
+        .map(|e| (e.kind(), &text[e.line_range()], e.space_indent_range()))
+        .collect()
+}
+
+fn range(start: u32, end: u32) -> Option<rowan::TextRange> {
+    Some(rowan::TextRange::new(start.into(), end.into()))
+}
+
+#[test]
+fn test_error_line_range_space_indent() {
+    assert_eq!(
+        error_line_texts("all:\n\n  echo hi\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "  echo hi", range(6, 8))]
+    );
+    // Reported at the end of the line rather than at the indent.
+    assert_eq!(
+        error_line_texts("  echo hi\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "  echo hi", range(0, 2))]
+    );
+    assert_eq!(
+        error_line_texts("ifdef X\n  foo bar\nendif\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "  foo bar", range(8, 10))]
+    );
+}
+
+#[test]
+fn test_error_line_range_no_indent() {
+    assert_eq!(
+        error_line_texts("all:\nfoo\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "foo", None)]
+    );
+    assert_eq!(
+        error_line_texts("foo", None),
+        vec![(ParseErrorKind::MissingSeparator, "foo", None)]
+    );
+    // Only spaces count, not a tab after them.
+    assert_eq!(
+        error_line_texts("X = 1\n \tfoo\n", None),
+        vec![(ParseErrorKind::MissingSeparator, " \tfoo", range(6, 7))]
+    );
+}
+
+#[test]
+fn test_error_line_range_continuation() {
+    assert_eq!(
+        error_line_texts("all:\n\n  bad \\\n  line\n", None),
+        vec![(
+            ParseErrorKind::MissingSeparator,
+            "  bad \\\n  line",
+            range(6, 8)
+        )]
+    );
+    assert_eq!(
+        error_line_texts("all:\nx \\\n  y\nz: w\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "x \\\n  y", None)]
+    );
+    // An escaped backslash does not continue the line.
+    assert_eq!(
+        error_line_texts("all:\nx \\\\\n  y\n", None),
+        vec![
+            (ParseErrorKind::MissingSeparator, "x \\\\", None),
+            (ParseErrorKind::MissingSeparator, "  y", range(10, 12)),
+        ]
+    );
+}
+
+#[test]
+fn test_error_line_range_crlf() {
+    assert_eq!(
+        error_line_texts("X = 1\r\n  echo hi\r\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "  echo hi", range(7, 9))]
+    );
+    assert_eq!(
+        error_line_texts("all:\r\nx \\\r\n  y\r\n", None),
+        vec![(ParseErrorKind::MissingSeparator, "x \\\r\n  y", None)]
+    );
+}
+
+#[test]
+fn test_error_line_range_recipe_before_first_target() {
+    assert_eq!(
+        error_line_texts("\techo hi\n", None),
+        vec![(ParseErrorKind::RecipeBeforeFirstTarget, "\techo hi", None)]
+    );
+}
+
+#[test]
+fn test_error_line_range_at_end() {
+    let text = "ifdef X\nfoo: bar\n";
+    let parsed = parse(text, None);
+    let errors = &parsed.positioned_errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].line_range(), rowan::TextRange::empty(17.into()));
+    assert_eq!(errors[0].space_indent_range(), None);
+}
+
+#[test]
+fn test_error_line_range_bsd() {
+    assert_eq!(
+        error_line_texts("all:\n\n  echo hi\n", Some(MakefileVariant::BSDMake)),
+        error_line_texts("all:\n\n  echo hi\n", None)
+    );
+}
+
 #[test]
 fn test_regular_line_error_reporting() {
     let input = "rule target\n\tcommand";

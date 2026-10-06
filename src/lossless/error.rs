@@ -145,12 +145,53 @@ pub struct PositionedParseError {
     /// Optional error code for categorization
     pub code: Option<String>,
     pub(crate) kind: ParseErrorKind,
+    pub(crate) line_range: rowan::TextRange,
+    pub(crate) space_indent_range: Option<rowan::TextRange>,
 }
 
 impl PositionedParseError {
     /// The class of this error.
     pub fn kind(&self) -> ParseErrorKind {
         self.kind
+    }
+
+    /// The source range of the logical line the error is on, from the
+    /// start of its first physical line to the end of its last one
+    /// (joined by backslash-newline continuations), excluding the final
+    /// line ending.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    ///
+    /// let parsed = Makefile::parse("all:\n\nfoo \\\n  bar\n");
+    /// let error = &parsed.positioned_errors()[0];
+    /// assert_eq!(error.line_range(), TextRange::new(6.into(), 17.into()));
+    /// ```
+    pub fn line_range(&self) -> rowan::TextRange {
+        self.line_range
+    }
+
+    /// For a [`ParseErrorKind::MissingSeparator`] error on a line indented
+    /// with spaces, the source range of those spaces.
+    ///
+    /// Such a line is usually a recipe line that should have been indented
+    /// with a tab.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, ParseErrorKind, TextRange};
+    ///
+    /// let parsed = Makefile::parse("all:\n\n  echo hi\n");
+    /// let error = &parsed.positioned_errors()[0];
+    /// assert_eq!(error.kind(), ParseErrorKind::MissingSeparator);
+    /// assert_eq!(
+    ///     error.space_indent_range(),
+    ///     Some(TextRange::new(6.into(), 8.into()))
+    /// );
+    /// ```
+    pub fn space_indent_range(&self) -> Option<rowan::TextRange> {
+        self.space_indent_range
     }
 }
 

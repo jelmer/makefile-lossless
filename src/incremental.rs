@@ -214,6 +214,12 @@ impl Parse<Makefile> {
             }
         }
 
+        // The reparsed region need not start at a line start, and lines may
+        // have shifted, so find the lines in the new tree.
+        crate::lossless::locate_error_lines(
+            &rowan::SyntaxNode::new_root(new_root.clone()),
+            &mut new_positioned_errors,
+        );
         let new_parse = Parse::new(new_root, new_errors, new_positioned_errors);
         (new_parse, new_text)
     }
@@ -481,6 +487,29 @@ mod tests {
         assert_eq!(vars[0].raw_value(), Some("ONE".to_string()));
         assert_eq!(vars[1].raw_value(), Some("two".to_string()));
         assert_eq!(vars[2].raw_value(), Some("THREE".to_string()));
+    }
+
+    #[test]
+    fn test_apply_edit_shifts_error_line_ranges() {
+        let old_text = "A = 1\n\n  foo bar\n\nB = 2\n\n  baz \\\n  qux\n";
+        let parse = Parse::<Makefile>::parse_makefile(old_text);
+        let ranges = |parse: &Parse<Makefile>| {
+            parse
+                .positioned_errors()
+                .iter()
+                .map(|e| (e.range, e.line_range(), e.space_indent_range()))
+                .collect::<Vec<_>>()
+        };
+        for edit in [
+            TextEdit::new(TextRange::new(4.into(), 5.into()), "123".to_string()),
+            TextEdit::new(TextRange::new(4.into(), 5.into()), "".to_string()),
+            TextEdit::new(TextRange::new(9.into(), 12.into()), "x".to_string()),
+        ] {
+            let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+            let full = Parse::<Makefile>::parse_makefile(&new_text);
+            assert_eq!(ranges(&new_parse), ranges(&full));
+            assert_eq!(ranges(&full).len(), 2);
+        }
     }
 
     #[test]
