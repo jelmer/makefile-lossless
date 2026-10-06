@@ -1742,6 +1742,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
+        /// For nmake, consume a caret at the end of a line of a macro
+        /// definition, which continues the value with a newline, and the
+        /// line break and indentation after it.
+        fn consume_nmake_caret_newline(&mut self) -> bool {
+            let n = self.tokens.len();
+            if self.variant != Some(MakefileVariant::NMake)
+                || n < 2
+                || self.tokens[n - 1] != (TEXT, "^".to_string())
+                || self.tokens[n - 2].0 != NEWLINE
+            {
+                return false;
+            }
+            self.bump(); // caret
+            self.bump(); // newline
+            if self.current() == Some(INDENT) {
+                self.bump();
+            }
+            true
+        }
+
         fn parse_comment(&mut self) {
             if self.current() == Some(COMMENT) {
                 self.bump(); // Consume the comment token
@@ -2009,7 +2029,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 && self.current() != Some(COMMENT)
             {
                 // The value may continue on the next physical line.
-                if self.consume_line_continuation() {
+                if self.consume_line_continuation() || self.consume_nmake_caret_newline() {
                     continue;
                 }
                 if self.current() == Some(DOLLAR) {
@@ -17940,12 +17960,63 @@ mod test_nmake {
         assert!(!includes[0].is_optional());
         includes[0].clone().set_path("other.mak").unwrap();
         assert_eq!(includes[0].path(), Some("other.mak".to_string()));
-        // TODO: nmake escapes `#` as `^#`, which set_path doesn't write yet.
-        assert!(includes[1].clone().set_path("a#b.mak").is_err());
+        includes[1].clone().set_path("a#b.mak").unwrap();
+        assert_eq!(includes[1].path(), Some("a#b.mak".to_string()));
         assert_eq!(
             makefile.to_string(),
-            "!INCLUDE <other.mak>\n!include config.mak\n"
+            "!INCLUDE <other.mak>\n!include a^#b.mak\n"
         );
+    }
+
+    #[test]
+    fn test_include_caret_escapes() {
+        let code = "!INCLUDE a^#b.mak # c\n!INCLUDE <a^^^#^\\>\n!INCLUDE a^\\\nX = 1\n";
+        let makefile = parse_nmake(code);
+        assert_eq!(makefile.to_string(), code);
+        assert_eq!(
+            makefile.includes().map(|i| i.path()).collect::<Vec<_>>(),
+            vec![
+                Some("a#b.mak".to_string()),
+                Some("a^#\\".to_string()),
+                Some("a\\".to_string()),
+            ]
+        );
+        assert_eq!(makefile.variable_definitions().count(), 1);
+    }
+
+    #[test]
+    fn test_include_set_path_caret_escapes() {
+        for (code, path, expected) in [
+            ("!INCLUDE old.mak\n", "a#b", "!INCLUDE a^#b\n"),
+            ("!INCLUDE <old.mak>\n", "a#b", "!INCLUDE <a^#b>\n"),
+            ("!INCLUDE old.mak\n", "a^#b", "!INCLUDE a^^^#b\n"),
+            ("!INCLUDE old.mak\n", "a^b", "!INCLUDE a^b\n"),
+            ("!INCLUDE old.mak # c\n", "a\\", "!INCLUDE a^\\ # c\n"),
+            ("!INCLUDE old.mak\n", "a\\", "!INCLUDE a^\\\n"),
+        ] {
+            let makefile = parse_nmake(code);
+            let mut include = makefile.includes().next().unwrap();
+            include.set_path(path).unwrap();
+            assert_eq!(makefile.to_string(), expected, "{path:?}");
+            assert_eq!(include.path(), Some(path.to_string()), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn test_include_set_quoted_path_carets() {
+        // Carets in a quoted string are literal, so the path is not escaped.
+        for path in ["a^:b", "a^^b", "a\\"] {
+            let makefile = parse_nmake("!INCLUDE \"old.mak\"\n");
+            let mut include = makefile.includes().next().unwrap();
+            include.set_path(path).unwrap();
+            assert_eq!(makefile.to_string(), format!("!INCLUDE \"{path}\"\n"));
+            assert_eq!(include.path(), Some(path.to_string()), "{path:?}");
+        }
+        // There is no documented way to write a `#` in a quoted string.
+        let makefile = parse_nmake("!INCLUDE \"old.mak\"\n");
+        let mut include = makefile.includes().next().unwrap();
+        assert!(include.set_path("a#b").is_err());
+        assert_eq!(makefile.to_string(), "!INCLUDE \"old.mak\"\n");
     }
 
     #[test]

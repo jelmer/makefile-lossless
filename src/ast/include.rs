@@ -1,6 +1,7 @@
 use super::bsd::{directive_keyword, keyword_token};
 use super::makefile::MakefileItem;
 use super::{collapse_continuations, escape_hashes, logical_text, LineSyntax};
+use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{
     parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
 };
@@ -20,6 +21,28 @@ fn strip_delimiters(path: &str) -> Option<&str> {
         _ => return None,
     };
     rest.find(close).map(|end| &rest[..end])
+}
+
+/// Escape `path` for an nmake `!INCLUDE`: each `#` becomes `^#`, so that
+/// it does not start a comment, a caret that would escape the next
+/// character becomes `^^`, and a trailing backslash becomes `^\` so that
+/// it does not continue the line.
+fn escape_nmake(path: &str) -> String {
+    let mut escaped = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escape = match c {
+            '#' => true,
+            '^' => chars.peek().is_some_and(|n| NMAKE_ESCAPABLE.contains(n)),
+            '\\' => chars.peek().is_none(),
+            _ => false,
+        };
+        if escape {
+            escaped.push('^');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 impl Include {
@@ -75,7 +98,8 @@ impl Include {
     /// expansion.
     ///
     /// Line continuations are collapsed and `\#` is unescaped the way
-    /// BSD make does for `.include` and GNU make otherwise; see
+    /// BSD make does for `.include` and GNU make otherwise, while for an
+    /// nmake `!INCLUDE` escapes such as `^#` are unescaped; see
     /// [`crate::VariableDefinition::value`] and [`Self::path_for`] for
     /// other variants. Variable references and backslashes before
     /// whitespace are kept, since make only handles them after expanding
@@ -266,19 +290,26 @@ impl Include {
             .next_sibling_or_token()
             .is_some_and(|it| it.kind() == COMMENT);
         let nmake = self.prefix() == Some('!');
-        // TODO: Escape `#` for nmake, as `^#`. Until then, a path with `#`
-        // is rejected below since it reads back differently.
-        let mut text = if nmake {
-            new_path.to_string()
-        } else {
-            escape_hashes(new_path, self.is_bsd(), before_comment)
-        };
         // Keep the delimiters of a BSD make or nmake include.
-        if let Some(raw) = self.raw_path().filter(|_| self.has_delimited_path()) {
-            if strip_delimiters(&raw).is_some() {
-                let close = if raw.starts_with('<') { '>' } else { '"' };
-                text = format!("{}{}{}", &raw[..1], text, close);
+        let open = self
+            .raw_path()
+            .filter(|raw| self.has_delimited_path() && strip_delimiters(raw).is_some())
+            .and_then(|raw| raw.chars().next());
+        let mut text = match (nmake, open) {
+            // Carets in an nmake quoted string are literal, so there is no
+            // way to escape a `#`.
+            (true, Some('"')) if new_path.contains('#') => {
+                return Err(error(format!(
+                    "Cannot set a quoted nmake include path containing '#': {new_path}"
+                )));
             }
+            (true, Some('"')) => new_path.to_string(),
+            (true, _) => escape_nmake(new_path),
+            (false, _) => escape_hashes(new_path, self.is_bsd(), before_comment),
+        };
+        if let Some(open) = open {
+            let close = if open == '<' { '>' } else { '"' };
+            text = format!("{open}{text}{close}");
         }
 
         // Parse the directive with the new path, from its keyword (or the

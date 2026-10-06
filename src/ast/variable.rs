@@ -442,8 +442,12 @@ impl VariableDefinition {
     /// - BSD make keeps the whitespace before a line continuation, does not
     ///   halve backslashes, unescapes `\#` and ends the value at `#` even
     ///   inside variable references, and removes trailing whitespace.
-    /// - For nmake, `\#` is not an escape. Its `^` escapes are not
-    ///   supported yet.
+    /// - For nmake, `\#` is not an escape, but a caret before one of
+    ///   ``: ; # ( ) $ ^ \ { } ! @ -`` is, as in `^#`, and a caret at the end
+    ///   of a line continues the value with a newline. Other carets and
+    ///   those in quoted strings are literal. The makefile has to be parsed
+    ///   as nmake for this, since other variants lex `^#` as a caret and a
+    ///   comment.
     ///
     /// # Example
     /// ```
@@ -1676,6 +1680,61 @@ mod tests {
             value_in(MakefileVariant::NMake, "X = a\\#b\n"),
             Some("a\\".to_string())
         );
+    }
+
+    #[test]
+    fn test_value_nmake_caret_escapes() {
+        let nmake_value = |code| value_in(MakefileVariant::NMake, code);
+        assert_eq!(nmake_value("X = a^#b # c\n"), Some("a#b ".to_string()));
+        assert_eq!(nmake_value("X = a^\\\n"), Some("a\\".to_string()));
+        assert_eq!(nmake_value("X = a^^#b\n"), Some("a^".to_string()));
+        assert_eq!(nmake_value("X = ^$(Y)\n"), Some("$(Y)".to_string()));
+        assert_eq!(
+            nmake_value("X = ^:^;^(^)^{^}^!^@^-\n"),
+            Some(":;(){}!@-".to_string())
+        );
+        // A caret before any other character, or in a quoted string, is
+        // literal.
+        assert_eq!(nmake_value("X = a^b\n"), Some("a^b".to_string()));
+        assert_eq!(nmake_value("X = \"a^:b\"\n"), Some("\"a^:b\"".to_string()));
+        assert_eq!(
+            nmake_value("X = \"a^:b\" ^:\n"),
+            Some("\"a^:b\" :".to_string())
+        );
+        // A caret at the end of a line continues a quoted string too.
+        assert_eq!(nmake_value("X = \"a^\nb\"\n"), Some("\"a\nb\"".to_string()));
+    }
+
+    #[test]
+    fn test_value_nmake_caret_newline() {
+        let code = "CMDS = cls^\ndir\nY = 1\n";
+        let makefile = Makefile::parse_with_variant(code, MakefileVariant::NMake).tree();
+        assert_eq!(makefile.to_string(), code);
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(
+            vars.iter()
+                .map(|v| (v.name(), v.value(MakefileVariant::NMake)))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("CMDS".to_string()), Some("cls\ndir".to_string())),
+                (Some("Y".to_string()), Some("1".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_value_caret_not_escape_in_other_variants() {
+        for variant in [
+            MakefileVariant::GNUMake,
+            MakefileVariant::BSDMake,
+            MakefileVariant::POSIXMake,
+        ] {
+            assert_eq!(
+                value_in(variant, "X = a^\\#b\n"),
+                Some("a^#b".to_string()),
+                "{variant:?}"
+            );
+        }
     }
 
     #[test]
