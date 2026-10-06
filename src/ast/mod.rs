@@ -15,7 +15,7 @@ use crate::MakefileVariant;
 use crate::SyntaxKind::{
     self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
     DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
-    LBRACE, LOAD, LPAREN, NEWLINE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
+    LBRACE, LOAD, LPAREN, NEWLINE, PREREQUISITE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
 };
 
 /// Whether `token` is the backslash of a backslash-newline line
@@ -132,10 +132,31 @@ pub(crate) fn with_trailing_newline(node: &SyntaxNode, eol: &str) -> SyntaxNode 
     copy
 }
 
+/// Whether `last`, the last token of a line without a line break, ends in
+/// a backslash that would continue the line if one was added.
+fn ends_in_continuation(last: &SyntaxToken) -> bool {
+    let mut backslashes = 0;
+    let mut token = Some(last.clone());
+    while let Some(t) = token {
+        let run = t.text().chars().rev().take_while(|c| *c == '\\').count();
+        backslashes += run;
+        if run < t.text().chars().count() {
+            break;
+        }
+        token = t.prev_token();
+    }
+    backslashes % 2 == 1
+}
+
 /// Make sure the text before child `index` of `parent` ends in a line
 /// break, so that a new line can be inserted there. If it doesn't, `eol` is
 /// added where the parser would have put it. Returns the index to insert at,
 /// which shifts if the line break was added to `parent` itself.
+///
+/// If the line ends in a backslash, a line break would continue it onto the
+/// inserted line, so a blank line is added as well to end it. GNU make
+/// reads a backslash at the very end of a file literally, so this changes
+/// the value of e.g. `X = a \` at the end of a file from `a \` to `a `.
 pub(crate) fn terminate_line_before(parent: &SyntaxNode, index: usize, eol: &str) -> usize {
     let Some((prev, last)) = parent
         .children_with_tokens()
@@ -157,6 +178,42 @@ pub(crate) fn terminate_line_before(parent: &SyntaxNode, index: usize, eol: &str
         return index;
     }
     let newline = detached_elements(&[(NEWLINE, eol)], None);
+    if ends_in_continuation(&last) {
+        // The line break continuing the line goes with the backslash, as
+        // the parser puts it, and the blank line after it in the item.
+        let mut container = last.parent().expect("token has a parent");
+        // A backslash ending the file is read as part of a prerequisite,
+        // but one before a line break continues the prerequisite list.
+        if container.kind() == PREREQUISITE {
+            let outer = container.parent().expect("prerequisite has a parent");
+            let after = container.index() + 1;
+            last.detach();
+            outer.splice_children(after..after, vec![last.clone().into()]);
+            if container.first_child_or_token().is_none() {
+                container.detach();
+            }
+            container = outer;
+        }
+        if last.kind() == COMMENT {
+            let comment = detached_elements(&[(COMMENT, &format!("{}{eol}", last.text()))], None);
+            container.splice_children(last.index()..last.index() + 1, comment);
+        } else {
+            let after = last.index() + 1;
+            container.splice_children(after..after, detached_elements(&[(NEWLINE, eol)], None));
+        }
+        return match prev {
+            // A blank line after a command belongs to the rule.
+            SyntaxElement::Node(node) if node.kind() != RECIPE => {
+                let len = node.children_with_tokens().count();
+                node.splice_children(len..len, newline);
+                index
+            }
+            _ => {
+                parent.splice_children(index..index, newline);
+                index + 1
+            }
+        };
+    }
     match prev {
         SyntaxElement::Node(mut node) if holds_line_break(node.kind()) => {
             while let Some(child) = node

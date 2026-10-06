@@ -3418,6 +3418,64 @@ VAR3 = value3
     }
 
     #[test]
+    fn test_add_after_unterminated_continuation() {
+        // A newline after the backslash would continue the line onto the
+        // new item, so a blank line ends the continuation.
+        let cases = [
+            ("X = a \\", "X = a \\\n\n"),
+            ("X = a \\\\\\", "X = a \\\\\\\n\n"),
+            ("# c \\", "# c \\\n\n"),
+            ("a: x \\", "a: x \\\n\n"),
+            ("a: x\\", "a: x\\\n\n"),
+            ("a: x \\\\\\", "a: x \\\\\\\n\n"),
+            ("a:\n\techo \\", "a:\n\techo \\\n\n"),
+            ("include a.mk \\", "include a.mk \\\n\n"),
+        ];
+        for (text, expected) in cases {
+            let mut makefile: Makefile = text.parse().unwrap();
+            makefile.add_rule("b");
+            assert_eq!(makefile.to_string(), format!("{expected}b:\n"), "{text:?}");
+
+            let (mut makefile, _) = Makefile::from_str_relaxed(text);
+            let index = makefile.items().count();
+            makefile.insert_include(index, "b.mk").unwrap();
+            assert_eq!(
+                makefile.to_string(),
+                format!("{expected}include b.mk\n"),
+                "{text:?}"
+            );
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_add_after_unterminated_escaped_backslash() {
+        let mut makefile: Makefile = "X = a\\\\".parse().unwrap();
+        makefile.insert_include(1, "b.mk").unwrap();
+        assert_eq!(makefile.to_string(), "X = a\\\\\ninclude b.mk\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_include_after_unterminated_continuation() {
+        let mut makefile: Makefile = "X = a \\".parse().unwrap();
+        makefile.insert_include(1, "b.mk").unwrap();
+        assert_eq!(makefile.to_string(), "X = a \\\n\ninclude b.mk\n");
+        assert_eq!(makefile.includes().count(), 1);
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_push_command_after_unterminated_continuation() {
+        let makefile: Makefile = "a:\n\techo a \\".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.push_command("echo b");
+        assert_eq!(makefile.to_string(), "a:\n\techo a \\\n\n\techo b\n");
+        assert_eq!(rule.recipe_count(), 2);
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
     fn test_add_phony_target_after_unterminated_line() {
         let mut makefile: Makefile = "X = 1".parse().unwrap();
         makefile.add_phony_target("clean").unwrap();
