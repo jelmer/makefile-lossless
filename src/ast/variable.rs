@@ -186,7 +186,7 @@ impl VariableDefinition {
 
     /// Internal: the EXPR node holding the value, which follows the name
     /// (or, for BSD make's empty variable name, the assignment operator).
-    fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
+    pub(crate) fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
         let name_end = match self.name_elements().last() {
             Some(element) => element.index(),
             None => self
@@ -1881,5 +1881,113 @@ mod tests {
     #[test]
     fn test_define_variable_references_not_define() {
         assert_eq!(define_references("E = $(FOO)\n"), vec![]);
+    }
+
+    fn name_references(text: &str) -> Vec<(String, Option<String>, std::ops::Range<usize>)> {
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.code(), text);
+        makefile
+            .variable_references()
+            .map(|r| {
+                (
+                    r.syntax().text().to_string(),
+                    r.name(),
+                    r.syntax().text_range().into(),
+                )
+            })
+            .collect()
+    }
+
+    fn define_name(text: &str) -> (Option<String>, Option<std::ops::Range<usize>>) {
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_define());
+        (var.name(), var.name_range().map(Into::into))
+    }
+
+    #[test]
+    fn test_define_name_references() {
+        let r = |text: &str, name: &str, range: std::ops::Range<usize>| {
+            (text.to_string(), Some(name.to_string()), range)
+        };
+        assert_eq!(
+            name_references("define $(A) =\nbody\nendef\n"),
+            vec![r("$(A)", "A", 7..11)]
+        );
+        assert_eq!(
+            name_references("define $(PREFIX)_FLAGS\nbody\nendef\n"),
+            vec![r("$(PREFIX)", "PREFIX", 7..16)]
+        );
+        assert_eq!(
+            name_references("define ${A}.${B}\nbody\nendef\n"),
+            vec![r("${A}", "A", 7..11), r("${B}", "B", 12..16)]
+        );
+        assert_eq!(
+            name_references("override define $(A)\nbody\nendef\n"),
+            vec![r("$(A)", "A", 16..20)]
+        );
+        assert_eq!(
+            name_references("export define $(A) :=\nbody\nendef\n"),
+            vec![r("$(A)", "A", 14..18)]
+        );
+        assert_eq!(
+            name_references("define $(A) \\\n $(B)\nbody\nendef\n"),
+            vec![r("$(A)", "A", 7..11), r("$(B)", "B", 15..19)]
+        );
+        // References in the body are left to define_variable_references.
+        assert_eq!(
+            name_references("define $(A)\n$(B)\nendef\n"),
+            vec![r("$(A)", "A", 7..11)]
+        );
+        // Consistent with an ordinary assignment.
+        assert_eq!(name_references("$(A)_X = 1\n"), vec![r("$(A)", "A", 0..4)]);
+        assert_eq!(
+            name_references("override $(A) = 1\n"),
+            vec![r("$(A)", "A", 9..13)]
+        );
+    }
+
+    #[test]
+    fn test_define_name_with_references() {
+        for (text, name, range) in [
+            ("define $(A) =\nbody\nendef\n", "$(A)", 7..11),
+            (
+                "define $(PREFIX)_FLAGS\nbody\nendef\n",
+                "$(PREFIX)_FLAGS",
+                7..22,
+            ),
+            ("define ${A}.${B}\nbody\nendef\n", "${A}.${B}", 7..16),
+            ("override define $(A)\nbody\nendef\n", "$(A)", 16..20),
+            ("export define $(A) :=\nbody\nendef\n", "$(A)", 14..18),
+            ("define $(A) B\nbody\nendef\n", "$(A) B", 7..13),
+            ("define $(A) \\\n $(B)\nbody\nendef\n", "$(A) $(B)", 7..19),
+            ("define $(A) B =\nbody\nendef\n", "$(A) B =", 7..15),
+        ] {
+            assert_eq!(
+                define_name(text),
+                (Some(name.to_string()), Some(range)),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_define_name_references_keep_body() {
+        let text = "export define $(A) :=\n$(B)\nendef\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert!(var.is_export());
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+        assert_eq!(var.raw_value(), Some("$(B)\n".to_string()));
+        assert_eq!(define_references(text), vec![("B".to_string(), 24..25)]);
+    }
+
+    #[test]
+    fn test_define_rename_name_with_reference() {
+        let makefile: Makefile = "define $(A)_X =\nbody\nendef\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_name("C");
+        assert_eq!(var.name(), Some("C".to_string()));
+        assert_eq!(makefile.code(), "define C =\nbody\nendef\n");
     }
 }
