@@ -3296,9 +3296,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// - `vpath PATTERN`      - clear the search path for PATTERN
         /// - `vpath`              - clear every `vpath` setting
         ///
-        /// Produces a `VPATH` node containing the keyword token, optional
-        /// pattern (as an IDENTIFIER) and an optional EXPR holding the
-        /// directory list.
+        /// Produces a `VPATH` node containing the keyword token, the
+        /// optional pattern's tokens and an optional EXPR holding the
+        /// directory list. Variable references in either are nested EXPR
+        /// nodes.
         fn parse_vpath(&mut self) {
             self.in_rule = RuleContext::Outside;
             self.builder.start_node(VPATH.into());
@@ -3313,6 +3314,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     match kind {
                         WHITESPACE | NEWLINE | COMMENT => break,
                         BACKSLASH if self.is_line_continuation() => break,
+                        DOLLAR => self.parse_variable_reference(),
                         _ => self.bump(),
                     }
                 }
@@ -3333,6 +3335,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             {
                                 break
                             }
+                            Some(DOLLAR) => self.parse_variable_reference(),
                             _ => {
                                 if !self.consume_line_continuation() {
                                     self.bump();

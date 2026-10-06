@@ -1,7 +1,7 @@
 //! Accessors for `vpath` directives.
 
 use super::{is_continuation, logical_text, LineSyntax};
-use crate::lossless::Vpath;
+use crate::lossless::{SyntaxElement, Vpath};
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -15,44 +15,32 @@ impl Vpath {
     ///
     /// `\#` is unescaped as GNU make does.
     pub fn pattern(&self) -> Option<String> {
-        // Walk tokens: skip the leading `vpath` keyword and whitespace,
-        // then collect tokens up to the next whitespace or to the EXPR
-        // (directories) node.
-        let mut after_keyword = false;
-        let mut tokens = Vec::new();
-        for child in self.syntax().children_with_tokens() {
-            match child {
-                rowan::NodeOrToken::Token(t) => {
-                    if !after_keyword {
-                        if t.kind() == IDENTIFIER && t.text() == "vpath" {
-                            after_keyword = true;
-                        }
-                        continue;
-                    }
-                    if t.kind() == WHITESPACE || is_continuation(&t.clone().into()) {
-                        if tokens.is_empty() {
-                            continue;
-                        } else {
-                            break;
-                        }
-                    }
-                    if matches!(t.kind(), NEWLINE | COMMENT) {
-                        break;
-                    }
-                    tokens.push(t);
-                }
-                rowan::NodeOrToken::Node(_) => {
-                    // The EXPR (directories) node marks the end of the
-                    // pattern.
-                    break;
-                }
-            }
+        let elements = self.pattern_elements();
+        if elements.is_empty() {
+            return None;
         }
-        if tokens.is_empty() {
-            None
-        } else {
-            Some(logical_text(self.syntax(), tokens, LineSyntax::Gnu, true))
-        }
+        let tokens = elements.into_iter().flat_map(|it| match it {
+            rowan::NodeOrToken::Token(t) => vec![t],
+            rowan::NodeOrToken::Node(n) => n
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .collect(),
+        });
+        Some(logical_text(self.syntax(), tokens, LineSyntax::Gnu, true))
+    }
+
+    /// The tokens and variable reference nodes making up the pattern: those
+    /// after the `vpath` keyword up to the next whitespace.
+    fn pattern_elements(&self) -> Vec<SyntaxElement> {
+        self.syntax()
+            .children_with_tokens()
+            .skip_while(|it| !(it.kind() == IDENTIFIER && it.to_string() == "vpath"))
+            .skip(1)
+            .skip_while(|it| it.kind() == WHITESPACE || is_continuation(it))
+            .take_while(|it| {
+                !matches!(it.kind(), WHITESPACE | NEWLINE | COMMENT) && !is_continuation(it)
+            })
+            .collect()
     }
 
     /// Returns the directory-list text (everything after the pattern,
@@ -88,9 +76,10 @@ impl Vpath {
     }
 
     fn directories_text_with(&self, syntax: LineSyntax) -> Option<String> {
+        let pattern_end = self.pattern_elements().last()?.index();
         self.syntax()
             .children()
-            .find(|c| c.kind() == EXPR)
+            .find(|c| c.kind() == EXPR && c.index() > pattern_end)
             .map(|n| {
                 let tokens = n.descendants_with_tokens().filter_map(|it| it.into_token());
                 logical_text(&n, tokens, syntax, true)
@@ -118,6 +107,144 @@ mod tests {
             .descendants()
             .find_map(Vpath::cast)
             .expect("no VPATH node")
+    }
+
+    fn references(input: &str) -> Vec<(String, Option<String>, std::ops::Range<u32>)> {
+        let makefile = parse(input, None).root();
+        assert_eq!(makefile.syntax().to_string(), input);
+        makefile
+            .variable_references()
+            .map(|r| {
+                let range = r.syntax().text_range();
+                (
+                    r.syntax().to_string(),
+                    r.name(),
+                    range.start().into()..range.end().into(),
+                )
+            })
+            .collect()
+    }
+
+    fn reference(
+        text: &str,
+        name: &str,
+        range: std::ops::Range<u32>,
+    ) -> (String, Option<String>, std::ops::Range<u32>) {
+        (text.to_string(), Some(name.to_string()), range)
+    }
+
+    #[test]
+    fn test_references_in_directories() {
+        let code = "vpath %.c $(A) $(B)\n";
+        assert_eq!(
+            references(code),
+            vec![
+                reference("$(A)", "A", 10..14),
+                reference("$(B)", "B", 15..19)
+            ]
+        );
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.pattern(), Some("%.c".to_string()));
+        assert_eq!(vpath.directories_text(), Some("$(A) $(B)".to_string()));
+    }
+
+    #[test]
+    fn test_reference_in_pattern() {
+        let code = "vpath $(P) dir\n";
+        assert_eq!(references(code), vec![reference("$(P)", "P", 6..10)]);
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.pattern(), Some("$(P)".to_string()));
+        assert_eq!(vpath.directories_text(), Some("dir".to_string()));
+    }
+
+    #[test]
+    fn test_references_joined_by_colon() {
+        let code = "vpath %.h $(INC):$(OTHER)\n";
+        assert_eq!(
+            references(code),
+            vec![
+                reference("$(INC)", "INC", 10..16),
+                reference("$(OTHER)", "OTHER", 17..25)
+            ]
+        );
+        assert_eq!(
+            vpath_of(code).directories_text(),
+            Some("$(INC):$(OTHER)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_references_in_pattern_and_directories() {
+        let code = "vpath ${P} $(D)/sub\n";
+        assert_eq!(
+            references(code),
+            vec![
+                reference("${P}", "P", 6..10),
+                reference("$(D)", "D", 11..15)
+            ]
+        );
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.pattern(), Some("${P}".to_string()));
+        assert_eq!(vpath.directories_text(), Some("$(D)/sub".to_string()));
+    }
+
+    #[test]
+    fn test_reference_as_only_pattern() {
+        let code = "vpath $(P)\n";
+        assert_eq!(references(code), vec![reference("$(P)", "P", 6..10)]);
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.pattern(), Some("$(P)".to_string()));
+        assert_eq!(vpath.directories_text(), None);
+    }
+
+    #[test]
+    fn test_nested_references() {
+        let code = "vpath %$(S) $(addprefix $(R)/,a b) # c\n";
+        assert_eq!(
+            references(code),
+            vec![
+                reference("$(S)", "S", 7..11),
+                reference("$(addprefix $(R)/,a b)", "addprefix", 12..34),
+                reference("$(R)", "R", 24..28),
+            ]
+        );
+        let vpath = vpath_of(code);
+        assert_eq!(vpath.pattern(), Some("%$(S)".to_string()));
+        assert_eq!(
+            vpath.directories_text(),
+            Some("$(addprefix $(R)/,a b)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_references_in_vpath_variable() {
+        assert_eq!(
+            references("VPATH = $(A) $(B)\n"),
+            vec![
+                reference("$(A)", "A", 8..12),
+                reference("$(B)", "B", 13..17)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reference_tree() {
+        let vpath = vpath_of("vpath $(P) $(D)\n");
+        assert_eq!(
+            vpath
+                .syntax()
+                .children_with_tokens()
+                .map(|c| c.kind())
+                .collect::<Vec<_>>(),
+            vec![IDENTIFIER, WHITESPACE, EXPR, WHITESPACE, EXPR, NEWLINE]
+        );
+        let dirs = vpath.syntax().children().nth(1).unwrap();
+        assert_eq!(
+            dirs.children_with_tokens()
+                .map(|c| c.kind())
+                .collect::<Vec<_>>(),
+            vec![EXPR]
+        );
     }
 
     #[test]
