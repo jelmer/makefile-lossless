@@ -3602,21 +3602,53 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(FOR_HEADER.into());
             self.bump_n(count);
             self.skip_ws_and_continuations();
+            // Like BSD make, take each word up to `in` as a variable,
+            // whatever characters it consists of, as in `.for , in 1`.
             let mut found_variable = false;
-            while self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 != "in" {
+            let mut valid = true;
+            loop {
+                // A line continuation also ends the word.
+                let mut word_len = 0;
+                for i in (0..self.tokens.len()).rev() {
+                    let kind = self.tokens[i].0;
+                    let continuation =
+                        kind == BACKSLASH && i > 0 && self.tokens[i - 1].0 == NEWLINE;
+                    if matches!(kind, WHITESPACE | INDENT | NEWLINE | COMMENT) || continuation {
+                        break;
+                    }
+                    word_len += 1;
+                }
+                let word: String = self.tokens[self.tokens.len() - word_len..]
+                    .iter()
+                    .rev()
+                    .map(|(_, text)| text.as_str())
+                    .collect();
+                if word.is_empty() || word == "in" {
+                    break;
+                }
+                if let Some(c) = word.chars().find(|c| "$:\\(){}".contains(*c)) {
+                    self.record_error(
+                        ParseErrorKind::InvalidForLoop,
+                        format!("Invalid character \"{c}\" in .for loop variable name"),
+                    );
+                    valid = false;
+                    break;
+                }
                 found_variable = true;
-                self.bump();
+                self.tokens.truncate(self.tokens.len() - word_len);
+                self.pending_backslash_escape = false;
+                self.builder.token(IDENTIFIER.into(), &word);
                 self.skip_ws_and_continuations();
             }
-            if !found_variable {
+            if valid && !found_variable {
                 self.record_error(
                     ParseErrorKind::InvalidForLoop,
                     "expected variable name after .for".to_string(),
                 );
             }
-            if self.current() == Some(IDENTIFIER) {
+            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "in" {
                 self.bump();
-            } else {
+            } else if valid {
                 self.record_error(
                     ParseErrorKind::InvalidForLoop,
                     "expected 'in' in .for".to_string(),

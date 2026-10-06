@@ -1249,4 +1249,39 @@ mod tests {
             assert_eq!(parsed.tree().to_string(), code);
         }
     }
+
+    #[test]
+    fn test_for_variable_names() {
+        // BSD make takes any word without `$ : \\ ( ) { }` as a loop
+        // variable, as in NetBSD make's directive-for-escape.mk.
+        for (code, variables) in [
+            (".for , in 1\nX+=$,\n.endfor\n", vec![","]),
+            (".for a=b c.d in 1 2\n.endfor\n", vec!["a=b", "c.d"]),
+            (".for a\\\n  b in 1 2\n.endfor\n", vec!["a", "b"]),
+        ] {
+            let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+            assert_eq!(parsed.errors(), &[], "{code:?}");
+            let makefile = parsed.tree();
+            let Some(MakefileItem::ForLoop(for_loop)) = makefile.items().next() else {
+                panic!("{code:?}");
+            };
+            assert_eq!(for_loop.variables(), variables, "{code:?}");
+            assert_eq!(makefile.to_string(), code);
+        }
+        for (code, message) in [
+            (
+                ".for a:b in 1\n.endfor\n",
+                "Invalid character \":\" in .for loop variable name",
+            ),
+            (
+                ".for $$ in 1\n.endfor\n",
+                "Invalid character \"$\" in .for loop variable name",
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
+            let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(messages, vec![message], "{code:?}");
+            assert_eq!(parsed.tree().to_string(), code);
+        }
+    }
 }
