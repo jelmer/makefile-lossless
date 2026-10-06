@@ -52,6 +52,14 @@ pub struct Lexer<'a> {
     // TODO: Check whether nmake starts a comment at a `#` in a quoted
     // string; its documentation doesn't say.
     nmake_quoted: bool,
+    /// For nmake, the number of inline files still to read, from the `<<`
+    /// in the last command line.
+    nmake_inline_files: usize,
+    /// Whether no token has been read yet on the current logical line.
+    line_start: bool,
+    /// Whether the current logical line so far is a `.` at its start,
+    /// optionally followed by whitespace, so that a directive name follows.
+    after_directive_dot: bool,
 }
 
 /// The characters that nmake takes literally after a `^`.
@@ -81,6 +89,9 @@ impl<'a> Lexer<'a> {
             line: Some(String::new()),
             nmake_definition: None,
             nmake_quoted: false,
+            nmake_inline_files: 0,
+            line_start: true,
+            after_directive_dot: false,
         }
     }
 
@@ -169,6 +180,18 @@ impl<'a> Lexer<'a> {
             && probe.next() == Some('\n')
     }
 
+    /// Read the rest of a recipe line as text, noting whether it continues
+    /// on the next line.
+    fn read_recipe_text(&mut self) -> (SyntaxKind, String) {
+        let text = self.read_line();
+        let trailing_backslashes = text.chars().rev().take_while(|&c| c == '\\').count();
+        self.recipe_continuation = trailing_backslashes % 2 == 1;
+        if self.nmake {
+            self.nmake_inline_files += text.matches("<<").count();
+        }
+        (SyntaxKind::TEXT, text)
+    }
+
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
@@ -183,6 +206,47 @@ impl<'a> Lexer<'a> {
             result.push(c);
         }
         result
+    }
+
+    /// For BSD make, the length of the identifier starting with `c` up to
+    /// the end of a conditional directive name, if the name is followed by
+    /// something other than a letter. BSD make reads the name up to the
+    /// first non-letter, so `.if0` is `.if 0`.
+    fn bsd_conditional_name_len(&self, c: char) -> Option<usize> {
+        if !self.bsd || self.gnu {
+            return None;
+        }
+        let skip = if self.line_start && c == '.' {
+            1
+        } else if self.after_directive_dot {
+            0
+        } else {
+            return None;
+        };
+        let word: String = self
+            .input
+            .clone()
+            .take_while(|&c| Self::is_valid_identifier_char(c))
+            .collect();
+        let rest = &word[skip..];
+        let name_len = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let conditional = matches!(
+            &rest[..name_len],
+            "if" | "ifdef"
+                | "ifndef"
+                | "ifmake"
+                | "ifnmake"
+                | "elif"
+                | "elifdef"
+                | "elifndef"
+                | "elifmake"
+                | "elifnmake"
+                | "else"
+                | "endif"
+        );
+        (conditional && name_len < rest.len()).then_some(skip + name_len)
     }
 
     fn is_valid_identifier_char(c: char) -> bool {
@@ -241,6 +305,16 @@ impl<'a> Lexer<'a> {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
             match (c, self.line_type) {
+                (_, None) if self.nmake_inline_files > 0 && !self.at_newline() => {
+                    // A line of an nmake inline file, up to a line starting
+                    // with `<<`.
+                    self.line_type = Some(LineType::Recipe);
+                    let text = self.read_line();
+                    if text.starts_with("<<") {
+                        self.nmake_inline_files -= 1;
+                    }
+                    return Some((SyntaxKind::TEXT, text));
+                }
                 (c, None) if c == self.recipe_prefix && c != '\t' && !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
@@ -270,6 +344,12 @@ impl<'a> Lexer<'a> {
                     // nmake command line, which may start with spaces.
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, self.read_while(|ch| ch == ' ')));
+                }
+                (_, None) if recipe_continuation && !self.at_newline() => {
+                    // An unindented continuation of a recipe line, which
+                    // make passes on to the shell as is, `#` included.
+                    self.line_type = Some(LineType::Recipe);
+                    return Some(self.read_recipe_text());
                 }
                 (' ', None) if !self.continuation => {
                     // Only a tab introduces a recipe line; leading spaces are
@@ -310,21 +390,18 @@ impl<'a> Lexer<'a> {
             }
 
             match self.line_type.unwrap() {
-                LineType::Recipe => {
-                    let text = self.read_line();
-                    let trailing_backslashes =
-                        text.chars().rev().take_while(|&c| c == '\\').count();
-                    self.recipe_continuation = trailing_backslashes % 2 == 1;
-                    Some((SyntaxKind::TEXT, text))
-                }
+                LineType::Recipe => Some(self.read_recipe_text()),
                 LineType::Other => match c {
                     c if self.is_word_separator(c) => {
                         Some((SyntaxKind::WHITESPACE, self.read_word_separators()))
                     }
-                    c if Self::is_valid_identifier_char(c) => Some((
-                        SyntaxKind::IDENTIFIER,
-                        self.read_while(Self::is_valid_identifier_char),
-                    )),
+                    c if Self::is_valid_identifier_char(c) => {
+                        let text = match self.bsd_conditional_name_len(c) {
+                            Some(len) => self.input.by_ref().take(len).collect(),
+                            None => self.read_while(Self::is_valid_identifier_char),
+                        };
+                        Some((SyntaxKind::IDENTIFIER, text))
+                    }
                     // Make does not treat quotes specially when reading a
                     // line, so each quote is a token of its own.
                     '"' | '\'' => {
@@ -478,6 +555,12 @@ impl Iterator for Lexer<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let token = self.next_token()?;
+        let at_line_start = std::mem::replace(&mut self.line_start, false);
+        self.after_directive_dot = match token.0 {
+            SyntaxKind::IDENTIFIER => at_line_start && token.1 == ".",
+            SyntaxKind::WHITESPACE => self.after_directive_dot,
+            _ => false,
+        };
         if self.gnu {
             if self.line_type == Some(LineType::Recipe) {
                 self.line = None;
@@ -500,6 +583,7 @@ impl Iterator for Lexer<'_> {
                 self.reference_depth = self.reference_depth.saturating_sub(1)
             }
             SyntaxKind::NEWLINE if !self.continuation => {
+                self.line_start = true;
                 self.reference_depth = 0;
                 self.nmake_definition = None;
                 self.nmake_quoted = false;

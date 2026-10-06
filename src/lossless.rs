@@ -534,6 +534,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.bump();
 
             // Parse the recipe content, handling line continuations (backslash at end of line)
+            let mut inline_files = 0;
             loop {
                 let mut last_text_content: Option<String> = None;
 
@@ -542,6 +543,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // Save the text content if this is a TEXT token
                     if self.current() == Some(TEXT) {
                         if let Some((_kind, text)) = self.tokens.last() {
+                            if self.variant == Some(MakefileVariant::NMake) {
+                                inline_files += text.matches("<<").count();
+                            }
                             last_text_content = Some(text.clone());
                         }
                     }
@@ -554,24 +558,51 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
 
                 // Check if the last TEXT token ended with a backslash (continuation)
-                let is_continuation = last_text_content
-                    .as_ref()
-                    .map(|text| text.trim_end_matches([' ', '\t']).ends_with('\\'))
-                    .unwrap_or(false);
+                // Like the lexer, only an odd number of backslashes continues
+                // the line; `\\\\` is an escaped backslash.
+                let is_continuation = last_text_content.as_ref().is_some_and(|text| {
+                    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+                });
 
                 if is_continuation {
-                    // This is a continuation line - consume the indent of the next line and continue
-                    if self.current() == Some(INDENT) {
-                        self.bump();
-                        // Continue parsing the next line
-                        continue;
-                    } else {
-                        // If there's no indent after a backslash, that's unusual but we'll stop here
-                        break;
+                    // This is a continuation line - consume the indent of the next line, if
+                    // any, and continue
+                    match self.current() {
+                        Some(INDENT) => {
+                            self.bump();
+                            continue;
+                        }
+                        Some(TEXT) => continue,
+                        _ => break,
                     }
                 } else {
                     // No continuation - we're done
                     break;
+                }
+            }
+
+            // Each `<<` in an nmake command starts an inline file, whose
+            // lines run up to a line starting with `<<`.
+            while inline_files > 0 {
+                match self.current() {
+                    Some(TEXT) => {
+                        if self.tokens.last().unwrap().1.starts_with("<<") {
+                            inline_files -= 1;
+                        }
+                        self.bump();
+                        if self.current() == Some(NEWLINE) {
+                            self.bump();
+                        }
+                    }
+                    Some(NEWLINE) => self.bump(),
+                    None => {
+                        self.record_error(
+                            ParseErrorKind::Other,
+                            "unterminated inline file (missing <<)".to_string(),
+                        );
+                        break;
+                    }
+                    _ => break,
                 }
             }
 
@@ -2061,7 +2092,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         return true
                     }
-                    Some(DOLLAR) => self.parse_variable_reference(),
+                    Some(DOLLAR) => {
+                        // Parse_IsVar counts the parentheses and braces in
+                        // expressions too, although make may end an
+                        // expression before its braces balance, as in
+                        // `${:UVAR{value}}`.
+                        let start = usize::from(self.current_range().start());
+                        self.parse_variable_reference();
+                        let end = usize::from(self.current_range().start());
+                        level += self.original_text[start..end]
+                            .chars()
+                            .map(|c| match c {
+                                '(' | '{' => 1,
+                                ')' | '}' => -1,
+                                _ => 0,
+                            })
+                            .sum::<isize>();
+                    }
                     Some(kind) => {
                         match kind {
                             LPAREN | LBRACE => level += 1,
@@ -2339,7 +2386,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                     }
 
-                    if is_function {
+                    if self.at_nmake_substitution() {
+                        // nmake's substitution strings can't invoke macros,
+                        // so the reference ends at the first `)`.
+                        loop {
+                            match self.current() {
+                                Some(RPAREN) => {
+                                    self.bump();
+                                    break;
+                                }
+                                Some(NEWLINE) | None => {
+                                    self.record_error(
+                                        ParseErrorKind::UnclosedReference,
+                                        "unclosed variable reference".to_string(),
+                                    );
+                                    break;
+                                }
+                                Some(_) => self.bump(),
+                            }
+                        }
+                    } else if is_function {
                         // Preserve the function name
                         self.bump();
 
@@ -2377,6 +2443,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
+        }
+
+        /// Whether the tokens after `$(` are an nmake macro substitution,
+        /// `name:string1=string2`.
+        fn at_nmake_substitution(&self) -> bool {
+            let n = self.tokens.len();
+            self.variant == Some(MakefileVariant::NMake)
+                && n >= 2
+                && matches!(self.tokens[n - 1].0, IDENTIFIER | TEXT)
+                && self.tokens[n - 2].0 == OPERATOR
+                && self.tokens[n - 2].1.starts_with(':')
         }
 
         // Helper method to parse a conditional comparison (ifeq/ifneq)
@@ -3584,21 +3661,53 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(FOR_HEADER.into());
             self.bump_n(count);
             self.skip_ws_and_continuations();
+            // Like BSD make, take each word up to `in` as a variable,
+            // whatever characters it consists of, as in `.for , in 1`.
             let mut found_variable = false;
-            while self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 != "in" {
+            let mut valid = true;
+            loop {
+                // A line continuation also ends the word.
+                let mut word_len = 0;
+                for i in (0..self.tokens.len()).rev() {
+                    let kind = self.tokens[i].0;
+                    let continuation =
+                        kind == BACKSLASH && i > 0 && self.tokens[i - 1].0 == NEWLINE;
+                    if matches!(kind, WHITESPACE | INDENT | NEWLINE | COMMENT) || continuation {
+                        break;
+                    }
+                    word_len += 1;
+                }
+                let word: String = self.tokens[self.tokens.len() - word_len..]
+                    .iter()
+                    .rev()
+                    .map(|(_, text)| text.as_str())
+                    .collect();
+                if word.is_empty() || word == "in" {
+                    break;
+                }
+                if let Some(c) = word.chars().find(|c| "$:\\(){}".contains(*c)) {
+                    self.record_error(
+                        ParseErrorKind::InvalidForLoop,
+                        format!("Invalid character \"{c}\" in .for loop variable name"),
+                    );
+                    valid = false;
+                    break;
+                }
                 found_variable = true;
-                self.bump();
+                self.tokens.truncate(self.tokens.len() - word_len);
+                self.pending_backslash_escape = false;
+                self.builder.token(IDENTIFIER.into(), &word);
                 self.skip_ws_and_continuations();
             }
-            if !found_variable {
+            if valid && !found_variable {
                 self.record_error(
                     ParseErrorKind::InvalidForLoop,
                     "expected variable name after .for".to_string(),
                 );
             }
-            if self.current() == Some(IDENTIFIER) {
+            if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "in" {
                 self.bump();
-            } else {
+            } else if valid {
                 self.record_error(
                     ParseErrorKind::InvalidForLoop,
                     "expected 'in' in .for".to_string(),
@@ -18397,5 +18506,70 @@ mod test_nmake {
         let mut out = String::new();
         walk(node, 0, &mut out);
         out
+    }
+
+    #[test]
+    fn test_inline_files() {
+        // As in libisc.mak: the lines after a command with `<<` up to a
+        // line starting with `<<` are the text of an inline file.
+        let code = "\
+a.dll : a.obj
+    link @<<
+  /out:a.dll a.obj
+<<
+    echo done
+
+a.rc : a.manifest
+    type <<$@ <<b.txt
+#include <winuser.h>
+1RT_MANIFEST \"a.manifest\"
+<< KEEP
+x: y
+<<NOKEEP
+";
+        let makefile = parse_nmake(code);
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].recipes().collect::<Vec<_>>(),
+            vec!["link @<<\n  /out:a.dll a.obj\n<<", "echo done"]
+        );
+        assert_eq!(
+            rules[1].recipes().collect::<Vec<_>>(),
+            vec!["type <<$@ <<b.txt\n#include <winuser.h>\n1RT_MANIFEST \"a.manifest\"\n<< KEEP\nx: y\n<<NOKEEP"]
+        );
+
+        let code = "a:\n    type <<\ntext\n";
+        let parsed = Makefile::parse_with_variant(code, MakefileVariant::NMake);
+        let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["unterminated inline file (missing <<)"]);
+        assert_eq!(parsed.tree().to_string(), code);
+    }
+
+    #[test]
+    fn test_substitution_strings_are_literal() {
+        // nmake's "string1 and string2 can't invoke macros", so a
+        // substitution ends at the first `)`, as in c-ares' Makefile.msvc.
+        let makefile = parse_nmake("X = $(SRCS: = $(DIR)\\)\nY = $(SRCS:.c=.obj)\n");
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+        let references = |v: &VariableDefinition| -> Vec<String> {
+            v.syntax()
+                .descendants()
+                .filter(|n| {
+                    n.kind() == EXPR
+                        && n.parent().is_some_and(|p| p.kind() == EXPR)
+                        && n.first_token().is_some_and(|t| t.kind() == DOLLAR)
+                })
+                .map(|n| n.text().to_string())
+                .collect()
+        };
+        assert_eq!(references(&vars[0]), vec!["$(SRCS: = $(DIR)"]);
+        assert_eq!(references(&vars[1]), vec!["$(SRCS:.c=.obj)"]);
+
+        // Functions may contain references.
+        let makefile = parse_nmake("X = $(subst $(A),b,c)\n");
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(references(&var), vec!["$(subst $(A),b,c)", "$(A)"]);
     }
 }

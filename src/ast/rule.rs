@@ -3014,4 +3014,47 @@ mod tests {
         assert!(rule.set_prerequisites(vec!["c;d"]).is_err());
         assert_eq!(makefile.to_string(), "a: b\n");
     }
+
+    #[test]
+    fn test_recipe_continuation_lines_without_indent() {
+        // As in intel-ipsec-mb's LibTestApp/Makefile. Both makes run
+        // `echo a b,c,# d` (GNU make) as one command.
+        let text = "style:\n\techo a \\\nb,\\\nc,\\\n# d\nall:\n";
+        for variant in [
+            crate::MakefileVariant::GNUMake,
+            crate::MakefileVariant::BSDMake,
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert_eq!(parsed.errors(), &[], "{variant:?}");
+            let makefile = parsed.tree();
+            let rules: Vec<_> = makefile.rules().collect();
+            assert_eq!(rules.len(), 2, "{variant:?}");
+            assert_eq!(
+                rules[0].recipes().collect::<Vec<_>>(),
+                vec!["echo a \\\nb,\\\nc,\\\n# d"],
+                "{variant:?}"
+            );
+            assert_eq!(makefile.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn test_recipe_line_ending_in_escaped_backslash() {
+        // As in NetBSD make's escape.mk: both makes run two commands.
+        let text = "x:\n\techo two\\\\\n\techo three\\\\\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo two\\\\", "echo three\\\\"]
+        );
+
+        // A backslash followed by a space doesn't continue the line either.
+        let makefile: Makefile = "x:\n\techo a \\ \n\techo b\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["echo a \\ ", "echo b"]
+        );
+    }
 }
