@@ -961,6 +961,7 @@ mod tests {
 
     use super::{ConditionalBranch, ConditionalItem};
     use crate::lossless::Makefile;
+    use crate::test_util::{assert_matches_reparse, item_without_newline};
     use crate::{
         BsdComparisonOp, BsdCondition, BsdConditionError, BsdConditionErrorKind, BsdFunction,
         BsdOperand, MakefileItem, MakefileVariant, ParseErrorKind, RuleItem,
@@ -1785,5 +1786,454 @@ endif
             branch.bsd_condition(),
             Some(crate::parse_bsd_condition("${A:S/a/b/  :S/c/d/} == x"))
         );
+    }
+
+    #[test]
+    fn test_conditionals_iterator() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+
+ifndef RELEASE
+OTHER = dev
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditionals: Vec<_> = makefile.conditionals().collect();
+        assert_eq!(conditionals.len(), 2);
+
+        assert_eq!(
+            conditionals[0].conditional_type(),
+            Some("ifdef".to_string())
+        );
+        assert_eq!(
+            conditionals[1].conditional_type(),
+            Some("ifndef".to_string())
+        );
+    }
+
+    #[test]
+    fn test_conditional_type_and_condition() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+        assert_eq!(conditional.condition(), Some("DEBUG".to_string()));
+    }
+
+    #[test]
+    fn test_conditional_has_else() {
+        let makefile_with_else: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile_with_else.conditionals().next().unwrap();
+        assert!(conditional.has_else());
+
+        let makefile_without_else: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile_without_else.conditionals().next().unwrap();
+        assert!(!conditional.has_else());
+    }
+
+    #[test]
+    fn test_conditional_if_body() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        let if_body = conditional.if_body();
+        assert!(if_body.is_some());
+        assert!(if_body.unwrap().contains("VAR = debug"));
+    }
+
+    #[test]
+    fn test_conditional_else_body() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let conditional = makefile.conditionals().next().unwrap();
+        let else_body = conditional.else_body();
+        assert!(else_body.is_some());
+        assert!(else_body.unwrap().contains("VAR = release"));
+    }
+
+    #[test]
+    fn test_add_else_item_to_unterminated_conditional() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\nY = 1");
+        let item = "Y = 2\n"
+            .parse::<Makefile>()
+            .unwrap()
+            .items()
+            .next()
+            .unwrap();
+        makefile.conditionals().next().unwrap().add_else_item(item);
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nelse\nY = 2\n");
+    }
+
+    #[test]
+    fn test_add_endif_after_unterminated_line() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\nY = 1");
+        assert!(makefile.conditionals().next().unwrap().add_endif().unwrap());
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_endif_after_unterminated_rule() {
+        let (makefile, _) = Makefile::from_str_relaxed("ifdef X\na:");
+        assert!(makefile.conditionals().next().unwrap().add_endif().unwrap());
+        assert_eq!(makefile.to_string(), "ifdef X\na:\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_api_integration() {
+        // Create a makefile with a rule and a variable
+        let mut makefile: Makefile = r#"VAR1 = value1
+
+rule1:
+	command1
+"#
+        .parse()
+        .unwrap();
+
+        // Add a conditional
+        makefile
+            .add_conditional("ifdef", "DEBUG", "CFLAGS += -g\n", Some("CFLAGS += -O2\n"))
+            .unwrap();
+
+        // Verify the conditional was added
+        assert_eq!(makefile.conditionals().count(), 1);
+        let conditional = makefile.conditionals().next().unwrap();
+        assert_eq!(conditional.conditional_type(), Some("ifdef".to_string()));
+        assert_eq!(conditional.condition(), Some("DEBUG".to_string()));
+        assert!(conditional.has_else());
+
+        // Verify the original content is preserved
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_if_items() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one rule
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Rule(r) => {
+                assert!(r.targets().any(|t| t == "rule"));
+            }
+            _ => panic!("Expected rule"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_else_items() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR2 = release
+rule2:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.else_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one rule
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR2".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Rule(r) => {
+                assert!(r.targets().any(|t| t == "rule2"));
+            }
+            _ => panic!("Expected rule"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_add_if_item() {
+        let makefile: Makefile = "ifdef DEBUG\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+
+        // Parse a variable from a temporary makefile
+        let temp: Makefile = "CFLAGS = -g\n".parse().unwrap();
+        let var = temp.variable_definitions().next().unwrap();
+        cond.add_if_item(MakefileItem::Variable(var));
+
+        let code = makefile.to_string();
+        assert!(code.contains("CFLAGS = -g"));
+
+        // Verify it's in the if branch
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.if_items().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_add_else_item() {
+        let makefile: Makefile = "ifdef DEBUG\nVAR=1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+
+        // Parse a variable from a temporary makefile
+        let temp: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+        let var = temp.variable_definitions().next().unwrap();
+        cond.add_else_item(MakefileItem::Variable(var));
+
+        let code = makefile.to_string();
+        assert!(code.contains("else"));
+        assert!(code.contains("CFLAGS = -O2"));
+
+        // Verify it's in the else branch
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.else_items().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("Y = 2"));
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 2\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_else_item_without_newline() {
+        let makefile: Makefile = "ifdef X\nY = 1\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_else_item(item_without_newline("Y = 2"));
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nelse\nY = 2\nendif\n");
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_rule_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("a:\n\tcmd"));
+        assert_eq!(makefile.to_string(), "ifdef X\na:\n\tcmd\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_conditional_without_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.add_if_item(item_without_newline("ifdef Y\nZ = 1\nendif"));
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef X\nifdef Y\nZ = 1\nendif\nendif\n"
+        );
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_add_if_item_with_newline() {
+        let makefile: Makefile = "ifdef X\nendif\n".parse().unwrap();
+        let mut cond = makefile.conditionals().next().unwrap();
+        let item = "Y = 2\n"
+            .parse::<Makefile>()
+            .unwrap()
+            .items()
+            .next()
+            .unwrap();
+        cond.add_if_item(item);
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 2\nendif\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_conditional_items_with_nested_conditional() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+ifdef VERBOSE
+	VAR2 = verbose
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One variable, one nested conditional
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+
+        match &items[1] {
+            MakefileItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifdef".to_string()));
+            }
+            _ => panic!("Expected conditional"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_items_with_include() {
+        let makefile: Makefile = r#"ifdef DEBUG
+include debug.mk
+VAR = debug
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2); // One include, one variable
+
+        match &items[0] {
+            MakefileItem::Include(i) => {
+                assert_eq!(i.path(), Some("debug.mk".to_string()));
+            }
+            _ => panic!("Expected include"),
+        }
+
+        match &items[1] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_unwrap() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        let expected = "VAR = debug\nrule:\n\tcommand\n";
+        assert_eq!(code, expected);
+
+        // Should have no conditionals now
+        assert_eq!(makefile.conditionals().count(), 0);
+
+        // Should still have the variable and rule
+        assert_eq!(makefile.variable_definitions().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_conditional_unwrap_with_else_fails() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+else
+VAR = release
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        let result = cond.unwrap();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot unwrap conditional with else clause"));
+    }
+
+    #[test]
+    fn test_conditional_unwrap_nested() {
+        let makefile: Makefile = r#"ifdef OUTER
+VAR = outer
+ifdef INNER
+VAR2 = inner
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        // Unwrap the outer conditional
+        let mut outer_cond = makefile.conditionals().next().unwrap();
+        outer_cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        let expected = "VAR = outer\nifdef INNER\nVAR2 = inner\nendif\n";
+        assert_eq!(code, expected);
+    }
+
+    #[test]
+    fn test_conditional_unwrap_empty() {
+        let makefile: Makefile = r#"ifdef DEBUG
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let mut cond = makefile.conditionals().next().unwrap();
+        cond.unwrap().unwrap();
+
+        let code = makefile.to_string();
+        assert_eq!(code, "");
     }
 }

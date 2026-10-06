@@ -1,0 +1,163 @@
+#[derive(Debug)]
+/// An error that can occur when parsing a makefile
+#[non_exhaustive]
+pub enum Error {
+    /// An I/O error occurred
+    Io(std::io::Error),
+
+    /// A parse error occurred
+    Parse(ParseError),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match &self {
+            Error::Io(e) => write!(f, "IO error: {}", e),
+            Error::Parse(e) => write!(f, "Parse error: {}", e),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// An error that occurred while parsing a makefile
+pub struct ParseError {
+    /// The list of individual parsing errors
+    pub errors: Vec<ErrorInfo>,
+}
+
+/// The class of a parse error.
+///
+/// Use this rather than matching on error messages, which are meant for
+/// humans and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    /// A line that is not a rule, variable assignment or directive, such as
+    /// a rule without a `:` (GNU make: "missing separator").
+    MissingSeparator,
+    /// An indented line outside of a rule (GNU make: "recipe commences
+    /// before first target").
+    RecipeBeforeFirstTarget,
+    /// A rule without a target.
+    MissingTarget,
+    /// An archive member reference such as `lib(member` without a closing
+    /// parenthesis.
+    UnclosedArchiveMember,
+    /// A variable reference such as `$(FOO` without a closing delimiter.
+    UnclosedReference,
+    /// A parenthesized conditional argument without a closing parenthesis.
+    UnclosedParenthesis,
+    /// A missing or empty variable name, e.g. in `export` or `define`.
+    ExpectedVariableName,
+    /// A variable name not followed by a valid assignment operator.
+    ExpectedAssignmentOperator,
+    /// A malformed conditional directive, such as `ifeq` without arguments
+    /// (GNU make: "invalid syntax in conditional").
+    InvalidConditional,
+    /// A conditional that is not closed before the end of the input
+    /// (GNU make: "missing 'endif'").
+    MissingEndif,
+    /// An `endif` without a matching conditional (GNU make: "extraneous
+    /// 'endif'").
+    ExtraneousEndif,
+    /// An `else` (or BSD `.elif`) without a matching conditional.
+    ElseWithoutIf,
+    /// A malformed BSD `.for` loop header.
+    InvalidForLoop,
+    /// A BSD `.for` loop that is not closed before the end of the input.
+    MissingEndfor,
+    /// A BSD `.endfor` without a matching `.for`.
+    ExtraneousEndfor,
+    /// A `define` that is not closed before the end of the input
+    /// (GNU make: "missing 'endef', unterminated 'define'").
+    MissingEndef,
+    /// An `include` directive without a file name.
+    MissingIncludePath,
+    /// A BSD make `.include` path without its closing `>` or `"`.
+    UnclosedIncludePath,
+    /// A BSD make `.include` path not delimited by `<...>` or `"..."`.
+    UndelimitedIncludePath,
+    /// A BSD make line starting with `.` that is neither a known directive
+    /// nor a dependency line or variable assignment, such as `.iff`.
+    UnknownDirective,
+    /// Unexpected text where the end of the line was expected. GNU make
+    /// only warns about text after a directive such as `else junk` or
+    /// `endef junk`, while BSD make treats it as an error.
+    ExtraneousText,
+    /// A token that cannot start any construct.
+    UnexpectedToken,
+    /// Any other error.
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Information about a specific parsing error
+pub struct ErrorInfo {
+    /// The error message
+    pub message: String,
+    /// The line number where the error occurred
+    pub line: usize,
+    /// The context around the error
+    pub context: String,
+    pub(crate) kind: ParseErrorKind,
+}
+
+impl ErrorInfo {
+    /// The class of this error.
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for err in &self.errors {
+            writeln!(f, "Error at line {}: {}", err.line, err.message)?;
+            writeln!(f, "{}| {}", err.line, err.context)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Self {
+        Error::Parse(e)
+    }
+}
+
+/// A positioned parse error containing location information.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PositionedParseError {
+    /// The error message
+    pub message: String,
+    /// The text range where the error occurred
+    pub range: rowan::TextRange,
+    /// Optional error code for categorization
+    pub code: Option<String>,
+    pub(crate) kind: ParseErrorKind,
+}
+
+impl PositionedParseError {
+    /// The class of this error.
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for PositionedParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PositionedParseError {}

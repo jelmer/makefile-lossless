@@ -1050,4 +1050,29 @@ mod tests {
             Some("a#b  c.mk".to_string())
         );
     }
+
+    #[test]
+    fn test_include_api() {
+        // Test the API for working with include directives
+        let makefile_str = "include simple.mk\n-include optional.mk\nsinclude synonym.mk\n";
+        let makefile: Makefile = makefile_str.parse().unwrap();
+
+        // Test the includes method
+        let includes: Vec<_> = makefile.includes().collect();
+        assert_eq!(includes.len(), 3);
+
+        // Test the is_optional method
+        assert!(!includes[0].is_optional()); // include
+        assert!(includes[1].is_optional()); // -include
+        assert!(includes[2].is_optional()); // sinclude
+
+        // Test the included_files method
+        let files: Vec<_> = makefile.included_files().collect();
+        assert_eq!(files, vec!["simple.mk", "optional.mk", "synonym.mk"]);
+
+        // Test the path method on Include
+        assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
+        assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
+        assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
+    }
 }

@@ -1990,4 +1990,55 @@ mod tests {
         assert_eq!(var.name(), Some("C".to_string()));
         assert_eq!(makefile.code(), "define C =\nbody\nendef\n");
     }
+
+    #[test]
+    fn test_define_rename_name_with_continuation() {
+        let code = "define A \\\nB\nbody\nendef\n";
+        let makefile: Makefile = code.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let range = var.name_range().unwrap();
+        assert_eq!(&code[range], "A \\\nB");
+        var.set_name("C");
+        assert_eq!(var.name(), Some("C".to_string()));
+        assert_eq!(makefile.code(), "define C\nbody\nendef\n");
+    }
+
+    #[test]
+    fn test_variable_definition_set_value() {
+        let makefile: Makefile = "VAR = old_value\n".parse().unwrap();
+
+        let mut var = makefile
+            .variable_definitions()
+            .next()
+            .expect("Should have variable");
+        assert_eq!(var.raw_value(), Some("old_value".to_string()));
+
+        // Change the value
+        var.set_value("new_value");
+
+        // Verify the value changed
+        assert_eq!(var.raw_value(), Some("new_value".to_string()));
+        assert!(makefile.code().contains("VAR = new_value"));
+    }
+
+    #[test]
+    fn test_variable_definition_set_value_preserves_format() {
+        let makefile: Makefile = "export VAR := old_value\n".parse().unwrap();
+
+        let mut var = makefile
+            .variable_definitions()
+            .next()
+            .expect("Should have variable");
+        assert_eq!(var.raw_value(), Some("old_value".to_string()));
+
+        // Change the value
+        var.set_value("new_value");
+
+        // Verify the value changed but format preserved
+        assert_eq!(var.raw_value(), Some("new_value".to_string()));
+        let code = makefile.code();
+        assert!(code.contains("export"), "Should preserve export prefix");
+        assert!(code.contains(":="), "Should preserve := operator");
+        assert!(code.contains("new_value"), "Should have new value");
+    }
 }

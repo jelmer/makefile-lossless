@@ -1612,6 +1612,7 @@ impl Default for Makefile {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_util::assert_matches_reparse;
     use crate::{
         ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem, RuleOperator,
     };
@@ -3214,5 +3215,494 @@ mod tests {
             rule.recipes().collect::<Vec<_>>(),
             vec!["echo a \\ ", "echo b"]
         );
+    }
+
+    #[test]
+    fn test_push_command() {
+        let mut makefile = Makefile::new();
+        let mut rule = makefile.add_rule("rule");
+
+        // Add commands in place to the rule
+        rule.push_command("command");
+        rule.push_command("command2");
+
+        // Check the commands in the rule
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2"]
+        );
+
+        // Add a third command
+        rule.push_command("command3");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2", "command3"]
+        );
+
+        // Check if the makefile was modified
+        assert_eq!(
+            makefile.to_string(),
+            "rule:\n\tcommand\n\tcommand2\n\tcommand3\n"
+        );
+
+        // The rule should have the same string representation
+        assert_eq!(
+            rule.to_string(),
+            "rule:\n\tcommand\n\tcommand2\n\tcommand3\n"
+        );
+    }
+
+    #[test]
+    fn test_replace_command() {
+        let mut makefile = Makefile::new();
+        let mut rule = makefile.add_rule("rule");
+
+        // Add commands in place
+        rule.push_command("command");
+        rule.push_command("command2");
+
+        // Check the commands in the rule
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["command", "command2"]
+        );
+
+        // Replace the first command
+        rule.replace_command(0, "new command");
+        assert_eq!(
+            rule.recipes().collect::<Vec<_>>(),
+            vec!["new command", "command2"]
+        );
+
+        // Check if the makefile was modified
+        assert_eq!(makefile.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+
+        // The rule should have the same string representation
+        assert_eq!(rule.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+    }
+
+    #[test]
+    fn test_replace_command_with_comments() {
+        // Regression test for bug where replace_command() inserts instead of replacing
+        // when the rule contains comments
+        let content = b"override_dh_strip:\n\t# no longer necessary after buster\n\tdh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'\n";
+
+        let makefile = Makefile::read_relaxed(&content[..]).unwrap();
+
+        let mut rule = makefile.rules().next().unwrap();
+
+        // Before replacement, there should be 2 recipe nodes (comment + command)
+        assert_eq!(rule.recipe_nodes().count(), 2);
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes[0].text(), ""); // comment-only
+        assert_eq!(
+            recipes[1].text(),
+            "dh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'"
+        );
+
+        // Replace the second recipe (index 1, the actual command)
+        assert!(rule.replace_command(1, "dh_strip"));
+
+        // After replacement, there should still be 2 recipe nodes
+        assert_eq!(rule.recipe_nodes().count(), 2);
+        let recipes: Vec<_> = rule.recipe_nodes().collect();
+        assert_eq!(recipes[0].text(), ""); // comment still there
+        assert_eq!(recipes[1].text(), "dh_strip");
+    }
+
+    #[test]
+    fn test_remove_command() {
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        rule.remove_command(1);
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command3"]);
+        assert_eq!(rule.recipe_count(), 2);
+    }
+
+    #[test]
+    fn test_remove_command_out_of_bounds() {
+        let mut rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+
+        let result = rule.remove_command(5);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_insert_command() {
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand3\n".parse().unwrap();
+
+        rule.insert_command(1, "command2");
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command2", "command3"]);
+    }
+
+    #[test]
+    fn test_insert_command_at_end() {
+        let mut rule: Rule = "rule:\n\tcommand1\n".parse().unwrap();
+
+        rule.insert_command(1, "command2");
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["command1", "command2"]);
+    }
+
+    #[test]
+    fn test_insert_command_in_empty_rule() {
+        let mut rule: Rule = "rule:\n".parse().unwrap();
+
+        rule.insert_command(0, "new_command");
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, vec!["new_command"]);
+    }
+
+    #[test]
+    fn test_recipe_count() {
+        let rule1: Rule = "rule:\n".parse().unwrap();
+        assert_eq!(rule1.recipe_count(), 0);
+
+        let rule2: Rule = "rule:\n\tcommand1\n\tcommand2\n".parse().unwrap();
+        assert_eq!(rule2.recipe_count(), 2);
+    }
+
+    #[test]
+    fn test_clear_commands() {
+        let mut rule: Rule = "rule:\n\tcommand1\n\tcommand2\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        rule.clear_commands();
+        assert_eq!(rule.recipe_count(), 0);
+
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(recipes, Vec::<String>::new());
+
+        // Rule target should still be preserved
+        let targets: Vec<_> = rule.targets().collect();
+        assert_eq!(targets, vec!["rule"]);
+    }
+
+    #[test]
+    fn test_clear_commands_empty_rule() {
+        let mut rule: Rule = "rule:\n".parse().unwrap();
+
+        rule.clear_commands();
+        assert_eq!(rule.recipe_count(), 0);
+
+        let targets: Vec<_> = rule.targets().collect();
+        assert_eq!(targets, vec!["rule"]);
+    }
+
+    #[test]
+    fn test_command_operations_preserve_indentation() {
+        let mut rule: Rule = "rule:\n\t\tdeep_indent\n\tshallow_indent\n"
+            .parse()
+            .unwrap();
+
+        rule.insert_command(1, "middle_command");
+        let recipes: Vec<_> = rule.recipes().collect();
+        assert_eq!(
+            recipes,
+            vec!["\tdeep_indent", "middle_command", "shallow_indent"]
+        );
+    }
+
+    #[test]
+    fn test_command_manipulation_edge_cases() {
+        // Test with rule that has no commands
+        let mut empty_rule: Rule = "empty:\n".parse().unwrap();
+        assert_eq!(empty_rule.recipe_count(), 0);
+
+        empty_rule.insert_command(0, "first_command");
+        assert_eq!(empty_rule.recipe_count(), 1);
+
+        // Test clearing already empty rule
+        let mut empty_rule2: Rule = "empty:\n".parse().unwrap();
+        empty_rule2.clear_commands();
+        assert_eq!(empty_rule2.recipe_count(), 0);
+    }
+
+    #[test]
+    fn test_complex_recipe_manipulation() {
+        let mut complex_rule: Rule = r#"complex:
+	@echo "Starting build"
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "Build complete"
+	chmod +x $@
+"#
+        .parse()
+        .unwrap();
+
+        assert_eq!(complex_rule.recipe_count(), 4);
+
+        // Remove the echo statements, keep the actual build commands
+        complex_rule.remove_command(0); // Remove first echo
+        complex_rule.remove_command(1); // Remove second echo (now at index 1, not 2)
+
+        let final_recipes: Vec<_> = complex_rule.recipes().collect();
+        assert_eq!(final_recipes.len(), 2);
+        assert!(final_recipes[0].contains("$(CC)"));
+        assert!(final_recipes[1].contains("chmod"));
+    }
+
+    #[test]
+    fn test_rule_add_prerequisite() {
+        let mut rule: Rule = "target: dep1\n".parse().unwrap();
+        rule.add_prerequisite("dep2").unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        // Verify proper spacing
+        assert_eq!(rule.to_string(), "target: dep1 dep2\n");
+    }
+
+    #[test]
+    fn test_rule_add_prerequisite_to_rule_without_prereqs() {
+        // Regression test for missing space after colon when adding first prerequisite
+        let mut rule: Rule = "target:\n".parse().unwrap();
+        rule.add_prerequisite("dep1").unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dep1"]);
+        // Should have space after colon
+        assert_eq!(rule.to_string(), "target: dep1\n");
+    }
+
+    #[test]
+    fn test_rule_remove_prerequisite() {
+        let mut rule: Rule = "target: dep1 dep2 dep3\n".parse().unwrap();
+        assert!(rule.remove_prerequisite("dep2").unwrap());
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep3"]
+        );
+        assert!(!rule.remove_prerequisite("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_rule_set_prerequisites() {
+        let mut rule: Rule = "target: old_dep\n".parse().unwrap();
+        rule.set_prerequisites(vec!["new_dep1", "new_dep2"])
+            .unwrap();
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["new_dep1", "new_dep2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_prerequisites_empty() {
+        let mut rule: Rule = "target: dep1 dep2\n".parse().unwrap();
+        rule.set_prerequisites(vec![]).unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>().len(), 0);
+    }
+
+    #[test]
+    fn test_rule_add_target() {
+        let mut rule: Rule = "target1: dep1\n".parse().unwrap();
+        rule.add_target("target2").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "target2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_targets() {
+        let mut rule: Rule = "old_target: dependency\n".parse().unwrap();
+        rule.set_targets(vec!["new_target1", "new_target2"])
+            .unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["new_target1", "new_target2"]
+        );
+    }
+
+    #[test]
+    fn test_rule_set_targets_empty() {
+        let mut rule: Rule = "target: dep1\n".parse().unwrap();
+        let result = rule.set_targets(vec![]);
+        assert!(result.is_err());
+        // Verify target wasn't changed
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target"]);
+    }
+
+    #[test]
+    fn test_rule_has_target() {
+        let rule: Rule = "target1 target2: dependency\n".parse().unwrap();
+        assert!(rule.has_target("target1"));
+        assert!(rule.has_target("target2"));
+        assert!(!rule.has_target("target3"));
+        assert!(!rule.has_target("nonexistent"));
+    }
+
+    #[test]
+    fn test_rule_rename_target() {
+        let mut rule: Rule = "old_target: dependency\n".parse().unwrap();
+        assert!(rule.rename_target("old_target", "new_target").unwrap());
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target"]);
+        // Try renaming non-existent target
+        assert!(!rule.rename_target("nonexistent", "something").unwrap());
+    }
+
+    #[test]
+    fn test_rule_rename_target_multiple() {
+        let mut rule: Rule = "target1 target2 target3: dependency\n".parse().unwrap();
+        assert!(rule.rename_target("target2", "renamed_target").unwrap());
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "renamed_target", "target3"]
+        );
+    }
+
+    #[test]
+    fn test_rule_remove_target() {
+        let mut rule: Rule = "target1 target2 target3: dependency\n".parse().unwrap();
+        assert!(rule.remove_target("target2").unwrap());
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target1", "target3"]
+        );
+        // Try removing non-existent target
+        assert!(!rule.remove_target("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_rule_remove_target_last() {
+        let mut rule: Rule = "single_target: dependency\n".parse().unwrap();
+        let result = rule.remove_target("single_target");
+        assert!(result.is_err());
+        // Verify target wasn't removed
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["single_target"]);
+    }
+
+    #[test]
+    fn test_rule_target_manipulation_preserves_prerequisites() {
+        let mut rule: Rule = "target1 target2: dep1 dep2\n\tcommand".parse().unwrap();
+
+        // Remove a target
+        rule.remove_target("target1").unwrap();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target2"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        // Add a target
+        rule.add_target("target3").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["target2", "target3"]
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+
+        // Rename a target
+        rule.rename_target("target2", "renamed").unwrap();
+        assert_eq!(
+            rule.targets().collect::<Vec<_>>(),
+            vec!["renamed", "target3"]
+        );
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            vec!["dep1", "dep2"]
+        );
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    }
+
+    #[test]
+    fn test_push_command_after_unterminated_recipe() {
+        let makefile: Makefile = "a:\n\tcmd".parse().unwrap();
+        makefile.rules().next().unwrap().push_command("x");
+        assert_eq!(makefile.to_string(), "a:\n\tcmd\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_push_command_after_unterminated_rule_line() {
+        let makefile: Makefile = "a: b".parse().unwrap();
+        makefile.rules().next().unwrap().push_command("x");
+        assert_eq!(makefile.to_string(), "a: b\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_command_after_unterminated_recipe() {
+        let makefile: Makefile = "a:\n\tcmd".parse().unwrap();
+        assert!(makefile.rules().next().unwrap().insert_command(1, "x"));
+        assert_eq!(makefile.to_string(), "a:\n\tcmd\n\tx\n");
+        assert_matches_reparse(&makefile);
+    }
+    #[test]
+    fn test_rule_items() {
+        // Test rule with both recipes and conditionals
+        let input = r#"test:
+	echo "before"
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	./run-tests
+endif
+	echo "after"
+"#;
+        let rule: Rule = input.parse().unwrap();
+
+        let items: Vec<_> = rule.items().collect();
+        assert_eq!(
+            items.len(),
+            3,
+            "Expected 3 items: recipe, conditional, recipe"
+        );
+
+        // Check first item is a recipe
+        match &items[0] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo \"before\""),
+            RuleItem::Conditional(_) => panic!("Expected recipe, got conditional"),
+        }
+
+        // Check second item is a conditional
+        match &items[1] {
+            RuleItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifeq".to_string()));
+            }
+            RuleItem::Recipe(_) => panic!("Expected conditional, got recipe"),
+        }
+
+        // Check third item is a recipe
+        match &items[2] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo \"after\""),
+            RuleItem::Conditional(_) => panic!("Expected recipe, got conditional"),
+        }
+
+        // Test rule with only recipes (no conditionals)
+        let simple_rule: Rule = "simple:\n\techo one\n\techo two\n".parse().unwrap();
+        let simple_items: Vec<_> = simple_rule.items().collect();
+        assert_eq!(simple_items.len(), 2);
+
+        match &simple_items[0] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo one"),
+            _ => panic!("Expected recipe"),
+        }
+
+        match &simple_items[1] {
+            RuleItem::Recipe(r) => assert_eq!(r, "echo two"),
+            _ => panic!("Expected recipe"),
+        }
+
+        // Test rule with only conditional (no plain recipes)
+        let cond_only: Rule = "condtest:\nifeq (a,b)\n\techo yes\nendif\n"
+            .parse()
+            .unwrap();
+        let cond_items: Vec<_> = cond_only.items().collect();
+        assert_eq!(cond_items.len(), 1);
+
+        match &cond_items[0] {
+            RuleItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifeq".to_string()));
+            }
+            _ => panic!("Expected conditional"),
+        }
     }
 }

@@ -1807,6 +1807,7 @@ impl Makefile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{assert_matches_reparse, item_without_newline};
 
     #[test]
     fn test_makefile_item_line_col() {
@@ -2646,5 +2647,997 @@ override_dh_auto_configure:
         let makefile: Makefile = "ifdef X\ninclude b.mk\nendif\n".parse().unwrap();
         makefile.includes().next().unwrap().remove().unwrap();
         assert_eq!(makefile.to_string(), "ifdef X\nendif\n");
+    }
+
+    #[test]
+    fn test_add_rule() {
+        let mut makefile = Makefile::new();
+        let rule = makefile.add_rule("rule");
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
+        assert_eq!(
+            rule.prerequisites().collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+
+        assert_eq!(makefile.to_string(), "rule:\n");
+    }
+
+    #[test]
+    fn test_try_add_rule() {
+        let mut makefile: Makefile = "all: $(OBJS) a#b\n".parse().unwrap();
+        for target in ["$(OBJS)", "a#b", "$(call f,x y)", "lib(a.o)", "a\\ b"] {
+            let rule = makefile.try_add_rule(target).unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), vec![target]);
+        }
+        assert_eq!(
+            makefile.to_string(),
+            "all: $(OBJS) a#b\n\n$(OBJS):\n\na\\#b:\n\n$(call f,x y):\n\nlib(a.o):\n\na\\ b:\n"
+        );
+    }
+
+    #[test]
+    fn test_try_add_rule_invalid() {
+        let mut makefile: Makefile = "all: x\n".parse().unwrap();
+        for target in ["", "a b", "a:b", "a\nb", "a=b", "$(X", "a\\"] {
+            let Err(Error::Parse(e)) = makefile.try_add_rule(target) else {
+                panic!("expected an error for {target:?}");
+            };
+            assert_eq!(
+                e.errors
+                    .iter()
+                    .map(|e| (e.message.clone(), e.context.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    format!("Cannot write {:?} as targets", [target]),
+                    "add_rule"
+                )]
+            );
+        }
+        assert_eq!(makefile.to_string(), "all: x\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid target")]
+    fn test_add_rule_invalid_panics() {
+        Makefile::new().add_rule("a b");
+    }
+
+    #[test]
+    fn test_add_rule_with_shebang() {
+        // Regression test for bug where add_rule() panics on makefiles with shebangs
+        let content = r#"#!/usr/bin/make -f
+
+build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+"#;
+
+        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let initial_count = makefile.rules().count();
+        assert_eq!(initial_count, 2);
+
+        // This should not panic
+        let rule = makefile.add_rule("build-indep");
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["build-indep"]);
+
+        // Should have one more rule now
+        assert_eq!(makefile.rules().count(), initial_count + 1);
+    }
+
+    #[test]
+    fn test_add_rule_formatting() {
+        // Regression test for formatting issues when adding rules
+        let content = r#"build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+"#;
+
+        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let mut rule = makefile.add_rule("build-indep");
+        rule.add_prerequisite("build").unwrap();
+
+        let expected = r#"build: blah
+	$(MAKE) install
+
+clean:
+	dh_clean
+
+build-indep: build
+"#;
+
+        assert_eq!(makefile.to_string(), expected);
+    }
+
+    #[test]
+    fn test_replace_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        makefile.replace_rule(0, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["new_rule", "rule2"]);
+
+        let recipes: Vec<_> = makefile.rules().next().unwrap().recipes().collect();
+        assert_eq!(recipes, vec!["new_command"]);
+    }
+
+    #[test]
+    fn test_replace_rule_out_of_bounds() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        let result = makefile.replace_rule(5, new_rule);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\nrule3:\n\tcommand3\n"
+            .parse()
+            .unwrap();
+
+        let removed = makefile.remove_rule(1).unwrap();
+        assert_eq!(removed.targets().collect::<Vec<_>>(), vec!["rule2"]);
+
+        let remaining_targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(remaining_targets, vec!["rule1", "rule3"]);
+        assert_eq!(makefile.rules().count(), 2);
+    }
+
+    #[test]
+    fn test_remove_rule_out_of_bounds() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
+
+        let result = makefile.remove_rule(5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_rule() {
+        let mut makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let new_rule: Rule = "inserted_rule:\n\tinserted_command\n".parse().unwrap();
+
+        makefile.insert_rule(1, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["rule1", "inserted_rule", "rule2"]);
+        assert_eq!(makefile.rules().count(), 3);
+    }
+
+    #[test]
+    fn test_insert_rule_preserves_blank_line_spacing_at_end() {
+        // Test that inserting at the end preserves blank line spacing
+        let input = "rule1:\n\tcommand1\n\nrule2:\n\tcommand2\n";
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule = Rule::new(&["rule3"], &[], &["command3"]);
+
+        makefile.insert_rule(2, new_rule).unwrap();
+
+        let expected = "rule1:\n\tcommand1\n\nrule2:\n\tcommand2\n\nrule3:\n\tcommand3\n";
+        assert_eq!(makefile.to_string(), expected);
+    }
+
+    #[test]
+    fn test_insert_rule_adds_blank_lines_when_missing() {
+        // Test that inserting adds blank lines even when input has none
+        let input = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n";
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule = Rule::new(&["rule3"], &[], &["command3"]);
+
+        makefile.insert_rule(2, new_rule).unwrap();
+
+        let expected = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n\nrule3:\n\tcommand3\n";
+        assert_eq!(makefile.to_string(), expected);
+    }
+
+    #[test]
+    fn test_rule_manipulation_preserves_structure() {
+        // Test that makefile structure (comments, variables, etc.) is preserved during rule manipulation
+        let input = r#"# Comment
+VAR = value
+
+rule1:
+	command1
+
+# Another comment
+rule2:
+	command2
+
+VAR2 = value2
+"#;
+
+        let mut makefile: Makefile = input.parse().unwrap();
+        let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
+
+        // Insert rule in the middle
+        makefile.insert_rule(1, new_rule).unwrap();
+
+        // Check that rules are correct
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["rule1", "new_rule", "rule2"]);
+
+        // Check that variables are preserved
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        assert_eq!(vars.len(), 2);
+
+        // The structure should be preserved in the output
+        let output = makefile.code();
+        assert!(output.contains("# Comment"));
+        assert!(output.contains("VAR = value"));
+        assert!(output.contains("# Another comment"));
+        assert!(output.contains("VAR2 = value2"));
+    }
+
+    #[test]
+    fn test_replace_rule_with_multiple_targets() {
+        let mut makefile: Makefile = "target1 target2: dep\n\tcommand\n".parse().unwrap();
+        let new_rule: Rule = "new_target: new_dep\n\tnew_command\n".parse().unwrap();
+
+        makefile.replace_rule(0, new_rule).unwrap();
+
+        let targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(targets, vec!["new_target"]);
+    }
+
+    #[test]
+    fn test_empty_makefile_operations() {
+        let mut makefile = Makefile::new();
+
+        // Test operations on empty makefile
+        assert!(makefile
+            .replace_rule(0, "rule:\n\tcommand\n".parse().unwrap())
+            .is_err());
+        assert!(makefile.remove_rule(0).is_err());
+
+        // Insert into empty makefile should work
+        let new_rule: Rule = "first_rule:\n\tcommand\n".parse().unwrap();
+        makefile.insert_rule(0, new_rule).unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_rule_operations_with_variables_and_includes() {
+        let input = r#"VAR1 = value1
+include common.mk
+
+rule1:
+	command1
+
+VAR2 = value2
+include other.mk
+
+rule2:
+	command2
+"#;
+
+        let mut makefile: Makefile = input.parse().unwrap();
+
+        // Remove middle rule
+        makefile.remove_rule(0).unwrap();
+
+        // Verify structure is preserved
+        let output = makefile.code();
+        assert!(output.contains("VAR1 = value1"));
+        assert!(output.contains("include common.mk"));
+        assert!(output.contains("VAR2 = value2"));
+        assert!(output.contains("include other.mk"));
+
+        // Only rule2 should remain
+        assert_eq!(makefile.rules().count(), 1);
+        let remaining_targets: Vec<_> = makefile
+            .rules()
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(remaining_targets, vec!["rule2"]);
+    }
+
+    #[test]
+    fn test_makefile_find_variable() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find existing variable
+        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("VAR2".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
+
+        // Try to find non-existent variable
+        assert_eq!(makefile.find_variable("NONEXISTENT").count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_find_variable_with_export() {
+        let makefile: Makefile = r#"VAR1 = value1
+export VAR2 := value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find exported variable
+        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name(), Some("VAR2".to_string()));
+        assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_makefile_find_variable_multiple() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR1 = value2
+VAR2 = other
+VAR1 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find all VAR1 definitions
+        let vars: Vec<_> = makefile.find_variable("VAR1").collect();
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].raw_value(), Some("value1".to_string()));
+        assert_eq!(vars[1].raw_value(), Some("value2".to_string()));
+        assert_eq!(vars[2].raw_value(), Some("value3".to_string()));
+
+        // Find VAR2
+        let var2s: Vec<_> = makefile.find_variable("VAR2").collect();
+        assert_eq!(var2s.len(), 1);
+        assert_eq!(var2s[0].raw_value(), Some("other".to_string()));
+    }
+
+    #[test]
+    fn test_variable_remove_and_find() {
+        let makefile: Makefile = r#"VAR1 = value1
+VAR2 = value2
+VAR3 = value3
+"#
+        .parse()
+        .unwrap();
+
+        // Find and remove VAR2
+        let mut var2 = makefile
+            .find_variable("VAR2")
+            .next()
+            .expect("Should find VAR2");
+        var2.remove();
+
+        // Verify VAR2 is gone
+        assert_eq!(makefile.find_variable("VAR2").count(), 0);
+
+        // Verify other variables still exist
+        assert_eq!(makefile.find_variable("VAR1").count(), 1);
+        assert_eq!(makefile.find_variable("VAR3").count(), 1);
+    }
+
+    #[test]
+    fn test_rule_remove() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target("rule1").unwrap();
+        rule.remove().unwrap();
+        assert_eq!(makefile.rules().count(), 1);
+        assert!(makefile.find_rule_by_target("rule1").is_none());
+        assert!(makefile.find_rule_by_target("rule2").is_some());
+    }
+
+    #[test]
+    fn test_rule_remove_last_trims_blank_lines() {
+        // Regression test for bug where removing the last rule left trailing blank lines
+        let makefile: Makefile =
+            "%:\n\tdh $@\n\noverride_dh_missing:\n\tdh_missing --fail-missing\n"
+                .parse()
+                .unwrap();
+
+        // Remove the last rule (override_dh_missing)
+        let rule = makefile.find_rule_by_target("override_dh_missing").unwrap();
+        rule.remove().unwrap();
+
+        // Should not have trailing blank line
+        assert_eq!(makefile.code(), "%:\n\tdh $@\n");
+        assert_eq!(makefile.rules().count(), 1);
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule2:\n\tcommand2\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target("rule2");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().collect::<Vec<_>>(), vec!["rule2"]);
+        assert!(makefile.find_rule_by_target("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target() {
+        let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n"
+            .parse()
+            .unwrap();
+        assert_eq!(makefile.find_rules_by_target("rule1").count(), 2);
+        assert_eq!(makefile.find_rules_by_target("rule2").count(), 1);
+        assert_eq!(makefile.find_rules_by_target("nonexistent").count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_simple() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_no_match() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.c");
+        assert!(rule.is_none());
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_exact() {
+        let makefile: Makefile = "foo.o: foo.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "foo.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_prefix() {
+        let makefile: Makefile = "lib%.a: %.o\n\tar rcs $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("libfoo.a");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "lib%.a");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_suffix() {
+        let makefile: Makefile = "%_test.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("foo_test.o");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%_test.o");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_middle() {
+        let makefile: Makefile = "lib%_debug.a: %.o\n\tar rcs $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("libfoo_debug.a");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "lib%_debug.a");
+    }
+
+    #[test]
+    fn test_makefile_find_rule_by_target_pattern_wildcard_only() {
+        let makefile: Makefile = "%: %.c\n\t$(CC) -o $@ $<\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target_pattern("anything");
+        assert!(rule.is_some());
+        assert_eq!(rule.unwrap().targets().next().unwrap(), "%");
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_multiple() {
+        let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n"
+            .parse()
+            .unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_mixed() {
+        let makefile: Makefile =
+        "%.o: %.c\n\t$(CC) -c $<\nfoo.o: foo.h\n\t$(CC) -c foo.c\nbar.txt: baz.txt\n\tcp $< $@\n"
+            .parse()
+            .unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 2); // Matches both %.o and foo.o
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.txt").collect();
+        assert_eq!(rules.len(), 1); // Only exact match
+    }
+
+    #[test]
+    fn test_makefile_find_rules_by_target_pattern_no_wildcard() {
+        let makefile: Makefile = "foo.o: foo.c\n\t$(CC) -c $<\n".parse().unwrap();
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        assert_eq!(rules.len(), 1);
+        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.o").collect();
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn test_makefile_add_phony_target() {
+        let mut makefile = Makefile::new();
+        makefile.add_phony_target("clean").unwrap();
+        assert!(makefile.is_phony("clean"));
+        assert_eq!(makefile.phony_targets().collect::<Vec<_>>(), vec!["clean"]);
+    }
+
+    #[test]
+    fn test_makefile_add_phony_target_existing() {
+        let mut makefile: Makefile = ".PHONY: test\n".parse().unwrap();
+        makefile.add_phony_target("clean").unwrap();
+        assert!(makefile.is_phony("test"));
+        assert!(makefile.is_phony("clean"));
+        let targets: Vec<_> = makefile.phony_targets().collect();
+        assert!(targets.contains(&"test".to_string()));
+        assert!(targets.contains(&"clean".to_string()));
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target() {
+        let mut makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        assert!(!makefile.is_phony("clean"));
+        assert!(makefile.is_phony("test"));
+        assert!(!makefile.remove_phony_target("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target_last() {
+        let mut makefile: Makefile = ".PHONY: clean\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        assert!(!makefile.is_phony("clean"));
+        // .PHONY rule should be removed entirely
+        assert!(makefile.find_rule_by_target(".PHONY").is_none());
+    }
+
+    #[test]
+    fn test_makefile_is_phony() {
+        let makefile: Makefile = ".PHONY: clean test\n".parse().unwrap();
+        assert!(makefile.is_phony("clean"));
+        assert!(makefile.is_phony("test"));
+        assert!(!makefile.is_phony("build"));
+    }
+
+    #[test]
+    fn test_makefile_phony_targets() {
+        let makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
+        let phony_targets: Vec<_> = makefile.phony_targets().collect();
+        assert_eq!(phony_targets, vec!["clean", "test", "build"]);
+    }
+
+    #[test]
+    fn test_makefile_phony_targets_empty() {
+        let makefile = Makefile::new();
+        assert_eq!(makefile.phony_targets().count(), 0);
+    }
+
+    #[test]
+    fn test_makefile_remove_first_phony_target_no_extra_space() {
+        let mut makefile: Makefile = ".PHONY: clean test build\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        let result = makefile.to_string();
+        assert_eq!(result, ".PHONY: test build\n");
+    }
+
+    #[test]
+    fn test_add_conditional_ifdef() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("VAR = debug"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_with_else() {
+        let mut makefile = Makefile::new();
+        let result =
+            makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", Some("VAR = release\n"));
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("VAR = debug"));
+        assert!(code.contains("else"));
+        assert!(code.contains("VAR = release"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_body_without_trailing_newline() {
+        let mut makefile: Makefile = "X = 1\n".parse().unwrap();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\nZ = 1", Some("Y = 2"))
+            .unwrap();
+        let text = makefile.to_string();
+        assert_eq!(
+            text,
+            "X = 1\n\nifdef DEBUG\nY = 1\nZ = 1\nelse\nY = 2\nendif\n"
+        );
+        assert_eq!(text.parse::<Makefile>().unwrap().to_string(), text);
+    }
+
+    #[test]
+    fn test_add_conditional_if_body_without_trailing_newline() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1", None)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "ifdef DEBUG\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_conditional_body_with_trailing_newline() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\n", Some("Y = 2\n"))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef DEBUG\nY = 1\nelse\nY = 2\nendif\n"
+        );
+    }
+
+    #[test]
+    fn test_add_conditional_body_ending_in_blank_line() {
+        let mut makefile = Makefile::new();
+        makefile
+            .add_conditional("ifdef", "DEBUG", "Y = 1\n\n", Some("Y = 2\n\n"))
+            .unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef DEBUG\nY = 1\n\nelse\nY = 2\n\nendif\n"
+        );
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "X = 1\nb:\n");
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_define() {
+        let mut makefile: Makefile = "define V\nx\nendef".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "define V\nx\nendef\nb:\n");
+    }
+
+    #[test]
+    fn test_add_rule_after_unterminated_conditional() {
+        let mut makefile: Makefile = "ifdef X\nY = 1\nendif".parse().unwrap();
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "ifdef X\nY = 1\nendif\nb:\n");
+    }
+
+    #[test]
+    fn test_add_conditional_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile
+            .add_conditional("ifdef", "D", "Y = 1\n", None)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nifdef D\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_add_conditional_with_items_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        let items: Makefile = "Y = 1\n".parse().unwrap();
+        makefile
+            .add_conditional_with_items("ifdef", "D", items.items(), None::<Vec<MakefileItem>>)
+            .unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nifdef D\nY = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_insert_rule_after_unterminated_line() {
+        let mut makefile: Makefile = "a:".parse().unwrap();
+        makefile.insert_rule(1, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\nb:\n");
+
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.insert_rule(0, "b:\n".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n\nb:\n");
+    }
+
+    #[test]
+    fn test_insert_include_after_unterminated() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.insert_include(1, "a.mk").unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\ninclude a.mk\n");
+        assert_matches_reparse(&makefile);
+
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        let first = makefile.items().next().unwrap();
+        let include = makefile.insert_include_after(&first, "a.mk").unwrap();
+        assert_eq!(include.path(), Some("a.mk".to_string()));
+        assert_eq!(makefile.to_string(), "X = 1\ninclude a.mk\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_phony_target_after_unterminated_line() {
+        let mut makefile: Makefile = "X = 1".parse().unwrap();
+        makefile.add_phony_target("clean").unwrap();
+        assert_eq!(makefile.to_string(), "X = 1\n.PHONY: clean\n");
+    }
+
+    #[test]
+    fn test_add_conditional_invalid_type() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_conditional_formatting() {
+        let mut makefile: Makefile = "VAR1 = value1\n".parse().unwrap();
+        let result = makefile.add_conditional("ifdef", "DEBUG", "VAR = debug\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        // Should have a blank line before the conditional
+        assert!(code.contains("\n\nifdef DEBUG"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifndef() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifndef", "NDEBUG", "VAR = enabled\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifndef NDEBUG"));
+        assert!(code.contains("VAR = enabled"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifeq() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifeq", "($(OS),Linux)", "VAR = linux\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifeq ($(OS),Linux)"));
+        assert!(code.contains("VAR = linux"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_add_conditional_ifneq() {
+        let mut makefile = Makefile::new();
+        let result = makefile.add_conditional("ifneq", "($(OS),Windows)", "VAR = unix\n", None);
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifneq ($(OS),Windows)"));
+        assert!(code.contains("VAR = unix"));
+        assert!(code.contains("endif"));
+    }
+
+    #[test]
+    fn test_item_replace_without_newline() {
+        let makefile: Makefile = "X = 1\nY = 1\n".parse().unwrap();
+        let mut first = makefile.items().next().unwrap();
+        first.replace(item_without_newline("Z = 1")).unwrap();
+        assert_eq!(makefile.to_string(), "Z = 1\nY = 1\n");
+        assert_eq!(first.syntax().to_string(), "Z = 1\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_replace_rule_without_newline() {
+        let mut makefile: Makefile = "a:\nb:\n".parse().unwrap();
+        makefile
+            .replace_rule(0, "c:\n\tcmd".parse().unwrap())
+            .unwrap();
+        assert_eq!(makefile.to_string(), "c:\n\tcmd\nb:\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_rule_without_newline() {
+        let mut makefile: Makefile = "a:\nb:\n".parse().unwrap();
+        makefile.insert_rule(0, "c:".parse().unwrap()).unwrap();
+        makefile.insert_rule(2, "d:".parse().unwrap()).unwrap();
+        makefile.insert_rule(4, "e:".parse().unwrap()).unwrap();
+        assert_eq!(makefile.to_string(), "c:\n\na:\n\nd:\n\nb:\n\ne:\n");
+    }
+
+    #[test]
+    fn test_add_conditional_with_items() {
+        let mut makefile = Makefile::new();
+
+        // Parse items from temporary makefiles
+        let temp1: Makefile = "CFLAGS = -g\n".parse().unwrap();
+        let var1 = temp1.variable_definitions().next().unwrap();
+
+        let temp2: Makefile = "CFLAGS = -O2\n".parse().unwrap();
+        let var2 = temp2.variable_definitions().next().unwrap();
+
+        let temp3: Makefile = "debug:\n\techo debug\n".parse().unwrap();
+        let rule1 = temp3.rules().next().unwrap();
+
+        let result = makefile.add_conditional_with_items(
+            "ifdef",
+            "DEBUG",
+            vec![MakefileItem::Variable(var1), MakefileItem::Rule(rule1)],
+            Some(vec![MakefileItem::Variable(var2)]),
+        );
+
+        assert!(result.is_ok());
+
+        let code = makefile.to_string();
+        assert!(code.contains("ifdef DEBUG"));
+        assert!(code.contains("CFLAGS = -g"));
+        assert!(code.contains("debug:"));
+        assert!(code.contains("else"));
+        assert!(code.contains("CFLAGS = -O2"));
+    }
+
+    #[test]
+    fn test_makefile_items_iterator() {
+        let makefile: Makefile = r#"VAR = value
+ifdef DEBUG
+CFLAGS = -g
+endif
+rule:
+	command
+include common.mk
+"#
+        .parse()
+        .unwrap();
+
+        // First verify we can find each type individually
+        // variable_definitions() is recursive, so it finds VAR and CFLAGS (inside conditional)
+        assert_eq!(makefile.variable_definitions().count(), 2);
+        assert_eq!(makefile.conditionals().count(), 1);
+        assert_eq!(makefile.rules().count(), 1);
+
+        let items: Vec<_> = makefile.items().collect();
+        // Note: include directives might not be at top level, need to check
+        assert!(
+            items.len() >= 3,
+            "Expected at least 3 items, got {}",
+            items.len()
+        );
+
+        match &items[0] {
+            MakefileItem::Variable(v) => {
+                assert_eq!(v.name(), Some("VAR".to_string()));
+            }
+            _ => panic!("Expected variable at position 0"),
+        }
+
+        match &items[1] {
+            MakefileItem::Conditional(c) => {
+                assert_eq!(c.conditional_type(), Some("ifdef".to_string()));
+            }
+            _ => panic!("Expected conditional at position 1"),
+        }
+
+        match &items[2] {
+            MakefileItem::Rule(r) => {
+                let targets: Vec<_> = r.targets().collect();
+                assert_eq!(targets, vec!["rule"]);
+            }
+            _ => panic!("Expected rule at position 2"),
+        }
+    }
+
+    #[test]
+    fn test_item_parent_in_conditional() {
+        let makefile: Makefile = r#"ifdef DEBUG
+VAR = debug
+rule:
+	command
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let cond = makefile.conditionals().next().unwrap();
+
+        // Get items from the conditional
+        let items: Vec<_> = cond.if_items().collect();
+        assert_eq!(items.len(), 2);
+
+        // Check variable parent is the conditional
+        if let MakefileItem::Variable(var) = &items[0] {
+            let parent = var.parent();
+            assert!(parent.is_some());
+            if let Some(MakefileItem::Conditional(_)) = parent {
+                // Expected - parent is a conditional
+            } else {
+                panic!("Expected variable parent to be a Conditional");
+            }
+        } else {
+            panic!("Expected first item to be a Variable");
+        }
+
+        // Check rule parent is the conditional
+        if let MakefileItem::Rule(rule) = &items[1] {
+            let parent = rule.parent();
+            assert!(parent.is_some());
+            if let Some(MakefileItem::Conditional(_)) = parent {
+                // Expected - parent is a conditional
+            } else {
+                panic!("Expected rule parent to be a Conditional");
+            }
+        } else {
+            panic!("Expected second item to be a Rule");
+        }
+    }
+
+    #[test]
+    fn test_nested_conditional_parent() {
+        let makefile: Makefile = r#"ifdef OUTER
+VAR = outer
+ifdef INNER
+VAR2 = inner
+endif
+endif
+"#
+        .parse()
+        .unwrap();
+
+        let outer_cond = makefile.conditionals().next().unwrap();
+
+        // Get inner conditional from outer conditional's items
+        let items: Vec<_> = outer_cond.if_items().collect();
+
+        // Find the nested conditional
+        let inner_cond = items
+            .iter()
+            .find_map(|item| {
+                if let MakefileItem::Conditional(c) = item {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        // Inner conditional's parent should be the outer conditional
+        let parent = inner_cond.parent();
+        assert!(parent.is_some());
+        if let Some(MakefileItem::Conditional(_)) = parent {
+            // Expected - parent is a conditional
+        } else {
+            panic!("Expected inner conditional's parent to be a Conditional");
+        }
+    }
+
+    #[test]
+    fn test_item_text_range() {
+        let makefile: Makefile = "A = 1\nifdef X\nrule:\n\tcmd\nendif\n".parse().unwrap();
+        let ranges: Vec<_> = makefile.items().map(|i| i.text_range()).collect();
+        assert_eq!(
+            ranges,
+            vec![
+                rowan::TextRange::new(0.into(), 6.into()),
+                rowan::TextRange::new(6.into(), 31.into()),
+            ]
+        );
+        let cond = makefile.conditionals().next().unwrap();
+        let branch = cond.branches().next().unwrap();
+        let ranges: Vec<_> = branch.items().map(|i| i.text_range()).collect();
+        assert_eq!(ranges, vec![rowan::TextRange::new(14.into(), 25.into())]);
     }
 }
