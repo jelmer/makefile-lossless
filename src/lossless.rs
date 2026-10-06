@@ -1102,7 +1102,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Whether the current token is a `!` dependency operator. Without
-        /// a known variant, a `!` followed by a `:` on the same line is
+        /// a known variant, a `!` followed by a `:` on the same logical line is
         /// instead part of a target name, as in GNU make's `a!b:`.
         fn at_bang_dependency_operator(&self) -> bool {
             if !matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!") {
@@ -1331,20 +1331,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             true
         }
 
-        /// Whether the rest of the physical line has a dependency operator.
+        /// Whether the rest of the logical line has a dependency operator.
         /// A backslash escapes the first character of an operator, so `\:`
         /// is not one.
         fn line_has_dependency_operator(&self) -> bool {
             self.line_has_operator(|op| self.is_dependency_operator(op))
         }
 
-        /// Whether the rest of the physical line has an operator matching
+        /// Whether the rest of the logical line has an operator matching
         /// `matches`, after removing any escaped first character.
         fn line_has_operator(&self, matches: impl Fn(&str) -> bool) -> bool {
             let mut escaped = self.pending_backslash_escape;
             for (kind, text) in self.tokens.iter().rev() {
                 match kind {
-                    NEWLINE => break,
+                    // An unescaped backslash before the newline continues the
+                    // line.
+                    NEWLINE if !escaped => break,
                     OPERATOR => {
                         let op = if escaped { &text[1..] } else { text.as_str() };
                         if matches(op) {
@@ -8357,6 +8359,8 @@ rule: dependency
                 ("!x:\n\techo $@\n", vec!["!x"], vec![]),
                 ("a! b!c: d!e\n", vec!["a!", "b!c"], vec!["d!e"]),
                 ("x ! y: z\n", vec!["x", "!", "y"], vec!["z"]),
+                ("a!b \\\n c:\n", vec!["a!b", "c"], vec![]),
+                ("*.o \\\n b!c: d\n", vec!["*.o", "b!c"], vec!["d"]),
             ] {
                 let parsed = parse(code, variant);
                 assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
@@ -8411,6 +8415,13 @@ rule: dependency
             ),
             (None, "a ! b\n", vec!["a"], vec!["b"]),
             (None, "a b! c\n", vec!["a", "b"], vec!["c"]),
+            (None, "a!b \\\n c\n", vec!["a"], vec!["b", "c"]),
+            (
+                Some(MakefileVariant::BSDMake),
+                "a!b \\\n c:\n",
+                vec!["a"],
+                vec!["b", "c:"],
+            ),
         ] {
             let parsed = parse(code, variant);
             assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
