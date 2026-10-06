@@ -1,3 +1,4 @@
+use super::rule::build_targets_node;
 use super::{line_ending, terminate_line_before, with_trailing_newline};
 use crate::lossless::{
     parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement, ForLoop, Include, Load,
@@ -862,6 +863,13 @@ impl Makefile {
 
     /// Add a new rule to the makefile
     ///
+    /// The target is escaped as by [`Rule::set_targets`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target` can not be written as a single target that reads
+    /// back the same.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -871,14 +879,16 @@ impl Makefile {
     /// ```
     pub fn add_rule(&mut self, target: &str) -> Rule {
         let eol = line_ending(self.syntax());
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RULE.into());
-        builder.token(IDENTIFIER.into(), target);
-        builder.token(OPERATOR.into(), ":");
-        builder.token(NEWLINE.into(), &eol);
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root_mut(builder.finish());
+        let targets = build_targets_node(&[target.to_string()], "add_rule")
+            .unwrap_or_else(|e| panic!("invalid target: {e}"));
+        let syntax = SyntaxNode::new_root_mut(rowan::GreenNode::new(
+            RULE.into(),
+            [
+                targets.green().into_owned().into(),
+                rowan::GreenToken::new(OPERATOR.into(), ":").into(),
+                rowan::GreenToken::new(NEWLINE.into(), &eol).into(),
+            ],
+        ));
         let pos = terminate_line_before(
             self.syntax(),
             self.syntax().children_with_tokens().count(),
