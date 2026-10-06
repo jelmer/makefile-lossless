@@ -39,6 +39,15 @@ pub(crate) fn keyword_token(node: &SyntaxNode) -> Option<(SyntaxToken, String)> 
     }
 }
 
+/// The source range of the directive keyword at the start of `node`, from
+/// any `.` or `!` before the name up to the end of the name token returned
+/// by [`keyword_token`], so `.  if` is covered entirely.
+pub(crate) fn keyword_range(node: &SyntaxNode) -> Option<rowan::TextRange> {
+    let (token, _) = keyword_token(node)?;
+    let first = node.children_with_tokens().find_map(|it| it.into_token())?;
+    Some(first.text_range().cover(token.text_range()))
+}
+
 /// The normalized directive keyword at the start of `node`; see
 /// [`keyword_token`].
 pub(crate) fn directive_keyword(node: &SyntaxNode) -> Option<String> {
@@ -170,6 +179,21 @@ impl Directive {
     /// ```
     pub fn keyword(&self) -> Option<String> {
         directive_keyword(self.syntax())
+    }
+
+    /// The source range of the directive keyword, including the leading dot
+    /// or `!` and any whitespace after it, as in `.  error`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem, MakefileVariant, TextRange};
+    /// let makefile =
+    ///     Makefile::parse_with_variant(".  undef X\n", MakefileVariant::BSDMake).tree();
+    /// let Some(MakefileItem::Directive(d)) = makefile.items().next() else { panic!() };
+    /// assert_eq!(d.keyword_range(), Some(TextRange::new(0.into(), 8.into())));
+    /// ```
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        keyword_range(self.syntax())
     }
 
     /// The unexpanded argument of the directive, if any.
@@ -1285,5 +1309,34 @@ mod tests {
             assert_eq!(messages, vec![message], "{code:?}");
             assert_eq!(parsed.tree().to_string(), code);
         }
+    }
+
+    #[test]
+    fn test_directive_keyword_range() {
+        let text = ".undef X\n.  error a \\\n b\n";
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let ranges: Vec<_> = makefile
+            .items()
+            .map(|item| {
+                let MakefileItem::Directive(d) = item else {
+                    panic!("expected a directive");
+                };
+                &text[d.keyword_range().unwrap()]
+            })
+            .collect();
+        assert_eq!(ranges, vec![".undef", ".  error"]);
+    }
+
+    #[test]
+    fn test_directive_keyword_range_nmake() {
+        let text = "! message hi\n";
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::NMake).tree();
+        let Some(MakefileItem::Directive(d)) = makefile.items().next() else {
+            panic!("expected a directive");
+        };
+        assert_eq!(
+            d.keyword_range(),
+            Some(rowan::TextRange::new(0.into(), 9.into()))
+        );
     }
 }

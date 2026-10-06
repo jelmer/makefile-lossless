@@ -1,4 +1,4 @@
-use super::bsd::keyword_token;
+use super::bsd::{keyword_range, keyword_token};
 use super::makefile::MakefileItem;
 use super::{line_ending, logical_text, terminate_line_before, with_trailing_newline, LineSyntax};
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
@@ -220,6 +220,44 @@ impl ConditionalBranch {
             ".else" => None,
             _ => Some(keyword),
         }
+    }
+
+    /// The source range of the directive keywords starting this branch.
+    ///
+    /// This covers both words of an `else ifeq` or nmake `!ELSE IF`
+    /// header, and any leading dot or `!` with the whitespace after it, as
+    /// in `.  elif`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nelse ifeq (a,b)\nelse\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let ranges: Vec<_> = cond.branches().map(|b| b.keyword_range()).collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![
+    ///         Some(TextRange::new(0.into(), 5.into())),
+    ///         Some(TextRange::new(8.into(), 17.into())),
+    ///         Some(TextRange::new(24.into(), 28.into())),
+    ///     ]
+    /// );
+    /// ```
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        let (token, keyword) = keyword_token(&self.header)?;
+        let range = keyword_range(&self.header)?;
+        if !matches!(keyword.as_str(), "else" | "!ELSE") {
+            return Some(range);
+        }
+        // The directive after `else`, if any. Other text after it is in an
+        // ERROR node.
+        let directive = token
+            .siblings_with_tokens(Direction::Next)
+            .skip(1)
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() != WHITESPACE)
+            .filter(|t| t.kind() == IDENTIFIER);
+        Some(directive.map_or(range, |t| range.cover(t.text_range())))
     }
 
     /// Whether this is a plain `else` / `.else` branch, taken when no
@@ -645,6 +683,28 @@ impl Conditional {
         } else {
             Some(body)
         }
+    }
+
+    /// The source range of the `endif` keyword closing this conditional,
+    /// or `None` if it has none.
+    ///
+    /// Like [`ConditionalBranch::keyword_range`], this includes any leading
+    /// dot or `!` with the whitespace after it, as in `.  endif`, but not
+    /// a comment after the keyword.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nendif # A\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// assert_eq!(cond.endif_range(), Some(TextRange::new(8.into(), 13.into())));
+    /// ```
+    pub fn endif_range(&self) -> Option<rowan::TextRange> {
+        let endif = self
+            .syntax()
+            .children()
+            .find(|it| it.kind() == CONDITIONAL_ENDIF)?;
+        keyword_range(&endif)
     }
 
     /// Get the body content of the else branch (if it exists)
@@ -2235,5 +2295,102 @@ endif
 
         let code = makefile.to_string();
         assert_eq!(code, "");
+    }
+
+    fn branch_keywords(makefile: &Makefile) -> Vec<Vec<Option<String>>> {
+        let text = makefile.to_string();
+        makefile
+            .conditionals()
+            .map(|cond| {
+                cond.branches()
+                    .map(|b| b.keyword_range())
+                    .chain(std::iter::once(cond.endif_range()))
+                    .map(|r| r.map(|r| text[r].to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn strings(v: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
+        v.iter()
+            .map(|b| b.iter().map(|s| s.map(str::to_string)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_keyword_ranges_gnu() {
+        let (makefile, _) = Makefile::from_str_relaxed(
+            "ifdef A\nelse ifeq (a,b)\nelse  ifndef B # c\nelse # d\nendif # e\nifeq (x,y)\n",
+        );
+        assert_eq!(
+            branch_keywords(&makefile),
+            strings(&[
+                &[
+                    Some("ifdef"),
+                    Some("else ifeq"),
+                    Some("else  ifndef"),
+                    Some("else"),
+                    Some("endif"),
+                ],
+                &[Some("ifeq"), None],
+            ])
+        );
+    }
+
+    #[test]
+    fn test_keyword_ranges_indented_crlf() {
+        let text = "  ifdef A\r\nX = 1\r\n  else\r\n  endif\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        let ranges: Vec<_> = cond
+            .branches()
+            .map(|b| b.keyword_range())
+            .chain(std::iter::once(cond.endif_range()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Some(rowan::TextRange::new(2.into(), 7.into())),
+                Some(rowan::TextRange::new(20.into(), 24.into())),
+                Some(rowan::TextRange::new(28.into(), 33.into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_keyword_ranges_bsd() {
+        let makefile = Makefile::parse_with_variant(
+            ".if 1\n.  elif 2\n.else\n.  endif\n",
+            MakefileVariant::BSDMake,
+        )
+        .tree();
+        assert_eq!(
+            branch_keywords(&makefile),
+            strings(&[&[
+                Some(".if"),
+                Some(".  elif"),
+                Some(".else"),
+                Some(".  endif")
+            ]])
+        );
+    }
+
+    #[test]
+    fn test_keyword_ranges_nmake() {
+        let makefile = Makefile::parse_with_variant(
+            "!  if 1\n!ELSE IF 2\n!ELSEIFDEF A\n! else\n!ENDIF\n",
+            MakefileVariant::NMake,
+        )
+        .tree();
+        assert_eq!(
+            branch_keywords(&makefile),
+            strings(&[&[
+                Some("!  if"),
+                Some("!ELSE IF"),
+                Some("!ELSEIFDEF"),
+                Some("! else"),
+                Some("!ENDIF"),
+            ]])
+        );
     }
 }

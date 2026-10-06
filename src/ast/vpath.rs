@@ -7,6 +7,19 @@ use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 
 impl Vpath {
+    /// The source range of the `vpath` keyword.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem, TextRange};
+    /// let makefile: Makefile = "vpath %.c src\n".parse().unwrap();
+    /// let Some(MakefileItem::Vpath(vpath)) = makefile.items().next() else { panic!() };
+    /// assert_eq!(vpath.keyword_range(), Some(TextRange::new(0.into(), 5.into())));
+    /// ```
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        super::bsd::keyword_range(self.syntax())
+    }
+
     /// Returns the pattern argument of the `vpath` directive, if any.
     ///
     /// `vpath` (no args) returns `None`.
@@ -402,6 +415,25 @@ mod tests {
         assert_eq!(
             vpath.directories_text_for(MakefileVariant::POSIXMake),
             Some("$(subst a  b,c,a  b)  src".to_string())
+        );
+    }
+
+    #[test]
+    fn test_keyword_range() {
+        let text = "ifdef X\n  vpath\nendif\nvpath %.c \\\n src\n";
+        let makefile: crate::Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .syntax()
+            .descendants()
+            .filter_map(Vpath::cast)
+            .map(|v| v.keyword_range())
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Some(rowan::TextRange::new(10.into(), 15.into())),
+                Some(rowan::TextRange::new(22.into(), 27.into())),
+            ]
         );
     }
 }

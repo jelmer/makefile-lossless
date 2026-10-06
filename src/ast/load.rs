@@ -64,6 +64,19 @@ impl Load {
             .is_some_and(|t| t.text() == "-load")
     }
 
+    /// The source range of the `load` or `-load` keyword.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileItem, TextRange};
+    /// let makefile: Makefile = "-load foo.so\n".parse().unwrap();
+    /// let Some(MakefileItem::Load(load)) = makefile.items().next() else { panic!() };
+    /// assert_eq!(load.keyword_range(), Some(TextRange::new(0.into(), 5.into())));
+    /// ```
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        super::bsd::keyword_range(self.syntax())
+    }
+
     /// Get the parent item of this directive, if any.
     pub fn parent(&self) -> Option<MakefileItem> {
         self.syntax().parent().and_then(MakefileItem::cast)
@@ -222,5 +235,21 @@ mod tests {
                 "{variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_keyword_range() {
+        let text = "load a.so\r\n-load b.so\r\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile
+            .items()
+            .map(|item| {
+                let MakefileItem::Load(load) = item else {
+                    panic!("expected a load directive");
+                };
+                load.keyword_range().map(|r| &text[r])
+            })
+            .collect();
+        assert_eq!(ranges, vec![Some("load"), Some("-load")]);
     }
 }

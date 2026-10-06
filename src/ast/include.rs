@@ -1,4 +1,4 @@
-use super::bsd::{directive_keyword, keyword_token};
+use super::bsd::{directive_keyword, keyword_range, keyword_token};
 use super::makefile::MakefileItem;
 use super::{collapse_continuations, escape_hashes, is_continuation, logical_text, LineSyntax};
 use crate::lex::NMAKE_ESCAPABLE;
@@ -65,7 +65,7 @@ impl Include {
 
     /// Internal: the token holding the include keyword and the keyword
     /// name without any dot, such as `-include`.
-    fn keyword(&self) -> Option<(SyntaxToken<Lang>, String)> {
+    fn keyword_name(&self) -> Option<(SyntaxToken<Lang>, String)> {
         let (token, keyword) = keyword_token(self.syntax())?;
         let name = keyword.trim_start_matches('.').to_string();
         Some((token, name))
@@ -307,11 +307,42 @@ impl Include {
         self.path_expr().map(|it| it.text_range())
     }
 
+    /// The include keyword, such as `include`, `-include` or `sinclude`.
+    ///
+    /// As for [`Directive::keyword`](crate::Directive::keyword), a BSD make
+    /// keyword is normalized to a leading dot followed by the name, as in
+    /// `.include` or `.-include`, and an nmake one to `!INCLUDE`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "-include a.mk\n. include \"b.mk\"\n".parse().unwrap();
+    /// let keywords: Vec<_> = makefile.includes().map(|i| i.keyword()).collect();
+    /// assert_eq!(keywords, vec![Some("-include".to_string()), Some(".include".to_string())]);
+    /// ```
+    pub fn keyword(&self) -> Option<String> {
+        directive_keyword(self.syntax())
+    }
+
+    /// The source range of the include keyword, including a leading dot or
+    /// `!` and any whitespace after it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "sinclude a.mk\n".parse().unwrap();
+    /// let include = makefile.includes().next().unwrap();
+    /// assert_eq!(include.keyword_range(), Some(TextRange::new(0.into(), 8.into())));
+    /// ```
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        keyword_range(self.syntax())
+    }
+
     /// Check if this is an optional include (-include or sinclude)
     ///
     /// For BSD make, `.-include`, `.sinclude` and `.dinclude` are optional.
     pub fn is_optional(&self) -> bool {
-        self.keyword()
+        self.keyword_name()
             .is_some_and(|(_, name)| matches!(name.as_str(), "-include" | "sinclude" | "dinclude"))
     }
 
@@ -476,7 +507,7 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
     pub fn set_optional(&mut self, optional: bool) -> Result<(), Error> {
-        let Some((token, name)) = self.keyword() else {
+        let Some((token, name)) = self.keyword_name() else {
             return Ok(());
         };
         if optional && name.starts_with('!') {
@@ -1333,5 +1364,60 @@ mod tests {
         assert_eq!(includes[0].path(), Some("simple.mk".to_string()));
         assert_eq!(includes[1].path(), Some("optional.mk".to_string()));
         assert_eq!(includes[2].path(), Some("synonym.mk".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_and_range() {
+        let text =
+            "include a.mk\n-include b.mk\nsinclude c.mk\n.  include \"d.mk\"\n.-include <e.mk>\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let keywords: Vec<_> = makefile
+            .includes()
+            .map(|i| (i.keyword().unwrap(), &text[i.keyword_range().unwrap()]))
+            .collect();
+        assert_eq!(
+            keywords,
+            vec![
+                ("include".to_string(), "include"),
+                ("-include".to_string(), "-include"),
+                ("sinclude".to_string(), "sinclude"),
+                (".include".to_string(), ".  include"),
+                (".-include".to_string(), ".-include"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_keyword_range_nmake() {
+        let text = "!  include a.mak\r\n!INCLUDE <b.mak>\r\n";
+        let makefile = crate::Makefile::parse_with_variant(text, MakefileVariant::NMake).tree();
+        let keywords: Vec<_> = makefile
+            .includes()
+            .map(|i| (i.keyword(), i.keyword_range()))
+            .collect();
+        assert_eq!(
+            keywords,
+            vec![
+                (
+                    Some("!INCLUDE".to_string()),
+                    Some(rowan::TextRange::new(0.into(), 10.into()))
+                ),
+                (
+                    Some("!INCLUDE".to_string()),
+                    Some(rowan::TextRange::new(18.into(), 26.into()))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_keyword_range_in_conditional() {
+        let text = "ifdef X\n  include a.mk\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let include = makefile.includes().next().unwrap();
+        assert_eq!(
+            include.keyword_range(),
+            Some(rowan::TextRange::new(10.into(), 17.into()))
+        );
     }
 }
