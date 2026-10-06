@@ -5891,6 +5891,37 @@ mod tests {
     }
 
     #[test]
+    fn test_bsd_reference_unseparated_indirect() {
+        let text = "X = ${v:L:${:Dempty}S,v,r,}\n";
+        assert_eq!(
+            reference_texts(text, MakefileVariant::BSDMake),
+            vec!["${v:L:${:Dempty}S,v,r,}", "${:Dempty}"]
+        );
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let reference = makefile.variable_references().next().unwrap();
+        assert_eq!(
+            reference.parse(MakefileVariant::BSDMake),
+            Ok(crate::ParsedReference {
+                name: "v".to_string(),
+                modifiers: vec![
+                    crate::Modifier::Literal,
+                    crate::Modifier::UnseparatedIndirect("${:Dempty}".to_string()),
+                    crate::Modifier::Substitute {
+                        from: crate::ModifierArg::literal("v"),
+                        to: crate::ModifierArg::literal("r"),
+                        anchor_start: false,
+                        anchor_end: false,
+                        flags: Default::default(),
+                    },
+                ],
+            })
+        );
+        let parsed = parse(text, None);
+        assert_eq!(parsed.errors, vec![]);
+        assert_eq!(parsed.root().to_string(), text);
+    }
+
+    #[test]
     fn test_bsd_reference_substitute_anchor() {
         assert_eq!(
             reference_texts("X = ${X:S/$/x/}\n", MakefileVariant::BSDMake),
