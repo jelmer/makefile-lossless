@@ -839,3 +839,35 @@ fn test_inserted_continuation_line_endings_kept() {
     assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["x", "y"]);
     assert_eq!(rule.recipe_nodes().count(), 1);
 }
+
+#[test]
+fn test_set_value_define() {
+    for (text, value, expected) in [
+        (
+            "define X\r\nold\r\nendef\r\n",
+            "a\nb",
+            "define X\r\na\r\nb\r\nendef\r\n",
+        ),
+        (
+            "define X\r\nold\r\nendef\r\n",
+            "a\r\nb\r\n",
+            "define X\r\na\r\nb\r\nendef\r\n",
+        ),
+        ("define X\r\nendef\r\n", "a", "define X\r\na\r\nendef\r\n"),
+        ("define X\r\nold\r\nendef\r\n", "", "define X\r\nendef\r\n"),
+        ("define X\r\nold\r\nendef", "a", "define X\r\na\r\nendef"),
+    ] {
+        let makefile: Makefile = text.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value(value);
+        assert_eq!(makefile.to_string(), expected, "{text:?}");
+        assert_matches_reparse(&makefile);
+        let value = value.replace("\r\n", "\n");
+        let value = if value.is_empty() || value.ends_with('\n') {
+            value
+        } else {
+            format!("{value}\n")
+        };
+        assert_eq!(var.raw_value(), Some(value), "{text:?}");
+    }
+}

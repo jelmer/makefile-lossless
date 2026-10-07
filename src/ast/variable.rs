@@ -1133,6 +1133,7 @@ impl VariableDefinition {
     ///
     /// For a `define` block, `new_value` is the body, as returned by
     /// [`Self::raw_value`]. A line ending is added if it does not end in one.
+    /// Its lines are written with the line ending of the file, LF or CRLF.
     ///
     /// A space is added between the operator and a value that was empty, as
     /// in `X =`. An `export` or `unexport` directive of a single variable
@@ -1196,17 +1197,20 @@ impl VariableDefinition {
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
         let new_expr = if self.is_define() {
             let eol = line_ending(self.syntax());
-            let body = if new_value.is_empty() || new_value.ends_with('\n') {
-                new_value.to_string()
-            } else {
-                format!("{new_value}{eol}")
-            };
-            parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &body).ok_or_else(|| {
-                value_error(
-                    "set_value",
-                    format!("Cannot write {new_value:?} as the body of a define block"),
-                )
-            })?
+            // The body as raw_value returns it, with LF line endings.
+            let mut value = new_value.replace("\r\n", "\n");
+            if !value.is_empty() && !value.ends_with('\n') {
+                value.push('\n');
+            }
+            let body = value.replace('\n', &eol);
+            parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &value).ok_or_else(
+                || {
+                    value_error(
+                        "set_value",
+                        format!("Cannot write {new_value:?} as the body of a define block"),
+                    )
+                },
+            )?
         } else {
             if breaks_line(new_value) {
                 return Err(value_error(
