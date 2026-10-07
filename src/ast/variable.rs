@@ -70,6 +70,32 @@ fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossles
     Some(SyntaxNode::new_root_mut(expr.green().into_owned()))
 }
 
+/// The EXPR node for `value` as the value of an assignment on a single
+/// line, with each `#` that would start a comment escaped.
+///
+/// GNU make halves the backslashes before a `#`, and an odd one left over
+/// escapes it, so the backslashes before such a `#` are doubled and one is
+/// added. BSD make keeps all but the last of them.
+fn single_line_value_expr(value: &str) -> Option<SyntaxNode<crate::lossless::Lang>> {
+    let mut value = value.to_string();
+    loop {
+        let text = format!("X = {value}\n");
+        if let Some(expr) = parse_value_expr(&text, &value) {
+            return Some(expr);
+        }
+        let comment = parse(&text, None)
+            .root()
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == COMMENT)?;
+        let pos = usize::from(comment.text_range().start()) - "X = ".len();
+        let before = &value[..pos];
+        let backslashes = before.len() - before.trim_end_matches('\\').len();
+        value.insert_str(pos, &"\\".repeat(backslashes + 1));
+    }
+}
+
 /// The number of `define` blocks opened in the body of a `define` block
 /// and not closed again, counted the way the parser does: by the first word
 /// of each logical line.
@@ -1112,6 +1138,12 @@ impl VariableDefinition {
     /// The whitespace before a comment after the value is kept, although
     /// make includes it in the value.
     ///
+    /// Outside a `define` block, `new_value` is written as it is if the
+    /// parser reads it back as the raw value. Otherwise each `#` that would
+    /// start a comment is escaped with a backslash, as GNU and BSD make
+    /// read it; the backslashes before it are doubled, as GNU make halves
+    /// them. `$` is not escaped, since references are part of the value.
+    ///
     /// # Panics
     ///
     /// Panics if `new_value` can not be written as the value, or the
@@ -1139,8 +1171,11 @@ impl VariableDefinition {
     /// contains a newline that is not part of a line continuation or ends
     /// in a backslash that would continue the line. In a `define` block
     /// newlines are allowed, but the body must not end the block early,
-    /// e.g. with an `endef` line. Also returns an error if the definition
-    /// can not have a value, such as an `undefine` directive or an `export`
+    /// e.g. with an `endef` line. Outside a `define` block, also returns an
+    /// error if make would read the value differently even with `#`
+    /// escaped: if it starts with whitespace, which make strips, or has an
+    /// unterminated reference. Also returns an error if the definition can
+    /// not have a value, such as an `undefine` directive or an `export`
     /// directive of several variables.
     ///
     /// # Example
@@ -1149,8 +1184,11 @@ impl VariableDefinition {
     /// let mut makefile: Makefile = "VAR = old\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_value("a\nb").is_err());
+    /// assert!(var.try_set_value(" a").is_err());
     /// var.try_set_value("a \\\n  b").unwrap();
     /// assert_eq!(makefile.code(), "VAR = a \\\n  b\n");
+    /// var.try_set_value("a#b").unwrap();
+    /// assert_eq!(makefile.code(), "VAR = a\\#b\n");
     /// ```
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
         let new_expr = if self.is_define() {
@@ -1173,15 +1211,12 @@ impl VariableDefinition {
                     format!("Cannot write {new_value:?} as a value on a single line"),
                 ));
             }
-            parse_value_expr(&format!("X = {new_value}\n"), new_value).unwrap_or_else(|| {
-                // TODO: escape values that the parser would read differently,
-                // such as ones containing `#`
-                let mut builder = GreenNodeBuilder::new();
-                builder.start_node(EXPR.into());
-                builder.token(IDENTIFIER.into(), new_value);
-                builder.finish_node();
-                SyntaxNode::new_root_mut(builder.finish())
-            })
+            single_line_value_expr(new_value).ok_or_else(|| {
+                value_error(
+                    "set_value",
+                    format!("Cannot write {new_value:?} as a variable value"),
+                )
+            })?
         };
 
         let Some(expr) = self.value_expr() else {
@@ -2641,6 +2676,82 @@ mod tests {
         assert_eq!(set_value("export X\r\n", "new"), "export X = new\r\n");
         assert_eq!(set_value("export X # c\n", "new"), "export X = new # c\n");
         assert_eq!(set_value("export X\n", ""), "export X =\n");
+    }
+
+    /// Set the value of the only variable definition in `text` and check
+    /// that GNU make, and BSD make if `bsd`, read `value` back.
+    fn set_value_escaped(text: &str, value: &str, bsd: bool) -> String {
+        let makefile: Makefile = text.parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value(value);
+        crate::test_util::assert_matches_reparse(&makefile);
+        assert_eq!(var.value(MakefileVariant::GNUMake).as_deref(), Some(value));
+        if bsd {
+            assert_eq!(var.value(MakefileVariant::BSDMake).as_deref(), Some(value));
+        }
+        makefile.code()
+    }
+
+    #[test]
+    fn test_set_value_escapes_hash() {
+        assert_eq!(set_value_escaped("X = old\n", "a#b", true), "X = a\\#b\n");
+        assert_eq!(set_value_escaped("X = old\n", "#", true), "X = \\#\n");
+        assert_eq!(
+            set_value_escaped("X = old\n", "a # b", true),
+            "X = a \\# b\n"
+        );
+        assert_eq!(
+            set_value_escaped("X = old\n", "a#b#c", true),
+            "X = a\\#b\\#c\n"
+        );
+        let makefile: Makefile = "X = old # c\n".parse().unwrap();
+        makefile
+            .variable_definitions()
+            .next()
+            .unwrap()
+            .set_value("a#b");
+        crate::test_util::assert_matches_reparse(&makefile);
+        assert_eq!(makefile.code(), "X = a\\#b # c\n");
+        assert_eq!(
+            set_value_escaped("export X\n", "a#b", true),
+            "export X = a\\#b\n"
+        );
+        // GNU make halves the backslashes before a `#`, BSD make does not.
+        assert_eq!(
+            set_value_escaped("X = old\n", "a\\\\#b", false),
+            "X = a\\\\\\\\\\#b\n"
+        );
+    }
+
+    #[test]
+    fn test_set_value_hash_not_escaped() {
+        // An escaped `#`, or one in a reference, does not start a comment.
+        assert_eq!(set_value("X = old\n", "a\\#b"), "X = a\\#b\n");
+        assert_eq!(set_value("X = old\n", "$(f #)"), "X = $(f #)\n");
+    }
+
+    #[test]
+    fn test_try_set_value_unrepresentable() {
+        // make strips leading whitespace from a value, and reports an
+        // unterminated reference.
+        for value in [" a", "\ta", " ", "$(x", "$(f #"] {
+            let makefile: Makefile = "X = old\n".parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            let error = var.try_set_value(value).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Parse error: Error at line 1: Cannot write {value:?} as a variable value\n1| set_value\n"
+                )
+            );
+            assert_eq!(makefile.code(), "X = old\n");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot write \" a\" as a variable value")]
+    fn test_set_value_leading_whitespace() {
+        set_value("X = old\n", " a");
     }
 
     #[test]
