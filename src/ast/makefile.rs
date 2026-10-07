@@ -1,8 +1,8 @@
 use super::rule::build_targets_node;
 use super::{
     detach_tokens, doc_comment_lines, hoist_doc_comment, index_before_doc_comment, line_ending,
-    lines_above, terminate_line_before, text_before, with_recipe_prefix, with_trailing_newline,
-    LineSyntax,
+    lines_above, terminate_line_before, with_recipe_prefix, with_recipe_prefix_before,
+    with_trailing_newline, LineSyntax,
 };
 use crate::lossless::{
     invalid_edit, line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo,
@@ -119,11 +119,19 @@ fn needs_blank_line_at_end(root: &SyntaxNode) -> bool {
 /// Like [`needs_blank_line_at_end`], for an item inserted before the
 /// child at `index` of `root`.
 fn needs_blank_line_before(root: &SyntaxNode, index: usize) -> bool {
-    let text: String = root
-        .children_with_tokens()
-        .take(index)
-        .map(|it| it.to_string())
-        .collect();
+    let last = index
+        .checked_sub(1)
+        .and_then(|i| root.children_with_tokens().nth(i));
+    // Only the last line matters, so don't build the text of all of them.
+    let mut text = String::new();
+    for element in std::iter::successors(last, |it| it.prev_sibling_or_token()) {
+        let element = element.to_string();
+        let complete = element.contains('\n') && !text.is_empty();
+        text.insert_str(0, &element);
+        if complete {
+            break;
+        }
+    }
     let Some(body) = text.strip_suffix('\n') else {
         return false;
     };
@@ -175,7 +183,7 @@ fn insert_items(parent: &SyntaxNode, index: usize, elements: Vec<crate::lossless
 /// described by [`needs_blank_line_at_end`].
 fn append_with_blank_line(root: &SyntaxNode, node: SyntaxNode, eol: &str) {
     let pos = terminate_line_before(root, root.children_with_tokens().count(), eol);
-    let node = with_recipe_prefix(&node, &text_before(root, pos));
+    let node = with_recipe_prefix_before(&node, root, pos);
     let mut nodes = Vec::new();
     if needs_blank_line_at_end(root) {
         let mut bl_builder = GreenNodeBuilder::new();
@@ -471,7 +479,7 @@ impl MakefileItem {
             "MakefileItem::replace",
         )?;
         let current_index = self.syntax().index();
-        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, current_index));
+        let new_node = with_recipe_prefix_before(new_item.syntax(), &parent, current_index);
         let new_node = with_trailing_newline(&new_node, &line_ending(&parent));
 
         // Replace the current node with the new item's syntax
@@ -692,7 +700,7 @@ impl MakefileItem {
         )?;
         hoist_doc_comment(self.syntax());
         let current_index = index_before_doc_comment(self.syntax());
-        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, current_index));
+        let new_node = with_recipe_prefix_before(new_item.syntax(), &parent, current_index);
         let new_node = with_trailing_newline(&new_node, &line_ending(&parent));
 
         parent.splice_children(current_index..current_index, vec![new_node.into()]);
@@ -736,7 +744,7 @@ impl MakefileItem {
         let eol = line_ending(&parent);
         hoist_next_doc_comment(self.syntax());
         let index = terminate_line_before(&parent, self.syntax().index() + 1, &eol);
-        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, index));
+        let new_node = with_recipe_prefix_before(new_item.syntax(), &parent, index);
         let new_node = with_trailing_newline(&new_node, &eol);
 
         // Insert the new item after the current item
@@ -1658,7 +1666,7 @@ impl Makefile {
         let target_index = target_node.index();
         let parent = target_node.parent().unwrap();
 
-        let new_node = with_recipe_prefix(new_rule.syntax(), &text_before(&parent, target_index));
+        let new_node = with_recipe_prefix_before(new_rule.syntax(), &parent, target_index);
         let new_node = with_trailing_newline(&new_node, &line_ending(self.syntax()));
 
         parent.splice_children(target_index..target_index + 1, vec![new_node.into()]);
@@ -1772,7 +1780,7 @@ impl Makefile {
 
         let eol = line_ending(self.syntax());
         let target_index = terminate_line_before(&parent, target_index, &eol);
-        let new_node = with_recipe_prefix(new_rule.syntax(), &text_before(&parent, target_index));
+        let new_node = with_recipe_prefix_before(new_rule.syntax(), &parent, target_index);
         let new_node = with_trailing_newline(&new_node, &eol);
 
         let blank_line = || {
