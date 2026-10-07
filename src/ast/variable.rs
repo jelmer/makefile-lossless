@@ -2432,7 +2432,7 @@ mod tests {
                 None => crate::Makefile::parse(text),
                 Some(v) => crate::Makefile::parse_with_variant(text, v),
             };
-            assert!(parsed.ok(), "{variant:?}");
+            assert!(parsed.is_ok(), "{variant:?}");
             let vars: Vec<_> = parsed.tree().variable_definitions().collect();
             assert_eq!(vars.len(), 2, "{variant:?}");
             assert_eq!(vars[0].name(), Some("flags-$(CONFIG_X)".to_string()));
@@ -2860,7 +2860,11 @@ mod tests {
                     None => Makefile::parse(code),
                     Some(v) => Makefile::parse_with_variant(code, v),
                 };
-                assert!(parsed.ok(), "{variant:?} {code:?}: {:?}", parsed.errors());
+                assert!(
+                    parsed.is_ok(),
+                    "{variant:?} {code:?}: {:?}",
+                    parsed.errors()
+                );
                 let makefile = parsed.tree();
                 assert_eq!(makefile.code(), code);
                 let vars: Vec<_> = makefile.variable_definitions().collect();
@@ -2881,7 +2885,7 @@ mod tests {
         // go negative.
         for (code, name) in [("a{b c} = 1\n", "a{b c}"), ("a}b{ = 1\n", "a}b{")] {
             let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
-            assert!(parsed.ok(), "{code:?}: {:?}", parsed.errors());
+            assert!(parsed.is_ok(), "{code:?}: {:?}", parsed.errors());
             let makefile = parsed.tree();
             assert_eq!(makefile.code(), code);
             let var = makefile.variable_definitions().next().unwrap();
@@ -2922,7 +2926,7 @@ mod tests {
     fn test_try_set_name_with_errors() {
         let code = "X = 1\n)foo\nifdef A\n";
         let parsed = Makefile::parse(code);
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         let makefile = parsed.tree();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("Y").unwrap();
@@ -3969,7 +3973,7 @@ mod tests {
     #[test]
     fn test_set_value_in_makefile_with_errors() {
         let parsed = Makefile::parse("X = a  # c\nifdef Y\nZ = 1\n");
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         let makefile = parsed.tree();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_value("b").unwrap();

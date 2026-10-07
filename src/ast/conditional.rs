@@ -2159,7 +2159,7 @@ endif
             ".if ${A:S/a/b/ \\\n\t:S/c/d/} == x\n.endif\n",
             MakefileVariant::BSDMake,
         );
-        assert!(parsed.ok(), "{:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{:?}", parsed.errors());
         let cond = parsed.tree().conditionals().next().unwrap();
         assert_eq!(
             cond.condition_for(MakefileVariant::GNUMake),

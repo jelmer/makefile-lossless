@@ -1348,7 +1348,7 @@ mod tests {
             ".include <${DIR:S/a/b/ \\\n\t:S/c/d/}/x.mk>\n",
             MakefileVariant::BSDMake,
         );
-        assert!(parsed.ok(), "{:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{:?}", parsed.errors());
         let inc = parsed.tree().includes().next().unwrap();
         assert_eq!(inc.path(), Some("${DIR:S/a/b/  :S/c/d/}/x.mk".to_string()));
         assert_eq!(

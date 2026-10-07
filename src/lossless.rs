@@ -518,7 +518,7 @@ impl FromStr for Rule {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Rule::parse(s).to_result()
+        Rule::parse(s).into_result()
     }
 }
 
@@ -526,6 +526,6 @@ impl FromStr for Makefile {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Makefile::parse(s).to_result()
+        Makefile::parse(s).into_result()
     }
 }

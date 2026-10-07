@@ -2374,7 +2374,7 @@ mod tests {
     #[test]
     fn test_recipe_edits_in_makefile_with_errors() {
         let parsed = Makefile::parse("all: ; @echo a\n\techo b\nifdef X\nY = 1\n");
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         let makefile = parsed.tree();
         let mut rule = makefile.rules().next().unwrap();
         let mut recipes: Vec<_> = rule.recipe_nodes().collect();

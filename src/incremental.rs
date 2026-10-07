@@ -584,7 +584,7 @@ mod tests {
         // Verify that positioned errors from the reparsed region get correct offsets
         let old_text = "VAR1 = one\nVAR2 = two\n";
         let parse = Parse::parse_makefile(old_text);
-        assert!(parse.ok());
+        assert!(parse.is_ok());
 
         // Insert text that causes a parse error (indented line not in a rule)
         let edit = TextEdit::new(

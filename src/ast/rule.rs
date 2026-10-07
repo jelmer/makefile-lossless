@@ -3023,7 +3023,7 @@ mod tests {
             ),
         ] {
             let parsed = Makefile::parse_with_variant(text, variant);
-            assert!(parsed.ok());
+            assert!(parsed.is_ok());
             let makefile = parsed.tree();
             assert_eq!(makefile.conditionals().count(), 0, "{variant:?}");
             let rule = makefile.rules().next().unwrap();
@@ -3178,7 +3178,7 @@ mod tests {
     fn test_recipe_prefix() {
         let text = ".RECIPEPREFIX = >\nall:\n> echo one\n>echo two\n\tx = 1\n.RECIPEPREFIX :=\nb:\n\techo b\n";
         let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::GNUMake);
-        assert!(parsed.ok(), "{:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{:?}", parsed.errors());
         let makefile = parsed.tree();
         let rules: Vec<_> = makefile.rules().collect();
         assert_eq!(rules.len(), 2);
@@ -3201,7 +3201,7 @@ mod tests {
             crate::MakefileVariant::NMake,
         ] {
             let parsed = Makefile::parse_with_variant(text, variant);
-            assert!(!parsed.ok(), "{variant:?}");
+            assert!(!parsed.is_ok(), "{variant:?}");
         }
     }
 
@@ -3219,7 +3219,7 @@ mod tests {
         ] {
             let text = format!("{modifiers} .RECIPEPREFIX := >\nall:\n>echo one\n");
             let parsed = Makefile::parse_with_variant(&text, crate::MakefileVariant::GNUMake);
-            assert!(parsed.ok(), "{text:?}: {:?}", parsed.errors());
+            assert!(parsed.is_ok(), "{text:?}: {:?}", parsed.errors());
             let makefile = parsed.tree();
             let rules: Vec<_> = makefile.rules().collect();
             assert_eq!(rules.len(), 1, "{text:?}");
@@ -3232,7 +3232,7 @@ mod tests {
     fn test_define_recipe_prefix() {
         let text = "define FOO\n.RECIPEPREFIX = ;\nendef\ndefine .RECIPEPREFIX\n>\nendef\nall:\n>echo one\n";
         let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::GNUMake);
-        assert!(parsed.ok(), "{:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{:?}", parsed.errors());
         let makefile = parsed.tree();
         let rules: Vec<_> = makefile.rules().collect();
         assert_eq!(rules.len(), 1);
@@ -3244,7 +3244,7 @@ mod tests {
     /// return the targets and prerequisites of its single rule.
     fn parse_rule_names(text: &str, variant: crate::MakefileVariant) -> (Vec<String>, Vec<String>) {
         let parsed = Makefile::parse_with_variant(text, variant);
-        assert!(parsed.ok(), "{text:?}: {:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{text:?}: {:?}", parsed.errors());
         let makefile = parsed.tree();
         assert_eq!(makefile.to_string(), text);
         let rules: Vec<_> = makefile.rules().collect();
@@ -3395,7 +3395,7 @@ mod tests {
     fn test_rule_accessors_for_bsd() {
         let text = "${A:S/a/b/ \\\n\t:S/c/d/}: ${B:S/a/b/ \\\n\t:S/c/d/}\n";
         let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
-        assert!(parsed.ok(), "{:?}", parsed.errors());
+        assert!(parsed.is_ok(), "{:?}", parsed.errors());
         let rule = parsed.tree().rules().next().unwrap();
         assert_eq!(
             rule.targets_for(MakefileVariant::BSDMake)
@@ -3431,7 +3431,7 @@ mod tests {
             Makefile::parse(text),
             Makefile::parse_with_variant(text, MakefileVariant::GNUMake),
         ] {
-            assert!(parsed.ok(), "{:?}", parsed.errors());
+            assert!(parsed.is_ok(), "{:?}", parsed.errors());
             let makefile = parsed.tree();
             assert_eq!(makefile.to_string(), text);
             let rule = makefile.rules().next().unwrap();
@@ -3466,7 +3466,7 @@ mod tests {
             ),
         ] {
             let parsed = Makefile::parse_with_variant(text, variant);
-            assert!(parsed.ok(), "{variant:?}: {:?}", parsed.errors());
+            assert!(parsed.is_ok(), "{variant:?}: {:?}", parsed.errors());
             let makefile = parsed.tree();
             assert_eq!(makefile.to_string(), text);
             let rule = makefile.rules().next().unwrap();
@@ -4294,7 +4294,7 @@ endif
     fn test_edit_rule_in_makefile_with_errors() {
         let text = "a: b \\\n  c\nifdef X\nY = 1\n";
         let parsed = Makefile::parse(text);
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         let makefile = parsed.tree();
         let mut rule = makefile.rules().next().unwrap();
         rule.add_prerequisite("d").unwrap();

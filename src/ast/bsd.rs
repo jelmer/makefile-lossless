@@ -523,7 +523,7 @@ mod tests {
 
         // GNU make accepts this too.
         let parsed = Makefile::parse_with_variant(": empty-source\n", MakefileVariant::GNUMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
     }
 
     #[test]
@@ -578,7 +578,7 @@ mod tests {
         );
 
         let parsed = Makefile::parse_with_variant("!= echo\n", MakefileVariant::GNUMake);
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
         // BSD make treats this as an assignment to `a:b`; GNU make, and the
         // default mode, as a target-specific variable.
         let parsed = Makefile::parse_with_variant("a:b=c\n", MakefileVariant::BSDMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         let var = parsed.tree().variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("a:b".to_string()));
         assert_eq!(var.raw_value(), Some("c".to_string()));
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_name_with_space_is_not_assignment() {
         let parsed = Makefile::parse("VARIABLE NAME=\tvalue\n");
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         assert_eq!(parsed.tree().variable_definitions().count(), 0);
     }
 
@@ -733,18 +733,18 @@ mod tests {
     fn test_gnu_variant_ignores_bsd_directives() {
         let parsed =
             Makefile::parse_with_variant(".include <bsd.prog.mk>\n", MakefileVariant::GNUMake);
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         assert_eq!(parsed.tree().includes().count(), 0);
     }
 
     #[test]
     fn test_bsd_variant_ignores_gnu_conditionals() {
         let parsed = Makefile::parse_with_variant("ifdef X\nendif\n", MakefileVariant::BSDMake);
-        assert!(!parsed.ok());
+        assert!(!parsed.is_ok());
         assert_eq!(parsed.tree().conditionals().count(), 0);
 
         let parsed = Makefile::parse_with_variant(".ifdef X\n.endif\n", MakefileVariant::BSDMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         assert_eq!(parsed.tree().conditionals().count(), 1);
     }
 
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn test_gmake_export_in_bsd_make() {
         let parsed = Makefile::parse_with_variant("export X = 1\n", MakefileVariant::BSDMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         let var = parsed.tree().variable_definitions().next().unwrap();
         assert_eq!(var.name(), Some("X".to_string()));
         assert!(var.is_export());
@@ -1079,7 +1079,7 @@ mod tests {
             "EXP.[A-]= x\n*= y\na(b)= z\nx,y = w\n",
             MakefileVariant::GNUMake,
         );
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         assert_eq!(
             parsed
                 .tree()
@@ -1111,7 +1111,7 @@ mod tests {
         );
         // GNU make parses it as a normal line.
         let parsed = Makefile::parse_with_variant("X=1\n\tA = 1\n", MakefileVariant::GNUMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         assert_eq!(parsed.tree().variable_definitions().count(), 2);
     }
 
@@ -1377,7 +1377,7 @@ mod tests {
         }
         // GNU make assigns to a variable named `a}b`.
         let parsed = Makefile::parse_with_variant("a}b := 1\n", MakefileVariant::GNUMake);
-        assert!(parsed.ok());
+        assert!(parsed.is_ok());
         assert_eq!(
             parsed.tree().variable_definitions().next().unwrap().name(),
             Some("a}b".to_string())
