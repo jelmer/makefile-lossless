@@ -33,6 +33,9 @@ pub struct Lexer<'a> {
     /// Whether the previous line was a recipe line ending in a backslash, so
     /// that this line continues the recipe.
     recipe_continuation: bool,
+    /// Whether the current line continues a recipe line, so that a `#` at
+    /// its start is part of the command rather than a comment.
+    continues_recipe: bool,
     /// Number of parentheses and braces open inside `$(...)` and `${...}`
     /// references on the current logical line.
     reference_depth: usize,
@@ -85,6 +88,7 @@ impl<'a> Lexer<'a> {
             nmake: variant == Some(MakefileVariant::NMake),
             after_lbracket: false,
             recipe_continuation: false,
+            continues_recipe: false,
             reference_depth: 0,
             dollars: 0,
             recipe_prefix: '\t',
@@ -307,6 +311,9 @@ impl<'a> Lexer<'a> {
         if let Some(&c) = self.input.peek() {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
+            if self.line_type.is_none() {
+                self.continues_recipe = recipe_continuation;
+            }
             match (c, self.line_type) {
                 (_, None) if self.nmake_inline_files > 0 && !self.at_newline() => {
                     // A line of an nmake inline file, up to a line starting
@@ -387,6 +394,11 @@ impl<'a> Lexer<'a> {
                     && (!self.comments
                         || (self.bsd && after_lbracket)
                         || (self.hash_in_references && self.reference_depth > 0)) => {}
+                // GNU and BSD make pass a `#` at the start of a continuation
+                // line on to the shell with the rest of the command.
+                '#' if self.line_type == Some(LineType::Recipe)
+                    && self.continues_recipe
+                    && !self.nmake => {}
                 '#' => {
                     let comment = self.read_comment();
                     // GNU and BSD make continue a recipe line starting with
