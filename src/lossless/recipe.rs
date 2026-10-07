@@ -1,7 +1,7 @@
 use super::*;
 use crate::ast::{
-    line_ending, recipe_prefix_before, replace_children, replace_recipe_prefix,
-    terminate_line_before,
+    detach_elements, line_ending, recipe_prefix_before, replace_children, replace_range,
+    replace_recipe_prefix, terminate_line_before,
 };
 use rowan::{GreenNode, GreenToken};
 
@@ -724,44 +724,24 @@ impl Recipe {
                 self.text()
             )));
         }
-        // TODO: splice them out once rowan's splice_children removes more
-        // than the first child of the range, as it does from 0.17 on.
+        let mut old = prefix_tokens;
+        old.extend(first_text);
+        let text = combined;
+        if let Some(same) = old.iter().position(|t| t.text() == text) {
+            old.remove(same);
+            detach_elements(old.into_iter().map(Into::into));
+            return Ok(());
+        }
         // A recipe line starting with `#` is a comment, and one starting
         // with a prefix character is text.
-        let replace = |token: &SyntaxToken, text: &str| {
-            let index = token.index();
-            token.detach();
-            if !text.is_empty() {
-                let kind = if text.starts_with('#') { COMMENT } else { TEXT };
-                node.splice_children(index..index, detached_elements(&[(kind, text)], None));
-            }
+        let kind = if text.starts_with('#') { COMMENT } else { TEXT };
+        let new = if text.is_empty() {
+            vec![]
+        } else {
+            detached_elements(&[(kind, &text)], None)
         };
-        match (first_text, prefix_tokens.split_first()) {
-            (Some(token), _) => {
-                for old in &prefix_tokens {
-                    old.detach();
-                }
-                let text = format!("{prefix}{rest}");
-                if text != token.text() {
-                    replace(&token, &text);
-                }
-            }
-            (None, Some((first, others))) => {
-                for old in others {
-                    old.detach();
-                }
-                if first.text() != prefix {
-                    replace(first, prefix);
-                }
-            }
-            (None, None) if !prefix.is_empty() => {
-                node.splice_children(
-                    insert_at..insert_at,
-                    detached_elements(&[(TEXT, prefix)], None),
-                );
-            }
-            (None, None) => {}
-        }
+        let start = old.first().map_or(insert_at, |t| t.index());
+        replace_range(node, start..start + old.len(), new);
         Ok(())
     }
 
@@ -1032,10 +1012,11 @@ impl Recipe {
 
         let prefix = recipe_prefix_before(&parent, node.index()).to_string();
         let newline = line_ending(node);
-        for token in inline_prefix {
-            token.detach();
-        }
-        node.splice_children(0..0, detached_elements(&[(INDENT, &prefix)], None));
+        replace_range(
+            node,
+            0..inline_prefix.len(),
+            detached_elements(&[(INDENT, &prefix)], None),
+        );
         let index = node.index();
         parent.splice_children(
             index..index,

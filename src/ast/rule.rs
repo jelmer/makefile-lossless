@@ -1490,10 +1490,7 @@ impl Rule {
                 None
             };
             let fresh = build_prerequisites_node(&prereqs, separator, next_kind == Some(COMMENT))?;
-            for child in &children[..keep] {
-                child.detach();
-            }
-            node.splice_children(0..0, fresh.children_with_tokens().collect::<Vec<_>>());
+            super::replace_range(&node, 0..keep, fresh.children_with_tokens().collect());
             if !has_external_whitespace && !prereqs.is_empty() {
                 let index = node.index();
                 self.syntax().splice_children(

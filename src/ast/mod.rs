@@ -20,6 +20,7 @@ use crate::SyntaxKind::{
     DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
     LBRACE, LOAD, LPAREN, NEWLINE, PREREQUISITE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
 };
+use std::ops::Range;
 
 /// An error for invalid input to the method `context`.
 pub(crate) fn edit_error(context: &str, message: String) -> Error {
@@ -208,14 +209,28 @@ pub(crate) fn replace_children(node: &SyntaxNode, new: Vec<GreenElement>) {
         .zip(new[prefix..].iter().rev())
         .take_while(|(old, new)| same_green(old, new))
         .count();
-    detach_elements(old[prefix..old.len() - suffix].iter().cloned());
     let middle = new[prefix..new.len() - suffix].to_vec();
     let root = SyntaxNode::new_root_mut(rowan::GreenNode::new(
         crate::SyntaxKind::ROOT.into(),
         middle,
     ));
     let elements: Vec<_> = root.children_with_tokens().collect();
-    node.splice_children(prefix..prefix, elements);
+    replace_range(node, prefix..old.len() - suffix, elements);
+}
+
+/// Replace the children of `node` in `range` with `new`.
+///
+/// Use this rather than `node.splice_children(range, new)`, which in
+/// rowan 0.16 only detaches the first element of a longer range.
+pub(crate) fn replace_range(node: &SyntaxNode, range: Range<usize>, new: Vec<SyntaxElement>) {
+    let start = range.start;
+    detach_elements(
+        node.children_with_tokens()
+            .skip(start)
+            .take(range.len())
+            .collect::<Vec<_>>(),
+    );
+    node.splice_children(start..start, new);
 }
 
 /// Detach `elements` from the tree one by one.
@@ -822,5 +837,19 @@ mod tests {
         detach_elements(elements);
         assert_eq!(makefile.to_string(), "X# c\nall:\n");
         assert_eq!(variable.syntax().to_string(), "X# c\n");
+    }
+
+    #[test]
+    fn test_replace_range() {
+        let makefile: Makefile = "X := a b # c\nall:\n".parse().unwrap();
+        let variable = makefile.variable_definitions().next().unwrap();
+        let last = variable.syntax().last_token().unwrap();
+        replace_range(
+            variable.syntax(),
+            1..5,
+            detached_elements(&[(OPERATOR, "="), (WHITESPACE, " ")], None),
+        );
+        assert_eq!(makefile.to_string(), "X= # c\nall:\n");
+        assert_eq!(last.parent().as_ref(), Some(variable.syntax()));
     }
 }
