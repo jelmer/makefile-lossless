@@ -2745,6 +2745,22 @@ mod tests {
     }
 
     #[test]
+    fn test_semicolon_before_target_specific_operator() {
+        // GNU make starts the recipe at the `;`, before the `=`.
+        let rule: Rule = "foo: A;B = 1\n".parse().unwrap();
+        assert!(rule.scoped_assignment().is_none());
+        assert_eq!(prereqs(&rule), (vec!["A".to_string()], vec![]));
+        assert_eq!(recipes(&rule), vec!["B = 1"]);
+
+        // Unless it is escaped or in a reference.
+        for code in ["foo: A\\;B = 1\n", "foo: $(A;B) = 1\n"] {
+            let rule: Rule = code.parse().unwrap();
+            assert_eq!(recipes(&rule), Vec::<String>::new(), "{code:?}");
+            assert!(rule.scoped_assignment().is_some(), "{code:?}");
+        }
+    }
+
+    #[test]
     fn test_inline_recipe_with_continuation() {
         let input = "all: ; echo a \\\n\tb\n\techo c\n";
         let rule: Rule = input.parse().unwrap();
