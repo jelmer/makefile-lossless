@@ -377,8 +377,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     /// The rest of a logical line, from [`Parser::bsd_logical_line`].
     struct BsdLine {
         text: String,
-        /// `text` as make sees it, with `\#` replaced by `#`.
-        unescaped: crate::reference::UnescapedHash,
+        /// `text` as make sees it, with `\#` replaced by `#`, and the
+        /// expressions parsed in it.
+        exprs: crate::reference::BsdExprLine,
         /// The source position of each token and its offset in `text`.
         starts: Vec<(rowan::TextSize, usize)>,
         /// The source position of the end of the line.
@@ -2452,7 +2453,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 });
             let (text, starts, end) = bsd_logical_line(tokens, self.pending_backslash_escape);
             BsdLine {
-                unescaped: crate::reference::UnescapedHash::new(&text),
+                exprs: crate::reference::BsdExprLine::new(crate::reference::UnescapedHash::new(
+                    &text,
+                )),
                 text,
                 starts,
                 end: end.unwrap_or_else(|| self.current_range().start()),
@@ -2512,10 +2515,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// without consuming anything if the expression is malformed.
         fn parse_bsd_variable_reference(&mut self) -> bool {
             let offset = self.bsd_line_offset();
-            let line = self.bsd_line.take().expect("set by bsd_line_offset");
-            let found = crate::reference::bsd_expr_extent_at(&line.unescaped, offset);
+            let mut line = self.bsd_line.take().expect("set by bsd_line_offset");
+            let found = line.exprs.extent_at(offset);
             if let Some((end, nested)) = &found {
-                self.emit_bsd_expr(&line.unescaped, offset, *end, nested);
+                self.emit_bsd_expr(&mut line.exprs, offset, *end, nested);
             }
             self.bsd_line = Some(line);
             found.is_some()
@@ -2528,7 +2531,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// make parses it.
         fn emit_bsd_expr(
             &mut self,
-            line: &crate::reference::UnescapedHash,
+            line: &mut crate::reference::BsdExprLine,
             offset: usize,
             len: usize,
             nested: &[std::ops::Range<usize>],
@@ -2537,11 +2540,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let mut pos = 0;
             for span in nested {
                 self.bump_logical_bytes(span.start - pos);
-                let inner_nested =
-                    match crate::reference::bsd_expr_extent_at(line, offset + span.start) {
-                        Some((end, inner_nested)) if end == span.len() => inner_nested,
-                        _ => vec![],
-                    };
+                let inner_nested = match line.extent_at(offset + span.start) {
+                    Some((end, inner_nested)) if end == span.len() => inner_nested,
+                    _ => vec![],
+                };
                 self.emit_bsd_expr(line, offset + span.start, span.len(), &inner_nested);
                 pos = span.end;
             }
