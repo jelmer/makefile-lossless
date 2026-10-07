@@ -38,6 +38,7 @@ mod bsd_condition;
 mod incremental;
 mod lex;
 mod lossless;
+mod nmake_condition;
 mod parse;
 mod pattern;
 mod reference;
@@ -63,6 +64,10 @@ pub use lossless::{
     ForLoop, Identifier, Include, Lang, Load, Makefile, ParseError, ParseErrorKind,
     PositionedParseError, Recipe, RecipeVariableReference, ReferenceLocation, Rule,
     VariableDefinition, VariableReference, Vpath,
+};
+pub use nmake_condition::{
+    parse_nmake_condition, NmakeBinaryOp, NmakeCondition, NmakeConditionError,
+    NmakeConditionErrorKind, NmakeUnaryOp,
 };
 pub use parse::Parse;
 pub use reference::{split_references, TextPart};
