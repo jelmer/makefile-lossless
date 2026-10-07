@@ -251,8 +251,7 @@ fn token_continuations(token: &SyntaxToken) -> Vec<rowan::TextRange> {
     let text = token.text();
     let odd_backslashes = |before: &str| {
         let before = before.strip_suffix('\r').unwrap_or(before);
-        let n = before.len() - before.trim_end_matches('\\').len();
-        (n % 2 == 1).then(|| before.len() - 1)
+        crate::lex::ends_with_unescaped_backslash(before).then(|| before.len() - 1)
     };
     let offset = |i: usize| start + rowan::TextSize::from(i as u32);
     let mut ranges: Vec<_> = text
