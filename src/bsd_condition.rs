@@ -10,7 +10,7 @@
 //!          | Leaf | Leaf CompareOp Leaf | BareWord
 //! ```
 
-use crate::reference::{ParsedReference, ReferenceError, ReferenceSyntaxErrorKind};
+use crate::reference::{ParsedReference, ReferenceError, ReferenceSyntaxErrorKind, MAX_DEPTH};
 use crate::MakefileVariant;
 use std::fmt;
 use std::str::FromStr;
@@ -262,6 +262,8 @@ pub enum BsdConditionErrorKind {
     UnknownModifier,
     /// A malformed variable reference.
     Reference(ReferenceSyntaxErrorKind),
+    /// Parentheses or `!` are nested more deeply than this crate supports.
+    TooDeeplyNested,
 }
 
 /// A syntax error in a BSD make conditional expression.
@@ -404,6 +406,8 @@ struct Parser {
     pos: usize,
     /// Whether plain characters are allowed in an unquoted left-hand side.
     left_unquoted_ok: bool,
+    /// The number of terms being parsed that enclose the position.
+    depth: usize,
 }
 
 impl Parser {
@@ -433,6 +437,7 @@ impl Parser {
             offsets,
             pos: 0,
             left_unquoted_ok,
+            depth: 0,
         }
     }
 
@@ -516,6 +521,19 @@ impl Parser {
 
     fn parse_term(&mut self) -> Result<BsdCondition, BsdConditionError> {
         self.skip_whitespace();
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error(
+                BsdConditionErrorKind::TooDeeplyNested,
+                "condition nested too deeply",
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_term_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_term_inner(&mut self) -> Result<BsdCondition, BsdConditionError> {
         match self.peek() {
             None | Some(b'#') => {
                 Err(self.error(BsdConditionErrorKind::MissingOperand, "missing operand"))
@@ -1495,5 +1513,44 @@ mod tests {
         ] {
             assert!(!is_number(s), "{s}");
         }
+    }
+
+    #[test]
+    fn test_deeply_nested_condition() {
+        let parens = |depth: usize| format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        let negations = |depth: usize| format!("{}1", "!".repeat(depth));
+        assert!(parse_bsd_condition(&parens(MAX_DEPTH - 1)).is_ok());
+        assert!(parse_bsd_condition(&negations(MAX_DEPTH - 1)).is_ok());
+        for text in [parens(MAX_DEPTH), parens(2000)] {
+            assert_eq!(
+                error(&text),
+                ("condition nested too deeply".to_string(), MAX_DEPTH)
+            );
+            assert_eq!(
+                parse_bsd_condition(&text).unwrap_err().kind(),
+                BsdConditionErrorKind::TooDeeplyNested
+            );
+        }
+        assert_eq!(
+            error(&negations(2000)),
+            ("condition nested too deeply".to_string(), MAX_DEPTH)
+        );
+    }
+
+    #[test]
+    fn test_deeply_nested_reference_in_nested_condition() {
+        let reference = |depth: usize| format!("{}X{}", "${".repeat(depth), "}".repeat(depth));
+        let text = format!(
+            "{}{} == 1{}",
+            "(!".repeat(MAX_DEPTH / 2 - 1),
+            reference(MAX_DEPTH),
+            ")".repeat(MAX_DEPTH / 2 - 1)
+        );
+        assert!(parse_bsd_condition(&text).is_ok());
+        let text = format!("({} == 1)", reference(2000));
+        assert_eq!(
+            parse_bsd_condition(&text).unwrap_err().kind(),
+            BsdConditionErrorKind::Reference(ReferenceSyntaxErrorKind::TooDeeplyNested)
+        );
     }
 }

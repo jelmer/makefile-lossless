@@ -1,4 +1,5 @@
 use super::*;
+use crate::reference::MAX_DEPTH;
 
 #[test]
 fn test_variable_reference_names() {
@@ -899,4 +900,55 @@ fn test_parent_reference() {
             ("$(e)".to_string(), None),
         ]
     );
+}
+
+fn nested_reference(open: &str, close: &str, depth: usize) -> String {
+    format!("{}Y{}", open.repeat(depth), close.repeat(depth))
+}
+
+#[test]
+fn test_deeply_nested_reference() {
+    let contexts = [
+        (None, "X = {}\n"),
+        (None, "all: {}\n"),
+        (None, "{}: dep\n"),
+        (None, "ifeq ({},)\nendif\n"),
+        (None, "$(info {})\n"),
+        (None, "include {}\n"),
+        (Some(MakefileVariant::GNUMake), "X := {}\n"),
+        (Some(MakefileVariant::BSDMake), "X = {}\n"),
+        (Some(MakefileVariant::BSDMake), "all: {}\n"),
+        (Some(MakefileVariant::BSDMake), ".if {} == 1\n.endif\n"),
+        (Some(MakefileVariant::NMake), "X = {}\n"),
+    ];
+    for (open, close) in [("$(", ")"), ("${", "}")] {
+        for (variant, template) in contexts {
+            let parse = |depth: usize| {
+                let text = template.replace("{}", &nested_reference(open, close, depth));
+                let parsed = match variant {
+                    Some(variant) => Makefile::parse_with_variant(&text, variant),
+                    None => Makefile::parse(&text),
+                };
+                assert_eq!(parsed.tree().to_string(), text);
+                parsed
+                    .errors()
+                    .iter()
+                    .map(|e| e.kind())
+                    .filter(|&kind| kind == ParseErrorKind::TooDeeplyNested)
+                    .count()
+            };
+            assert_eq!(parse(MAX_DEPTH - 1), 0, "{template} {variant:?} {open}");
+            assert_eq!(parse(2000), 1, "{template} {variant:?} {open}");
+        }
+    }
+}
+
+#[test]
+fn test_deeply_nested_reference_in_recipe() {
+    // Like make, references in recipes are only parsed for their extent;
+    // deeper ones are left as text.
+    let text = format!("all:\n\techo {}\n", nested_reference("$(", ")", 8000));
+    let parsed = Makefile::parse(&text);
+    assert!(parsed.ok());
+    assert_eq!(parsed.tree().to_string(), text);
 }
