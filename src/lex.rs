@@ -1,4 +1,7 @@
-use crate::lossless::ASSIGNMENT_OPERATORS;
+use crate::syntax_rules::{
+    ends_with_unescaped_backslash, escapes_next, is_assignment_modifier, is_bsd_conditional,
+    is_gnu_conditional_start, ASSIGNMENT_OPERATORS, GNU_INCLUDE_KEYWORDS,
+};
 use crate::{MakefileVariant, SyntaxKind};
 use std::collections::HashMap;
 use std::iter::Peekable;
@@ -215,11 +218,13 @@ impl Variables {
     fn update(&mut self, line: &str) {
         let first_word = line.split([' ', '\t']).next().unwrap_or_default();
         match first_word {
-            "ifeq" | "ifneq" | "ifdef" | "ifndef" => self.conditional_depth += 1,
+            word if is_gnu_conditional_start(word) => self.conditional_depth += 1,
             "endif" => self.conditional_depth = self.conditional_depth.saturating_sub(1),
             "undefine" => self.assign(line[first_word.len()..].trim(), "undefine", ""),
             // These can set any variable.
-            "include" | "-include" | "sinclude" | "load" | "-load" => self.known.clear(),
+            word if GNU_INCLUDE_KEYWORDS.contains(&word) || matches!(word, "load" | "-load") => {
+                self.known.clear()
+            }
             _ if line.contains("eval") => self.known.clear(),
             _ => {
                 if let Some((name, op, value)) = Self::split_assignment(line) {
@@ -259,12 +264,6 @@ struct Define {
     variable: Option<(String, &'static str)>,
     /// The text of the body so far.
     body: String,
-}
-
-/// Whether `text` ends in an odd number of backslashes, so that the last
-/// one is not escaped by the one before it.
-pub(crate) fn ends_with_unescaped_backslash(text: &str) -> bool {
-    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
 /// The characters that nmake takes literally after a `^`.
@@ -401,12 +400,10 @@ impl<'a> Lexer<'a> {
     /// repeated.
     fn strip_modifiers(line: &str) -> &str {
         let mut rest = line.trim_start();
-        while let Some(r) = ["override", "export", "unexport", "private"]
-            .into_iter()
-            .find_map(|m| {
-                rest.strip_prefix(m)
-                    .filter(|r| r.starts_with(Self::is_whitespace))
-            })
+        while let Some(r) = rest
+            .split_once(Self::is_whitespace)
+            .filter(|(word, _)| is_assignment_modifier(word))
+            .map(|(_, r)| r)
         {
             rest = r.trim_start();
         }
@@ -582,20 +579,7 @@ impl<'a> Lexer<'a> {
         let name_len = rest
             .find(|c: char| !c.is_ascii_alphabetic())
             .unwrap_or(rest.len());
-        let conditional = matches!(
-            &rest[..name_len],
-            "if" | "ifdef"
-                | "ifndef"
-                | "ifmake"
-                | "ifnmake"
-                | "elif"
-                | "elifdef"
-                | "elifndef"
-                | "elifmake"
-                | "elifnmake"
-                | "else"
-                | "endif"
-        );
+        let conditional = is_bsd_conditional(&rest[..name_len]);
         (conditional && name_len < rest.len()).then_some(skip + name_len)
     }
 
@@ -907,7 +891,7 @@ impl<'a> Lexer<'a> {
                         if !escaped && self.at_newline() {
                             self.continuation = true;
                         }
-                        self.pending_backslash_escape = !escaped;
+                        self.pending_backslash_escape = escapes_next(true, escaped);
                         Some((SyntaxKind::BACKSLASH, "\\".to_string()))
                     }
                     // nmake's `$**`, all dependents of the target.

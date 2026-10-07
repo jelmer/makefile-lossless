@@ -4,9 +4,11 @@ use super::{
     terminate_line_before, GreenElement, LineSyntax,
 };
 use crate::lossless::{
-    detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
-    scan_recipe_variable_refs, Error, ErrorInfo, ParseError, RecipeVariableReference,
-    VariableDefinition, VariableReference, ASSIGNMENT_OPERATORS,
+    detached_elements, node_text, parse, remove_with_preceding_comments, scan_recipe_variable_refs,
+    Error, ErrorInfo, ParseError, RecipeVariableReference, VariableDefinition, VariableReference,
+};
+use crate::syntax_rules::{
+    is_assignment_modifier, is_colons_before_subst, is_sunsh_operator, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -181,7 +183,7 @@ fn is_assignment_operator(text: &str) -> bool {
 fn has_assignment_operator(variant: MakefileVariant, op: &str) -> bool {
     match variant {
         MakefileVariant::GNUMake | MakefileVariant::POSIXMake => !is_sunsh_operator(op),
-        MakefileVariant::BSDMake => !matches!(op, "::=" | ":::="),
+        MakefileVariant::BSDMake => !is_colons_before_subst(op),
         MakefileVariant::NMake => op == "=",
     }
 }
@@ -220,10 +222,8 @@ impl VariableDefinition {
         let keyword = |word: &[crate::lossless::SyntaxElement]| match word {
             [rowan::NodeOrToken::Token(t)]
                 if t.kind() == IDENTIFIER
-                    && matches!(
-                        t.text(),
-                        "export" | "unexport" | "override" | "private" | "define" | "undefine"
-                    ) =>
+                    && (is_assignment_modifier(t.text())
+                        || matches!(t.text(), "define" | "undefine")) =>
             {
                 Some(t.clone())
             }
