@@ -388,7 +388,15 @@ impl<'a> Lexer<'a> {
                         || (self.bsd && after_lbracket)
                         || (self.hash_in_references && self.reference_depth > 0)) => {}
                 '#' => {
-                    return Some((SyntaxKind::COMMENT, self.read_comment()));
+                    let comment = self.read_comment();
+                    // GNU and BSD make continue a recipe line starting with
+                    // `#` like any other, although nmake ends a comment at
+                    // the end of the line.
+                    if self.line_type == Some(LineType::Recipe) && !self.nmake {
+                        let backslashes = comment.chars().rev().take_while(|&c| c == '\\').count();
+                        self.recipe_continuation = backslashes % 2 == 1;
+                    }
+                    return Some((SyntaxKind::COMMENT, comment));
                 }
                 _ => {}
             }

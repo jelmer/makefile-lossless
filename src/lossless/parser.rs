@@ -429,13 +429,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Parse the recipe content, handling line continuations (backslash at end of line)
             let mut inline_files = 0;
+            // GNU and BSD make continue a line starting with `#` too, and the
+            // continuation lines are part of the comment. nmake ends the
+            // comment at the end of the line.
+            let comment =
+                self.current() == Some(COMMENT) && self.variant != Some(MakefileVariant::NMake);
             loop {
                 let mut last_text_content: Option<String> = None;
 
                 // Consume all tokens until newline, tracking the last TEXT token's content
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
                     // Save the text content if this is a TEXT token
-                    if self.current() == Some(TEXT) {
+                    if self.current() == Some(TEXT) || (comment && self.current() == Some(COMMENT))
+                    {
                         if let Some((_kind, text)) = self.tokens.last() {
                             if self.variant == Some(MakefileVariant::NMake) {
                                 inline_files += text.matches("<<").count();
@@ -443,7 +449,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             last_text_content = Some(text.clone());
                         }
                     }
-                    self.bump();
+                    if comment && self.current() == Some(TEXT) {
+                        self.bump_as(COMMENT);
+                    } else {
+                        self.bump();
+                    }
                 }
 
                 // Consume the newline
@@ -517,6 +527,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// text starting with `#` becomes a COMMENT token instead.
         fn parse_text_to_eol(&mut self, leading_comment: bool) {
             let mut first = true;
+            let mut comment = false;
             loop {
                 let mut text = String::new();
                 while self.current().is_some_and(|kind| kind != NEWLINE) {
@@ -530,8 +541,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 let continued = self.current() == Some(NEWLINE)
                     && text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
                 if !text.is_empty() {
-                    // Mirror how a tab-indented `# ...` line is tokenized.
-                    let kind = if leading_comment && first && text.starts_with('#') {
+                    // Mirror how a tab-indented `# ...` line is tokenized,
+                    // with any continuation lines in the comment except
+                    // for nmake.
+                    let starts_comment = leading_comment && first && text.starts_with('#');
+                    comment |= starts_comment && self.variant != Some(MakefileVariant::NMake);
+                    let kind = if starts_comment || comment {
                         COMMENT
                     } else {
                         TEXT

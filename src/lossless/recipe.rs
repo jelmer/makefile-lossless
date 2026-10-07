@@ -82,7 +82,7 @@ impl Recipe {
     ///
     /// For comment-only lines, this returns an empty string.
     pub fn text(&self) -> String {
-        self.logical_text(false)
+        self.logical_text(false, None)
     }
 
     /// Get the text of this recipe line as GNU make hands it to the shell,
@@ -110,15 +110,20 @@ impl Recipe {
     /// assert_eq!(recipes[1].shell_text(), "@echo a \\\n\tb # c");
     /// ```
     pub fn shell_text(&self) -> String {
-        self.logical_text(true)
+        self.logical_text(true, None)
     }
 
-    fn logical_text(&self, include_comments: bool) -> String {
+    /// The text of the line from `from`, or from its start, with line
+    /// continuations as make passes them to the shell.
+    fn logical_text(&self, include_comments: bool, from: Option<rowan::TextSize>) -> String {
         let mut after_newline = false;
         let comment = self.comment_start();
         self.body_tokens()
             .filter_map(|t| {
                 if !include_comments && comment.is_some_and(|c| t.text_range().start() >= c) {
+                    return None;
+                }
+                if from.is_some_and(|from| t.text_range().start() < from) {
                     return None;
                 }
                 // Tokens in a reference are all text.
@@ -267,7 +272,10 @@ impl Recipe {
     /// Get the comment content of this recipe line, if any
     ///
     /// Returns the comment text (including the '#' character) if this recipe
-    /// line contains a comment, or None if there is no comment.
+    /// line contains a comment, or None if there is no comment. A comment
+    /// ending in a backslash takes in the lines it is continued onto, except
+    /// for nmake, with a leading tab removed from each as in
+    /// [`Recipe::shell_text`].
     ///
     /// # Example
     /// ```
@@ -280,13 +288,8 @@ impl Recipe {
     /// assert_eq!(recipes[1].comment(), None);
     /// ```
     pub fn comment(&self) -> Option<String> {
-        let token = self
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == COMMENT)?;
-        let elements = comment_elements(&token)?;
-        Some(elements.iter().map(|it| it.to_string()).collect())
+        let start = self.comment_start()?;
+        Some(self.logical_text(true, Some(start)))
     }
 
     /// Get the full content of this recipe line
@@ -907,6 +910,90 @@ mod tests {
                 .unwrap();
             assert_eq!(recipe.references().count(), 0, "{variant:?}");
             assert_eq!(recipe.comment(), Some("# $(X)".to_string()));
+        }
+    }
+
+    fn parse_variant(text: &str, variant: Option<crate::MakefileVariant>) -> Makefile {
+        let makefile = match variant {
+            None => Makefile::parse(text),
+            Some(variant) => Makefile::parse_with_variant(text, variant),
+        }
+        .tree();
+        assert_eq!(makefile.to_string(), text);
+        makefile
+    }
+
+    #[test]
+    fn test_comment_line_continuation() {
+        // GNU and BSD make continue a line starting with `#` like any other
+        // recipe line. GNU make passes the lines to the shell together, BSD
+        // make skips them all.
+        use crate::MakefileVariant::*;
+        let text = "all:\n\t# a \\\n\techo $(X)\n\t# b \\\nc: d\n\t# e \\\\\n\techo x\n";
+        for variant in [None, Some(GNUMake), Some(BSDMake), Some(POSIXMake)] {
+            let makefile = parse_variant(text, variant);
+            assert_eq!(makefile.rules().count(), 1, "{variant:?}");
+            let recipes: Vec<_> = makefile.rules().flat_map(|r| r.recipe_nodes()).collect();
+            let accessors: Vec<_> = recipes
+                .iter()
+                .map(|r| (r.text(), r.comment(), r.shell_text()))
+                .collect();
+            let comment = |c: &str| (String::new(), Some(c.to_string()), c.to_string());
+            assert_eq!(
+                accessors,
+                vec![
+                    comment("# a \\\necho $(X)"),
+                    comment("# b \\\nc: d"),
+                    comment("# e \\\\"),
+                    ("echo x".to_string(), None, "echo x".to_string()),
+                ],
+                "{variant:?}"
+            );
+            let references: Vec<_> = recipes[0].references().map(|r| r.to_string()).collect();
+            let expected: &[&str] = if variant == Some(BSDMake) {
+                &[]
+            } else {
+                &["$(X)"]
+            };
+            assert_eq!(references, expected, "{variant:?}");
+            assert_eq!(
+                makefile.comment_ranges().collect::<Vec<_>>(),
+                vec![
+                    rowan::TextRange::new(6.into(), 22.into()),
+                    rowan::TextRange::new(24.into(), 34.into()),
+                    rowan::TextRange::new(36.into(), 42.into()),
+                ],
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_comment_line_continuation_nmake() {
+        // nmake ends a comment at the end of the line.
+        let makefile = parse_variant(
+            "all:\n\t# a \\\n\techo x\n",
+            Some(crate::MakefileVariant::NMake),
+        );
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["", "echo x"]);
+    }
+
+    #[test]
+    fn test_inline_comment_continuation() {
+        use crate::MakefileVariant::*;
+        for variant in [None, Some(GNUMake), Some(BSDMake)] {
+            let makefile = parse_variant("a: ; # x \\\n\techo $(Y)\nb:\n", variant);
+            let recipes: Vec<_> = makefile.rules().flat_map(|r| r.recipe_nodes()).collect();
+            assert_eq!(recipes.len(), 1);
+            assert_eq!(recipes[0].comment(), Some("# x \\\necho $(Y)".to_string()));
+            assert_eq!(recipes[0].text(), "");
+            assert_eq!(
+                recipes[0].references().count(),
+                usize::from(variant != Some(BSDMake)),
+                "{variant:?}"
+            );
+            assert_eq!(makefile.comment_ranges().count(), 1);
         }
     }
 
