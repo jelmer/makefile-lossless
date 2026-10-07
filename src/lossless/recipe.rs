@@ -86,12 +86,41 @@ pub(crate) fn build_command(
 fn strip_nmake_modifiers(text: &str) -> &str {
     let mut rest = text;
     loop {
-        let modifier = rest.trim_start_matches([' ', '\t']);
+        let modifier = rest.trim_start_matches(BLANKS);
         rest = match modifier.chars().next() {
             Some('@' | '!') => &modifier[1..],
             Some('-') => modifier[1..].trim_start_matches(|c: char| c.is_ascii_digit()),
             _ => return rest,
         };
+    }
+}
+
+const PREFIX_CHARS: [char; 3] = ['@', '-', '+'];
+const BLANKS: [char; 2] = [' ', '\t'];
+
+/// The rest of `text` after the command modifiers at its start, as
+/// `variant` reads them, keeping the whitespace after the last one.
+///
+/// GNU make reads `@`, `-` and `+` with spaces or tabs before and between
+/// them. BSD make allows spaces or tabs only before them. Without a variant
+/// GNU make's modifiers are used, which include BSD make's.
+fn strip_modifiers(text: &str, variant: Option<crate::MakefileVariant>) -> &str {
+    match variant {
+        Some(crate::MakefileVariant::NMake) => strip_nmake_modifiers(text),
+        Some(crate::MakefileVariant::BSDMake) => {
+            let after = text.trim_start_matches(BLANKS);
+            let rest = after.trim_start_matches(PREFIX_CHARS);
+            if rest.len() == after.len() {
+                text
+            } else {
+                rest
+            }
+        }
+        _ => {
+            let run = text.trim_start_matches(|c| PREFIX_CHARS.contains(&c) || BLANKS.contains(&c));
+            let modifiers = text[..text.len() - run.len()].trim_end_matches(BLANKS);
+            &text[modifiers.len()..]
+        }
     }
 }
 
@@ -417,16 +446,19 @@ impl Recipe {
         self.syntax().ancestors().find_map(Rule::cast)
     }
 
-    /// Whether `flag` is among the `@`, `-` and `+` characters at the start
-    /// of the command, which make reads in any order.
-    fn has_prefix_flag(&self, flag: char) -> bool {
-        self.text()
-            .chars()
-            .take_while(|c| matches!(c, '@' | '-' | '+'))
-            .any(|c| c == flag)
+    /// Whether `flag` is among the command modifiers at the start of the
+    /// command, as `variant` reads them, which make reads in any order.
+    fn has_prefix_flag(&self, flag: char, variant: Option<crate::MakefileVariant>) -> bool {
+        let text = self.text();
+        let rest = strip_modifiers(&text, variant);
+        text[..text.len() - rest.len()].contains(flag)
     }
 
     /// Check if this recipe has the silent prefix (@)
+    ///
+    /// This follows GNU make, which also reads modifiers after spaces or
+    /// tabs, as in `- @echo`; see [`Recipe::is_silent_for`] for other
+    /// variants.
     ///
     /// # Example
     /// ```
@@ -439,10 +471,33 @@ impl Recipe {
     /// assert!(!recipes[1].is_silent());
     /// ```
     pub fn is_silent(&self) -> bool {
-        self.has_prefix_flag('@')
+        self.has_prefix_flag('@', None)
+    }
+
+    /// Check if this recipe has the silent prefix (@), as `variant` reads
+    /// the command modifiers
+    ///
+    /// GNU make reads modifiers separated by spaces or tabs, BSD make only
+    /// reads them before any, and nmake also has `!` and `-NUMBER`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    ///
+    /// let makefile: Makefile = "all:\n\t- @echo hello\n".parse().unwrap();
+    /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
+    /// assert!(recipe.is_silent_for(MakefileVariant::GNUMake));
+    /// assert!(!recipe.is_silent_for(MakefileVariant::BSDMake));
+    /// ```
+    pub fn is_silent_for(&self, variant: crate::MakefileVariant) -> bool {
+        self.has_prefix_flag('@', Some(variant))
     }
 
     /// Check if this recipe has the ignore-errors prefix (-)
+    ///
+    /// This follows GNU make, which also reads modifiers after spaces or
+    /// tabs, as in `@ -false`; see [`Recipe::is_ignore_errors_for`] for
+    /// other variants.
     ///
     /// # Example
     /// ```
@@ -455,7 +510,25 @@ impl Recipe {
     /// assert!(!recipes[1].is_ignore_errors());
     /// ```
     pub fn is_ignore_errors(&self) -> bool {
-        self.has_prefix_flag('-')
+        self.has_prefix_flag('-', None)
+    }
+
+    /// Check if this recipe has the ignore-errors prefix (-), as `variant`
+    /// reads the command modifiers, like [`Recipe::is_silent_for`]
+    ///
+    /// For nmake, `-NUMBER` counts too.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    ///
+    /// let makefile: Makefile = "all:\n\t@ -false\n".parse().unwrap();
+    /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
+    /// assert!(recipe.is_ignore_errors_for(MakefileVariant::GNUMake));
+    /// assert!(!recipe.is_ignore_errors_for(MakefileVariant::BSDMake));
+    /// ```
+    pub fn is_ignore_errors_for(&self, variant: crate::MakefileVariant) -> bool {
+        self.has_prefix_flag('-', Some(variant))
     }
 
     /// Set the command prefix for this recipe
@@ -585,18 +658,14 @@ impl Recipe {
                 }],
             })
         };
-        let nmake = variant == Some(crate::MakefileVariant::NMake);
-        let strip = |text: &str| -> String {
-            if nmake {
-                strip_nmake_modifiers(text).to_string()
-            } else {
-                text.trim_start_matches(['@', '-', '+']).to_string()
+        let strip = |text: &str| strip_modifiers(text, variant).to_string();
+        // Without a variant, only write modifiers that GNU and BSD make
+        // both read.
+        let valid = match variant {
+            None | Some(crate::MakefileVariant::BSDMake) => {
+                prefix.chars().all(|c| PREFIX_CHARS.contains(&c))
             }
-        };
-        let valid = if nmake {
-            strip(prefix).trim_start_matches([' ', '\t']).is_empty()
-        } else {
-            strip(prefix).is_empty()
+            _ => strip(prefix).trim_start_matches(BLANKS).is_empty(),
         };
         if !valid {
             let message = match variant {
@@ -641,9 +710,9 @@ impl Recipe {
             .children_with_tokens()
             .nth(insert_at)
             .is_some_and(|it| it.kind() != NEWLINE);
-        let separated = rest.starts_with([' ', '\t']) || (rest.is_empty() && !followed);
+        let separated = rest.starts_with(BLANKS) || (rest.is_empty() && !followed);
         let combined = format!("{prefix}{rest}");
-        let modifiers = prefix.trim_end_matches([' ', '\t']);
+        let modifiers = prefix.trim_end_matches(BLANKS);
         if combined.len() - strip(&combined).len() != modifiers.len()
             || (prefix.ends_with(|c: char| c.is_ascii_digit()) && !separated)
         {
@@ -1575,9 +1644,112 @@ mod tests {
                 set_prefix_for("x:\n\t@echo  hi # c\n", "+-", variant).unwrap(),
                 "x:\n\t+-echo  hi # c\n"
             );
-            for prefix in ["!", "-3 ", "@ "] {
+            for prefix in ["!", "-3 "] {
                 assert!(set_prefix_for("x:\n\techo hi\n", prefix, variant).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_for_whitespace() {
+        use crate::MakefileVariant::*;
+        // GNU make allows whitespace between modifiers, BSD make only before
+        // them.
+        for variant in [GNUMake, POSIXMake] {
+            for (code, prefix, expected) in [
+                ("x:\n\techo hi\n", "@ -", "x:\n\t@ -echo hi\n"),
+                ("x:\n\techo hi\n", "@ ", "x:\n\t@ echo hi\n"),
+                ("x:\n\t@ -false\n", "-\t@ ", "x:\n\t-\t@ false\n"),
+                ("x:\n\t@ -false # c\n", "", "x:\n\tfalse # c\n"),
+                ("x:\n\t @ - echo  hi\n", "+", "x:\n\t+ echo  hi\n"),
+            ] {
+                assert_eq!(
+                    set_prefix_for(code, prefix, variant).unwrap(),
+                    expected,
+                    "{code:?} {prefix:?} {variant:?}"
+                );
+            }
+        }
+        for (code, prefix, expected) in [
+            ("x:\n\t@ -false\n", "+", "x:\n\t+ -false\n"),
+            ("x:\n\t @echo hi\n", "-", "x:\n\t-echo hi\n"),
+            ("x:\n\t- @echo hi\n", "-+", "x:\n\t-+ @echo hi\n"),
+        ] {
+            assert_eq!(set_prefix_for(code, prefix, BSDMake).unwrap(), expected);
+        }
+        for (code, prefix) in [
+            ("x:\n\techo hi\n", "@ "),
+            ("x:\n\techo hi\n", "@ -"),
+            // BSD make would read the `-` as a modifier.
+            ("x:\n\t@ -false\n", ""),
+        ] {
+            assert!(
+                set_prefix_for(code, prefix, BSDMake).is_err(),
+                "{code:?} {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_whitespace() {
+        // Without a variant, the modifiers are those GNU make reads, which
+        // include BSD make's.
+        for (code, prefix, expected) in [
+            ("all:\n\t@ -false\n", "", "all:\n\tfalse\n"),
+            ("all:\n\t@ -false # c\n", "+", "all:\n\t+false # c\n"),
+            ("all:\n\t @ - echo x\n", "@", "all:\n\t@ echo x\n"),
+            ("all: ; @ -echo x\n", "-", "all: ; -echo x\n"),
+            ("all:\n\t- $(X)\n", "@", "all:\n\t@ $(X)\n"),
+            ("all:\n\t@\t+-echo\n", "", "all:\n\techo\n"),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            let rule = makefile.rules().next().unwrap();
+            let mut recipe = rule.recipe_nodes().next().unwrap();
+            recipe.try_set_prefix(prefix).unwrap();
+            assert_eq!(makefile.code(), expected, "{code:?}");
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_recipe_modifiers_after_whitespace() {
+        use crate::MakefileVariant::*;
+        let flags = |code: &str, variant: Option<crate::MakefileVariant>| {
+            let parsed = match variant {
+                Some(variant) => Makefile::parse_with_variant(code, variant),
+                None => Makefile::parse(code),
+            };
+            let recipe = parsed
+                .tree()
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            match variant {
+                Some(variant) => (
+                    recipe.is_silent_for(variant),
+                    recipe.is_ignore_errors_for(variant),
+                ),
+                None => (recipe.is_silent(), recipe.is_ignore_errors()),
+            }
+        };
+        for (code, variant, expected) in [
+            ("all:\n\t@ -false\n", None, (true, true)),
+            ("all:\n\t@ -false\n", Some(GNUMake), (true, true)),
+            ("all:\n\t@ -false\n", Some(POSIXMake), (true, true)),
+            ("all:\n\t@ -false\n", Some(BSDMake), (true, false)),
+            ("all:\n\t- @echo\n", None, (true, true)),
+            ("all:\n\t- @echo\n", Some(BSDMake), (false, true)),
+            ("all:\n\t @echo\n", None, (true, false)),
+            ("all:\n\t @echo\n", Some(BSDMake), (true, false)),
+            ("all:\n\t@\t+-echo\n", Some(GNUMake), (true, true)),
+            ("all:\n\techo -@\n", None, (false, false)),
+            ("all:\n\t-3 ! @echo\n", Some(NMake), (true, true)),
+            ("all:\n\t!echo -@\n", Some(NMake), (false, false)),
+        ] {
+            assert_eq!(flags(code, variant), expected, "{code:?} {variant:?}");
         }
     }
 
