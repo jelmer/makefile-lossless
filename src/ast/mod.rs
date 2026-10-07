@@ -177,6 +177,48 @@ pub(crate) fn lines_above(node: &SyntaxNode) -> Vec<LineAbove> {
     lines
 }
 
+/// A green node or token.
+pub(crate) type GreenElement = rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken>;
+
+fn same_green(element: &SyntaxElement, green: &GreenElement) -> bool {
+    match (element, green) {
+        (rowan::NodeOrToken::Node(node), rowan::NodeOrToken::Node(green)) => {
+            *node.green() == **green
+        }
+        (rowan::NodeOrToken::Token(token), rowan::NodeOrToken::Token(green)) => {
+            token.green() == &**green
+        }
+        _ => false,
+    }
+}
+
+/// Make the children of `node` the same as `new`, keeping those at the
+/// start and the end that already are.
+pub(crate) fn replace_children(node: &SyntaxNode, new: Vec<GreenElement>) {
+    let old: Vec<_> = node.children_with_tokens().collect();
+    let prefix = old
+        .iter()
+        .zip(&new)
+        .take_while(|(old, new)| same_green(old, new))
+        .count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(old, new)| same_green(old, new))
+        .count();
+    for element in &old[prefix..old.len() - suffix] {
+        element.detach();
+    }
+    let middle = new[prefix..new.len() - suffix].to_vec();
+    let root = SyntaxNode::new_root_mut(rowan::GreenNode::new(
+        crate::SyntaxKind::ROOT.into(),
+        middle,
+    ));
+    let elements: Vec<_> = root.children_with_tokens().collect();
+    node.splice_children(prefix..prefix, elements);
+}
+
 /// Detach `tokens` from the tree, along with any BLANK_LINE node left empty.
 pub(crate) fn detach_tokens(tokens: impl IntoIterator<Item = SyntaxToken>) {
     for token in tokens {
