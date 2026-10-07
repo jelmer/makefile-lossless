@@ -1,9 +1,12 @@
 #![no_main]
 
+mod variant;
+
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::{apply_edit_to_text, Makefile, Parse, TextEdit, TextRange};
+use makefile_lossless::{apply_edit_to_text, TextEdit, TextRange};
 
 // Input layout:
+//   u8 make variant, as for the parse target
 //   u16 (LE) start offset
 //   u16 (LE) end offset
 //   u16 (LE) split point between original text and replacement text
@@ -13,6 +16,9 @@ use makefile_lossless::{apply_edit_to_text, Makefile, Parse, TextEdit, TextRange
 // that splits a UTF-8 codepoint (something the public API does not promise
 // to handle, so we shouldn't fuzz it).
 fuzz_target!(|data: &[u8]| {
+    let Some((&selector, data)) = data.split_first() else {
+        return;
+    };
     if data.len() < 6 {
         return;
     }
@@ -26,6 +32,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let (orig_bytes, new_bytes) = body.split_at(split);
 
+    let variant = variant::optional_variant(selector);
     let Ok(orig) = std::str::from_utf8(orig_bytes) else {
         return;
     };
@@ -35,7 +42,11 @@ fuzz_target!(|data: &[u8]| {
 
     let start = start.min(orig.len());
     let end = end.min(orig.len());
-    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     if !orig.is_char_boundary(lo) || !orig.is_char_boundary(hi) {
         return;
     }
@@ -45,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
         new_text.to_string(),
     );
 
-    let parse = Parse::<Makefile>::parse_makefile(orig);
+    let parse = variant::parse(orig, variant);
     let (incremental_parse, incremental_text) = parse.apply_edit(orig, &edit);
 
     // apply_edit_to_text and apply_edit must agree on the resulting text.
@@ -55,7 +66,8 @@ fuzz_target!(|data: &[u8]| {
     // Incremental reparse must produce the same text as a full reparse,
     // and that text must equal the new source (lossless property must
     // survive incremental edits too).
-    let full_parse = Parse::<Makefile>::parse_makefile(&incremental_text);
+    let full_parse = variant::parse(&incremental_text, variant);
+    assert_eq!(incremental_parse.variant(), variant);
     let incremental_str = incremental_parse.tree().to_string();
     assert_eq!(incremental_str, incremental_text);
     assert_eq!(incremental_str, full_parse.tree().to_string());
