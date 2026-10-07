@@ -78,7 +78,6 @@ fn quoted_pair(s: &str) -> Option<Vec<String>> {
         for c in iter.by_ref() {
             if c == opener {
                 out.push(buf);
-                buf = String::new();
                 break;
             }
             buf.push(c);
