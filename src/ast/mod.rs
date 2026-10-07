@@ -315,30 +315,11 @@ pub(crate) fn recipe_prefix_before(parent: &SyntaxNode, index: usize) -> char {
     crate::lex::recipe_prefix_after(&text_before(parent, index))
 }
 
-/// Replace the recipe prefix `old` at the start of each line of `recipe`
-/// with `new`. make strips the prefix from continuation lines too.
-pub(crate) fn replace_recipe_prefix(recipe: &SyntaxNode, old: char, new: char) {
-    if old == new {
-        return;
-    }
-    let indents: Vec<_> = recipe
-        .children_with_tokens()
-        .filter_map(|it| it.into_token())
-        .filter(|t| t.kind() == INDENT && t.text().starts_with(old))
-        .collect();
-    for token in indents {
-        let text = format!("{new}{}", &token.text()[old.len_utf8()..]);
-        let index = token.index();
-        recipe.splice_children(
-            index..index + 1,
-            detached_elements(&[(INDENT, &text)], None),
-        );
-    }
-}
-
 /// `node`, or a copy of it in which the recipe lines start with the recipe
 /// prefix in effect where they would be after `before`, the text in front
 /// of `node`. Recipes on a rule line, after `;`, are left alone.
+// TODO: Rewrite the continuation lines of recipes on a rule line too, as
+// recipe_line_content does.
 pub(crate) fn with_recipe_prefix(node: &SyntaxNode, before: &str) -> SyntaxNode {
     let text = format!("{before}{node}");
     let changes = |node: &SyntaxNode| -> Vec<(SyntaxNode, char, char)> {
@@ -359,7 +340,7 @@ pub(crate) fn with_recipe_prefix(node: &SyntaxNode, before: &str) -> SyntaxNode 
     }
     let copy = SyntaxNode::new_root_mut(node.green().into_owned());
     for (recipe, old, new) in changes(&copy) {
-        replace_recipe_prefix(&recipe, old, new);
+        crate::lossless::change_recipe_prefix(&recipe, old, new);
     }
     copy
 }
