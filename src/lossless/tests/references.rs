@@ -952,3 +952,114 @@ fn test_deeply_nested_reference_in_recipe() {
     assert!(parsed.ok());
     assert_eq!(parsed.tree().to_string(), text);
 }
+
+#[test]
+fn test_bsd_reference_parse_closing_brace_after() {
+    // bmake expands `${S:a=b{}}` with S=a to `b{}`: the SysV substitution
+    // only needs a closing brace somewhere after it.
+    let text = "X = ${S:a=b{}}\n";
+    assert_eq!(
+        reference_texts(text, MakefileVariant::BSDMake),
+        vec!["${S:a=b{}"]
+    );
+    let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    let reference = makefile.variable_references().next().unwrap();
+    assert_eq!(
+        reference.parse(MakefileVariant::BSDMake),
+        Ok(crate::ParsedReference {
+            name: "S".to_string(),
+            modifiers: vec![crate::Modifier::SysVSubstitute {
+                from: crate::ModifierArg::literal("a"),
+                to: crate::ModifierArg::literal("b{"),
+            }],
+        })
+    );
+}
+
+#[test]
+fn test_bsd_reference_parse_nested_closing_brace_after() {
+    let text = "X = ${T:M${S:a=b{}}}\n";
+    let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    let references: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(
+        references.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        vec!["${T:M${S:a=b{}}}", "${S:a=b{}"]
+    );
+    assert_eq!(
+        references[1].parse(MakefileVariant::BSDMake),
+        Ok(crate::ParsedReference {
+            name: "S".to_string(),
+            modifiers: vec![crate::Modifier::SysVSubstitute {
+                from: crate::ModifierArg::literal("a"),
+                to: crate::ModifierArg::literal("b{"),
+            }],
+        })
+    );
+}
+
+#[test]
+fn test_bsd_reference_parse_line_continuation() {
+    // bmake expands this to `b  c{}` with S=a.
+    let text = "X = ${S:a=b \\\n c{}}\n";
+    let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    let reference = makefile.variable_references().next().unwrap();
+    assert_eq!(reference.to_string(), "${S:a=b \\\n c{}");
+    assert_eq!(
+        reference.parse(MakefileVariant::BSDMake),
+        Ok(crate::ParsedReference {
+            name: "S".to_string(),
+            modifiers: vec![crate::Modifier::SysVSubstitute {
+                from: crate::ModifierArg::literal("a"),
+                to: crate::ModifierArg::literal("b  c{"),
+            }],
+        })
+    );
+}
+
+#[test]
+fn test_bsd_reference_parse_error_offset_after_continuation() {
+    let text = "X = ${S \\\n :Z}\n";
+    let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    let reference = makefile.variable_references().next().unwrap();
+    assert_eq!(reference.to_string(), "${S \\\n :Z}");
+    assert_eq!(
+        reference.parse(MakefileVariant::BSDMake),
+        Err(crate::ReferenceError::UnknownModifier {
+            offset: 8,
+            modifier: "Z".to_string(),
+        })
+    );
+}
+
+#[test]
+fn test_bsd_reference_parse_ends_later() {
+    // Parsed as GNU make, the reference ends at the first closing brace.
+    let text = "X = ${X:S,},x,}\n";
+    let makefile = Makefile::parse(text).tree();
+    let reference = makefile.variable_references().next().unwrap();
+    assert_eq!(reference.to_string(), "${X:S,}");
+    assert_eq!(
+        reference.parse(MakefileVariant::BSDMake),
+        Err(crate::ReferenceError::Syntax {
+            offset: 7,
+            kind: crate::ReferenceSyntaxErrorKind::UnclosedExpression,
+            message: "reference continues past the end of the syntax node".to_string(),
+        })
+    );
+}
+
+#[test]
+fn test_bsd_reference_nested_closing_brace_after() {
+    // On its own, `${B:a=${S:a=b{}}` has no closing brace after the SysV
+    // substitution of B, but in the line it does. bmake expands this to
+    // `b{` with B=a and S=a.
+    let text = "X = ${A:U${B:a=${S:a=b{}}}\n";
+    assert_eq!(
+        reference_texts(text, MakefileVariant::BSDMake),
+        vec!["${A:U${B:a=${S:a=b{}}}", "${B:a=${S:a=b{}}", "${S:a=b{}"]
+    );
+    let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    for reference in makefile.variable_references() {
+        assert!(reference.parse(MakefileVariant::BSDMake).is_ok());
+    }
+}

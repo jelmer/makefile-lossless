@@ -219,6 +219,58 @@ pub(crate) fn locate_error_line(
     };
 }
 
+/// The logical line starting with `tokens`, as BSD make sees it when
+/// parsing an expression: up to the end of the line or a comment, with each
+/// line continuation and the indentation after it replaced by a space.
+/// `escaped` is whether the first token is escaped by a backslash.
+///
+/// Returns the text, the source position of each token and its offset in
+/// the text, and the source position of the end of the line, if there are
+/// any tokens.
+pub(crate) fn bsd_logical_line<S: AsRef<str>>(
+    tokens: impl Iterator<Item = (SyntaxKind, S, rowan::TextRange)>,
+    mut escaped: bool,
+) -> (
+    String,
+    Vec<(rowan::TextSize, usize)>,
+    Option<rowan::TextSize>,
+) {
+    let mut text = String::new();
+    let mut starts = vec![];
+    let mut end = None;
+    let mut tokens = tokens.peekable();
+    while let Some((kind, token, range)) = tokens.next() {
+        let token = token.as_ref();
+        starts.push((range.start(), text.len()));
+        end = Some(range.end());
+        match kind {
+            NEWLINE | COMMENT => {
+                end = Some(range.start());
+                break;
+            }
+            BACKSLASH if !escaped && tokens.peek().is_some_and(|(k, _, _)| *k == NEWLINE) => {
+                end = tokens.next().map(|(_, _, range)| range.end());
+                if let Some((_, _, range)) = tokens.next_if(|(k, _, _)| *k == INDENT) {
+                    end = Some(range.end());
+                }
+                text.push(' ');
+                escaped = false;
+                continue;
+            }
+            // A quoted string spanning lines. Its line continuation is not
+            // replaced, so stop here.
+            _ if token.contains('\n') => {
+                end = Some(range.start());
+                break;
+            }
+            _ => {}
+        }
+        escaped = kind == BACKSLASH && !escaped;
+        text.push_str(token);
+    }
+    (text, starts, end)
+}
+
 /// A token's kind and text.
 type Token = (SyntaxKind, String);
 
@@ -2388,56 +2440,24 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// The rest of the logical line, as BSD make sees it when parsing an
-        /// expression: up to the end of the line or a comment, with each
-        /// line continuation and the indentation after it replaced by a
-        /// space.
+        /// expression; see [`bsd_logical_line`].
         fn bsd_logical_line(&self) -> BsdLine {
-            let mut line = BsdLine {
-                text: String::new(),
-                unescaped: Default::default(),
-                starts: vec![],
-                end: self.current_range().start(),
-                token_edits: self.token_edits,
-            };
-            let mut escaped = self.pending_backslash_escape;
-            let mut tokens = self
+            let tokens = self
                 .tokens
                 .iter()
                 .rev()
                 .zip(self.token_positions.iter().rev())
-                .peekable();
-            while let Some(((kind, token), &(start, end))) = tokens.next() {
-                line.starts.push((start, line.text.len()));
-                line.end = end;
-                match kind {
-                    NEWLINE | COMMENT => {
-                        line.end = start;
-                        break;
-                    }
-                    BACKSLASH
-                        if !escaped && tokens.peek().is_some_and(|((k, _), _)| *k == NEWLINE) =>
-                    {
-                        line.end = tokens.next().unwrap().1 .1;
-                        if let Some((_, (_, end))) = tokens.next_if(|((k, _), _)| *k == INDENT) {
-                            line.end = *end;
-                        }
-                        line.text.push(' ');
-                        escaped = false;
-                        continue;
-                    }
-                    // A quoted string spanning lines. Its line continuation
-                    // is not replaced, so stop here.
-                    _ if token.contains('\n') => {
-                        line.end = start;
-                        break;
-                    }
-                    _ => {}
-                }
-                escaped = *kind == BACKSLASH && !escaped;
-                line.text.push_str(token);
+                .map(|((kind, token), &(start, end))| {
+                    (*kind, token.as_str(), rowan::TextRange::new(start, end))
+                });
+            let (text, starts, end) = bsd_logical_line(tokens, self.pending_backslash_escape);
+            BsdLine {
+                unescaped: crate::reference::UnescapedHash::new(&text),
+                text,
+                starts,
+                end: end.unwrap_or_else(|| self.current_range().start()),
+                token_edits: self.token_edits,
             }
-            line.unescaped = crate::reference::UnescapedHash::new(&line.text);
-            line
         }
 
         /// Consume the tokens making up the next `len` bytes of the logical
@@ -2495,28 +2515,37 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let line = self.bsd_line.take().expect("set by bsd_line_offset");
             let found = crate::reference::bsd_expr_extent_at(&line.unescaped, offset);
             if let Some((end, nested)) = &found {
-                self.emit_bsd_expr(&line.text[offset..offset + end], nested);
+                self.emit_bsd_expr(&line.unescaped, offset, *end, nested);
             }
             self.bsd_line = Some(line);
             found.is_some()
         }
 
-        /// Add an EXPR node for the expression `text`, which starts at the
-        /// current token, with nodes for the expressions at `nested`.
-        fn emit_bsd_expr(&mut self, text: &str, nested: &[std::ops::Range<usize>]) {
+        /// Add an EXPR node for the expression at `offset` in `line` of
+        /// length `len`, which starts at the current token, with nodes for
+        /// the expressions at `nested`, relative to `offset`. Each nested
+        /// expression is parsed in the context of the rest of the line, as
+        /// make parses it.
+        fn emit_bsd_expr(
+            &mut self,
+            line: &crate::reference::UnescapedHash,
+            offset: usize,
+            len: usize,
+            nested: &[std::ops::Range<usize>],
+        ) {
             self.builder.start_node(EXPR.into());
             let mut pos = 0;
             for span in nested {
                 self.bump_logical_bytes(span.start - pos);
-                let inner = &text[span.clone()];
-                let inner_nested = match crate::reference::bsd_expr_extent(inner) {
-                    Some((end, inner_nested)) if end == inner.len() => inner_nested,
-                    _ => vec![],
-                };
-                self.emit_bsd_expr(inner, &inner_nested);
+                let inner_nested =
+                    match crate::reference::bsd_expr_extent_at(line, offset + span.start) {
+                        Some((end, inner_nested)) if end == span.len() => inner_nested,
+                        _ => vec![],
+                    };
+                self.emit_bsd_expr(line, offset + span.start, span.len(), &inner_nested);
                 pos = span.end;
             }
-            self.bump_logical_bytes(text.len() - pos);
+            self.bump_logical_bytes(len - pos);
             self.builder.finish_node();
         }
 
