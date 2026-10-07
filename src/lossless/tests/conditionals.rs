@@ -1054,3 +1054,26 @@ fn test_too_deeply_nested_block_unterminated() {
     expected.extend([ParseErrorKind::MissingEndif; MAX_DEPTH]);
     assert_eq!(errors, expected);
 }
+
+#[test]
+fn test_too_deeply_nested_block_with_define() {
+    use crate::reference::MAX_DEPTH;
+    // The `endif` and `ifdef` lines in the define bodies are not
+    // directives, so the block ends at the last `endif`.
+    let block = "ifdef A\ndefine B\nendif\nendef\n  override define C\n  ifdef D\n  define E\n  endif\n  endef\n  endef\nendif\n";
+    let text = format!(
+        "{}{block}{}",
+        "ifdef X\n".repeat(MAX_DEPTH),
+        "endif\n".repeat(MAX_DEPTH)
+    );
+    let parsed = parse(&text, None);
+    assert_eq!(parsed.syntax().to_string(), text);
+    let errors: Vec<_> = parsed.errors.iter().map(ErrorInfo::kind).collect();
+    assert_eq!(errors, vec![ParseErrorKind::TooDeeplyNested]);
+    let error = parsed
+        .syntax()
+        .descendants()
+        .find(|n| n.kind() == ERROR)
+        .unwrap();
+    assert_eq!(error.to_string(), block);
+}
