@@ -1944,6 +1944,57 @@ endif
     }
 
     #[test]
+    fn test_ifeq_quote_inside_reference() {
+        // GNU make finds the closing quote before expanding the argument,
+        // so a quote inside a reference ends it, leaving the reference
+        // unterminated.
+        use crate::ParseErrorKind::{ExtraneousText, InvalidConditional, UnclosedReference};
+        for (code, errors) in [
+            (
+                "ifeq \"$(subst \",x,a)\" \"a\"\nendif\n",
+                vec![UnclosedReference, InvalidConditional],
+            ),
+            (
+                "ifeq '$(subst ',x,a)' 'a'\nendif\n",
+                vec![UnclosedReference, InvalidConditional],
+            ),
+            (
+                "ifeq \"${X\"}\" \"a\"\nendif\n",
+                vec![UnclosedReference, InvalidConditional],
+            ),
+            ("ifeq \"a\" \"$(X\"\nendif\n", vec![UnclosedReference]),
+            (
+                "ifeq \"a\" \"$(f $(X \")\"\nendif\n",
+                vec![UnclosedReference, UnclosedReference, ExtraneousText],
+            ),
+        ] {
+            let parsed = Makefile::parse(code);
+            assert_eq!(parsed.tree().code(), code);
+            assert_eq!(
+                parsed.errors().iter().map(|e| e.kind()).collect::<Vec<_>>(),
+                errors,
+                "{code:?}"
+            );
+        }
+        let makefile = Makefile::parse("ifeq \"a\" \"$(X\"\nendif\n").tree();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.ifeq_args(), Some(("a".to_string(), "$(X".to_string())));
+        // A quote of the other kind does not end the argument.
+        let code = "ifeq \"$(X')\" 'a'\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(
+            cond.ifeq_args(),
+            Some(("$(X')".to_string(), "a".to_string()))
+        );
+        // Nor is `$\"` a reference to a variable named `"`.
+        let code = "ifeq \"a$\" \"a\"\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        let cond = makefile.conditionals().next().unwrap();
+        assert_eq!(cond.ifeq_args(), Some(("a$".to_string(), "a".to_string())));
+    }
+
+    #[test]
     fn test_ifeq_quoted_other_quote_and_backslash() {
         // A backslash does not escape the closing quote.
         for (code, args) in [
