@@ -376,7 +376,7 @@ fn test_from_str_relaxed_with_errors() {
 fn test_positioned_errors_have_valid_ranges() {
     let input = "rule target\n\tcommand\n";
     let parsed = Makefile::parse(input);
-    assert!(!parsed.ok());
+    assert!(!parsed.is_ok());
 
     let positioned = parsed.positioned_errors();
     assert!(!positioned.is_empty());
@@ -394,7 +394,7 @@ fn test_positioned_errors_have_valid_ranges() {
 fn test_positioned_errors_point_to_error_location() {
     let input = "rule target\n\tcommand\n";
     let parsed = Makefile::parse(input);
-    assert!(!parsed.ok());
+    assert!(!parsed.is_ok());
 
     let positioned = parsed.positioned_errors();
     assert!(!positioned.is_empty());
@@ -1336,7 +1336,7 @@ fn test_error_location_unclosed_paren() {
 fn test_tree_with_errors_preserves_text() {
     let input = "rule target\n\tcommand\nVAR = value\n";
     let parsed = Makefile::parse(input);
-    assert!(!parsed.ok());
+    assert!(!parsed.is_ok());
 
     let tree = parsed.tree();
     assert_eq!(tree.to_string(), input);

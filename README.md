@@ -14,10 +14,10 @@ syntax are supported. By default the parser accepts any of them; use
 use makefile_lossless::{Makefile, MakefileVariant};
 
 let parsed = Makefile::parse_with_variant("!IF 1\nX = 1\n!ENDIF\n", MakefileVariant::NMake);
-assert!(parsed.ok());
+assert!(parsed.is_ok());
 
 let parsed = Makefile::parse_with_variant("ifdef X\nY = 1\nendif\n", MakefileVariant::POSIXMake);
-assert!(!parsed.ok());
+assert!(!parsed.is_ok());
 ```
 
 Parsing

@@ -949,7 +949,7 @@ fn test_deeply_nested_reference_in_recipe() {
     // deeper ones are left as text.
     let text = format!("all:\n\techo {}\n", nested_reference("$(", ")", 8000));
     let parsed = Makefile::parse(&text);
-    assert!(parsed.ok());
+    assert!(parsed.is_ok());
     assert_eq!(parsed.tree().to_string(), text);
 }
 

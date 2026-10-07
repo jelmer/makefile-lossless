@@ -863,11 +863,11 @@ fn test_rule_target_starting_with_lparen() {
 fn test_rule_parse_single_rule() {
     let text = "all: dep\n\techo hi\n";
     let parsed = Rule::parse(text);
-    assert!(parsed.ok());
+    assert!(parsed.is_ok());
     let rule = parsed.tree();
     assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
     assert_eq!(rule.to_string(), text);
-    let rule = parsed.to_result().unwrap();
+    let rule = parsed.into_result().unwrap();
     assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
 }
 
@@ -880,7 +880,7 @@ fn test_rule_parse_with_comments_and_blank_lines() {
         "# c\n\na: b\n\n",
     ] {
         let parsed = Rule::parse(text);
-        assert!(parsed.ok(), "{:?}", text);
+        assert!(parsed.is_ok(), "{:?}", text);
         assert_eq!(parsed.syntax_node().to_string(), text);
         let rule = parsed.tree();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a"], "{:?}", text);
@@ -900,7 +900,7 @@ fn test_rule_parse_not_a_single_rule() {
         ("# c\na: b\nX = 1\n", 3, "X = 1", 9, 15, Some("a")),
     ] {
         let parsed = Rule::parse(text);
-        assert!(!parsed.ok(), "{:?}", text);
+        assert!(!parsed.is_ok(), "{:?}", text);
         assert_eq!(parsed.syntax_node().to_string(), text);
         assert_eq!(
             parsed
@@ -923,7 +923,7 @@ fn test_rule_parse_not_a_single_rule() {
                 text
             );
         }
-        let Err(Error::Parse(err)) = parsed.to_result() else {
+        let Err(Error::Parse(err)) = parsed.into_result() else {
             panic!("expected a parse error for {:?}", text);
         };
         assert_eq!(

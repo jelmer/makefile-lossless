@@ -1024,7 +1024,7 @@ impl Makefile {
     ///     ".if defined(DEBUG)\nCFLAGS+= -g\n.endif\n",
     ///     MakefileVariant::BSDMake,
     /// );
-    /// assert!(parsed.ok());
+    /// assert!(parsed.is_ok());
     /// let makefile = parsed.tree();
     /// let cond = makefile.conditionals().next().unwrap();
     /// assert_eq!(cond.conditional_type(), Some(".if".to_string()));

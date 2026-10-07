@@ -3435,7 +3435,7 @@ mod tests {
             PARSED_EXPRS.with(|n| n.set(0));
             let text = format!("Y = {nest}\n");
             let parsed = crate::Makefile::parse_with_variant(&text, BSDMake);
-            assert!(parsed.ok());
+            assert!(parsed.is_ok());
             assert_eq!(parsed.tree().variable_references().count(), depth);
             assert_eq!(split_references(&nest, BSDMake).len(), 1);
             let count = PARSED_EXPRS.with(|n| n.get());
@@ -3862,7 +3862,7 @@ mod tests {
         );
         let unclosed = &matches[..matches.len() - 1];
         assert!(ParsedReference::parse(unclosed, BSDMake).is_err());
-        assert!(crate::Makefile::parse_with_variant(&format!("Y = {sysv}\n"), BSDMake).ok());
-        assert!(crate::Makefile::parse_with_variant(&format!("Y = {matches}\n"), BSDMake).ok());
+        assert!(crate::Makefile::parse_with_variant(&format!("Y = {sysv}\n"), BSDMake).is_ok());
+        assert!(crate::Makefile::parse_with_variant(&format!("Y = {matches}\n"), BSDMake).is_ok());
     }
 }

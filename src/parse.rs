@@ -63,13 +63,19 @@ impl<T> Parse<T> {
         &self.positioned_errors
     }
 
-    /// Check if there are any errors
-    pub fn ok(&self) -> bool {
+    /// Check that there are no errors
+    pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 
+    /// Check that there are no errors
+    #[deprecated(since = "0.4.2", note = "use `is_ok` instead")]
+    pub fn ok(&self) -> bool {
+        self.is_ok()
+    }
+
     /// Convert to a Result, returning the tree if there are no errors
-    pub fn to_result(self) -> Result<T, Error>
+    pub fn into_result(self) -> Result<T, Error>
     where
         T: AstNode<Language = crate::lossless::Lang>,
     {
@@ -82,10 +88,19 @@ impl<T> Parse<T> {
         }
     }
 
+    /// Convert to a Result, returning the tree if there are no errors
+    #[deprecated(since = "0.4.2", note = "use `into_result` instead")]
+    pub fn to_result(self) -> Result<T, Error>
+    where
+        T: AstNode<Language = crate::lossless::Lang>,
+    {
+        self.into_result()
+    }
+
     /// Get the parsed syntax tree
     ///
     /// Returns the tree even if there are parse errors. Use `errors()`,
-    /// `positioned_errors()`, or `ok()` to check for errors separately if needed.
+    /// `positioned_errors()`, or `is_ok()` to check for errors separately if needed.
     /// This allows for error-resilient tooling that can work with partial/invalid input.
     ///
     /// For a `Parse<Rule>`, this is the rule within the tree of the whole
@@ -94,7 +109,7 @@ impl<T> Parse<T> {
     /// # Panics
     ///
     /// Panics if the text has no node of this type, which happens for a
-    /// `Parse<Rule>` of text without a rule. `ok()` is false in that case.
+    /// `Parse<Rule>` of text without a rule. `is_ok()` is false in that case.
     pub fn tree(&self) -> T
     where
         T: AstNode<Language = crate::lossless::Lang>,
@@ -189,8 +204,9 @@ impl Parse<Rule> {
     }
 
     /// Convert to a Result, returning the rule if there are no errors
+    #[deprecated(since = "0.4.2", note = "use `into_result` instead")]
     pub fn to_rule_result(self) -> Result<Rule, Error> {
-        self.to_result()
+        self.into_result()
     }
 }
 
@@ -230,6 +246,21 @@ mod tests {
             SyntaxKind::try_from(SyntaxKind::ALL.len() as u16),
             Err(SyntaxKind::ALL.len() as u16)
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_result_methods() {
+        let parsed = Parse::<Makefile>::parse_makefile("all:\n");
+        assert!(parsed.ok());
+        assert_eq!(parsed.to_result().unwrap().to_string(), "all:\n");
+        let parsed = Parse::<Makefile>::parse_makefile("all\n");
+        assert!(!parsed.ok());
+        assert!(parsed.to_result().is_err());
+        let parsed = Parse::<Rule>::parse_rule("all:\n");
+        assert_eq!(parsed.to_rule_result().unwrap().to_string(), "all:\n");
+        let parsed = Parse::<Rule>::parse_rule("X = 1\n");
+        assert!(parsed.to_rule_result().is_err());
     }
 
     #[test]
