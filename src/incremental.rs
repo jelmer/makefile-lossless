@@ -178,6 +178,8 @@ impl Parse<Makefile> {
             });
             positioned_errors.push(PositionedParseError {
                 range: positioned.range + start,
+                line_range: positioned.line_range + start,
+                space_indent_range: positioned.space_indent_range.map(|r| r + start),
                 ..positioned.clone()
             });
         }
@@ -187,22 +189,21 @@ impl Parse<Makefile> {
                     line: (err.line as i64 + line_delta) as usize,
                     ..err.clone()
                 });
+                let shift_range = |range: TextRange| {
+                    TextRange::new(
+                        shift(range.start(), edit.delta()),
+                        shift(range.end(), edit.delta()),
+                    )
+                };
                 positioned_errors.push(PositionedParseError {
-                    range: TextRange::new(
-                        shift(positioned.range.start(), edit.delta()),
-                        shift(positioned.range.end(), edit.delta()),
-                    ),
+                    range: shift_range(positioned.range),
+                    line_range: shift_range(positioned.line_range),
+                    space_indent_range: positioned.space_indent_range.map(shift_range),
                     ..positioned.clone()
                 });
             }
         }
 
-        // Lines may have shifted, so find the lines in the new tree.
-        crate::lossless::locate_error_lines(
-            &rowan::SyntaxNode::new_root(new_root.clone()),
-            new_text,
-            &mut positioned_errors,
-        );
         Some(Parse::new(new_root, errors, positioned_errors).with_variant(self.variant()))
     }
 }
