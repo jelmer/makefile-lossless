@@ -180,12 +180,13 @@ fn test_include_set_quoted_path_carets() {
 fn test_include_set_optional() {
     let makefile = parse_nmake("!INCLUDE config.mak\n");
     let mut include = makefile.includes().next().unwrap();
-    let Err(Error::Parse(err)) = include.set_optional(true) else {
-        panic!("expected an error");
-    };
     assert_eq!(
-        err.errors[0].message,
-        "nmake has no optional include directive"
+        crate::test_util::expect_invalid_edit(include.set_optional(true)),
+        InvalidEdit::new(
+            InvalidEditKind::Unsupported,
+            "Include::set_optional",
+            "nmake has no optional include directive"
+        )
     );
     include.set_optional(false).unwrap();
     assert_eq!(makefile.to_string(), "!INCLUDE config.mak\n");

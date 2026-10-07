@@ -11,9 +11,7 @@ pub mod vpath;
 mod word_list;
 
 use crate::lex::NMAKE_ESCAPABLE;
-use crate::lossless::{
-    detached_elements, Error, ErrorInfo, ParseError, SyntaxElement, SyntaxNode, SyntaxToken,
-};
+use crate::lossless::{detached_elements, SyntaxElement, SyntaxNode, SyntaxToken};
 use crate::syntax_rules::last_backslash_unescaped;
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
@@ -23,18 +21,6 @@ use crate::SyntaxKind::{
     WHITESPACE,
 };
 use std::ops::Range;
-
-/// An error for invalid input to the method `context`.
-pub(crate) fn edit_error(context: &str, message: String) -> Error {
-    Error::Parse(ParseError {
-        errors: vec![ErrorInfo {
-            kind: crate::ParseErrorKind::Other,
-            message,
-            line: 1,
-            context: context.to_string(),
-        }],
-    })
-}
 
 /// Whether `token` is the backslash of a backslash-newline line
 /// continuation. A backslash escaped by an odd run of preceding backslashes

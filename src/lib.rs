@@ -125,8 +125,8 @@ pub use bsd_condition::{
 pub use incremental::{apply_edit_to_text, EditError, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
-    ForLoop, Identifier, Include, Lang, Load, Makefile, ParseError, ParseErrorKind,
-    PositionedParseError, Recipe, RecipeVariableReference, ReferenceLocation, Rule,
+    ForLoop, Identifier, Include, InvalidEdit, InvalidEditKind, Lang, Load, Makefile, ParseError,
+    ParseErrorKind, PositionedParseError, Recipe, RecipeVariableReference, ReferenceLocation, Rule,
     VariableDefinition, VariableReference, Vpath,
 };
 pub use nmake_condition::{

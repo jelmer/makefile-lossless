@@ -3,7 +3,7 @@ use super::makefile::MakefileItem;
 use super::{collapse_continuations, escape_hashes, is_continuation, logical_text, LineSyntax};
 use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{
-    parse, remove_with_preceding_comments, Error, ErrorInfo, Include, Lang, ParseError,
+    invalid_edit, parse, remove_with_preceding_comments, Error, Include, InvalidEditKind, Lang,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
@@ -48,8 +48,9 @@ fn escape_nmake(path: &str) -> String {
 }
 
 impl Include {
-    /// Internal: a detached `include` directive for `path`, ending in `eol`.
-    pub(crate) fn new(path: &str, eol: &str) -> Result<Include, Error> {
+    /// Internal: a detached `include` directive for `path`, ending in `eol`,
+    /// for the editing method `operation`.
+    pub(crate) fn new(path: &str, eol: &str, operation: &'static str) -> Result<Include, Error> {
         let mut builder = GreenNodeBuilder::new();
         builder.start_node(INCLUDE.into());
         builder.token(IDENTIFIER.into(), "include");
@@ -59,7 +60,7 @@ impl Include {
         builder.token(NEWLINE.into(), eol);
         builder.finish_node();
         let mut include = Include::cast(SyntaxNode::new_root_mut(builder.finish())).unwrap();
-        include.set_path(path)?;
+        include.set_path_with(path, operation)?;
         Ok(include)
     }
 
@@ -385,14 +386,11 @@ impl Include {
     /// ```
     pub fn remove(&mut self) -> Result<(), Error> {
         let Some(parent) = self.syntax().parent() else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot remove include: no parent node".to_string(),
-                    line: 1,
-                    context: "include_remove".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Include::remove",
+                "Cannot remove include: no parent node",
+            ));
         };
 
         remove_with_preceding_comments(self.syntax(), &parent);
@@ -416,24 +414,26 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "include new\\#1.mk\n");
     /// ```
     pub fn set_path(&mut self, new_path: &str) -> Result<(), Error> {
-        let error = |message: String| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message,
-                    line: 1,
-                    context: "include_set_path".to_string(),
-                }],
-            })
-        };
+        self.set_path_with(new_path, "Include::set_path")
+    }
+
+    /// Internal: set the path for the editing method `operation`.
+    fn set_path_with(&mut self, new_path: &str, operation: &'static str) -> Result<(), Error> {
+        let error = |kind, message: String| invalid_edit(kind, operation, message);
         // GNU make accepts an include without file names, but that is not
         // a path.
         if new_path.is_empty() {
-            return Err(error("Cannot set an empty include path".to_string()));
+            return Err(error(
+                InvalidEditKind::InvalidArgument,
+                "Cannot set an empty include path".to_string(),
+            ));
         }
-        let expr = self
-            .path_expr()
-            .ok_or_else(|| error("Cannot set path: include has no path".to_string()))?;
+        let expr = self.path_expr().ok_or_else(|| {
+            error(
+                InvalidEditKind::Unsupported,
+                "Cannot set path: include has no path".to_string(),
+            )
+        })?;
         let before_comment = expr
             .next_sibling_or_token()
             .is_some_and(|it| it.kind() == COMMENT);
@@ -447,9 +447,10 @@ impl Include {
             // Carets in an nmake quoted string are literal, so there is no
             // way to escape a `#`.
             (true, Some('"')) if new_path.contains('#') => {
-                return Err(error(format!(
-                    "Cannot set a quoted nmake include path containing '#': {new_path}"
-                )));
+                return Err(error(
+                    InvalidEditKind::NotRepresentable,
+                    format!("Cannot set a quoted nmake include path containing '#': {new_path}"),
+                ));
             }
             (true, Some('"')) => new_path.to_string(),
             (true, _) => escape_nmake(new_path),
@@ -484,7 +485,12 @@ impl Include {
                     && include.path().as_deref() == Some(new_path)
             })
             .and_then(|include| include.path_expr())
-            .ok_or_else(|| error(format!("Cannot write {:?} as an include path", new_path)))?;
+            .ok_or_else(|| {
+                error(
+                    InvalidEditKind::NotRepresentable,
+                    format!("Cannot write {:?} as an include path", new_path),
+                )
+            })?;
         super::replace_children(
             &expr,
             new_expr.green().children().map(|c| c.to_owned()).collect(),
@@ -512,14 +518,11 @@ impl Include {
     /// ```
     pub fn set_optional(&mut self, optional: bool) -> Result<(), Error> {
         let error = |message: &str| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: message.to_string(),
-                    line: 1,
-                    context: "include_set_optional".to_string(),
-                }],
-            })
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Include::set_optional",
+                message,
+            )
         };
         let (token, name) = self
             .keyword_name()
@@ -700,6 +703,29 @@ mod tests {
         assert_eq!(makefile.includes().count(), 1);
         let remaining = makefile.includes().next().unwrap();
         assert_eq!(remaining.path(), Some("second.mk".to_string()));
+    }
+
+    #[test]
+    fn test_include_set_path_errors() {
+        let mut makefile: Makefile = "include old.mk\n".parse().unwrap();
+        let mut inc = makefile.includes().next().unwrap();
+        assert_eq!(
+            crate::test_util::expect_invalid_edit(inc.set_path("")),
+            crate::InvalidEdit::new(
+                InvalidEditKind::InvalidArgument,
+                "Include::set_path",
+                "Cannot set an empty include path"
+            )
+        );
+        assert_eq!(
+            crate::test_util::expect_invalid_edit(makefile.add_include("a\nb")),
+            crate::InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Makefile::add_include",
+                "Cannot write \"a\\nb\" as an include path"
+            )
+        );
+        assert_eq!(makefile.to_string(), "include old.mk\n");
     }
 
     #[test]

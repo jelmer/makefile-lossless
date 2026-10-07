@@ -6,8 +6,8 @@ use super::{
 };
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
 use crate::lossless::{
-    lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
-    ErrorInfo, Lang, ParseError, Recipe, Rule, VariableDefinition,
+    invalid_edit, lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional,
+    Error, InvalidEditKind, Lang, Recipe, Rule, VariableDefinition,
 };
 use crate::nmake_condition::{parse_nmake_condition, NmakeCondition, NmakeConditionError};
 use crate::MakefileVariant;
@@ -979,14 +979,11 @@ impl Conditional {
     /// above is removed too.
     pub fn remove(&mut self) -> Result<(), Error> {
         let Some(parent) = self.syntax().parent() else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot remove conditional: no parent node".to_string(),
-                    line: 1,
-                    context: "conditional_remove".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Conditional::remove",
+                "Cannot remove conditional: no parent node",
+            ));
         };
 
         remove_with_preceding_comments(self.syntax(), &parent);
@@ -998,6 +995,12 @@ impl Conditional {
     ///
     /// This "unwraps" the conditional, keeping only the if branch content.
     /// Returns an error if the conditional has an else clause.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::Unsupported`] if the conditional has an else clause
+    /// or is not part of a makefile.
     ///
     /// # Example
     /// ```
@@ -1015,25 +1018,19 @@ impl Conditional {
     pub fn unwrap(&mut self) -> Result<(), Error> {
         // Check if there's an else clause
         if self.has_else() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot unwrap conditional with else clause".to_string(),
-                    line: 1,
-                    context: "conditional_unwrap".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Conditional::unwrap",
+                "Cannot unwrap conditional with else clause",
+            ));
         }
 
         let Some(parent) = self.syntax().parent() else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot unwrap conditional: no parent node".to_string(),
-                    line: 1,
-                    context: "conditional_unwrap".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Conditional::unwrap",
+                "Cannot unwrap conditional: no parent node",
+            ));
         };
 
         // Collect the body items (everything between CONDITIONAL_IF and CONDITIONAL_ENDIF)
@@ -1187,14 +1184,11 @@ impl Conditional {
     /// ```
     pub fn add_endif(&mut self) -> Result<bool, Error> {
         if self.conditional_type().is_none() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot add endif to conditional with no opener".to_string(),
-                    line: 1,
-                    context: "conditional_add_endif".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Conditional::add_endif",
+                "Cannot add endif to conditional with no opener",
+            ));
         }
         if self.has_endif() {
             return Ok(false);
@@ -2654,13 +2648,14 @@ endif
         .unwrap();
 
         let mut cond = makefile.conditionals().next().unwrap();
-        let result = cond.unwrap();
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot unwrap conditional with else clause"));
+        assert_eq!(
+            crate::test_util::expect_invalid_edit(cond.unwrap()),
+            crate::InvalidEdit::new(
+                crate::InvalidEditKind::Unsupported,
+                "Conditional::unwrap",
+                "Cannot unwrap conditional with else clause"
+            )
+        );
     }
 
     #[test]
