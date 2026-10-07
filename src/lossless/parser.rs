@@ -4006,9 +4006,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// the line that closes it, as an ERROR node without looking at
         /// what it contains, as it is nested too deeply to parse
         /// recursively.
-        ///
-        /// TODO: Lines in a `define` body are not told apart from
-        /// directives here.
         fn parse_too_deeply_nested_block(&mut self) {
             self.record_error(
                 ParseErrorKind::TooDeeplyNested,
@@ -4017,6 +4014,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.start_node(ERROR.into());
             let mut depth = 0;
             loop {
+                if self.is_define_line() {
+                    self.skip_define_lines();
+                    if self.is_at_eof() {
+                        break;
+                    }
+                    continue;
+                }
                 match self.block_delimiter() {
                     Some(true) => depth += 1,
                     Some(false) => depth -= 1,
@@ -4028,6 +4032,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
             self.builder.finish_node();
+        }
+
+        /// Skip the lines of the `define` block starting at the current
+        /// line, up to and including its `endef` line, finding its end as
+        /// [`Self::parse_define`] does.
+        fn skip_define_lines(&mut self) {
+            self.skip_logical_line();
+            let mut depth: usize = 1;
+            while !self.is_at_eof() {
+                match self.first_token_on_line() {
+                    Some("endef") => depth -= 1,
+                    Some("define") => depth += 1,
+                    _ => {}
+                }
+                self.skip_logical_line();
+                if depth == 0 {
+                    break;
+                }
+            }
         }
 
         /// Whether the current line opens (true) or closes (false) a
