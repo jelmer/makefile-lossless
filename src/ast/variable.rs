@@ -411,10 +411,10 @@ impl VariableDefinition {
 
     /// The source range covering just the variable's name.
     ///
-    /// Excludes any `export`/`override`/`private`/`define` prefix, the
-    /// assignment operator and the value. Lets callers compute a minimal
-    /// rename edit instead of re-rendering the whole definition (and with it
-    /// the surrounding whitespace).
+    /// Excludes any `export`/`unexport`/`override`/`private`/`define`
+    /// prefix, the assignment operator and the value. Lets callers compute a
+    /// minimal rename edit instead of re-rendering the whole definition (and
+    /// with it the surrounding whitespace).
     ///
     /// # Example
     /// ```
@@ -1073,7 +1073,7 @@ impl VariableDefinition {
     }
 
     /// Rename the variable, preserving the operator, value and any
-    /// `export`/`override`/`define` prefix.
+    /// `export`/`unexport`/`override`/`private`/`define` prefix.
     ///
     /// Replaces the whole name as returned by [`Self::name`], including any
     /// variable references in it. A no-op if the definition has no name.
