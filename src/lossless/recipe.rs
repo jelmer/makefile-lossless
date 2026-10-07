@@ -486,7 +486,10 @@ impl Recipe {
     /// assert_eq!(recipe.text(), "-@echo hello");
     /// ```
     pub fn try_set_prefix(&mut self, prefix: &str) -> Result<(), Error> {
-        // TODO: nmake's `!` and `-NUMBER` prefixes are not supported.
+        // TODO: support nmake's command modifiers `!` and `-NUMBER` (which
+        // must be followed by a space or tab), which may also be separated
+        // by spaces or tabs, and reject `+`, which nmake lacks. This needs
+        // the variant, which the tree does not record.
         if !prefix.chars().all(|c| matches!(c, '@' | '-' | '+')) {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
