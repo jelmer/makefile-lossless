@@ -485,10 +485,10 @@ impl Include {
             })
             .and_then(|include| include.path_expr())
             .ok_or_else(|| error(format!("Cannot write {:?} as an include path", new_path)))?;
-        let new_expr = SyntaxNode::new_root_mut(new_expr.green().into_owned());
-        let index = expr.index();
-        self.syntax()
-            .splice_children(index..index + 1, vec![new_expr.into()]);
+        super::replace_children(
+            &expr,
+            new_expr.green().children().map(|c| c.to_owned()).collect(),
+        );
         Ok(())
     }
 
@@ -1450,5 +1450,18 @@ mod tests {
             include.keyword_range(),
             Some(rowan::TextRange::new(10.into(), 17.into()))
         );
+    }
+
+    #[test]
+    fn test_set_path_keeps_unchanged_parts() {
+        let makefile: Makefile = "include  a.mk  $(B)  # x\n".parse().unwrap();
+        let mut inc = makefile.includes().next().unwrap();
+        let expr = inc.path_expr().unwrap();
+        let reference = expr.children().next().unwrap();
+        inc.set_path("z.mk  $(B)").unwrap();
+        assert_eq!(makefile.code(), "include  z.mk  $(B)  # x\n");
+        assert_eq!(inc.path_expr(), Some(expr.clone()));
+        assert_eq!(reference.parent(), Some(expr));
+        crate::test_util::assert_matches_reparse(&makefile);
     }
 }
