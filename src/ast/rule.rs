@@ -2285,7 +2285,7 @@ mod tests {
         // inside quotes.
         let code = "x\"y\": 'p q' \"r#s\"\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let rule = makefile.rules().next().unwrap();
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["x\"y\""]);
         assert_eq!(
@@ -4255,7 +4255,7 @@ endif
         let makefile: Makefile = src.parse().unwrap();
         let mut rule = makefile.rules().next().unwrap();
         edit(&mut rule);
-        assert_eq!(makefile.code(), expected);
+        assert_eq!(makefile.to_string(), expected);
         assert_matches_reparse(&makefile);
     }
 
@@ -4387,7 +4387,7 @@ endif
         let mut rule = makefile.rules().next().unwrap();
         assert!(rule.remove_prerequisite("c").unwrap());
         assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b\\\\"]);
-        assert_eq!(makefile.code(), "a: b\\\\\\\\# x\n");
+        assert_eq!(makefile.to_string(), "a: b\\\\\\\\# x\n");
         assert_matches_reparse(&makefile);
     }
 
@@ -4402,8 +4402,8 @@ endif
         rule.rename_target("a", "e").unwrap();
         rule.add_target("f").unwrap();
         assert!(rule.remove_prerequisite("b").unwrap());
-        assert_eq!(makefile.code(), "e f: c d\nifdef X\nY = 1\n");
-        let reparsed = Makefile::parse(&makefile.code()).tree();
+        assert_eq!(makefile.to_string(), "e f: c d\nifdef X\nY = 1\n");
+        let reparsed = Makefile::parse(&makefile.to_string()).tree();
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.syntax())
@@ -4418,7 +4418,7 @@ endif
         let (normal, order_only) = rule.prerequisite_nodes();
         rule.add_prerequisite("e").unwrap();
         assert!(rule.remove_prerequisite("b").unwrap());
-        assert_eq!(makefile.code(), "a: c e | d # x\n");
+        assert_eq!(makefile.to_string(), "a: c e | d # x\n");
         assert_eq!(rule.prerequisites_node(), Some(node.clone()));
         assert_eq!(normal[1].parent(), Some(node.clone()));
         assert_eq!(order_only[0].parent(), Some(node));
@@ -4432,10 +4432,10 @@ endif
         let node = rule.prerequisites_node().unwrap();
         let (_, order_only) = rule.prerequisite_nodes();
         rule.set_prerequisites(vec![]).unwrap();
-        assert_eq!(makefile.code(), "a: | d # x\n");
+        assert_eq!(makefile.to_string(), "a: | d # x\n");
         assert_matches_reparse(&makefile);
         rule.set_prerequisites(vec!["f"]).unwrap();
-        assert_eq!(makefile.code(), "a: f | d # x\n");
+        assert_eq!(makefile.to_string(), "a: f | d # x\n");
         assert_eq!(rule.prerequisites_node(), Some(node.clone()));
         assert_eq!(order_only[0].parent(), Some(node));
         assert_matches_reparse(&makefile);
@@ -4453,7 +4453,7 @@ endif
         rule.rename_target("b", "x").unwrap();
         rule.add_target("y").unwrap();
         assert!(rule.remove_target("a").unwrap());
-        assert_eq!(makefile.code(), "x \\\n  c y: d\n");
+        assert_eq!(makefile.to_string(), "x \\\n  c y: d\n");
         assert_eq!(rule.targets_node(), Some(node.clone()));
         let kept: Vec<_> = tokens.iter().filter(|t| t.parent().is_some()).collect();
         assert_eq!(

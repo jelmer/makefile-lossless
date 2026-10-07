@@ -53,12 +53,18 @@ impl ModifierArg {
     }
 
     /// The text of this argument, if it contains no nested expressions.
-    pub fn as_literal(&self) -> Option<String> {
+    pub fn as_literal_str(&self) -> Option<&str> {
         match self.0.as_slice() {
-            [] => Some(String::new()),
-            [ModifierArgPart::Literal(text)] => Some(text.clone()),
+            [] => Some(""),
+            [ModifierArgPart::Literal(text)] => Some(text),
             _ => None,
         }
+    }
+
+    /// The text of this argument, if it contains no nested expressions.
+    #[deprecated(since = "0.4.2", note = "use `as_literal_str` instead")]
+    pub fn as_literal(&self) -> Option<String> {
+        self.as_literal_str().map(str::to_string)
     }
 
     /// Whether this argument is empty.
@@ -1446,8 +1452,9 @@ impl<'a> Parser<'a> {
         self.bump();
         let var = self
             .parse_part(Some('@'), None, None)?
-            .as_literal()
+            .as_literal_str()
             .filter(|var| !var.contains('$'))
+            .map(str::to_string)
             .ok_or_else(|| {
                 syntax_error(
                     start,
@@ -1468,10 +1475,10 @@ impl<'a> Parser<'a> {
         if !delims.is_delimiter(self.peek()) {
             return Err(self.bad_modifier(start, delims));
         }
-        let Some(text) = arg.as_literal() else {
+        let Some(text) = arg.as_literal_str() else {
             return Ok(Modifier::Words(WordSelector::Unexpanded(arg)));
         };
-        let selector = match text.as_str() {
+        let selector = match text {
             "#" => WordSelector::Count,
             "*" => WordSelector::OneWord,
             "@" => WordSelector::Split,
@@ -1479,7 +1486,7 @@ impl<'a> Parser<'a> {
                 let (first, last) = match text.split_once("..") {
                     Some((first, last)) => (parse_int_base0(first), parse_int_base0(last)),
                     None => {
-                        let n = parse_int_base0(&text);
+                        let n = parse_int_base0(text);
                         (n, n)
                     }
                 };
@@ -3760,9 +3767,15 @@ mod tests {
     fn test_modifier_arg() {
         let arg = ModifierArg::new([text("a"), text(""), text("b"), expr("$X"), text("c")]);
         assert_eq!(arg.parts(), &[text("ab"), expr("$X"), text("c")]);
-        assert_eq!(arg.as_literal(), None);
-        assert_eq!(lit("ab").as_literal(), Some("ab".to_string()));
-        assert_eq!(lit("").as_literal(), Some("".to_string()));
+        assert_eq!(arg.as_literal_str(), None);
+        assert_eq!(lit("ab").as_literal_str(), Some("ab"));
+        assert_eq!(lit("").as_literal_str(), Some(""));
+        #[allow(deprecated)]
+        {
+            assert_eq!(arg.as_literal(), None);
+            assert_eq!(lit("ab").as_literal(), Some("ab".to_string()));
+            assert_eq!(lit("").as_literal(), Some("".to_string()));
+        }
         assert!(lit("").is_empty());
         assert!(!arg.is_empty());
     }

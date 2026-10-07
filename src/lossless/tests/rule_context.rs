@@ -99,7 +99,7 @@ fn test_include_ends_rule() {
             let parsed = parse(&text, variant);
             assert_eq!(parsed.errors, vec![]);
             let root = parsed.root();
-            assert_eq!(root.code(), text);
+            assert_eq!(root.to_string(), text);
             let items: Vec<_> = root.items().map(|i| i.syntax().kind()).collect();
             assert_eq!(items, vec![RULE, INCLUDE], "{text:?} {variant:?}");
             let rule = root.rules().next().unwrap();
@@ -170,7 +170,7 @@ fn test_conditional_with_tab_indented_line_outside_rule() {
 
     // Should preserve the code
     let mf = parsed.root();
-    assert_eq!(mf.code(), input);
+    assert_eq!(mf.to_string(), input);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn test_conditional_in_rule_recipe() {
 
     // Should preserve the code
     let mf = parsed.root();
-    assert_eq!(mf.code(), input);
+    assert_eq!(mf.to_string(), input);
 
     // Should have exactly one rule
     assert_eq!(mf.rules().count(), 1);
@@ -282,7 +282,7 @@ fn test_conditional_without_recipes_after_rule() {
         .map(|v| v.name().unwrap())
         .collect();
     assert_eq!(names, vec!["Q"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn test_conditional_with_rule_after_rule() {
     let rule_a = makefile.find_rule_by_target("a").unwrap();
     assert_eq!(rule_a.recipes().collect::<Vec<_>>(), vec!["x"]);
     assert_eq!(rule_a.items().count(), 1);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn test_conditional_mixing_recipes_and_variables_after_rule() {
         .map(|v| v.name().unwrap())
         .collect();
     assert_eq!(names, vec!["Q"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn test_bsd_loop_with_variable_in_rule() {
         .map(|v| v.name().unwrap())
         .collect();
     assert_eq!(names, vec!["Q"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -529,7 +529,7 @@ fn test_conditional_after_blank_line_and_comment() {
     let input = "all:\n\techo a\n\n# c\nifdef X\n\techo x\nendif\n";
     let parsed = parse(input, None);
     assert_eq!(parsed.errors, vec![]);
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
     assert_eq!(
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    RECIPE\n    CONDITIONAL_ENDIF\n"
@@ -542,7 +542,7 @@ fn test_recipe_after_blank_line_and_indented_comment() {
     let parsed = parse(input, None);
     assert_eq!(parsed.errors, vec![]);
     let makefile = parsed.root();
-    assert_eq!(makefile.code(), input);
+    assert_eq!(makefile.to_string(), input);
     assert_eq!(makefile.items().count(), 1);
     let rule = makefile.rules().next().unwrap();
     assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a", "echo b"]);
@@ -558,7 +558,7 @@ fn test_comments_after_blank_lines_in_recipe() {
     let parsed = parse(&input, None);
     assert_eq!(parsed.errors, vec![]);
     let makefile = parsed.root();
-    assert_eq!(makefile.code(), input);
+    assert_eq!(makefile.to_string(), input);
     let rule_node = makefile.rules().next().unwrap();
     assert_eq!(
         rule_node.recipes().collect::<Vec<_>>(),
@@ -580,7 +580,7 @@ fn test_recipe_after_conditional_ending_in_rule_context() {
             "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ELSE\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n"
         );
     let makefile = parsed.root();
-    assert_eq!(makefile.code(), input);
+    assert_eq!(makefile.to_string(), input);
     let items: Vec<_> = makefile.items().collect();
     assert_eq!(items.len(), 2);
     assert!(matches!(items[0], MakefileItem::Conditional(_)));
@@ -597,7 +597,7 @@ fn test_bsd_indented_comment_outside_rule() {
     let input = "X = 1\n\t# c\n\t# d \\\n\tmore\n\t\n";
     let parsed = parse(input, Some(MakefileVariant::BSDMake));
     assert_eq!(parsed.errors, vec![]);
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
     assert_eq!(node_kinds(&parsed.syntax()), "VARIABLE\n  EXPR\n");
     assert_eq!(
         parsed
@@ -627,7 +627,7 @@ fn test_recipe_after_conditional_ending_rule_on_some_paths() {
                 "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
             );
         let makefile = parsed.root();
-        assert_eq!(makefile.code(), input);
+        assert_eq!(makefile.to_string(), input);
         let items: Vec<_> = makefile.items().collect();
         assert_eq!(items.len(), 3);
         let MakefileItem::Rule(rule) = &items[0] else {
@@ -650,7 +650,7 @@ fn test_recipe_after_conditional_ending_rule_in_one_branch() {
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    VARIABLE\n      EXPR\n    CONDITIONAL_ELSE\n    RECIPE\n    CONDITIONAL_ENDIF\nRECIPE\n"
         );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -662,7 +662,7 @@ fn test_recipe_after_nested_conditional_ending_rule_on_some_paths() {
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  CONDITIONAL\n    CONDITIONAL_IF\n      EXPR\n    VARIABLE\n      EXPR\n    CONDITIONAL_ENDIF\n  CONDITIONAL_ENDIF\nRECIPE\n"
         );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -674,7 +674,7 @@ fn test_recipe_after_conditional_with_rule_in_one_branch() {
             node_kinds(&parsed.syntax()),
             "CONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  RULE\n    TARGETS\n    PREREQUISITES\n  CONDITIONAL_ENDIF\nRECIPE\n"
         );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -690,7 +690,7 @@ fn test_recipe_after_conditional_ending_rule_on_all_paths() {
             .collect::<Vec<_>>(),
         vec![(8, "indented line not part of a rule")]
     );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -704,7 +704,7 @@ fn test_assignment_after_conditional_ending_rule_on_some_paths() {
             node_kinds(&parsed.syntax()),
             "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nVARIABLE\n  EXPR\n"
         );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -729,7 +729,7 @@ fn test_statements_after_conditional_ending_rule_on_some_paths() {
                     kinds
                 )
             );
-        assert_eq!(parsed.root().code(), input);
+        assert_eq!(parsed.root().to_string(), input);
     }
 }
 
@@ -754,7 +754,7 @@ fn test_bsd_recipe_after_conditional_ending_rule_on_some_paths() {
                 "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nCONDITIONAL\n  CONDITIONAL_IF\n    EXPR\n  VARIABLE\n    EXPR\n  CONDITIONAL_ENDIF\nRECIPE\n"
             );
         let makefile = parsed.root();
-        assert_eq!(makefile.code(), input);
+        assert_eq!(makefile.to_string(), input);
         let crate::ast::makefile::MakefileItem::Recipe(recipe) = makefile.items().last().unwrap()
         else {
             panic!("expected recipe");
@@ -775,7 +775,7 @@ fn test_bsd_recipe_after_conditional_ending_rule_on_all_paths() {
             .collect::<Vec<_>>(),
         vec![(8, "indented line not part of a rule")]
     );
-    assert_eq!(parsed.root().code(), input);
+    assert_eq!(parsed.root().to_string(), input);
 }
 
 #[test]
@@ -792,7 +792,7 @@ fn test_expression_statement_ends_rule() {
         }]
     );
     let makefile = parsed.root();
-    assert_eq!(makefile.code(), input);
+    assert_eq!(makefile.to_string(), input);
     let rule = makefile.rules().next().unwrap();
     assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a"]);
 }

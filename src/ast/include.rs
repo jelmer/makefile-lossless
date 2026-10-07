@@ -1603,7 +1603,7 @@ mod tests {
         let expr = inc.path_expr().unwrap();
         let reference = expr.children().next().unwrap();
         inc.set_path("z.mk  $(B)").unwrap();
-        assert_eq!(makefile.code(), "include  z.mk  $(B)  # x\n");
+        assert_eq!(makefile.to_string(), "include  z.mk  $(B)  # x\n");
         assert_eq!(inc.path_expr(), Some(expr.clone()));
         assert_eq!(reference.parent(), Some(expr));
         crate::test_util::assert_matches_reparse(&makefile);

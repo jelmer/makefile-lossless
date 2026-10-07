@@ -1066,7 +1066,7 @@ impl Conditional {
 
     /// Remove the conditional directives (ifdef/endif) but keep the body content
     ///
-    /// This "unwraps" the conditional, keeping only the if branch content.
+    /// The conditional is replaced by the items of its if branch.
     /// Returns an error if the conditional has an else clause.
     ///
     /// # Errors
@@ -1083,17 +1083,17 @@ impl Conditional {
     /// endif
     /// "#.parse().unwrap();
     /// let mut cond = makefile.conditionals().next().unwrap();
-    /// cond.unwrap().unwrap();
+    /// cond.replace_with_body().unwrap();
     /// // Now makefile contains just "VAR = debug\n"
     /// assert!(makefile.to_string().contains("VAR = debug"));
     /// assert!(!makefile.to_string().contains("ifdef"));
     /// ```
-    pub fn unwrap(&mut self) -> Result<(), Error> {
+    pub fn replace_with_body(&mut self) -> Result<(), Error> {
         // Check if there's an else clause
         if self.has_else() {
             return Err(invalid_edit(
                 InvalidEditKind::Unsupported,
-                "Conditional::unwrap",
+                "Conditional::replace_with_body",
                 "Cannot unwrap conditional with else clause",
             ));
         }
@@ -1101,7 +1101,7 @@ impl Conditional {
         let Some(parent) = self.syntax().parent() else {
             return Err(invalid_edit(
                 InvalidEditKind::Unsupported,
-                "Conditional::unwrap",
+                "Conditional::replace_with_body",
                 "Cannot unwrap conditional: no parent node",
             ));
         };
@@ -1122,6 +1122,12 @@ impl Conditional {
         parent.splice_children(conditional_index..conditional_index + 1, body_nodes);
 
         Ok(())
+    }
+
+    /// Remove the conditional directives (ifdef/endif) but keep the body content
+    #[deprecated(since = "0.4.2", note = "use `replace_with_body` instead")]
+    pub fn unwrap(&mut self) -> Result<(), Error> {
+        self.replace_with_body()
     }
 
     /// Get all items (rules, variables, includes, nested conditionals) in the if branch
@@ -1253,7 +1259,7 @@ impl Conditional {
     /// let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nVAR = 1\n");
     /// let mut cond = makefile.conditionals().next().unwrap();
     /// assert!(cond.add_endif().unwrap());
-    /// assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+    /// assert_eq!(makefile.to_string(), "ifdef DEBUG\nVAR = 1\nendif\n");
     /// ```
     pub fn add_endif(&mut self) -> Result<bool, Error> {
         if self.conditional_type().is_none() {
@@ -1628,7 +1634,7 @@ mod tests {
     fn test_branches_header_comments() {
         let code = "ifdef A # c\nX = 1\nelse ifeq (a,b) # c\nX = 2\nelse ifneq \"a\" 'b'# c\nX = 3\nelse # c\nX = 4\nendif # c\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
@@ -1654,7 +1660,7 @@ mod tests {
     fn test_ifeq_args_header_comment() {
         let code = "ifeq ($(A),a) # c\nX = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("($(A),a)".to_string()));
         assert_eq!(
@@ -1667,7 +1673,7 @@ mod tests {
     fn test_ifdef_only_comment() {
         let code = "ifdef # c\nX = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
@@ -1677,7 +1683,7 @@ mod tests {
 
     fn error_summary(code: &str) -> Vec<(ParseErrorKind, usize, String)> {
         let parsed = Makefile::parse(code);
-        assert_eq!(parsed.tree().code(), code);
+        assert_eq!(parsed.tree().to_string(), code);
         parsed
             .errors()
             .iter()
@@ -1744,14 +1750,14 @@ mod tests {
         let code = ".ifdef A && B\nX = 1\n.endif\n";
         let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
         assert_eq!(parsed.errors(), &[]);
-        assert_eq!(parsed.tree().code(), code);
+        assert_eq!(parsed.tree().to_string(), code);
     }
 
     #[test]
     fn test_empty_ifdef() {
         let code = "ifdef\nX = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("".to_string()));
         assert_eq!(
@@ -1764,7 +1770,7 @@ mod tests {
     fn test_empty_ifndef() {
         let code = "ifndef \nX = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
@@ -1776,7 +1782,7 @@ mod tests {
     fn test_empty_else_ifdef() {
         let code = "ifdef A\nX = 1\nelse ifdef\nX = 2\nelse ifndef # c\nX = 3\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
@@ -1792,7 +1798,7 @@ mod tests {
     fn test_bsd_branches_header_comments() {
         let code = ".if A # c\nX = 1\n.elif ${B} == b # c\nX = 2\n.else # c\nX = 3\n.endif # c\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.branches().map(describe).collect::<Vec<_>>(),
@@ -2050,7 +2056,7 @@ endif
         let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nVAR = 1\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+        assert_eq!(makefile.to_string(), "ifdef DEBUG\nVAR = 1\nendif\n");
     }
 
     #[test]
@@ -2058,7 +2064,7 @@ endif
         let makefile: Makefile = "ifdef DEBUG\nVAR = 1\nendif\n".parse().unwrap();
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(!cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+        assert_eq!(makefile.to_string(), "ifdef DEBUG\nVAR = 1\nendif\n");
     }
 
     #[test]
@@ -2069,7 +2075,7 @@ endif
         let makefile = parsed.tree();
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), "ifdef DEBUG\nVAR = 1\nendif\n");
+        assert_eq!(makefile.to_string(), "ifdef DEBUG\nVAR = 1\nendif\n");
     }
 
     #[test]
@@ -2077,7 +2083,10 @@ endif
         let (makefile, _) = Makefile::from_str_relaxed("ifdef DEBUG\nA = 1\nelse\nA = 2\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), "ifdef DEBUG\nA = 1\nelse\nA = 2\nendif\n");
+        assert_eq!(
+            makefile.to_string(),
+            "ifdef DEBUG\nA = 1\nelse\nA = 2\nendif\n"
+        );
     }
 
     #[test]
@@ -2097,14 +2106,14 @@ endif
         let (makefile, _) = Makefile::from_str_relaxed("ifeq ($(X),y)\nA = 1\nB = 2\n");
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), "ifeq ($(X),y)\nA = 1\nB = 2\nendif\n");
+        assert_eq!(makefile.to_string(), "ifeq ($(X),y)\nA = 1\nB = 2\nendif\n");
     }
 
     #[test]
     fn test_ifdef_line_continuation() {
         let code = "ifdef \\\n  X\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         assert_eq!(makefile.rules().count(), 0);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("X".to_string()));
@@ -2115,7 +2124,7 @@ endif
     fn test_ifeq_quoted_line_continuation() {
         let code = "ifeq \"a\" \\\n  \"b\"\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("\"a\" \"b\"".to_string()));
         assert_eq!(cond.ifeq_args(), Some(("a".to_string(), "b".to_string())));
@@ -2126,7 +2135,7 @@ endif
     fn test_ifeq_line_continuation_in_quotes() {
         let code = "ifeq \"a \\\n   b\" \"a b\"\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("\"a b\" \"a b\"".to_string()));
         assert_eq!(
@@ -2139,7 +2148,7 @@ endif
     fn test_ifeq_quoted_reference() {
         let code = "ifeq \"$(A)\" '${B}'\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(
             cond.ifeq_args(),
@@ -2178,7 +2187,7 @@ endif
             ),
         ] {
             let parsed = Makefile::parse(code);
-            assert_eq!(parsed.tree().code(), code);
+            assert_eq!(parsed.tree().to_string(), code);
             assert_eq!(
                 parsed.errors().iter().map(|e| e.kind()).collect::<Vec<_>>(),
                 errors,
@@ -2243,7 +2252,7 @@ endif
     fn test_ifeq_parenthesized_line_continuation() {
         let code = "ifeq ($(A),\\\n  b)\nA = 1\nendif\n";
         let makefile: Makefile = code.parse().unwrap();
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.condition(), Some("($(A), b)".to_string()));
         assert_eq!(
@@ -2766,7 +2775,7 @@ endif
         .unwrap();
 
         let mut cond = makefile.conditionals().next().unwrap();
-        cond.unwrap().unwrap();
+        cond.replace_with_body().unwrap();
 
         let code = makefile.to_string();
         let expected = "VAR = debug\nrule:\n\tcommand\n";
@@ -2793,10 +2802,10 @@ endif
 
         let mut cond = makefile.conditionals().next().unwrap();
         assert_eq!(
-            crate::test_util::expect_invalid_edit(cond.unwrap()),
+            crate::test_util::expect_invalid_edit(cond.replace_with_body()),
             crate::InvalidEdit::new(
                 crate::InvalidEditKind::Unsupported,
-                "Conditional::unwrap",
+                "Conditional::replace_with_body",
                 "Cannot unwrap conditional with else clause"
             )
         );
@@ -2816,7 +2825,7 @@ endif
 
         // Unwrap the outer conditional
         let mut outer_cond = makefile.conditionals().next().unwrap();
-        outer_cond.unwrap().unwrap();
+        outer_cond.replace_with_body().unwrap();
 
         let code = makefile.to_string();
         let expected = "VAR = outer\nifdef INNER\nVAR2 = inner\nendif\n";
@@ -2832,7 +2841,7 @@ endif
         .unwrap();
 
         let mut cond = makefile.conditionals().next().unwrap();
-        cond.unwrap().unwrap();
+        cond.replace_with_body().unwrap();
 
         let code = makefile.to_string();
         assert_eq!(code, "");

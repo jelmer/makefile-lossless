@@ -973,7 +973,7 @@ VAR3 = value3
     var2.remove();
 
     // Verify the comment is also removed
-    assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    assert_eq!(makefile.to_string(), "VAR1 = value1\nVAR3 = value3\n");
 }
 
 #[test]
@@ -996,7 +996,7 @@ VAR3 = value3
     var2.remove();
 
     // Verify all comments are removed
-    assert_eq!(makefile.code(), "VAR1 = value1\nVAR3 = value3\n");
+    assert_eq!(makefile.to_string(), "VAR1 = value1\nVAR3 = value3\n");
 }
 
 #[test]
@@ -1018,7 +1018,7 @@ VAR3 = value3
     var2.remove();
 
     // The empty line still separates VAR1 from VAR3
-    assert_eq!(makefile.code(), "VAR1 = value1\n\nVAR3 = value3\n");
+    assert_eq!(makefile.to_string(), "VAR1 = value1\n\nVAR3 = value3\n");
 }
 
 #[test]
@@ -1028,7 +1028,7 @@ fn test_variable_remove_last_with_empty_line() {
         .unwrap();
     let mut var2 = makefile.variable_definitions().nth(1).unwrap();
     var2.remove();
-    assert_eq!(makefile.code(), "VAR1 = value1\n");
+    assert_eq!(makefile.to_string(), "VAR1 = value1\n");
 }
 
 #[test]
@@ -1036,7 +1036,7 @@ fn test_variable_remove_doc_comment_after_rule() {
     let makefile: Makefile = "a:\n\techo\n# doc\nX = 1\nY = 2\n".parse().unwrap();
     let mut var = makefile.variable_definitions().next().unwrap();
     var.remove();
-    assert_eq!(makefile.code(), "a:\n\techo\nY = 2\n");
+    assert_eq!(makefile.to_string(), "a:\n\techo\nY = 2\n");
 }
 
 #[test]
@@ -1058,7 +1058,7 @@ VAR3 = value3
         .expect("Should have second variable");
     var2.remove();
 
-    assert_eq!(makefile.code(), "VAR1 = value1\n\n\nVAR3 = value3\n");
+    assert_eq!(makefile.to_string(), "VAR1 = value1\n\n\nVAR3 = value3\n");
 }
 
 #[test]
@@ -1076,7 +1076,7 @@ VAR2 = value2
     var1.remove();
 
     // Verify the shebang is preserved but regular comment is removed
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.starts_with("#!/usr/bin/make -f"));
     assert!(!code.contains("regular comment"));
     assert!(!code.contains("VAR1"));
@@ -1103,7 +1103,7 @@ VAR3 = value3
     var2.remove();
 
     // Verify preceding comment is removed but subsequent comment/empty line are preserved
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert_eq!(
         code,
         "VAR1 = value1\n\n# Comment about VAR3\nVAR3 = value3\n"
@@ -1126,7 +1126,7 @@ export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
     var.remove();
 
     // Verify shebang is preserved and empty line after variable is preserved
-    assert_eq!(makefile.code(), "#!/usr/bin/make -f\n\n%:\n\tdh $@\n");
+    assert_eq!(makefile.to_string(), "#!/usr/bin/make -f\n\n%:\n\tdh $@\n");
 }
 
 #[test]

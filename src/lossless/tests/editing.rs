@@ -22,7 +22,7 @@ rule3:
     // Verify the comment is removed
     // Note: The empty line after rule1 is part of rule1's text, not a sibling, so it's preserved
     assert_eq!(
-        makefile.code(),
+        makefile.to_string(),
         "rule1:\n\tcommand1\n\nrule3:\n\tcommand3\n"
     );
 }
@@ -170,7 +170,7 @@ fn test_rule_remove_doc_comment() {
             .find(|r| r.targets().collect::<Vec<_>>() == ["c"])
             .unwrap();
         rule.remove().unwrap();
-        assert_eq!(makefile.code(), expected, "{text:?}");
+        assert_eq!(makefile.to_string(), expected, "{text:?}");
         assert_matches_reparse(&makefile);
     }
 }
@@ -182,11 +182,11 @@ fn test_include_and_conditional_remove_doc_comment() {
         .unwrap();
     makefile.includes().next().unwrap().remove().unwrap();
     assert_eq!(
-        makefile.code(),
+        makefile.to_string(),
         "a:\n\techo\n# far\n\n# doc\nifdef X\nendif\n"
     );
     makefile.conditionals().next().unwrap().remove().unwrap();
-    assert_eq!(makefile.code(), "a:\n\techo\n# far\n");
+    assert_eq!(makefile.to_string(), "a:\n\techo\n# far\n");
 }
 
 /// Lines that can not be written as a single recipe line, comment or
@@ -206,7 +206,7 @@ fn test_recipe_commands_reject_line_breaks() {
         assert!(recipe.try_replace_text(line).is_err(), "{line:?}");
         assert!(recipe.try_insert_before(line).is_err(), "{line:?}");
         assert!(recipe.try_insert_after(line).is_err(), "{line:?}");
-        assert_eq!(makefile.code(), text, "{line:?}");
+        assert_eq!(makefile.to_string(), text, "{line:?}");
     }
 }
 
@@ -222,7 +222,7 @@ fn test_recipe_commands_with_continuation() {
     let makefile: Makefile = "a:\n\techo\nb:\n".parse().unwrap();
     let mut rule = makefile.rules().next().unwrap();
     rule.try_push_command("echo x \\\n\ty").unwrap();
-    assert_eq!(makefile.code(), "a:\n\techo\n\techo x \\\n\ty\nb:\n");
+    assert_eq!(makefile.to_string(), "a:\n\techo\n\techo x \\\n\ty\nb:\n");
     assert_matches_reparse(&makefile);
     assert_eq!(
         rule.recipes().collect::<Vec<_>>(),
@@ -232,7 +232,7 @@ fn test_recipe_commands_with_continuation() {
     assert!(rule.try_replace_command(0, "c \\\n  d # e").unwrap());
     assert!(rule.try_insert_command(2, "f \\\\").unwrap());
     assert_eq!(
-        makefile.code(),
+        makefile.to_string(),
         "a:\n\tc \\\n  d # e\n\techo x \\\n\ty\n\tf \\\\\nb:\n"
     );
     assert_matches_reparse(&makefile);
@@ -245,7 +245,7 @@ fn test_inline_recipe_replace_with_continuation() {
     let makefile: Makefile = "a: ; echo\n".parse().unwrap();
     let mut rule = makefile.rules().next().unwrap();
     assert!(rule.try_replace_command(0, "x \\\n\ty").unwrap());
-    assert_eq!(makefile.code(), "a: ; x \\\n\ty\n");
+    assert_eq!(makefile.to_string(), "a: ; x \\\n\ty\n");
     assert_matches_reparse(&makefile);
 }
 
@@ -256,10 +256,10 @@ fn test_set_value_rejects_line_breaks() {
     let mut var = makefile.variable_definitions().next().unwrap();
     for value in LINE_BREAKING {
         assert!(var.try_set_value(value).is_err(), "{value:?}");
-        assert_eq!(makefile.code(), text, "{value:?}");
+        assert_eq!(makefile.to_string(), text, "{value:?}");
     }
     assert!(var.try_set_name("A\nB").is_err());
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn test_set_value_tree_matches_reparse() {
     let mut var = makefile.variable_definitions().next().unwrap();
     for value in ["a b", "a $(B) \\\n  c", "a\\\\"] {
         var.try_set_value(value).unwrap();
-        assert_eq!(makefile.code(), format!("X = {value}\nY = 2\n"));
+        assert_eq!(makefile.to_string(), format!("X = {value}\nY = 2\n"));
         assert_eq!(var.raw_value(), Some(value.to_string()));
         assert_matches_reparse(&makefile);
     }
@@ -291,7 +291,7 @@ fn test_set_value_continuation_at_end() {
         let makefile: Makefile = text.parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_value(value).unwrap();
-        assert_eq!(makefile.code(), expected, "{text:?}");
+        assert_eq!(makefile.to_string(), expected, "{text:?}");
         assert_eq!(var.raw_value(), Some(value.to_string()), "{text:?}");
         assert_matches_reparse(&makefile);
     }
@@ -302,12 +302,12 @@ fn test_set_value_define() {
     let makefile: Makefile = "define X\nold\nendef\n".parse().unwrap();
     let mut var = makefile.variable_definitions().next().unwrap();
     var.try_set_value("a b\nc").unwrap();
-    assert_eq!(makefile.code(), "define X\na b\nc\nendef\n");
+    assert_eq!(makefile.to_string(), "define X\na b\nc\nendef\n");
     assert_eq!(var.raw_value(), Some("a b\nc\n".to_string()));
     assert_matches_reparse(&makefile);
 
     assert!(var.try_set_value("a\nendef\nb").is_err());
-    assert_eq!(makefile.code(), "define X\na b\nc\nendef\n");
+    assert_eq!(makefile.to_string(), "define X\na b\nc\nendef\n");
 }
 
 #[test]
@@ -318,10 +318,10 @@ fn test_comments_reject_line_breaks() {
     for comment in LINE_BREAKING {
         assert!(item.add_comment(comment).is_err(), "{comment:?}");
         assert!(item.modify_comment(comment).is_err(), "{comment:?}");
-        assert_eq!(makefile.code(), text, "{comment:?}");
+        assert_eq!(makefile.to_string(), text, "{comment:?}");
     }
     item.add_comment("d \\\\").unwrap();
-    assert_eq!(makefile.code(), "# c\n# d \\\\\nX = 1\n");
+    assert_eq!(makefile.to_string(), "# c\n# d \\\\\nX = 1\n");
     assert_matches_reparse(&makefile);
 }
 
