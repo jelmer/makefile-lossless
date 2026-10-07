@@ -13,6 +13,42 @@ use crate::SyntaxKind::{self, *};
 use rowan::ast::AstNode;
 use rowan::SyntaxNode;
 
+/// The error kinds of parsing `text`.
+fn error_kinds(text: &str) -> Vec<crate::ParseErrorKind> {
+    parse(text, None).errors.iter().map(|e| e.kind).collect()
+}
+
+/// The variable definition `text`, after `prefix`, the start of the rule
+/// line of a target-specific assignment, if it reads back with the name
+/// `name` at offset `start` and without errors other than those of
+/// `original`, the text before renaming.
+fn parse_renamed(
+    prefix: &str,
+    original: &str,
+    text: &str,
+    name: &str,
+    start: usize,
+) -> Option<VariableDefinition> {
+    let parsed = parse(&format!("{prefix}{text}"), None);
+    let kinds: Vec<_> = parsed.errors.iter().map(|e| e.kind).collect();
+    if kinds != error_kinds(&format!("{prefix}{original}")) {
+        return None;
+    }
+    let offset = |n: usize| rowan::TextSize::try_from(n).ok();
+    let var = parsed
+        .root()
+        .syntax()
+        .descendants()
+        .filter_map(VariableDefinition::cast)
+        .find(|var| Some(var.syntax().text_range().start()) == offset(prefix.len()))?;
+    let expected = rowan::TextRange::at(offset(prefix.len() + start)?, offset(name.len())?);
+    (var.is_target_specific() == !prefix.is_empty()
+        && var.syntax().to_string() == text
+        && var.name_range() == Some(expected)
+        && var.name().as_deref() == Some(name))
+    .then_some(var)
+}
+
 /// Whether `text` has a line break that is not part of a line continuation,
 /// or ends in a backslash that would continue the line.
 fn breaks_line(text: &str) -> bool {
@@ -1107,8 +1143,9 @@ impl VariableDefinition {
     ///
     /// # Panics
     ///
-    /// Panics if `new_name` contains a newline. Use
-    /// [`Self::try_set_name`] to get an error instead.
+    /// Panics if the definition has no name or `new_name` would not be
+    /// read back as the name, as described for [`Self::try_set_name`],
+    /// which returns an error instead.
     pub fn set_name(&mut self, new_name: &str) {
         self.try_set_name(new_name)
             .unwrap_or_else(|e| panic!("invalid variable name: {e}"))
@@ -1116,8 +1153,11 @@ impl VariableDefinition {
 
     /// Rename the variable, like [`Self::set_name`]
     ///
-    /// Returns an error, leaving the definition unchanged, if `new_name`
-    /// contains a newline.
+    /// Returns an error, leaving the definition unchanged, if the
+    /// definition has no name, or if `new_name` would not be read back as
+    /// the name: for example if it is empty, contains a newline, an
+    /// assignment operator, a `#` or an unterminated reference, or, outside
+    /// `define` and `undefine` directives, whitespace.
     ///
     /// # Example
     /// ```
@@ -1125,28 +1165,57 @@ impl VariableDefinition {
     /// let mut makefile: Makefile = "FOO := bar\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_name("A\nB").is_err());
+    /// assert!(var.try_set_name("A B").is_err());
     /// var.try_set_name("BAZ").unwrap();
     /// assert_eq!(makefile.code(), "BAZ := bar\n");
     /// ```
     pub fn try_set_name(&mut self, new_name: &str) -> Result<(), Error> {
-        if new_name.contains(['\n', '\r']) {
-            return Err(edit_error(
+        let name_range = self.name_range().ok_or_else(|| {
+            edit_error(
                 "set_name",
-                format!("Variable name {new_name:?} contains a newline"),
-            ));
-        }
-        self.replace_name(new_name);
+                format!("{:?} has no name to set", self.syntax().to_string()),
+            )
+        })?;
+        let range = std::ops::Range::<usize>::from(name_range - self.syntax().text_range().start());
+        let original = self.syntax().to_string();
+        let mut text = original.clone();
+        text.replace_range(range.clone(), new_name);
+        let prefix = self
+            .syntax()
+            .parent()
+            .filter(|p| p.kind() == RULE)
+            .map(|rule| {
+                let len = self.syntax().text_range().start() - rule.text_range().start();
+                rule.to_string()[..usize::from(len)].to_string()
+            })
+            .unwrap_or_default();
+        let renamed =
+            parse_renamed(&prefix, &original, &text, new_name, range.start).ok_or_else(|| {
+                edit_error(
+                    "set_name",
+                    format!("Cannot write {new_name:?} as the variable name"),
+                )
+            })?;
+        self.replace_name(renamed.name_elements());
         Ok(())
     }
 
-    fn replace_name(&mut self, new_name: &str) {
+    /// Internal: replace the name elements with `new_elements`, leaving
+    /// the rest of the definition as it is.
+    fn replace_name(&self, new_elements: Vec<crate::lossless::SyntaxElement>) {
         let elements = self.name_elements();
-        let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
+        let Some(index) = elements.first().map(|it| it.index()) else {
             return;
         };
-        let new_variable =
-            self.with_children_replaced(first.index()..last.index() + 1, IDENTIFIER, new_name);
-        self.replace_with(new_variable);
+        for element in &new_elements {
+            element.detach();
+        }
+        // TODO: splice them out once rowan's splice_children removes more
+        // than the first child of the range, as it does from 0.17 on.
+        for element in &elements {
+            element.detach();
+        }
+        self.syntax().splice_children(index..index, new_elements);
     }
 
     /// Remove a trailing whitespace token at the tail of the value, if any.
@@ -2625,6 +2694,135 @@ mod tests {
             assert_eq!(var.name(), Some(name.to_string()));
             assert_eq!(var.raw_value(), Some("1".to_string()));
         }
+    }
+
+    #[test]
+    fn test_try_set_name_rejects_names_that_read_back_differently() {
+        let cases = [
+            "X = 1\n",
+            "export X = 1\n",
+            "override X := 1\n",
+            "export X\n",
+            "foo: X = 1\n",
+        ];
+        for code in cases {
+            for name in ["A B", "A=B", "A#B", "", "A:B", "$(X", "A\nB"] {
+                let makefile: Makefile = code.parse().unwrap();
+                let mut var = makefile.variable_definitions().next().unwrap();
+                assert!(var.try_set_name(name).is_err(), "{code:?} {name:?}");
+                assert_eq!(makefile.code(), code, "{name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_try_set_name_target_specific() {
+        let makefile: Makefile = "foo: X = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("Y").unwrap();
+        assert_eq!(makefile.code(), "foo: Y = 1\n");
+        assert!(var.is_target_specific());
+    }
+
+    #[test]
+    fn test_try_set_name_with_errors() {
+        let code = "X = 1\n)foo\nifdef A\n";
+        let parsed = Makefile::parse(code);
+        assert!(!parsed.ok());
+        let makefile = parsed.tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("Y").unwrap();
+        assert!(var.try_set_name("A B").is_err());
+        assert_eq!(makefile.code(), "Y = 1\n)foo\nifdef A\n");
+
+        let code = "define X\nbody\n";
+        let makefile = Makefile::parse(code).tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("Y").unwrap();
+        assert!(var.try_set_name("A=B").is_err());
+        assert_eq!(makefile.code(), "define Y\nbody\n");
+    }
+
+    #[test]
+    fn test_try_set_name_unusual_formatting() {
+        let cases = [
+            (
+                "export\tFOO \t:=  bar \\\n\tbaz  # c\n",
+                "export\tX \t:=  bar \\\n\tbaz  # c\n",
+            ),
+            (
+                "override  define\tFOO  :=\nbody\nendef\n",
+                "override  define\tX  :=\nbody\nendef\n",
+            ),
+            ("foo:  FOO\t+=  1 # c\n", "foo:  X\t+=  1 # c\n"),
+            ("undefine  FOO  # c\n", "undefine  X  # c\n"),
+            ("FOO\\\n  = 1\n", "X\\\n  = 1\n"),
+        ];
+        for (code, expected) in cases {
+            let makefile: Makefile = code.parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            var.try_set_name("X").unwrap();
+            assert_eq!(makefile.code(), expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn test_try_set_name_keeps_other_nodes() {
+        let makefile: Makefile = "A = 1\nexport FOO := $(B) # c\nC = 2\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().nth(1).unwrap();
+        let node = var.syntax().clone();
+        let expr = var.value_expr().unwrap();
+        let comment = node
+            .children_with_tokens()
+            .find(|it| it.kind() == COMMENT)
+            .unwrap();
+        var.try_set_name("$(D)").unwrap();
+        assert_eq!(makefile.code(), "A = 1\nexport $(D) := $(B) # c\nC = 2\n");
+        assert_eq!(var.syntax(), &node);
+        assert_eq!(node.parent(), Some(makefile.syntax().clone()));
+        assert_eq!(expr.parent(), Some(node.clone()));
+        assert_eq!(comment.parent(), Some(node.clone()));
+        assert_eq!(var.value_expr(), Some(expr));
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_try_set_name_semicolon() {
+        let makefile: Makefile = "X = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("A;B").unwrap();
+        assert_eq!(makefile.code(), "A;B = 1\n");
+    }
+
+    #[test]
+    fn test_try_set_name_define_rejects_names_that_read_back_differently() {
+        for name in ["", "A=B", "A#B", "$(X", "A\nB", "A \\"] {
+            let code = "define X\nbody\nendef\n";
+            let makefile: Makefile = code.parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            assert!(var.try_set_name(name).is_err(), "{name:?}");
+            assert_eq!(makefile.code(), code, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn test_try_set_name_undefine_with_spaces() {
+        let makefile: Makefile = "undefine X\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("A B").unwrap();
+        assert_eq!(var.name(), Some("A B".to_string()));
+        assert!(var.try_set_name("A#B").is_err());
+        assert_eq!(makefile.code(), "undefine A B\n");
+    }
+
+    #[test]
+    fn test_try_set_name_with_reference_matches_reparse() {
+        let makefile: Makefile = "X = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_name("A.$(B)").unwrap();
+        assert_eq!(var.name(), Some("A.$(B)".to_string()));
+        assert_eq!(makefile.code(), "A.$(B) = 1\n");
+        crate::test_util::assert_matches_reparse(&makefile);
     }
 
     #[test]
