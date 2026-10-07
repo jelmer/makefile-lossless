@@ -9,7 +9,7 @@ use crate::lossless::{
     VariableDefinition, VariableReference, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
-use crate::SyntaxKind::{self, *};
+use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
 use rowan::SyntaxNode;
 
@@ -1068,18 +1068,25 @@ impl VariableDefinition {
                 ))
             })?;
 
-        let new_variable = self.with_children_replaced(op_index..op_index + 1, OPERATOR, op);
+        let set_operator = |node: &SyntaxNode<crate::lossless::Lang>| {
+            node.splice_children(
+                op_index..op_index + 1,
+                detached_elements(&[(OPERATOR, op)], None),
+            );
+        };
+        let copy = SyntaxNode::new_root_mut(self.syntax().green().into_owned());
+        set_operator(&copy);
 
         // The name may end in characters that join the operator, so check
         // that GNU or BSD make reads the definition back.
-        let text = new_variable.to_string();
+        let text = copy.to_string();
         let reads_back = |variant| {
             let parsed = parse(&text, variant);
             let mut children = parsed.root().syntax().children_with_tokens();
             let node = children.next().and_then(|it| it.into_node());
             parsed.errors.is_empty()
                 && children.next().is_none()
-                && node.is_some_and(|n| n.green() == new_variable.green())
+                && node.is_some_and(|n| n.green() == copy.green())
         };
         let reads_back = reads_back(None) || reads_back(Some(MakefileVariant::BSDMake));
         if !reads_back {
@@ -1088,41 +1095,8 @@ impl VariableDefinition {
             )));
         }
 
-        self.replace_with(new_variable);
+        set_operator(self.syntax());
         Ok(())
-    }
-
-    /// A copy of this definition, with the children in `range` replaced by
-    /// a single token.
-    fn with_children_replaced(
-        &self,
-        range: std::ops::Range<usize>,
-        kind: SyntaxKind,
-        text: &str,
-    ) -> SyntaxNode<crate::lossless::Lang> {
-        let mut children: Vec<rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken>> = Vec::new();
-        for child in self.syntax().children_with_tokens() {
-            if child.index() == range.start {
-                children.push(rowan::GreenToken::new(kind.into(), text).into());
-            }
-            if !range.contains(&child.index()) {
-                children.push(match child {
-                    rowan::NodeOrToken::Token(token) => token.green().to_owned().into(),
-                    rowan::NodeOrToken::Node(node) => node.green().into_owned().into(),
-                });
-            }
-        }
-        SyntaxNode::new_root_mut(rowan::GreenNode::new(VARIABLE.into(), children))
-    }
-
-    /// Put `new_variable` in place of this definition, and point `self` at
-    /// it.
-    fn replace_with(&mut self, new_variable: SyntaxNode<crate::lossless::Lang>) {
-        if let Some(parent) = self.syntax().parent() {
-            let index = self.syntax().index();
-            parent.splice_children(index..index + 1, vec![new_variable.clone().into()]);
-        }
-        *self = VariableDefinition::cast(new_variable).expect("built a VARIABLE node");
     }
 
     /// Rename the variable, preserving the operator, value and any
@@ -3703,5 +3677,35 @@ mod tests {
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.syntax())
         );
+    }
+
+    #[test]
+    fn test_set_name_keeps_handles() {
+        let makefile: Makefile = "export  $(A)_B\t:=  x \\\n  y # c\nZ = 1\n"
+            .parse()
+            .unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let other = makefile.variable_definitions().next().unwrap();
+        let value = var.value_expr().unwrap();
+        var.try_set_name("C").unwrap();
+        assert_eq!(makefile.code(), "export  C\t:=  x \\\n  y # c\nZ = 1\n");
+        assert_eq!(other.name(), Some("C".to_string()));
+        assert_eq!(var.syntax(), other.syntax());
+        assert_eq!(value.parent().as_ref(), Some(var.syntax()));
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_assignment_operator_keeps_handles() {
+        let makefile: Makefile = "override  X\t:=  x \\\n  y # c\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let other = makefile.variable_definitions().next().unwrap();
+        let value = var.value_expr().unwrap();
+        var.try_set_assignment_operator("+=").unwrap();
+        assert_eq!(makefile.code(), "override  X\t+=  x \\\n  y # c\n");
+        assert_eq!(other.assignment_operator(), Some("+=".to_string()));
+        assert_eq!(var.syntax(), other.syntax());
+        assert_eq!(value.parent().as_ref(), Some(var.syntax()));
+        crate::test_util::assert_matches_reparse(&makefile);
     }
 }
