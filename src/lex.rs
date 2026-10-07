@@ -535,8 +535,8 @@ impl<'a> Lexer<'a> {
                     '\\' => {
                         self.input.next();
                         // `\#` is a literal hash rather than the start of a
-                        // comment.
-                        if !escaped && self.input.peek() == Some(&'#') {
+                        // comment. nmake only has `^#` for that.
+                        if !escaped && !self.nmake && self.input.peek() == Some(&'#') {
                             self.input.next();
                             return Some((SyntaxKind::TEXT, "\\#".to_string()));
                         }

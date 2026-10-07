@@ -420,3 +420,32 @@ fn test_all_dependents_reference() {
         .collect();
     assert_eq!(references, vec![r("$*", "*")]);
 }
+
+#[test]
+fn test_backslash_hash_starts_comment() {
+    // nmake has no `\#` escape, so the `#` starts a comment, as it does
+    // after any other character.
+    let code = "a: b\\#c d\nX = e\\#f\n";
+    let makefile = parse_nmake(code);
+    let rule = makefile.rules().next().unwrap();
+    assert_eq!(
+        rule.prerequisites_for(MakefileVariant::NMake)
+            .collect::<Vec<_>>(),
+        vec!["b\\"]
+    );
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(var.raw_value(), Some("e\\".to_string()));
+    assert_eq!(var.value(MakefileVariant::NMake), Some("e\\".to_string()));
+    let comments: Vec<_> = makefile
+        .syntax()
+        .descendants_with_tokens()
+        .filter(|it| it.kind() == COMMENT)
+        .map(|it| it.to_string())
+        .collect();
+    assert_eq!(comments, vec!["#c d", "#f"]);
+
+    // Nor are the backslashes before a comment escapes.
+    let makefile = parse_nmake("X = e\\\\#f\n");
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(var.value(MakefileVariant::NMake), Some("e\\\\".to_string()));
+}
