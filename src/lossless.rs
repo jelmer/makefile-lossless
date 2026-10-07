@@ -418,11 +418,16 @@ pub(crate) fn move_out_trailing_lines(rule: &SyntaxNode) {
         .map_or(header_end, |i| i.max(header_end))
         + 1;
     let tail = &children[start..];
+    // Without commands, a target-specific assignment takes no other lines.
+    let target_local = children[header_end].kind() == VARIABLE && !children.iter().any(has_recipe);
     // Follow the parser: blank lines stay in the rule, and so do comments
     // with no blank line before them, which take their line break along.
     let mut blank_lines = 0;
     let mut i = 0;
     let end = loop {
+        if target_local {
+            break 0;
+        }
         let Some(element) = tail.get(i) else {
             return;
         };

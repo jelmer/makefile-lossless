@@ -1058,6 +1058,14 @@ impl Recipe {
             .find(|t| t.kind() == NEWLINE);
         let replacement: Vec<_> = newline.map(Into::into).into_iter().collect();
         let node_index = node.index();
+        // After a BSD make target-local assignment, the line break goes in
+        // the VARIABLE node, as the parser has it without a command.
+        if let Some(variable) = node.prev_sibling().filter(|n| n.kind() == VARIABLE) {
+            parent.splice_children(node_index..node_index + 1, vec![]);
+            let len = variable.children_with_tokens().count();
+            variable.splice_children(len..len, replacement);
+            return;
+        }
         parent.splice_children(node_index..node_index + 1, replacement);
     }
 
