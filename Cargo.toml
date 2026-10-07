@@ -10,9 +10,8 @@ readme = "README.md"
 authors = [ "Jelmer Vernooij <jelmer@jelmer.uk>",]
 documentation = "https://docs.rs/makefile-lossless"
 homepage = "https://github.com/jelmer/makefile-lossless"
+keywords = ["makefile", "make", "parser", "lossless", "cst"]
+exclude = [".github/", "TODO"]
 
 [dependencies]
 rowan = "^0.16"
-
-[dev-dependencies]
-maplit = "1.0.2"
