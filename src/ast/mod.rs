@@ -213,6 +213,77 @@ pub(crate) fn line_ending(node: &SyntaxNode) -> String {
         .map_or_else(|| "\n".to_string(), |t| t.text().to_string())
 }
 
+/// The text of the file containing `parent` before its child `index`.
+pub(crate) fn text_before(parent: &SyntaxNode, index: usize) -> String {
+    let offset = parent
+        .children_with_tokens()
+        .nth(index)
+        .map_or(parent.text_range().end(), |it| it.text_range().start());
+    let root = parent
+        .ancestors()
+        .last()
+        .expect("ancestors() includes the node itself");
+    let mut text = root.to_string();
+    text.truncate(usize::from(offset - root.text_range().start()));
+    text
+}
+
+/// The character that starts a recipe line inserted before child `index` of
+/// `parent`: a tab, or the one set with GNU make's `.RECIPEPREFIX` in the
+/// lines before it.
+pub(crate) fn recipe_prefix_before(parent: &SyntaxNode, index: usize) -> char {
+    crate::lex::recipe_prefix_after(&text_before(parent, index))
+}
+
+/// Replace the recipe prefix `old` at the start of each line of `recipe`
+/// with `new`. make strips the prefix from continuation lines too.
+pub(crate) fn replace_recipe_prefix(recipe: &SyntaxNode, old: char, new: char) {
+    if old == new {
+        return;
+    }
+    let indents: Vec<_> = recipe
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|t| t.kind() == INDENT && t.text().starts_with(old))
+        .collect();
+    for token in indents {
+        let text = format!("{new}{}", &token.text()[old.len_utf8()..]);
+        let index = token.index();
+        recipe.splice_children(
+            index..index + 1,
+            detached_elements(&[(INDENT, &text)], None),
+        );
+    }
+}
+
+/// `node`, or a copy of it in which the recipe lines start with the recipe
+/// prefix in effect where they would be after `before`, the text in front
+/// of `node`. Recipes on a rule line, after `;`, are left alone.
+pub(crate) fn with_recipe_prefix(node: &SyntaxNode, before: &str) -> SyntaxNode {
+    let text = format!("{before}{node}");
+    let changes = |node: &SyntaxNode| -> Vec<(SyntaxNode, char, char)> {
+        let start = node.text_range().start();
+        node.descendants()
+            .filter(|n| n.kind() == RECIPE)
+            .filter_map(|recipe| {
+                let first = recipe.first_token().filter(|t| t.kind() == INDENT)?;
+                let old = first.text().chars().next().filter(|c| *c != ' ')?;
+                let offset = before.len() + usize::from(recipe.text_range().start() - start);
+                let new = crate::lex::recipe_prefix_after(&text[..offset]);
+                (old != new).then_some((recipe, old, new))
+            })
+            .collect()
+    };
+    if changes(node).is_empty() {
+        return node.clone();
+    }
+    let copy = SyntaxNode::new_root_mut(node.green().into_owned());
+    for (recipe, old, new) in changes(&copy) {
+        replace_recipe_prefix(&recipe, old, new);
+    }
+    copy
+}
+
 /// Whether nodes of this kind hold the line break that ends them, rather
 /// than being part of a longer line.
 fn holds_line_break(kind: SyntaxKind) -> bool {

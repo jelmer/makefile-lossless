@@ -1,5 +1,5 @@
 use super::*;
-use crate::ast::{line_ending, terminate_line_before};
+use crate::ast::{line_ending, recipe_prefix_before, replace_recipe_prefix, terminate_line_before};
 use rowan::{GreenNode, GreenToken};
 
 type GreenElement = rowan::NodeOrToken<GreenNode, GreenToken>;
@@ -64,9 +64,17 @@ fn tab() -> Vec<GreenElement> {
     vec![GreenToken::new(INDENT.into(), "\t").into()]
 }
 
-/// A tab-indented RECIPE node for the command `line`, as [`build_recipe`].
-pub(crate) fn build_command(line: &str, eol: &str, context: &str) -> Result<SyntaxNode, Error> {
-    build_recipe(tab(), line, eol, context)
+/// A RECIPE node for the command `line` whose lines start with the recipe
+/// prefix `prefix`, as [`build_recipe`].
+pub(crate) fn build_command(
+    prefix: char,
+    line: &str,
+    eol: &str,
+    context: &str,
+) -> Result<SyntaxNode, Error> {
+    let recipe = build_recipe(tab(), line, eol, context)?;
+    replace_recipe_prefix(&recipe, '\t', prefix);
+    Ok(recipe)
 }
 
 impl Recipe {
@@ -455,20 +463,21 @@ impl Recipe {
         let node_index = node.index();
 
         let inline_prefix = self.inline_prefix();
+        let indent = node
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|t| t.kind() == INDENT);
         let prefix: Vec<GreenElement> = if !inline_prefix.is_empty() {
             inline_prefix
                 .iter()
                 .map(|t| GreenToken::new(t.kind().into(), t.text()).into())
                 .collect()
-        } else if let Some(indent_token) = node
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == INDENT)
-        {
+        } else if let Some(indent_token) = &indent {
             // Preserve the existing INDENT token
             vec![GreenToken::new(INDENT.into(), indent_token.text()).into()]
         } else {
-            tab()
+            let prefix = recipe_prefix_before(&parent, node_index).to_string();
+            vec![GreenToken::new(INDENT.into(), &prefix).into()]
         };
 
         // Preserve the existing NEWLINE token if present
@@ -480,6 +489,15 @@ impl Recipe {
             .map_or_else(|| line_ending(node), |t| t.text().to_string());
 
         let new_syntax = build_recipe(prefix, new_text, &eol, "replace_text")?;
+        // Continuation lines start with the same recipe prefix as the first.
+        let recipe_prefix = new_syntax
+            .first_token()
+            .filter(|t| t.kind() == INDENT)
+            .and_then(|t| t.text().chars().next())
+            .filter(|c| *c != ' ');
+        if let Some(recipe_prefix) = recipe_prefix {
+            replace_recipe_prefix(&new_syntax, '\t', recipe_prefix);
+        }
 
         // Replace the old node with the new one
         parent.splice_children(node_index..node_index + 1, vec![new_syntax.into()]);
@@ -524,7 +542,12 @@ impl Recipe {
     /// Returns an error, leaving the rule unchanged, if `text` can not be
     /// written as a single recipe line, as for [`Recipe::try_replace_text`].
     pub fn try_insert_before(&self, text: &str) -> Result<(), Error> {
-        let new_syntax = build_command(text, &line_ending(self.syntax()), "insert_before")?;
+        let node = self.syntax();
+        let prefix = recipe_prefix_before(
+            &node.parent().expect("Recipe node must have a parent"),
+            node.index(),
+        );
+        let new_syntax = build_command(prefix, text, &line_ending(node), "insert_before")?;
         // A recipe on the rule line has to move to its own line first.
         let this = self.move_to_own_line().unwrap_or_else(|| self.clone());
         let node = this.syntax();
@@ -565,7 +588,8 @@ impl Recipe {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
         let eol = line_ending(node);
-        let new_syntax = build_command(text, &eol, "insert_after")?;
+        let prefix = recipe_prefix_before(&parent, node.index() + 1);
+        let new_syntax = build_command(prefix, text, &eol, "insert_after")?;
 
         let index = terminate_line_before(&parent, node.index() + 1, &eol);
         parent.splice_children(index..index, vec![new_syntax.into()]);
@@ -665,7 +689,8 @@ impl Recipe {
         let skip = self.inline_prefix().len();
         self.trim_preceding_whitespace();
 
-        let mut recipe = vec![GreenToken::new(INDENT.into(), "\t").into()];
+        let prefix = recipe_prefix_before(&parent, node.index()).to_string();
+        let mut recipe = vec![GreenToken::new(INDENT.into(), &prefix).into()];
         recipe.extend(
             node.green()
                 .children()
