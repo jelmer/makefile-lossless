@@ -14,7 +14,7 @@ use crate::reference::{bsd_expr_extent_at, UnescapedHash};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{self, *};
 use rowan::Language;
-use rowan::{GreenNode, GreenNodeBuilder, GreenNodeData, NodeOrToken};
+use rowan::{GreenNodeBuilder, GreenNodeData, NodeOrToken};
 use std::ops::Range;
 
 /// Where text with references comes from.
@@ -135,17 +135,6 @@ fn replay(
             builder.finish_node();
         }
     }
-}
-
-/// Build a RECIPE node holding `tokens`, with the references in them
-/// structured. The variant is not known when editing a tree, so references
-/// are found as GNU make finds them.
-pub(crate) fn recipe_green(tokens: &[(SyntaxKind, &str)]) -> GreenNode {
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(RECIPE.into());
-    emit_with_references(&mut builder, tokens, TextContext::Recipe, None);
-    builder.finish_node();
-    builder.finish()
 }
 
 /// Whether the newline at `newline` in `text` ends a line continuation: it
