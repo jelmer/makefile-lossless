@@ -164,7 +164,8 @@ impl Parser<'_> {
         let (kind, text) = self.pop_token().unwrap();
         // Track backslash-run parity: each backslash flips the flag, any
         // other token clears it. See `pending_backslash_escape`.
-        self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
+        self.pending_backslash_escape =
+            escapes_next(kind == BACKSLASH, self.pending_backslash_escape);
         self.builder.token(kind.into(), text.as_str());
         if kind == NEWLINE {
             self.line_ends.push(range);

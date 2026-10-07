@@ -33,17 +33,6 @@ const BSD_DIRECTIVES: &[&str] = &[
     "info",
 ];
 
-pub(super) fn is_bsd_if(name: &str) -> bool {
-    matches!(name, "if" | "ifdef" | "ifndef" | "ifmake" | "ifnmake")
-}
-
-pub(super) fn is_bsd_elif(name: &str) -> bool {
-    matches!(
-        name,
-        "elif" | "elifdef" | "elifndef" | "elifmake" | "elifnmake"
-    )
-}
-
 /// Map the keyword of an nmake preprocessing directive, `first` followed by
 /// the next word `second` if any, to the name of the equivalent BSD make
 /// directive, such as `elif` for `ELSEIF`. Also returns whether `second` is

@@ -1,6 +1,5 @@
-use super::assignment::{is_colons_before_subst, ASSIGNMENT_OPERATORS};
 use super::conditional::ConditionalRuleContext;
-use super::directive::{is_bsd_elif, is_bsd_if, nmake_directive_name};
+use super::directive::nmake_directive_name;
 use super::*;
 
 impl Parser<'_> {
@@ -143,9 +142,7 @@ impl Parser<'_> {
                     Some(context) => in_rule = context.end(in_rule),
                     None => return false,
                 },
-                (IDENTIFIER, t)
-                    if Self::is_conditional_start(t) && self.conditional_line_at(end) =>
-                {
+                (IDENTIFIER, t) if is_gnu_conditional_start(t) && self.conditional_line_at(end) => {
                     stack.push(ConditionalRuleContext::new(in_rule))
                 }
                 (IDENTIFIER, "else") if self.conditional_line_at(end) => match stack.last_mut() {
@@ -216,7 +213,7 @@ impl Parser<'_> {
         if !self.gnu_directives_enabled() {
             return false;
         }
-        if self.keyword_at(end, &["ifdef", "ifndef", "ifeq", "ifneq", "else", "endif"]) {
+        if self.keyword_at(end, GNU_CONDITIONAL_KEYWORDS) {
             return true;
         }
         let mut tokens = self.tokens[..end].iter().rev();
@@ -264,8 +261,8 @@ impl Parser<'_> {
     fn include_keyword_at(&self, end: usize) -> bool {
         let keywords: &[&str] = match self.variant {
             Some(MakefileVariant::NMake) => &[],
-            Some(MakefileVariant::POSIXMake) => &["include", "-include"],
-            _ => &["include", "-include", "sinclude"],
+            Some(MakefileVariant::POSIXMake) => POSIX_INCLUDE_KEYWORDS,
+            _ => GNU_INCLUDE_KEYWORDS,
         };
         if !self.keyword_at(end, keywords) {
             return false;
@@ -523,13 +520,7 @@ impl Parser<'_> {
             .iter()
             .rev()
             .filter(|(kind, _)| *kind != WHITESPACE)
-            .skip_while(|(kind, text)| {
-                *kind == IDENTIFIER
-                    && matches!(
-                        text.as_str(),
-                        "export" | "unexport" | "override" | "private"
-                    )
-            });
+            .skip_while(|(kind, text)| *kind == IDENTIFIER && is_assignment_modifier(text));
         matches!(words.next(), Some((IDENTIFIER, text)) if text == "undefine")
             && !matches!(words.next(), Some((OPERATOR, _)))
     }
@@ -558,8 +549,7 @@ impl Parser<'_> {
             return true;
         }
         let gnu = self.gnu_directives_enabled();
-        let is_directive =
-            |text: &str| gnu && matches!(text, "export" | "unexport" | "override" | "private");
+        let is_directive = |text: &str| gnu && is_assignment_modifier(text);
         let mut tokens = self.tokens[..end].iter().rev().peekable();
         let mut seen_name = false;
         // Whitespace after the name: anything but an operator now means

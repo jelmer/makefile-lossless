@@ -42,6 +42,7 @@ mod nmake_condition;
 mod parse;
 mod pattern;
 mod reference;
+mod syntax_rules;
 #[cfg(test)]
 mod test_util;
 mod text;

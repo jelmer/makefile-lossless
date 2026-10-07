@@ -10,6 +10,7 @@ use crate::lossless::{
     VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
+use crate::syntax_rules::{is_bsd_if, is_gnu_conditional_start};
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -20,8 +21,8 @@ use std::collections::VecDeque;
 /// which may be a GNU make (`ifdef`) or BSD make (`.ifdef`) conditional.
 fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'static str)> {
     match conditional_type {
-        "ifdef" | "ifndef" | "ifeq" | "ifneq" => Some(("else", "endif")),
-        ".if" | ".ifdef" | ".ifndef" | ".ifmake" | ".ifnmake" => Some((".else", ".endif")),
+        t if is_gnu_conditional_start(t) => Some(("else", "endif")),
+        t if t.strip_prefix('.').is_some_and(is_bsd_if) => Some((".else", ".endif")),
         _ => None,
     }
 }

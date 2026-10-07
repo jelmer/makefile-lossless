@@ -14,6 +14,7 @@ use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{
     detached_elements, Error, ErrorInfo, ParseError, SyntaxElement, SyntaxNode, SyntaxToken,
 };
+use crate::syntax_rules::last_backslash_unescaped;
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
     self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
@@ -40,11 +41,11 @@ pub(crate) fn edit_error(context: &str, message: String) -> Error {
 fn is_continuation_backslash(token: &SyntaxToken) -> bool {
     token.kind() == BACKSLASH
         && token.next_token().is_some_and(|t| t.kind() == NEWLINE)
-        && std::iter::successors(token.prev_token(), |t| t.prev_token())
-            .take_while(|t| t.kind() == BACKSLASH)
-            .count()
-            % 2
-            == 0
+        && last_backslash_unescaped(
+            1 + std::iter::successors(token.prev_token(), |t| t.prev_token())
+                .take_while(|t| t.kind() == BACKSLASH)
+                .count(),
+        )
 }
 
 /// Whether `element` is part of a line continuation: the backslash, the

@@ -253,7 +253,7 @@ impl Parser<'_> {
                 }
                 Some(IDENTIFIER) => {
                     // Check if this is a starting conditional directive
-                    if self.current_text().is_some_and(Self::is_conditional_start)
+                    if self.current_text().is_some_and(is_gnu_conditional_start)
                         && self.at_conditional_keyword()
                     {
                         // Unless it continues the recipe, this is a top-level
@@ -302,7 +302,7 @@ impl Parser<'_> {
             && !self.at_include_keyword()
             && !matches!(
                 self.current_token(),
-                Some((IDENTIFIER, word)) if Self::is_conditional_start(word)
+                Some((IDENTIFIER, word)) if is_gnu_conditional_start(word)
                     || matches!(word, "else" | "endif" | "define" | "endef")
             );
         self.tokens.push(ws);

@@ -1,4 +1,3 @@
-use super::directive::{is_bsd_elif, is_bsd_if};
 use super::*;
 
 /// Tracks rule context across the branches of a conditional. Only one
@@ -142,7 +141,7 @@ impl Parser<'_> {
                 return None;
             }
         };
-        if !Self::is_conditional_start(&token) {
+        if !is_gnu_conditional_start(&token) {
             // Reached for an `else` or `endif` outside of a conditional.
             let kind = match token.as_str() {
                 "else" => ParseErrorKind::ElseWithoutIf,
@@ -215,13 +214,6 @@ impl Parser<'_> {
         self.expect_eol();
     }
 
-    // Helper to check if a token starts a conditional block.
-    // Note this requires an exact match: a variable named e.g. `ifpkg`
-    // merely starts with "if" and is not a conditional directive.
-    pub(super) fn is_conditional_start(token: &str) -> bool {
-        matches!(token, "ifdef" | "ifndef" | "ifeq" | "ifneq")
-    }
-
     /// Whether the `else` at `end - 1` in the token stack is an
     /// `else ifdef` etc. rather than a final `else`. As for other
     /// conditional keywords, whitespace must follow, so GNU make takes
@@ -231,15 +223,16 @@ impl Parser<'_> {
         while next > 0 && self.tokens[next - 1].0 == WHITESPACE {
             next -= 1;
         }
-        self.keyword_at(next, &["ifdef", "ifndef", "ifeq", "ifneq"])
+        self.keyword_at(next, GNU_CONDITIONAL_STARTS)
     }
 
     /// Parse a nested conditional, or the `else` or `endif` of the one
     /// being parsed. Returns false if `token` is none of those.
     fn handle_conditional_token(&mut self, token: &str) -> bool {
         match token {
-            "ifdef" | "ifndef" | "ifeq" | "ifneq"
-                if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
+            token
+                if is_gnu_conditional_start(token)
+                    && matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
             {
                 self.parse_conditional();
                 true
@@ -278,7 +271,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn parse_conditional(&mut self) {
-        if matches!(self.current_token(), Some((IDENTIFIER, t)) if Self::is_conditional_start(t))
+        if matches!(self.current_token(), Some((IDENTIFIER, t)) if is_gnu_conditional_start(t))
             && self.nesting_depth >= crate::reference::MAX_DEPTH
         {
             self.parse_too_deeply_nested_block();
@@ -580,7 +573,7 @@ impl Parser<'_> {
         }
         match self.tokens[end - 1].1.as_str() {
             "endif" => Some(false),
-            token => Self::is_conditional_start(token).then_some(true),
+            token => is_gnu_conditional_start(token).then_some(true),
         }
     }
 }

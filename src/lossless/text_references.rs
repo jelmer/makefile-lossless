@@ -139,7 +139,7 @@ fn is_continued(text: &str, newline: usize) -> bool {
     let before = text[..newline]
         .strip_suffix('\r')
         .unwrap_or(&text[..newline]);
-    crate::lex::ends_with_unescaped_backslash(before)
+    crate::syntax_rules::ends_with_unescaped_backslash(before)
 }
 
 /// The byte ranges of `text` to search for references. A reference lies

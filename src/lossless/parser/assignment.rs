@@ -1,22 +1,5 @@
 use super::*;
 
-pub(crate) const ASSIGNMENT_OPERATORS: &[&str] = &["=", ":=", "::=", ":::=", "+=", "?=", "!="];
-
-/// Whether `op` is `::=` or `:::=`, which BSD make does not have: it reads
-/// the leading colons as part of the variable name, followed by `:=`.
-pub(super) fn is_colons_before_subst(op: &str) -> bool {
-    matches!(op, "::=" | ":::=")
-}
-
-/// Whether `text` is BSD make's `:sh=` shell assignment operator, which may
-/// contain whitespace and repeat the modifier, as in `:sh :sh =`.
-pub(crate) fn is_sunsh_operator(text: &str) -> bool {
-    let compact: String = text.split_whitespace().collect();
-    compact
-        .strip_suffix('=')
-        .is_some_and(|modifiers| !modifiers.is_empty() && modifiers.split(":sh").all(str::is_empty))
-}
-
 impl Parser<'_> {
     /// For nmake, consume a caret at the end of a line of a macro
     /// definition, which continues the value with a newline, and the
@@ -43,9 +26,9 @@ impl Parser<'_> {
     /// variable name itself, as in `override := 1`.
     fn at_assignment_prefix_keyword(&self) -> bool {
         let enabled = match self.current_token() {
-            Some((IDENTIFIER, "export")) => self.gnu_directives_enabled() || self.is_bsd_make(),
-            Some((IDENTIFIER, "unexport" | "override" | "private")) => {
-                self.gnu_directives_enabled()
+            Some((IDENTIFIER, "export")) if self.is_bsd_make() => true,
+            Some((IDENTIFIER, word)) => {
+                self.gnu_directives_enabled() && is_assignment_modifier(word)
             }
             _ => false,
         };
@@ -413,7 +396,7 @@ impl Parser<'_> {
 
         // Consume any `override`/`export`/`unexport`/`private` modifiers and the
         // `define` keyword itself.
-        while matches!(self.current_token(), Some((IDENTIFIER, t)) if Self::is_define_modifier(t)) {
+        while matches!(self.current_token(), Some((IDENTIFIER, t)) if is_assignment_modifier(t)) {
             self.bump();
             self.skip_ws_and_continuations();
         }
@@ -546,7 +529,7 @@ impl Parser<'_> {
                     }
                     let (_, text) = self.pop_token().unwrap();
                     self.pending_backslash_escape =
-                        kind == BACKSLASH && !self.pending_backslash_escape;
+                        escapes_next(kind == BACKSLASH, self.pending_backslash_escape);
                     word.push_str(&text);
                 }
             }
@@ -611,10 +594,6 @@ impl Parser<'_> {
         self.bump();
     }
 
-    fn is_define_modifier(token: &str) -> bool {
-        matches!(token, "override" | "export" | "unexport" | "private")
-    }
-
     /// Whether the current line starts a `define` block, optionally
     /// preceded by modifiers such as `override define NAME`. `define = 1`
     /// instead assigns to a variable named "define".
@@ -640,7 +619,7 @@ impl Parser<'_> {
                         Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str())
                     );
                 }
-                Some((IDENTIFIER, text)) if Self::is_define_modifier(text) => {}
+                Some((IDENTIFIER, text)) if is_assignment_modifier(text) => {}
                 _ => return false,
             }
         }

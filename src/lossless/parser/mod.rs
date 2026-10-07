@@ -1,7 +1,10 @@
 use super::*;
 use crate::bsd_condition::BsdConditionErrorKind;
-use crate::lex::{
-    ends_with_unescaped_backslash, lex, lex_first_non_recipe_line, lex_non_recipe_line,
+use crate::lex::{lex, lex_first_non_recipe_line, lex_non_recipe_line};
+use crate::syntax_rules::{
+    ends_with_unescaped_backslash, escapes_next, is_assignment_modifier, is_bsd_elif, is_bsd_if,
+    is_colons_before_subst, is_gnu_conditional_start, ASSIGNMENT_OPERATORS,
+    GNU_CONDITIONAL_KEYWORDS, GNU_CONDITIONAL_STARTS, GNU_INCLUDE_KEYWORDS, POSIX_INCLUDE_KEYWORDS,
 };
 use crate::MakefileVariant;
 use rowan::GreenNode;
@@ -16,7 +19,6 @@ mod reference;
 mod rule;
 mod tokens;
 
-pub(crate) use assignment::{is_sunsh_operator, ASSIGNMENT_OPERATORS};
 pub(crate) use errors::locate_error_line;
 pub(crate) use reference::bsd_logical_line;
 use tokens::token_stack;
@@ -82,9 +84,8 @@ struct Parser<'a> {
     /// Parity of the current run of bumped BACKSLASH tokens: true once an
     /// odd number have been seen, meaning the next backslash is escaped
     /// (`\\`) and a following newline is a literal backslash, not a line
-    /// continuation. Reset to false by any other token. Mirrors the lexer's
-    /// `pending_backslash_escape`, which makes the same decision for tokenizing
-    /// the continued line's indent.
+    /// continuation. Reset to false by any other token. Like the lexer's
+    /// `pending_backslash_escape`, this follows [`escapes_next`].
     pending_backslash_escape: bool,
     /// The quote that ends the quoted `ifeq` argument being parsed, if
     /// any. It ends any variable reference in the argument too.

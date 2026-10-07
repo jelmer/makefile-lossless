@@ -1,4 +1,3 @@
-use super::assignment::ASSIGNMENT_OPERATORS;
 use super::*;
 
 impl Parser<'_> {
@@ -522,13 +521,10 @@ impl Parser<'_> {
     where
         I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
     {
-        tokens.next().is_some_and(|(kind, text)| {
-            *kind == IDENTIFIER
-                && matches!(
-                    text.as_str(),
-                    "export" | "unexport" | "override" | "private"
-                )
-        }) && Self::skip_ws_and_continuation_tokens(&mut tokens)
+        tokens
+            .next()
+            .is_some_and(|(kind, text)| *kind == IDENTIFIER && is_assignment_modifier(text))
+            && Self::skip_ws_and_continuation_tokens(&mut tokens)
             && matches!(tokens.peek(), Some((IDENTIFIER | DOLLAR | BACKSLASH, _)))
     }
 
