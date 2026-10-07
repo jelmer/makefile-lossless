@@ -1,5 +1,8 @@
 use super::*;
-use crate::ast::{line_ending, recipe_prefix_before, replace_recipe_prefix, terminate_line_before};
+use crate::ast::{
+    line_ending, recipe_prefix_before, replace_children, replace_recipe_prefix,
+    terminate_line_before,
+};
 use rowan::{GreenNode, GreenToken};
 
 type GreenElement = rowan::NodeOrToken<GreenNode, GreenToken>;
@@ -453,7 +456,7 @@ impl Recipe {
     /// assert!(recipe.is_silent());
     /// ```
     pub fn set_prefix(&mut self, prefix: &str) {
-        let text = self.text();
+        let text = self.replacement_text();
 
         // Strip existing prefix characters
         let stripped = text.trim_start_matches(['@', '-', '+']);
@@ -549,19 +552,47 @@ impl Recipe {
             replace_recipe_prefix(&new_syntax, '\t', recipe_prefix);
         }
 
-        // Replace the old node with the new one
-        parent.splice_children(node_index..node_index + 1, vec![new_syntax.into()]);
-
-        // Update self to point to the new node
-        // Note: index() returns position among all siblings (nodes + tokens)
-        // so we need to use children_with_tokens() and filter for the node
-        *self = parent
-            .children_with_tokens()
-            .nth(node_index)
-            .and_then(|element| element.into_node())
-            .and_then(Recipe::cast)
-            .expect("New recipe node should exist at the same index");
+        replace_children(
+            node,
+            new_syntax
+                .green()
+                .children()
+                .map(|c| c.to_owned())
+                .collect(),
+        );
         Ok(())
+    }
+
+    /// The text of this recipe line as [`Recipe::try_replace_text`] takes
+    /// it: without the indentation or `;` before it and its line ending,
+    /// and with the recipe prefix that starts continuation lines written as
+    /// a tab.
+    fn replacement_text(&self) -> String {
+        let node = self.syntax();
+        let inline_prefix = self.inline_prefix();
+        let mut children: Vec<_> = node.children_with_tokens().collect();
+        if children.last().is_some_and(|c| c.kind() == NEWLINE) {
+            children.pop();
+        }
+        let skip = if !inline_prefix.is_empty() {
+            inline_prefix.len()
+        } else {
+            usize::from(self.starts_with_indent())
+        };
+        // try_replace_text writes the prefix of the first line on
+        // continuation lines in place of a tab.
+        let prefix = Some(self.recipe_prefix()).filter(|p| skip == 1 && *p != '\t');
+        children
+            .into_iter()
+            .skip(skip)
+            .map(|child| {
+                let text = child.to_string();
+                match prefix.and_then(|p| text.strip_prefix(p)) {
+                    Some(rest) if child.kind() == INDENT => format!("\t{rest}"),
+                    _ => text,
+                }
+            })
+            .collect()
     }
 
     /// Insert a new recipe line before this one
@@ -599,8 +630,7 @@ impl Recipe {
         );
         let new_syntax = build_command(prefix, text, &line_ending(node), "insert_before")?;
         // A recipe on the rule line has to move to its own line first.
-        let this = self.move_to_own_line().unwrap_or_else(|| self.clone());
-        let node = this.syntax();
+        self.move_to_own_line();
         let parent = node.parent().expect("Recipe node must have a parent");
         let node_index = node.index();
 
@@ -674,12 +704,8 @@ impl Recipe {
         let newline = node
             .children_with_tokens()
             .filter_map(|it| it.into_token())
-            .find(|t| t.kind() == NEWLINE)
-            .map(|t| t.text().to_string());
-        let mut replacement = Vec::new();
-        if let Some(newline) = newline {
-            replacement.extend(detached_elements(&[(NEWLINE, &newline)], None));
-        }
+            .find(|t| t.kind() == NEWLINE);
+        let replacement: Vec<_> = newline.map(Into::into).into_iter().collect();
         let node_index = node.index();
         parent.splice_children(node_index..node_index + 1, replacement);
     }
@@ -728,38 +754,27 @@ impl Recipe {
         }
     }
 
-    /// Move a recipe on the rule line to a line of its own, returning the
-    /// new recipe node, or `None` if this recipe is not on the rule line.
-    fn move_to_own_line(&self) -> Option<Recipe> {
+    /// Move this recipe to a line of its own if it is on the rule line.
+    fn move_to_own_line(&self) {
         if !self.is_inline() {
-            return None;
+            return;
         }
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
-        let skip = self.inline_prefix().len();
+        let inline_prefix = self.inline_prefix();
         self.trim_preceding_whitespace();
 
         let prefix = recipe_prefix_before(&parent, node.index()).to_string();
-        let mut recipe = vec![GreenToken::new(INDENT.into(), &prefix).into()];
-        recipe.extend(
-            node.green()
-                .children()
-                .skip(skip)
-                .map(|child| child.to_owned()),
-        );
         let newline = line_ending(node);
-        let elements = detached_elements(
-            &[(NEWLINE, &newline)],
-            Some(GreenNode::new(RECIPE.into(), recipe)),
+        for token in inline_prefix {
+            token.detach();
+        }
+        node.splice_children(0..0, detached_elements(&[(INDENT, &prefix)], None));
+        let index = node.index();
+        parent.splice_children(
+            index..index,
+            detached_elements(&[(NEWLINE, &newline)], None),
         );
-
-        let node_index = node.index();
-        parent.splice_children(node_index..node_index + 1, elements);
-        parent
-            .children_with_tokens()
-            .nth(node_index + 1)
-            .and_then(|it| it.into_node())
-            .and_then(Recipe::cast)
     }
 
     /// Iterate `$(VAR)` and `${VAR}` variable references inside this recipe.
@@ -1315,5 +1330,155 @@ mod tests {
         let rule = makefile.rules().next().unwrap();
         let recipes: Vec<_> = rule.recipes().collect();
         assert_eq!(recipes, vec!["@echo modified", "echo three", "echo two"]);
+    }
+
+    /// The tokens of `recipe`, with the RECIPE node they are in.
+    fn tokens_in(recipe: &Recipe) -> Vec<(SyntaxToken, SyntaxNode)> {
+        recipe
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .map(|t| (t, recipe.syntax().clone()))
+            .collect()
+    }
+
+    /// Whether `token` is still in `makefile`, in the RECIPE node `node`.
+    fn is_kept(makefile: &Makefile, token: &SyntaxToken, node: &SyntaxNode) -> bool {
+        token
+            .parent_ancestors()
+            .find(|n| n.kind() == RECIPE)
+            .as_ref()
+            == Some(node)
+            && token.parent_ancestors().last().as_ref() == Some(makefile.syntax())
+    }
+
+    #[test]
+    fn test_replace_text_keeps_recipe_node() {
+        let makefile: Makefile = "all:\n\t  echo a \\\n\t  b\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        let other = rule.recipe_nodes().next().unwrap();
+        let tokens = tokens_in(&recipe);
+        recipe.try_replace_text("  echo a \\\n\t  c").unwrap();
+        assert_eq!(makefile.code(), "all:\n\t  echo a \\\n\t  c\n");
+        assert_eq!(other.text(), "  echo a \\\n  c");
+        assert_eq!(recipe.syntax(), other.syntax());
+        // Only the last line's text changes.
+        let kept: Vec<_> = tokens
+            .iter()
+            .filter(|(t, node)| is_kept(&makefile, t, node))
+            .map(|(t, _)| t.text().to_string())
+            .collect();
+        assert_eq!(kept, vec!["\t", "  echo a \\", "\n", "\t", "\n"]);
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_prefix_keeps_rest_of_recipe() {
+        let makefile: Makefile = "all:\n\t@$(CC) -o $@ \\\n\t  x.c # c\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        let tokens = tokens_in(&recipe);
+        recipe.set_prefix("-");
+        assert_eq!(makefile.code(), "all:\n\t-$(CC) -o $@ \\\n\t  x.c # c\n");
+        let replaced: Vec<_> = tokens
+            .iter()
+            .filter(|(t, node)| !is_kept(&makefile, t, node))
+            .map(|(t, _)| t.text().to_string())
+            .collect();
+        assert_eq!(replaced, vec!["@"]);
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_replace_command_keeps_recipe_node() {
+        let makefile: Makefile = "all:\n\techo a\n\techo b\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        assert!(rule.try_replace_command(0, "echo c").unwrap());
+        assert_eq!(makefile.code(), "all:\n\techo c\n\techo b\n");
+        assert_eq!(recipe.text(), "echo c");
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_insert_before_inline_recipe_keeps_recipe_node() {
+        let makefile: Makefile = "all: b ;  echo $(X)  # c\nZ = 1\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        let tokens = tokens_in(&recipe);
+        recipe.try_insert_before("echo y").unwrap();
+        assert_eq!(
+            makefile.code(),
+            "all: b\n\techo y\n\techo $(X)  # c\nZ = 1\n"
+        );
+        assert_eq!(recipe.text(), "echo $(X)  # c");
+        let kept: Vec<_> = tokens
+            .iter()
+            .filter(|(t, node)| is_kept(&makefile, t, node))
+            .map(|(t, _)| t.text().to_string())
+            .collect();
+        assert_eq!(kept, vec!["echo ", "$", "(", "X", ")", "  # c", "\n"]);
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_remove_inline_recipe_keeps_line_break() {
+        let makefile: Makefile = "all: b ; echo x\r\nZ = 1\r\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let recipe = rule.recipe_nodes().next().unwrap();
+        let newline = recipe.syntax().last_token().unwrap();
+        recipe.remove();
+        assert_eq!(makefile.code(), "all: b\r\nZ = 1\r\n");
+        assert_eq!(newline.parent().as_ref(), Some(rule.syntax()));
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_prefix_keeps_continuation_lines() {
+        let cases = [
+            ("all:\n\t@echo a \\\n\t  b\n", "all:\n\t-echo a \\\n\t  b\n"),
+            (
+                ".RECIPEPREFIX = >\nall:\n>@echo a \\\n>  b\n",
+                ".RECIPEPREFIX = >\nall:\n>-echo a \\\n>  b\n",
+            ),
+            ("all: ; @echo a \\\n\t  b\n", "all: ; -echo a \\\n\t  b\n"),
+            ("all:\n\t# note\n", "all:\n\t-# note\n"),
+        ];
+        for (text, expected) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut recipe = makefile
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            recipe.set_prefix("-");
+            assert_eq!(makefile.code(), expected);
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_recipe_edits_in_makefile_with_errors() {
+        let parsed = Makefile::parse("all: ; @echo a\n\techo b\nifdef X\nY = 1\n");
+        assert!(!parsed.ok());
+        let makefile = parsed.tree();
+        let mut rule = makefile.rules().next().unwrap();
+        let mut recipes: Vec<_> = rule.recipe_nodes().collect();
+        recipes[0].set_prefix("");
+        recipes[0].try_insert_before("echo c").unwrap();
+        assert!(rule.try_replace_command(2, "echo d").unwrap());
+        assert_eq!(
+            makefile.code(),
+            "all:\n\techo c\n\techo a\n\techo d\nifdef X\nY = 1\n"
+        );
+        assert_eq!(recipes[1].text(), "echo d");
+        let reparsed = Makefile::parse(&makefile.code()).tree();
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.syntax())
+        );
     }
 }

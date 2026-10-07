@@ -1156,14 +1156,16 @@ impl Rule {
             return Ok(true);
         }
         let target_node = recipe.syntax();
-        let target_index = target_node.index();
         let parent = target_node
             .parent()
             .expect("Recipe node must have a parent");
 
-        let prefix = recipe_prefix_before(&parent, target_index);
+        let prefix = recipe_prefix_before(&parent, target_node.index());
         let syntax = build_command(prefix, line, &line_ending(self.syntax()), "replace_command")?;
-        parent.splice_children(target_index..target_index + 1, vec![syntax.into()]);
+        super::replace_children(
+            target_node,
+            syntax.green().children().map(|c| c.to_owned()).collect(),
+        );
 
         Ok(true)
     }
