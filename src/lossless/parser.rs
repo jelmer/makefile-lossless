@@ -2083,6 +2083,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // variable named "override A".
             let bsd_gmake_export = self.is_bsd_make() && self.at_gmake_export();
             let mut is_export_directive = false;
+            // Without an assignment only `export` and `unexport` can start
+            // the line; GNU make rejects `override export X`.
+            let bare_needs_export = self.at_assignment_prefix_keyword()
+                && !matches!(
+                    self.tokens.last().unwrap().1.as_str(),
+                    "export" | "unexport"
+                );
             while self.at_assignment_prefix_keyword() {
                 is_export_directive |= matches!(
                     self.tokens.last().unwrap().1.as_str(),
@@ -2196,6 +2203,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             format!("invalid assignment operator: {}", op),
                         );
                     }
+                }
+                Some(NEWLINE | COMMENT) | None if bare_needs_export => {
+                    self.record_error(
+                        ParseErrorKind::ExpectedAssignmentOperator,
+                        "expected assignment operator".to_string(),
+                    );
+                    self.expect_eol();
                 }
                 // Bare "export VARNAME" without assignment operator is valid GNU Make
                 Some(NEWLINE) => {

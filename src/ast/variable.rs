@@ -125,7 +125,8 @@ impl VariableDefinition {
     /// one when another word follows it, so `undefine = 1` assigns to a
     /// variable named `undefine`. The exception is a trailing keyword without
     /// an assignment operator, such as a bare `export` or the `undefine` in
-    /// `override undefine` with its name missing.
+    /// `override undefine` with its name missing. A bare `export` or
+    /// `unexport` directive has only its first word as a keyword.
     fn directive_keywords(&self) -> Vec<crate::lossless::SyntaxToken> {
         let mut words: Vec<Vec<crate::lossless::SyntaxElement>> = Vec::new();
         let mut in_word = false;
@@ -171,8 +172,18 @@ impl VariableDefinition {
             keywords.push(token);
             // Everything after `define` or `undefine` is part of the name.
             if is_last {
-                break;
+                return keywords;
             }
+        }
+        // GNU make only reads the first word of a bare `export` or
+        // `unexport` directive as a keyword, so `unexport export X`
+        // unexports the variables "export" and "X".
+        if !has_operator
+            && keywords
+                .first()
+                .is_some_and(|t| matches!(t.text(), "export" | "unexport"))
+        {
+            keywords.truncate(1);
         }
         keywords
     }
@@ -183,7 +194,8 @@ impl VariableDefinition {
     /// `define` block.
     ///
     /// A word only counts as a keyword in the same cases as for
-    /// [`Self::is_export`] and the like, so `export = 1` has none.
+    /// [`Self::is_export`] and the like, so `export = 1` has none and
+    /// `unexport export X` just `unexport`.
     ///
     /// # Example
     /// ```
@@ -372,9 +384,10 @@ impl VariableDefinition {
     /// such as `$(VARS)` verbatim.
     ///
     /// Usually this is just [`Self::name`], but a bare `export` or
-    /// `unexport` directive can list several variables. An `undefine`
-    /// or `define` directive always has a single name, as in `undefine A B`,
-    /// which yields just "A B".
+    /// `unexport` directive can list several variables. As in GNU make,
+    /// only its first word is a keyword, so `unexport export X` lists
+    /// "export" and "X". An `undefine` or `define` directive always has a
+    /// single name, as in `undefine A B`, which yields just "A B".
     ///
     /// # Example
     /// ```
@@ -629,10 +642,13 @@ impl VariableDefinition {
 
     /// Check if this variable definition uses the `export` directive
     ///
-    /// This only reports whether the keyword is present. A line can have
-    /// both `export` and `unexport`, in which case both this and
+    /// This only reports whether the keyword is present. An assignment can
+    /// have both `export` and `unexport`, in which case both this and
     /// [`Self::is_unexport`] return true; use [`Self::export_state`] for
-    /// whether GNU make actually exports the variable.
+    /// whether GNU make actually exports the variable. In a bare directive
+    /// without an assignment only the first word is a keyword, so
+    /// `unexport export X` is not an export: it unexports the variables
+    /// "export" and "X".
     pub fn is_export(&self) -> bool {
         self.directive_keywords()
             .iter()

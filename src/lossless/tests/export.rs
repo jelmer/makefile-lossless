@@ -409,8 +409,8 @@ fn test_export_state() {
         ("export X\n", true, false, Some(Export)),
         ("export\n", true, false, Some(Export)),
         ("unexport\n", false, true, Some(Unexport)),
-        ("unexport export X\n", true, true, Some(Unexport)),
-        ("export unexport X\n", true, true, Some(Export)),
+        ("unexport export X\n", false, true, Some(Unexport)),
+        ("export unexport X\n", true, false, Some(Export)),
         ("export undefine X\n", true, false, None),
     ];
     for (code, is_export, is_unexport, state) in cases {
@@ -429,5 +429,148 @@ fn test_export_state() {
             ),
             "{code:?}"
         );
+    }
+}
+
+#[test]
+fn test_bare_export_later_keywords_are_names() {
+    use crate::ExportState::{Export, Unexport};
+    // GNU make only treats the first word of a bare directive as a keyword,
+    // so `unexport export X` unexports the variables "export" and "X".
+    // (code, names, is_export, is_unexport, is_override, is_private, state)
+    let cases = [
+        (
+            "unexport export X\n",
+            vec!["export", "X"],
+            false,
+            true,
+            false,
+            false,
+            Some(Unexport),
+        ),
+        (
+            "export unexport X\n",
+            vec!["unexport", "X"],
+            true,
+            false,
+            false,
+            false,
+            Some(Export),
+        ),
+        (
+            "export export X\n",
+            vec!["export", "X"],
+            true,
+            false,
+            false,
+            false,
+            Some(Export),
+        ),
+        (
+            "export override X\n",
+            vec!["override", "X"],
+            true,
+            false,
+            false,
+            false,
+            Some(Export),
+        ),
+        (
+            "unexport private X\n",
+            vec!["private", "X"],
+            false,
+            true,
+            false,
+            false,
+            Some(Unexport),
+        ),
+        (
+            "export \\\n unexport X\n",
+            vec!["unexport", "X"],
+            true,
+            false,
+            false,
+            false,
+            Some(Export),
+        ),
+        (
+            "unexport \\\n export \\\n X\n",
+            vec!["export", "X"],
+            false,
+            true,
+            false,
+            false,
+            Some(Unexport),
+        ),
+        (
+            "export export\n",
+            vec!["export"],
+            true,
+            false,
+            false,
+            false,
+            Some(Export),
+        ),
+        (
+            "unexport export # c\n",
+            vec!["export"],
+            false,
+            true,
+            false,
+            false,
+            Some(Unexport),
+        ),
+    ];
+    for (code, names, is_export, is_unexport, is_override, is_private, state) in cases {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let vars: Vec<_> = root.variable_definitions().collect();
+        assert_eq!(1, vars.len(), "{code:?}");
+        let var = &vars[0];
+        assert_eq!(names, var.names().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(Some(names[0].to_string()), var.name(), "{code:?}");
+        assert_eq!(
+            (is_export, is_unexport, is_override, is_private, state),
+            (
+                var.is_export(),
+                var.is_unexport(),
+                var.is_override(),
+                var.is_private(),
+                var.export_state()
+            ),
+            "{code:?}"
+        );
+        assert_eq!(
+            vec![code.split_whitespace().next().unwrap().to_string()],
+            var.keyword_ranges()
+                .into_iter()
+                .map(|(keyword, _)| keyword)
+                .collect::<Vec<_>>(),
+            "{code:?}"
+        );
+    }
+}
+
+#[test]
+fn test_bare_modifier_not_export_is_error() {
+    // GNU make: "missing separator", since only `export` and `unexport`
+    // can appear without an assignment.
+    for code in [
+        "override export X\n",
+        "private export X\n",
+        "override unexport X Y\n",
+        "override export\n",
+        "override X\n",
+        "private X # c\n",
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(
+            vec![ParseErrorKind::ExpectedAssignmentOperator],
+            parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            "{code:?}"
+        );
+        assert_eq!(code, parsed.root().to_string());
     }
 }
