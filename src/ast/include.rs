@@ -498,7 +498,8 @@ impl Include {
     /// this switches between `.include` and `.-include`.
     ///
     /// Returns an error when making an nmake `!INCLUDE` optional, as nmake
-    /// has no optional include directive.
+    /// has no optional include directive, and when making a BSD make
+    /// `.dinclude` non-optional, as there is no such form of it.
     ///
     /// # Example
     /// ```
@@ -510,18 +511,24 @@ impl Include {
     /// assert_eq!(makefile.to_string(), "-include config.mk\n");
     /// ```
     pub fn set_optional(&mut self, optional: bool) -> Result<(), Error> {
-        let Some((token, name)) = self.keyword_name() else {
-            return Ok(());
-        };
-        if optional && name.starts_with('!') {
-            return Err(Error::Parse(ParseError {
+        let error = |message: &str| {
+            Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     kind: crate::ParseErrorKind::Other,
-                    message: "nmake has no optional include directive".to_string(),
+                    message: message.to_string(),
                     line: 1,
                     context: "include_set_optional".to_string(),
                 }],
-            }));
+            })
+        };
+        let (token, name) = self
+            .keyword_name()
+            .ok_or_else(|| error("Include has no keyword"))?;
+        if optional == self.is_optional() {
+            return Ok(());
+        }
+        if optional && name.starts_with('!') {
+            return Err(error("nmake has no optional include directive"));
         }
         // In the `.include` form the dot is part of the keyword token.
         let dot = if token.text().starts_with('.') {
@@ -532,7 +539,8 @@ impl Include {
         let new_name = match (optional, name.as_str()) {
             (true, "include") => "-include",
             (false, "-include" | "sinclude") => "include",
-            _ => return Ok(()),
+            (false, "dinclude") => return Err(error(".dinclude has no non-optional form")),
+            _ => return Err(error(&format!("Unknown include directive {name:?}"))),
         };
 
         let mut builder = GreenNodeBuilder::new();
@@ -552,8 +560,8 @@ impl Include {
 #[cfg(test)]
 mod tests {
 
+    use super::*;
     use crate::lossless::Makefile;
-    use crate::MakefileVariant;
 
     #[test]
     fn test_include_parent() {
@@ -1001,6 +1009,26 @@ mod tests {
             makefile.to_string(),
             ".include <bsd.prog.mk>\n.  include \"x.mk\"\n"
         );
+    }
+
+    #[test]
+    fn test_bsd_set_optional_dinclude() {
+        let makefile: Makefile = ".dinclude <b.mk>\n".parse().unwrap();
+        let mut inc = makefile.includes().next().unwrap();
+        assert!(inc.set_optional(false).is_err());
+        assert!(inc.is_optional());
+        inc.set_optional(true).unwrap();
+        assert_eq!(makefile.to_string(), ".dinclude <b.mk>\n");
+    }
+
+    #[test]
+    fn test_set_optional_without_keyword() {
+        let mut builder = GreenNodeBuilder::new();
+        builder.start_node(INCLUDE.into());
+        builder.finish_node();
+        let mut inc = Include::cast(SyntaxNode::new_root_mut(builder.finish())).unwrap();
+        assert!(inc.set_optional(true).is_err());
+        assert!(inc.set_optional(false).is_err());
     }
 
     #[test]
