@@ -68,7 +68,8 @@ pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// Extract the word (identifier) at the given byte offset.
 ///
 /// A word consists of ASCII alphanumeric characters, underscores, dots, and hyphens.
-/// Returns `None` if the offset is not on a word character.
+/// Returns `None` if the offset is not on a word character, is past the end
+/// of `text` or is not on a character boundary.
 ///
 /// # Example
 /// ```
@@ -78,7 +79,7 @@ pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// assert_eq!(word_at_offset("hello world", 6), Some("world"));
 /// ```
 pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
-    if offset > text.len() {
+    if !text.is_char_boundary(offset) {
         return None;
     }
     let bytes = text.as_bytes();
@@ -105,6 +106,9 @@ pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// Determine if the given byte offset is in the prerequisites area of a rule line
 /// (i.e. after the first `:` on a non-recipe line).
 ///
+/// Returns false if the offset is past the end of `text` or is not on a
+/// character boundary.
+///
 /// # Example
 /// ```
 /// use makefile_lossless::is_in_prerequisites;
@@ -114,6 +118,9 @@ pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// assert!(!is_in_prerequisites(text, 17)); // 'e' in recipe
 /// ```
 pub fn is_in_prerequisites(text: &str, offset: usize) -> bool {
+    if !text.is_char_boundary(offset) {
+        return false;
+    }
     let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line = &text[line_start..];
     // Recipe lines start with a tab
@@ -232,5 +239,29 @@ mod tests {
     fn test_is_in_prerequisites_no_colon() {
         let text = "VAR = value\n";
         assert!(!is_in_prerequisites(text, 6));
+    }
+
+    #[test]
+    fn test_offset_past_end() {
+        assert_eq!(variable_at_offset("ab", 5), None);
+        assert_eq!(variable_at_offset("$(FOO)", 7), None);
+        assert_eq!(word_at_offset("ab", 5), None);
+        assert!(!is_in_prerequisites("ab", 5));
+        assert!(!is_in_prerequisites("a: b", 5));
+    }
+
+    #[test]
+    fn test_offset_at_end() {
+        assert_eq!(variable_at_offset("$(FOO", 5), None);
+        assert_eq!(word_at_offset("ab", 2), Some("ab"));
+        assert!(is_in_prerequisites("a: b", 4));
+    }
+
+    #[test]
+    fn test_offset_not_on_char_boundary() {
+        assert_eq!(variable_at_offset("$(\u{e9})", 3), None);
+        assert_eq!(word_at_offset("\u{e9}", 1), None);
+        assert!(!is_in_prerequisites("\u{e9}: x", 1));
+        assert!(!is_in_prerequisites("a: \u{e9}", 4));
     }
 }
