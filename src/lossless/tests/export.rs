@@ -143,7 +143,7 @@ fn test_export_assignment_gnu_and_bsd_only() {
             "{variant:?}"
         );
         assert_eq!(parsed.root().variable_definitions().count(), 0);
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
     for variant in [
         None,
@@ -155,7 +155,7 @@ fn test_export_assignment_gnu_and_bsd_only() {
         let var = parsed.root().variable_definitions().next().unwrap();
         assert!(var.is_export(), "{variant:?}");
         assert_eq!(var.name(), Some("X".to_string()), "{variant:?}");
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 
@@ -192,7 +192,7 @@ fn test_gmake_export_of_keyword_names_in_bsd_make() {
         vars.iter().map(|v| v.raw_value()).collect::<Vec<_>>(),
         ["1", "2", "3", "4", "5", "6"].map(|v| Some(v.to_string()))
     );
-    assert_eq!(parsed.root().code(), text);
+    assert_eq!(parsed.root().to_string(), text);
 }
 
 #[test]
@@ -210,7 +210,10 @@ fn test_export_multiple_names() {
     );
     assert_eq!(vars[0].assignment_operator(), None);
     assert_eq!(makefile.rules().count(), 1);
-    assert_eq!(makefile.code(), "export quiet Q KBUILD_VERBOSE\nall:\n");
+    assert_eq!(
+        makefile.to_string(),
+        "export quiet Q KBUILD_VERBOSE\nall:\n"
+    );
 }
 
 #[test]
@@ -289,7 +292,7 @@ fn test_export_all() {
         assert_eq!(vars[0].is_export(), text.starts_with("export"));
         assert_eq!(vars[0].is_unexport(), text.starts_with("unexport"));
         assert_eq!(makefile.rules().count(), 0);
-        assert_eq!(makefile.code(), text);
+        assert_eq!(makefile.to_string(), text);
     }
 }
 

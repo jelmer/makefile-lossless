@@ -235,7 +235,7 @@ fn test_add_else_and_endif() {
     let temp = parse_nmake("X=2\n");
     let var = temp.variable_definitions().next().unwrap();
     cond.add_else_item(MakefileItem::Variable(var));
-    assert_eq!(makefile.code(), "!IFDEF A\nX=1\n!ELSE\nX=2\n!ENDIF\n");
+    assert_eq!(makefile.to_string(), "!IFDEF A\nX=1\n!ELSE\nX=2\n!ENDIF\n");
 }
 
 #[test]
@@ -490,7 +490,10 @@ fn test_backslash_hash_starts_comment() {
     );
     let var = makefile.variable_definitions().next().unwrap();
     assert_eq!(var.raw_value(), Some("e\\".to_string()));
-    assert_eq!(var.value(MakefileVariant::NMake), Some("e\\".to_string()));
+    assert_eq!(
+        var.value_for(MakefileVariant::NMake),
+        Some("e\\".to_string())
+    );
     let comments: Vec<_> = makefile
         .syntax()
         .descendants_with_tokens()
@@ -502,5 +505,8 @@ fn test_backslash_hash_starts_comment() {
     // Nor are the backslashes before a comment escapes.
     let makefile = parse_nmake("X = e\\\\#f\n");
     let var = makefile.variable_definitions().next().unwrap();
-    assert_eq!(var.value(MakefileVariant::NMake), Some("e\\\\".to_string()));
+    assert_eq!(
+        var.value_for(MakefileVariant::NMake),
+        Some("e\\\\".to_string())
+    );
 }

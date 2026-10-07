@@ -10,7 +10,7 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse basic ifdef")
         .0;
-    assert!(makefile.code().contains("DEBUG_FLAG"));
+    assert!(makefile.to_string().contains("DEBUG_FLAG"));
 
     // Basic conditionals - ifeq/ifneq
     let code = "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n";
@@ -18,8 +18,8 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse ifeq/ifneq")
         .0;
-    assert!(makefile.code().contains("RESULT"));
-    assert!(makefile.code().contains("windows"));
+    assert!(makefile.to_string().contains("RESULT"));
+    assert!(makefile.to_string().contains("windows"));
 
     // Nested conditionals with else
     let code = "ifdef DEBUG\n    CFLAGS += -g\n    ifdef VERBOSE\n        CFLAGS += -v\n    endif\nelse\n    CFLAGS += -O2\nendif\n";
@@ -27,8 +27,8 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse nested conditionals with else")
         .0;
-    assert!(makefile.code().contains("CFLAGS"));
-    assert!(makefile.code().contains("VERBOSE"));
+    assert!(makefile.to_string().contains("CFLAGS"));
+    assert!(makefile.to_string().contains("VERBOSE"));
 
     // Empty conditionals
     let code = "ifdef DEBUG\nendif\n";
@@ -36,7 +36,7 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse empty conditionals")
         .0;
-    assert!(makefile.code().contains("ifdef DEBUG"));
+    assert!(makefile.to_string().contains("ifdef DEBUG"));
 
     // Conditionals with else ifeq
     let code = "ifeq ($(OS),Windows)\n    EXT := .exe\nelse ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n";
@@ -44,7 +44,7 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse conditionals with else ifeq")
         .0;
-    assert!(makefile.code().contains("EXT"));
+    assert!(makefile.to_string().contains("EXT"));
 
     // Invalid conditionals - this should generate parse errors but still produce a Makefile
     let code = "ifXYZ DEBUG\nDEBUG := 1\nendif\n";
@@ -52,7 +52,7 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse with recovery")
         .0;
-    assert!(makefile.code().contains("DEBUG"));
+    assert!(makefile.to_string().contains("DEBUG"));
 
     // Missing condition - this should also generate parse errors but still produce a Makefile
     let code = "ifdef \nDEBUG := 1\nendif\n";
@@ -60,7 +60,7 @@ fn test_conditionals() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse with recovery - missing condition")
         .0;
-    assert!(makefile.code().contains("DEBUG"));
+    assert!(makefile.to_string().contains("DEBUG"));
 }
 
 #[test]
@@ -563,7 +563,7 @@ all: $(OBJS)
 
     // Instead of checking for variable definitions which might not get created
     // due to conditionals, let's verify that we can parse the content without errors
-    assert!(!makefile.code().is_empty(), "Makefile has content");
+    assert!(!makefile.to_string().is_empty(), "Makefile has content");
 
     // Check that we detected a rule
     let rules = makefile.rules().collect::<Vec<_>>();
@@ -609,7 +609,7 @@ fn test_real_conditional_directives() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse basic if/else conditional")
         .0;
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifdef DEBUG"));
     assert!(code.contains("else"));
     assert!(code.contains("endif"));
@@ -620,7 +620,7 @@ fn test_real_conditional_directives() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse nested ifdef")
         .0;
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifdef DEBUG"));
     assert!(code.contains("ifdef VERBOSE"));
 
@@ -630,7 +630,7 @@ fn test_real_conditional_directives() {
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse ifeq form")
         .0;
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifeq"));
     assert!(code.contains("Windows_NT"));
 }
@@ -653,7 +653,7 @@ endif
         .0;
 
     // Check that we detected conditionals
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifdef DEBUG"));
     assert!(code.contains("ifdef VERBOSE"));
     assert!(code.contains("endif"));
@@ -677,8 +677,8 @@ endif
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse else ifeq directive")
         .0;
-    assert!(makefile.code().contains("else ifeq"));
-    assert!(makefile.code().contains("TARGET"));
+    assert!(makefile.to_string().contains("else ifeq"));
+    assert!(makefile.to_string().contains("TARGET"));
 
     // Test else ifdef
     let content = r#"
@@ -696,7 +696,7 @@ endif
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse else ifdef directive")
         .0;
-    assert!(makefile.code().contains("else ifdef"));
+    assert!(makefile.to_string().contains("else ifdef"));
 
     // Test else ifndef
     let content = r#"
@@ -712,7 +712,7 @@ endif
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse else ifndef directive")
         .0;
-    assert!(makefile.code().contains("else ifndef"));
+    assert!(makefile.to_string().contains("else ifndef"));
 
     // Test else ifneq
     let content = r#"
@@ -728,7 +728,7 @@ endif
     let makefile = Makefile::from_reader_relaxed(&mut buf)
         .expect("Failed to parse else ifneq directive")
         .0;
-    assert!(makefile.code().contains("else ifneq"));
+    assert!(makefile.to_string().contains("else ifneq"));
 }
 
 #[test]
@@ -756,7 +756,7 @@ all:
         .0;
 
     // Verify the structure is preserved
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifeq ($(VAR1),foo)"));
     assert!(code.contains("else ifdef VAR2"));
     assert!(code.contains("else ifndef VAR3"));
@@ -851,7 +851,7 @@ endif
         .0;
 
     // Check that we detected conditionals
-    let code = makefile.code();
+    let code = makefile.to_string();
     assert!(code.contains("ifdef RELEASE"));
     assert!(code.contains("ifndef DEBUG"));
     assert!(code.contains("ifneq"));

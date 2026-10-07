@@ -289,7 +289,7 @@ mod tests {
         let makefile = parsed.tree();
         let mut cond = makefile.conditionals().next().unwrap();
         assert!(cond.add_endif().unwrap());
-        assert_eq!(makefile.code(), ".ifdef DEBUG\nVAR = 1\n.endif\n");
+        assert_eq!(makefile.to_string(), ".ifdef DEBUG\nVAR = 1\n.endif\n");
     }
 
     #[test]
@@ -299,7 +299,7 @@ mod tests {
         let temp = parse_ok("A=2\n");
         let var = temp.variable_definitions().next().unwrap();
         cond.add_else_item(MakefileItem::Variable(var));
-        assert_eq!(makefile.code(), ".if 1\nA=1\n.else\nA=2\n.endif\n");
+        assert_eq!(makefile.to_string(), ".if 1\nA=1\n.else\nA=2\n.endif\n");
     }
 
     #[test]
@@ -952,7 +952,7 @@ mod tests {
         let makefile = parse_bsd("VAR :sh =\techo\n");
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("!=");
-        assert_eq!(makefile.code(), "VAR !=\techo\n");
+        assert_eq!(makefile.to_string(), "VAR !=\techo\n");
         assert_eq!(var.assignment_operator(), Some("!=".to_string()));
     }
 
@@ -962,9 +962,9 @@ mod tests {
         let makefile = parse_bsd("a:b=c\n");
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.try_set_assignment_operator("::=").is_err());
-        assert_eq!(makefile.code(), "a:b=c\n");
+        assert_eq!(makefile.to_string(), "a:b=c\n");
         var.try_set_assignment_operator(":sh=").unwrap();
-        assert_eq!(makefile.code(), "a:b:sh=c\n");
+        assert_eq!(makefile.to_string(), "a:b:sh=c\n");
         assert_eq!(var.assignment_operator(), Some(":sh=".to_string()));
     }
 

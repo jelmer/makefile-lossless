@@ -706,7 +706,7 @@ fn test_bsd_cr_around_assignment() {
     let var = makefile.variable_definitions().next().unwrap();
     assert_eq!(var.name(), Some("X".to_string()));
     assert_eq!(
-        var.value(crate::MakefileVariant::BSDMake),
+        var.value_for(crate::MakefileVariant::BSDMake),
         Some("y\rz".to_string())
     );
 }

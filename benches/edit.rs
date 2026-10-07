@@ -55,7 +55,7 @@ fn set_value(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| Makefile::parse(&text).tree())
         .bench_local_values(|makefile| {
-            let mut var = makefile.find_variable(&name).next().unwrap();
+            let mut var = makefile.variable_definitions_by_name(&name).next().unwrap();
             var.set_value("-lm -lz");
             makefile
         });

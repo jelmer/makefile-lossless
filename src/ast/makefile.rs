@@ -1026,8 +1026,9 @@ impl Makefile {
     }
 
     /// Get the text content of the makefile
+    #[deprecated(since = "0.4.2", note = "use `to_string` instead")]
     pub fn code(&self) -> String {
-        self.syntax().text().to_string()
+        self.to_string()
     }
 
     /// Check if this node is the root of a makefile
@@ -1231,26 +1232,34 @@ impl Makefile {
         self.syntax().children().filter_map(MakefileItem::cast)
     }
 
-    /// Find all variables by name
+    /// Get all variable definitions with a specific name
     ///
-    /// Returns an iterator over all variable definitions with the given name.
     /// Makefiles can have multiple definitions of the same variable.
     ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
     /// let makefile: Makefile = "VAR1 = value1\nVAR2 = value2\nVAR1 = value3\n".parse().unwrap();
-    /// let vars: Vec<_> = makefile.find_variable("VAR1").collect();
+    /// let vars: Vec<_> = makefile.variable_definitions_by_name("VAR1").collect();
     /// assert_eq!(vars.len(), 2);
     /// assert_eq!(vars[0].raw_value(), Some("value1".to_string()));
     /// assert_eq!(vars[1].raw_value(), Some("value3".to_string()));
     /// ```
-    pub fn find_variable<'a>(
+    pub fn variable_definitions_by_name<'a>(
         &'a self,
         name: &'a str,
     ) -> impl Iterator<Item = VariableDefinition> + 'a {
         self.variable_definitions()
             .filter(move |var| var.name().as_deref() == Some(name))
+    }
+
+    /// Find all variables by name
+    #[deprecated(since = "0.4.2", note = "use `variable_definitions_by_name` instead")]
+    pub fn find_variable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = VariableDefinition> + 'a {
+        self.variable_definitions_by_name(name)
     }
 
     /// Get all variable references in the makefile.
@@ -1885,15 +1894,24 @@ impl Makefile {
     /// ```
     /// use makefile_lossless::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n".parse().unwrap();
-    /// let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+    /// let rules: Vec<_> = makefile.rules_by_target_pattern("foo.o").collect();
     /// assert_eq!(rules.len(), 2);
     /// ```
-    pub fn find_rules_by_target_pattern<'a>(
+    pub fn rules_by_target_pattern<'a>(
         &'a self,
         target: &'a str,
     ) -> impl Iterator<Item = Rule> + 'a {
         self.rules()
             .filter(move |rule| rule.targets().any(|t| matches_pattern(&t, target)))
+    }
+
+    /// Find all rules whose targets match the given pattern
+    #[deprecated(since = "0.4.2", note = "use `rules_by_target_pattern` instead")]
+    pub fn find_rules_by_target_pattern<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> impl Iterator<Item = Rule> + 'a {
+        self.rules_by_target_pattern(target)
     }
 
     /// Add a target to .PHONY (creates .PHONY rule if it doesn't exist)
@@ -2652,7 +2670,7 @@ mod tests {
             };
             assert_eq!(result.is_ok(), expected.is_some(), "{code:?} {index} {op}");
             assert_eq!(
-                makefile.code(),
+                makefile.to_string(),
                 expected.unwrap_or(code),
                 "{code:?} {index} {op}"
             );
@@ -2680,7 +2698,7 @@ mod tests {
                 "Cannot put an item before a recipe line, which would no longer belong to its rule"
             )
         );
-        assert_eq!(makefile.code(), code);
+        assert_eq!(makefile.to_string(), code);
     }
 
     #[test]
@@ -3415,7 +3433,7 @@ override_dh_auto_configure:
     fn test_find_variable_document_order() {
         let makefile: Makefile = "ifdef X\nA = 1\nendif\nA = 2\n".parse().unwrap();
         let values: Vec<_> = makefile
-            .find_variable("A")
+            .variable_definitions_by_name("A")
             .map(|v| v.raw_value().unwrap())
             .collect();
         assert_eq!(values, vec!["1", "2"]);
@@ -4129,7 +4147,7 @@ VAR2 = value2
         assert_eq!(vars.len(), 2);
 
         // The structure should be preserved in the output
-        let output = makefile.code();
+        let output = makefile.to_string();
         assert!(output.contains("# Comment"));
         assert!(output.contains("VAR = value"));
         assert!(output.contains("# Another comment"));
@@ -4187,7 +4205,7 @@ rule2:
         makefile.remove_rule(0).unwrap();
 
         // Verify structure is preserved
-        let output = makefile.code();
+        let output = makefile.to_string();
         assert!(output.contains("VAR1 = value1"));
         assert!(output.contains("include common.mk"));
         assert!(output.contains("VAR2 = value2"));
@@ -4212,13 +4230,16 @@ VAR3 = value3
         .unwrap();
 
         // Find existing variable
-        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        let vars: Vec<_> = makefile.variable_definitions_by_name("VAR2").collect();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("VAR2".to_string()));
         assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
 
         // Try to find non-existent variable
-        assert_eq!(makefile.find_variable("NONEXISTENT").count(), 0);
+        assert_eq!(
+            makefile.variable_definitions_by_name("NONEXISTENT").count(),
+            0
+        );
     }
 
     #[test]
@@ -4231,7 +4252,7 @@ VAR3 = value3
         .unwrap();
 
         // Find exported variable
-        let vars: Vec<_> = makefile.find_variable("VAR2").collect();
+        let vars: Vec<_> = makefile.variable_definitions_by_name("VAR2").collect();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name(), Some("VAR2".to_string()));
         assert_eq!(vars[0].raw_value(), Some("value2".to_string()));
@@ -4248,14 +4269,14 @@ VAR1 = value3
         .unwrap();
 
         // Find all VAR1 definitions
-        let vars: Vec<_> = makefile.find_variable("VAR1").collect();
+        let vars: Vec<_> = makefile.variable_definitions_by_name("VAR1").collect();
         assert_eq!(vars.len(), 3);
         assert_eq!(vars[0].raw_value(), Some("value1".to_string()));
         assert_eq!(vars[1].raw_value(), Some("value2".to_string()));
         assert_eq!(vars[2].raw_value(), Some("value3".to_string()));
 
         // Find VAR2
-        let var2s: Vec<_> = makefile.find_variable("VAR2").collect();
+        let var2s: Vec<_> = makefile.variable_definitions_by_name("VAR2").collect();
         assert_eq!(var2s.len(), 1);
         assert_eq!(var2s[0].raw_value(), Some("other".to_string()));
     }
@@ -4271,17 +4292,17 @@ VAR3 = value3
 
         // Find and remove VAR2
         let mut var2 = makefile
-            .find_variable("VAR2")
+            .variable_definitions_by_name("VAR2")
             .next()
             .expect("Should find VAR2");
         var2.remove();
 
         // Verify VAR2 is gone
-        assert_eq!(makefile.find_variable("VAR2").count(), 0);
+        assert_eq!(makefile.variable_definitions_by_name("VAR2").count(), 0);
 
         // Verify other variables still exist
-        assert_eq!(makefile.find_variable("VAR1").count(), 1);
-        assert_eq!(makefile.find_variable("VAR3").count(), 1);
+        assert_eq!(makefile.variable_definitions_by_name("VAR1").count(), 1);
+        assert_eq!(makefile.variable_definitions_by_name("VAR3").count(), 1);
     }
 
     #[test]
@@ -4307,7 +4328,7 @@ VAR3 = value3
         rule.remove().unwrap();
 
         // Should not have trailing blank line
-        assert_eq!(makefile.code(), "%:\n\tdh $@\n");
+        assert_eq!(makefile.to_string(), "%:\n\tdh $@\n");
         assert_eq!(makefile.rules().count(), 1);
     }
 
@@ -4326,7 +4347,7 @@ VAR3 = value3
             let makefile: Makefile = code.parse().unwrap();
             let rule = makefile.find_rule_by_target("b").unwrap();
             rule.remove().unwrap();
-            assert_eq!(makefile.code(), expected, "{code:?}");
+            assert_eq!(makefile.to_string(), expected, "{code:?}");
             assert_matches_reparse(&makefile);
         }
     }
@@ -4435,6 +4456,31 @@ VAR3 = value3
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_makefile_methods() {
+        let text = "%.o: %.c\n\t$(CC) -c $<\nV = 1\nV := 2\n";
+        let makefile: Makefile = text.parse().unwrap();
+        assert_eq!(makefile.code(), text);
+        assert_eq!(makefile.find_rules_by_target_pattern("foo.o").count(), 1);
+        assert_eq!(makefile.find_rules_by_target_pattern("foo.c").count(), 0);
+        let values: Vec<_> = makefile
+            .find_variable("V")
+            .map(|v| v.value(crate::MakefileVariant::GNUMake))
+            .collect();
+        assert_eq!(values, vec![Some("1".to_string()), Some("2".to_string())]);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_conditional_unwrap() {
+        let makefile: Makefile = "ifdef DEBUG\nVAR = debug\nendif\n".parse().unwrap();
+        makefile.conditionals().next().unwrap().unwrap().unwrap();
+        assert_eq!(makefile.to_string(), "VAR = debug\n");
+        let makefile: Makefile = "ifdef DEBUG\nA = 1\nelse\nA = 2\nendif\n".parse().unwrap();
+        assert!(makefile.conditionals().next().unwrap().unwrap().is_err());
+    }
+
+    #[test]
     fn test_makefile_find_rule_by_target_pattern_simple() {
         let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
         let rule = makefile.find_rule_by_target_pattern("foo.o");
@@ -4494,7 +4540,7 @@ VAR3 = value3
         let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n"
             .parse()
             .unwrap();
-        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        let rules: Vec<_> = makefile.rules_by_target_pattern("foo.o").collect();
         assert_eq!(rules.len(), 2);
     }
 
@@ -4504,18 +4550,18 @@ VAR3 = value3
         "%.o: %.c\n\t$(CC) -c $<\nfoo.o: foo.h\n\t$(CC) -c foo.c\nbar.txt: baz.txt\n\tcp $< $@\n"
             .parse()
             .unwrap();
-        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        let rules: Vec<_> = makefile.rules_by_target_pattern("foo.o").collect();
         assert_eq!(rules.len(), 2); // Matches both %.o and foo.o
-        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.txt").collect();
+        let rules: Vec<_> = makefile.rules_by_target_pattern("bar.txt").collect();
         assert_eq!(rules.len(), 1); // Only exact match
     }
 
     #[test]
     fn test_makefile_find_rules_by_target_pattern_no_wildcard() {
         let makefile: Makefile = "foo.o: foo.c\n\t$(CC) -c $<\n".parse().unwrap();
-        let rules: Vec<_> = makefile.find_rules_by_target_pattern("foo.o").collect();
+        let rules: Vec<_> = makefile.rules_by_target_pattern("foo.o").collect();
         assert_eq!(rules.len(), 1);
-        let rules: Vec<_> = makefile.find_rules_by_target_pattern("bar.o").collect();
+        let rules: Vec<_> = makefile.rules_by_target_pattern("bar.o").collect();
         assert_eq!(rules.len(), 0);
     }
 
@@ -4551,7 +4597,7 @@ VAR3 = value3
     fn test_makefile_remove_phony_target_duplicate() {
         let mut makefile: Makefile = "a:\n.PHONY: a a\n".parse().unwrap();
         assert!(makefile.remove_phony_target("a").unwrap());
-        assert_eq!(makefile.code(), "a:\n");
+        assert_eq!(makefile.to_string(), "a:\n");
         assert_matches_reparse(&makefile);
     }
 

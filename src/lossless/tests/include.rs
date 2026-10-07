@@ -34,7 +34,7 @@ fn test_vpath_gnu_only() {
             vec![RULE, RULE],
             "{variant:?}"
         );
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
     for variant in [None, Some(MakefileVariant::GNUMake)] {
         let parsed = parse(text, variant);
@@ -44,7 +44,7 @@ fn test_vpath_gnu_only() {
             vec![VPATH, VPATH],
             "{variant:?}"
         );
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 
@@ -169,7 +169,7 @@ fn test_include_in_bsd_rule() {
     let parsed = parse(text, Some(MakefileVariant::BSDMake));
     assert_eq!(parsed.errors, vec![]);
     let root = parsed.root();
-    assert_eq!(root.code(), text);
+    assert_eq!(root.to_string(), text);
     let items: Vec<_> = root.items().map(|i| i.syntax().kind()).collect();
     assert_eq!(items, vec![RULE]);
     let rule = root.rules().next().unwrap();
@@ -211,7 +211,7 @@ fn test_include_keywords_per_variant() {
             kinds,
             "{variant:?} {text:?}"
         );
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 

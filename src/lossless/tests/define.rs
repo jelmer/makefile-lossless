@@ -738,7 +738,7 @@ fn test_undefine() {
     assert_eq!(vars[1].assignment_operator(), None);
     assert_eq!(vars[1].raw_value(), None);
     assert_eq!(makefile.rules().count(), 1);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -752,7 +752,7 @@ fn test_override_undefine() {
     assert!(vars[0].is_undefine());
     assert!(vars[0].is_override());
     assert_eq!(vars[0].name(), Some("FOO".to_string()));
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -764,7 +764,7 @@ fn test_undefine_variable_reference() {
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
     assert_eq!(vars.len(), 1);
     assert!(vars[0].is_undefine());
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -778,7 +778,7 @@ fn test_undefine_computed_name() {
     assert!(var.is_override());
     assert_eq!(var.name(), Some("CFLAGS.${PROG}".to_string()));
     assert_eq!(var.raw_value(), None);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -788,7 +788,7 @@ fn test_undefine_at_eof() {
     assert_eq!(parsed.errors, vec![]);
     let makefile = parsed.root();
     assert_eq!(makefile.variable_definitions().count(), 1);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -811,7 +811,7 @@ fn test_undefine_name_with_spaces() {
     assert_eq!(vars[1].names().collect::<Vec<_>>(), vec!["B C"]);
     assert_eq!(vars[2].name(), Some("X".to_string()));
     assert_eq!(vars[2].names().collect::<Vec<_>>(), vec!["X"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -825,7 +825,7 @@ fn test_undefine_name_with_continuation() {
     assert!(var.is_undefine());
     assert_eq!(var.name(), Some("A $(B)".to_string()));
     assert_eq!(var.names().collect::<Vec<_>>(), vec!["A $(B)"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -839,7 +839,7 @@ fn test_undefine_name_starting_with_keyword() {
     assert!(var.is_undefine());
     assert!(!var.is_override());
     assert_eq!(var.name(), Some("override X".to_string()));
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -852,7 +852,7 @@ fn test_undefine_as_rule_target() {
     let rules = makefile.rules().collect::<Vec<_>>();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["undefine"]);
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -866,7 +866,7 @@ fn test_undefine_as_variable_name() {
     assert!(!vars[0].is_undefine());
     assert_eq!(vars[0].name(), Some("undefine".to_string()));
     assert_eq!(vars[0].raw_value(), Some("1".to_string()));
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -878,7 +878,7 @@ fn test_undefine_with_comment() {
     let var = makefile.variable_definitions().next().unwrap();
     assert!(var.is_undefine());
     assert_eq!(var.name(), Some("FOO".to_string()));
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -911,7 +911,7 @@ fn test_undefine_empty_name() {
         assert!(vars[0].is_undefine(), "{text:?}");
         assert_eq!(vars[0].name(), None, "{text:?}");
         assert_eq!(vars[0].names().collect::<Vec<_>>(), Vec::<String>::new());
-        assert_eq!(makefile.code(), text);
+        assert_eq!(makefile.to_string(), text);
     }
 }
 
@@ -933,7 +933,7 @@ fn test_undefine_name_with_operator() {
         assert_eq!(var.raw_value(), None);
     }
     assert!(vars[2].is_override());
-    assert_eq!(makefile.code(), text);
+    assert_eq!(makefile.to_string(), text);
 }
 
 #[test]
@@ -956,7 +956,7 @@ fn test_define_undefine_gnu_only() {
             );
             let makefile = parsed.root();
             assert_eq!(makefile.variable_definitions().count(), 0);
-            assert_eq!(makefile.code(), text);
+            assert_eq!(makefile.to_string(), text);
         }
     }
     // GNU make and the default
@@ -990,13 +990,13 @@ fn test_assignment_modifiers_gnu_only() {
             "{variant:?}"
         );
         assert_eq!(parsed.root().variable_definitions().count(), 0);
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
     for variant in [None, Some(MakefileVariant::GNUMake)] {
         let parsed = parse(text, variant);
         assert_eq!(parsed.errors, vec![], "{variant:?}");
         assert_eq!(parsed.root().variable_definitions().count(), 5);
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 
@@ -1020,7 +1020,7 @@ fn test_modifier_keyword_as_variable_name_any_variant() {
             vec![Some("override".to_string()), Some("export".to_string())],
             "{variant:?}"
         );
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 
@@ -1029,7 +1029,7 @@ fn test_bsd_undef_unaffected() {
     let text = ".undef A B\n";
     let parsed = parse(text, Some(MakefileVariant::BSDMake));
     assert_eq!(parsed.errors, vec![]);
-    assert_eq!(parsed.root().code(), text);
+    assert_eq!(parsed.root().to_string(), text);
 }
 
 #[test]
@@ -1049,7 +1049,7 @@ fn test_define_as_variable_name() {
         assert!(!vars[0].is_define(), "{variant:?}");
         assert_eq!(vars[0].name(), Some("define".to_string()), "{variant:?}");
         assert_eq!(vars[0].raw_value(), Some("1".to_string()), "{variant:?}");
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
     for variant in [None, Some(MakefileVariant::GNUMake)] {
         let text = "override define := 1\nexport define = 2\n";
@@ -1063,7 +1063,7 @@ fn test_define_as_variable_name() {
             assert!(!var.is_define(), "{variant:?}");
             assert_eq!(var.name(), Some("define".to_string()), "{variant:?}");
         }
-        assert_eq!(parsed.root().code(), text);
+        assert_eq!(parsed.root().to_string(), text);
     }
 }
 

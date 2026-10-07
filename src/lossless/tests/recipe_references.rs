@@ -394,7 +394,7 @@ fn test_define_body_references() {
         Some("$(1): $$($(1)_OBJS)\n\t$$(CC) -o $$@ $(LDFLAGS)\n$(foreach v,$(VARS),\n  $(info $(v)))\n".to_string())
     );
     assert_eq!(
-        var.value(MakefileVariant::GNUMake),
+        var.value_for(MakefileVariant::GNUMake),
         Some("$(1): $$($(1)_OBJS)\n\t$$(CC) -o $$@ $(LDFLAGS)\n$(foreach v,$(VARS),\n  $(info $(v)))".to_string())
     );
 }
@@ -413,7 +413,7 @@ fn test_define_body_hash_and_continuation() {
         .next()
         .unwrap();
     assert_eq!(
-        var.value(MakefileVariant::GNUMake),
+        var.value_for(MakefileVariant::GNUMake),
         Some("a # $(A)\n$(B c) $(D)".to_string())
     );
 }

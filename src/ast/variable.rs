@@ -578,7 +578,7 @@ impl VariableDefinition {
     /// let (makefile, _) = Makefile::from_str_relaxed("define A\ndefine B\nx");
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.add_endef().unwrap());
-    /// assert_eq!(makefile.code(), "define A\ndefine B\nx\nendef\nendef\n");
+    /// assert_eq!(makefile.to_string(), "define A\ndefine B\nx\nendef\nendef\n");
     /// assert!(var.has_endef());
     /// ```
     pub fn add_endef(&mut self) -> Result<bool, Error> {
@@ -962,10 +962,10 @@ impl VariableDefinition {
     /// let makefile: Makefile = "X := a\\#b \\\n    c # comment\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(var.raw_value(), Some("a\\#b \\\n    c ".to_string()));
-    /// assert_eq!(var.value(MakefileVariant::GNUMake), Some("a#b c ".to_string()));
-    /// assert_eq!(var.value(MakefileVariant::BSDMake), Some("a#b  c".to_string()));
+    /// assert_eq!(var.value_for(MakefileVariant::GNUMake), Some("a#b c ".to_string()));
+    /// assert_eq!(var.value_for(MakefileVariant::BSDMake), Some("a#b  c".to_string()));
     /// ```
-    pub fn value(&self, variant: MakefileVariant) -> Option<String> {
+    pub fn value_for(&self, variant: MakefileVariant) -> Option<String> {
         let expr = self.value_expr()?;
         let tokens = expr
             .descendants_with_tokens()
@@ -982,6 +982,12 @@ impl VariableDefinition {
             let value = logical_text(&expr, tokens, syntax, true);
             Some(value.trim_start_matches([' ', '\t']).to_string())
         }
+    }
+
+    /// Get the value of the variable as make sees it
+    #[deprecated(since = "0.4.2", note = "use `value_for` instead")]
+    pub fn value(&self, variant: MakefileVariant) -> Option<String> {
+        self.value_for(variant)
     }
 
     /// Get the parent item of this variable definition, if any
@@ -1048,7 +1054,7 @@ impl VariableDefinition {
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_assignment_operator("?=");
     /// assert_eq!(var.assignment_operator(), Some("?=".to_string()));
-    /// assert!(makefile.code().contains("VAR ?= value"));
+    /// assert!(makefile.to_string().contains("VAR ?= value"));
     /// ```
     pub fn set_assignment_operator(&mut self, op: &str) {
         self.try_set_assignment_operator(op)
@@ -1070,7 +1076,7 @@ impl VariableDefinition {
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_assignment_operator("bogus").is_err());
     /// var.try_set_assignment_operator("+=").unwrap();
-    /// assert_eq!(makefile.code(), "VAR += value\n");
+    /// assert_eq!(makefile.to_string(), "VAR += value\n");
     /// ```
     pub fn try_set_assignment_operator(&mut self, op: &str) -> Result<(), Error> {
         // TODO: reject operators the variant lacks, such as all but `=` in
@@ -1104,7 +1110,7 @@ impl VariableDefinition {
     /// let makefile = Makefile::parse_with_variant("VAR = cmd\n", MakefileVariant::BSDMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_assignment_operator_for(":sh=", MakefileVariant::BSDMake);
-    /// assert_eq!(makefile.code(), "VAR :sh= cmd\n");
+    /// assert_eq!(makefile.to_string(), "VAR :sh= cmd\n");
     /// ```
     pub fn set_assignment_operator_for(&mut self, op: &str, variant: MakefileVariant) {
         self.try_set_assignment_operator_for(op, variant)
@@ -1125,7 +1131,7 @@ impl VariableDefinition {
     /// let makefile = Makefile::parse_with_variant("VAR = value\n", MakefileVariant::NMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_assignment_operator_for(":=", MakefileVariant::NMake).is_err());
-    /// assert_eq!(makefile.code(), "VAR = value\n");
+    /// assert_eq!(makefile.to_string(), "VAR = value\n");
     /// ```
     pub fn try_set_assignment_operator_for(
         &mut self,
@@ -1224,7 +1230,7 @@ impl VariableDefinition {
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_name("BAZ");
     /// assert_eq!(var.name(), Some("BAZ".to_string()));
-    /// assert_eq!(makefile.code(), "export BAZ := bar\n");
+    /// assert_eq!(makefile.to_string(), "export BAZ := bar\n");
     /// ```
     ///
     /// # Panics
@@ -1253,7 +1259,7 @@ impl VariableDefinition {
     /// assert!(var.try_set_name("A\nB").is_err());
     /// assert!(var.try_set_name("A B").is_err());
     /// var.try_set_name("BAZ").unwrap();
-    /// assert_eq!(makefile.code(), "BAZ := bar\n");
+    /// assert_eq!(makefile.to_string(), "BAZ := bar\n");
     /// ```
     pub fn try_set_name(&mut self, new_name: &str) -> Result<(), Error> {
         let operation = "VariableDefinition::try_set_name";
@@ -1319,7 +1325,7 @@ impl VariableDefinition {
     /// let mut makefile: Makefile = "VAR = value  \n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.trim_trailing_value_whitespace());
-    /// assert_eq!(makefile.code(), "VAR = value\n");
+    /// assert_eq!(makefile.to_string(), "VAR = value\n");
     /// ```
     pub fn trim_trailing_value_whitespace(&mut self) -> bool {
         let Some(token) = self.trailing_value_whitespace() else {
@@ -1396,7 +1402,7 @@ impl VariableDefinition {
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_value("new_value");
     /// assert_eq!(var.raw_value(), Some("new_value".to_string()));
-    /// assert!(makefile.code().contains("export VAR := new_value"));
+    /// assert!(makefile.to_string().contains("export VAR := new_value"));
     /// ```
     pub fn set_value(&mut self, new_value: &str) {
         self.try_set_value(new_value)
@@ -1425,9 +1431,9 @@ impl VariableDefinition {
     /// assert!(var.try_set_value("a\nb").is_err());
     /// assert!(var.try_set_value(" a").is_err());
     /// var.try_set_value("a \\\n  b").unwrap();
-    /// assert_eq!(makefile.code(), "VAR = a \\\n  b\n");
+    /// assert_eq!(makefile.to_string(), "VAR = a \\\n  b\n");
     /// var.try_set_value("a#b").unwrap();
-    /// assert_eq!(makefile.code(), "VAR = a\\#b\n");
+    /// assert_eq!(makefile.to_string(), "VAR = a\\#b\n");
     /// ```
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
         self.set_value_with(new_value, None, "VariableDefinition::try_set_value")
@@ -1455,7 +1461,7 @@ impl VariableDefinition {
     /// let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_value_for("${A:S/a/#/}", MakefileVariant::BSDMake);
-    /// assert_eq!(makefile.code(), "X = ${A:S/a/\\#/}\n");
+    /// assert_eq!(makefile.to_string(), "X = ${A:S/a/\\#/}\n");
     /// ```
     pub fn set_value_for(&mut self, new_value: &str, variant: MakefileVariant) {
         self.try_set_value_for(new_value, variant)
@@ -1478,7 +1484,7 @@ impl VariableDefinition {
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_value_for("a ", MakefileVariant::BSDMake).is_err());
     /// var.try_set_value_for("a#b", MakefileVariant::BSDMake).unwrap();
-    /// assert_eq!(makefile.code(), "X = a\\#b\n");
+    /// assert_eq!(makefile.to_string(), "X = a\\#b\n");
     /// ```
     pub fn try_set_value_for(
         &mut self,
@@ -1776,7 +1782,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
-        assert_eq!(makefile.code(), "VAR ?= value\n");
+        assert_eq!(makefile.to_string(), "VAR ?= value\n");
     }
 
     #[test]
@@ -1785,7 +1791,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
-        assert_eq!(makefile.code(), "VAR ?= value\n");
+        assert_eq!(makefile.to_string(), "VAR ?= value\n");
     }
 
     #[test]
@@ -1795,7 +1801,7 @@ mod tests {
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
         assert!(var.is_export());
-        assert_eq!(makefile.code(), "export VAR ?= value\n");
+        assert_eq!(makefile.to_string(), "export VAR ?= value\n");
     }
 
     #[test]
@@ -1804,7 +1810,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
-        assert_eq!(makefile.code(), "VAR  ?=  value\n");
+        assert_eq!(makefile.to_string(), "VAR  ?=  value\n");
     }
 
     #[test]
@@ -1814,7 +1820,7 @@ mod tests {
         var.set_assignment_operator("=");
         assert_eq!(var.assignment_operator(), Some("=".to_string()));
         assert_eq!(var.raw_value(), Some("old_value".to_string()));
-        assert_eq!(makefile.code(), "VAR = old_value\n");
+        assert_eq!(makefile.to_string(), "VAR = old_value\n");
     }
 
     #[test]
@@ -1823,7 +1829,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("::=");
         assert_eq!(var.assignment_operator(), Some("::=".to_string()));
-        assert_eq!(makefile.code(), "VAR ::= value\n");
+        assert_eq!(makefile.to_string(), "VAR ::= value\n");
     }
 
     #[test]
@@ -1863,7 +1869,11 @@ mod tests {
             let mut var = makefile.variable_definitions().next().unwrap();
             let result = var.try_set_assignment_operator(op);
             assert_eq!(result.is_ok(), expected.is_some(), "{code:?} {op:?}");
-            assert_eq!(makefile.code(), expected.unwrap_or(code), "{code:?} {op:?}");
+            assert_eq!(
+                makefile.to_string(),
+                expected.unwrap_or(code),
+                "{code:?} {op:?}"
+            );
             if expected.is_some() {
                 assert_eq!(var.assignment_operator().as_deref(), Some(op));
             }
@@ -1898,8 +1908,8 @@ mod tests {
             let result = var.try_set_assignment_operator_for(op, variant);
             let context = format!("{code:?} {op:?} {variant:?}");
             assert_eq!(result.is_ok(), expected.is_some(), "{context}");
-            assert_eq!(makefile.code(), expected.unwrap_or(code), "{context}");
-            let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+            assert_eq!(makefile.to_string(), expected.unwrap_or(code), "{context}");
+            let reparsed = Makefile::parse_with_variant(&makefile.to_string(), variant);
             assert_eq!(reparsed.errors(), &[], "{context}");
             assert_eq!(
                 format!("{:#?}", makefile.syntax()),
@@ -1956,7 +1966,7 @@ mod tests {
         // Verify everything
         assert!(var.is_export());
         assert_eq!(var.name(), Some("VAR".to_string()));
-        assert_eq!(makefile.code(), "export VAR ?= new_value\n");
+        assert_eq!(makefile.to_string(), "export VAR ?= new_value\n");
     }
 
     #[test]
@@ -1967,7 +1977,7 @@ mod tests {
         assert_eq!(var.name(), Some("RENAMED".to_string()));
         assert_eq!(var.assignment_operator(), Some(":=".to_string()));
         assert_eq!(var.raw_value(), Some("value".to_string()));
-        assert_eq!(makefile.code(), "RENAMED := value\n");
+        assert_eq!(makefile.to_string(), "RENAMED := value\n");
     }
 
     #[test]
@@ -1977,7 +1987,7 @@ mod tests {
         var.set_name("BAR");
         assert!(var.is_export());
         assert_eq!(var.name(), Some("BAR".to_string()));
-        assert_eq!(makefile.code(), "export BAR = nocheck\n");
+        assert_eq!(makefile.to_string(), "export BAR = nocheck\n");
     }
 
     #[test]
@@ -1986,7 +1996,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("BAZ");
         assert!(var.is_override());
-        assert_eq!(makefile.code(), "override  BAZ  :=  bar\n");
+        assert_eq!(makefile.to_string(), "override  BAZ  :=  bar\n");
     }
 
     #[test]
@@ -1998,7 +2008,7 @@ mod tests {
         var.set_name("C");
         assert!(var.is_undefine());
         assert_eq!(var.name(), Some("C".to_string()));
-        assert_eq!(makefile.code(), "undefine C # c\n");
+        assert_eq!(makefile.to_string(), "undefine C # c\n");
     }
 
     #[test]
@@ -2006,7 +2016,7 @@ mod tests {
         let makefile: Makefile = "FOO := $(FOO) extra\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("BAR");
-        assert_eq!(makefile.code(), "BAR := $(FOO) extra\n");
+        assert_eq!(makefile.to_string(), "BAR := $(FOO) extra\n");
     }
 
     #[test]
@@ -2225,7 +2235,7 @@ mod tests {
         var.set_assignment_operator("?=");
         assert_eq!(var.assignment_operator(), Some("?=".to_string()));
         assert_eq!(
-            makefile.code(),
+            makefile.to_string(),
             "DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)\n"
         );
     }
@@ -2235,7 +2245,7 @@ mod tests {
         let makefile: Makefile = "VAR = value \n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR = value\n");
     }
 
     #[test]
@@ -2243,7 +2253,7 @@ mod tests {
         let makefile: Makefile = "VAR = value    \n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR = value\n");
     }
 
     #[test]
@@ -2251,7 +2261,7 @@ mod tests {
         let makefile: Makefile = "VAR = value\t\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR = value\n");
     }
 
     #[test]
@@ -2259,7 +2269,7 @@ mod tests {
         let makefile: Makefile = "VAR = value\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(!var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = value\n");
+        assert_eq!(makefile.to_string(), "VAR = value\n");
     }
 
     #[test]
@@ -2269,7 +2279,7 @@ mod tests {
         let makefile: Makefile = "VAR = value # comment\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = value# comment\n");
+        assert_eq!(makefile.to_string(), "VAR = value# comment\n");
     }
 
     #[test]
@@ -2277,7 +2287,7 @@ mod tests {
         let makefile: Makefile = "VAR = foo bar   \n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = foo bar\n");
+        assert_eq!(makefile.to_string(), "VAR = foo bar\n");
     }
 
     #[test]
@@ -2285,7 +2295,7 @@ mod tests {
         let makefile: Makefile = "VAR = $(BAR)  \n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = $(BAR)\n");
+        assert_eq!(makefile.to_string(), "VAR = $(BAR)\n");
     }
 
     #[test]
@@ -2295,7 +2305,7 @@ mod tests {
         let makefile: Makefile = "VAR = \n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(!var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = \n");
+        assert_eq!(makefile.to_string(), "VAR = \n");
     }
 
     #[test]
@@ -2304,7 +2314,7 @@ mod tests {
         let makefile: Makefile = "VAR = foo \\\n\tbar\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(!var.trim_trailing_value_whitespace());
-        assert_eq!(makefile.code(), "VAR = foo \\\n\tbar\n");
+        assert_eq!(makefile.to_string(), "VAR = foo \\\n\tbar\n");
     }
 
     #[test]
@@ -2318,7 +2328,7 @@ mod tests {
         assert_eq!(vars[0].raw_value(), Some("-DX".to_string()));
         let range = vars[0].name_range().unwrap();
         assert_eq!(
-            &makefile.code()[std::ops::Range::from(range)],
+            &makefile.to_string()[std::ops::Range::from(range)],
             "CPPFLAGS.${PROG}"
         );
         assert_eq!(vars[1].name(), Some("DIRS-$(CONFIG_FOO)".to_string()));
@@ -2331,7 +2341,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("COPTS.foo.c");
         assert_eq!(var.name(), Some("COPTS.foo.c".to_string()));
-        assert_eq!(makefile.code(), "COPTS.foo.c+=\t-O0\n");
+        assert_eq!(makefile.to_string(), "COPTS.foo.c+=\t-O0\n");
     }
 
     #[test]
@@ -2339,10 +2349,10 @@ mod tests {
         let makefile: Makefile = "export a\\b = 1\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         let range = var.name_range().unwrap();
-        assert_eq!(&makefile.code()[std::ops::Range::from(range)], "a\\b");
+        assert_eq!(&makefile.to_string()[std::ops::Range::from(range)], "a\\b");
         var.set_name("c");
         assert_eq!(var.name(), Some("c".to_string()));
-        assert_eq!(makefile.code(), "export c = 1\n");
+        assert_eq!(makefile.to_string(), "export c = 1\n");
     }
 
     #[test]
@@ -2350,7 +2360,7 @@ mod tests {
         let makefile: Makefile = "A.${B} = old\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_value("new");
-        assert_eq!(makefile.code(), "A.${B} = new\n");
+        assert_eq!(makefile.to_string(), "A.${B} = new\n");
     }
 
     #[test]
@@ -2372,7 +2382,7 @@ mod tests {
             let makefile: Makefile = text.parse().unwrap();
             let mut var = makefile.variable_definitions().next().unwrap();
             var.set_value(value);
-            assert_eq!(makefile.code(), expected, "{text:?}");
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
             crate::test_util::assert_matches_reparse(&makefile);
         }
     }
@@ -2392,7 +2402,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_assignment_operator("+=");
         assert_eq!(var.name(), Some("a:b".to_string()));
-        assert_eq!(makefile.code(), "a:b+=c\n");
+        assert_eq!(makefile.to_string(), "a:b+=c\n");
     }
 
     #[test]
@@ -2482,7 +2492,7 @@ mod tests {
         let makefile = Makefile::parse_with_variant(code, variant).tree();
         assert_eq!(makefile.to_string(), code);
         let var = makefile.variable_definitions().next().unwrap();
-        var.value(variant)
+        var.value_for(variant)
     }
 
     fn value_of(code: &str) -> Option<String> {
@@ -2583,7 +2593,7 @@ mod tests {
         assert_eq!(
             makefile
                 .variable_definitions()
-                .map(|v| v.value(MakefileVariant::BSDMake))
+                .map(|v| v.value_for(MakefileVariant::BSDMake))
                 .collect::<Vec<_>>(),
             vec![Some("${A:M".to_string()), Some("${L:[#]}".to_string())]
         );
@@ -2644,7 +2654,7 @@ mod tests {
         assert_eq!(
             rule.scoped_assignment()
                 .unwrap()
-                .value(MakefileVariant::GNUMake),
+                .value_for(MakefileVariant::GNUMake),
             Some("a#b c ".to_string())
         );
     }
@@ -2688,7 +2698,7 @@ mod tests {
         let makefile = Makefile::parse_with_variant("X = ${A:M#*} b\n", MakefileVariant::BSDMake);
         let var = makefile.tree().variable_definitions().next().unwrap();
         assert_eq!(
-            var.value(MakefileVariant::BSDMake),
+            var.value_for(MakefileVariant::BSDMake),
             Some("${A:M".to_string())
         );
         assert_eq!(bsd_value("X = ${L:[#]}\n"), Some("${L:[#]}".to_string()));
@@ -2717,8 +2727,14 @@ mod tests {
             let makefile: Makefile = code.parse().unwrap();
             assert_eq!(makefile.to_string(), code);
             let var = makefile.variable_definitions().next().unwrap();
-            assert_eq!(var.value(MakefileVariant::GNUMake), Some(gnu.to_string()));
-            assert_eq!(var.value(MakefileVariant::BSDMake), Some(bsd.to_string()));
+            assert_eq!(
+                var.value_for(MakefileVariant::GNUMake),
+                Some(gnu.to_string())
+            );
+            assert_eq!(
+                var.value_for(MakefileVariant::BSDMake),
+                Some(bsd.to_string())
+            );
         }
         assert_eq!(
             posix_value("X = 'a \\\n    b' '\\#'\n"),
@@ -2832,7 +2848,7 @@ mod tests {
         let vars: Vec<_> = makefile.variable_definitions().collect();
         assert_eq!(
             vars.iter()
-                .map(|v| (v.name(), v.value(MakefileVariant::NMake)))
+                .map(|v| (v.name(), v.value_for(MakefileVariant::NMake)))
                 .collect::<Vec<_>>(),
             vec![
                 (Some("CMDS".to_string()), Some("cls\ndir".to_string())),
@@ -2891,7 +2907,7 @@ mod tests {
                 };
                 assert!(parsed.ok(), "{variant:?} {code:?}: {:?}", parsed.errors());
                 let makefile = parsed.tree();
-                assert_eq!(makefile.code(), code);
+                assert_eq!(makefile.to_string(), code);
                 let vars: Vec<_> = makefile.variable_definitions().collect();
                 assert_eq!(vars.len(), 1, "{variant:?} {code:?}");
                 assert_eq!(
@@ -2912,7 +2928,7 @@ mod tests {
             let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
             assert!(parsed.ok(), "{code:?}: {:?}", parsed.errors());
             let makefile = parsed.tree();
-            assert_eq!(makefile.code(), code);
+            assert_eq!(makefile.to_string(), code);
             let var = makefile.variable_definitions().next().unwrap();
             assert_eq!(var.name(), Some(name.to_string()));
             assert_eq!(var.raw_value(), Some("1".to_string()));
@@ -2933,7 +2949,7 @@ mod tests {
                 let makefile: Makefile = code.parse().unwrap();
                 let mut var = makefile.variable_definitions().next().unwrap();
                 assert!(var.try_set_name(name).is_err(), "{code:?} {name:?}");
-                assert_eq!(makefile.code(), code, "{name:?}");
+                assert_eq!(makefile.to_string(), code, "{name:?}");
             }
         }
     }
@@ -2943,7 +2959,7 @@ mod tests {
         let makefile: Makefile = "foo: X = 1\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("Y").unwrap();
-        assert_eq!(makefile.code(), "foo: Y = 1\n");
+        assert_eq!(makefile.to_string(), "foo: Y = 1\n");
         assert!(var.is_target_specific());
     }
 
@@ -2956,14 +2972,14 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("Y").unwrap();
         assert!(var.try_set_name("A B").is_err());
-        assert_eq!(makefile.code(), "Y = 1\n)foo\nifdef A\n");
+        assert_eq!(makefile.to_string(), "Y = 1\n)foo\nifdef A\n");
 
         let code = "define X\nbody\n";
         let makefile = Makefile::parse(code).tree();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("Y").unwrap();
         assert!(var.try_set_name("A=B").is_err());
-        assert_eq!(makefile.code(), "define Y\nbody\n");
+        assert_eq!(makefile.to_string(), "define Y\nbody\n");
     }
 
     #[test]
@@ -2985,7 +3001,7 @@ mod tests {
             let makefile: Makefile = code.parse().unwrap();
             let mut var = makefile.variable_definitions().next().unwrap();
             var.try_set_name("X").unwrap();
-            assert_eq!(makefile.code(), expected, "{code:?}");
+            assert_eq!(makefile.to_string(), expected, "{code:?}");
         }
     }
 
@@ -3000,7 +3016,10 @@ mod tests {
             .find(|it| it.kind() == COMMENT)
             .unwrap();
         var.try_set_name("$(D)").unwrap();
-        assert_eq!(makefile.code(), "A = 1\nexport $(D) := $(B) # c\nC = 2\n");
+        assert_eq!(
+            makefile.to_string(),
+            "A = 1\nexport $(D) := $(B) # c\nC = 2\n"
+        );
         assert_eq!(var.syntax(), &node);
         assert_eq!(node.parent(), Some(makefile.syntax().clone()));
         assert_eq!(expr.parent(), Some(node.clone()));
@@ -3014,7 +3033,7 @@ mod tests {
         let makefile: Makefile = "X = 1\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("A;B").unwrap();
-        assert_eq!(makefile.code(), "A;B = 1\n");
+        assert_eq!(makefile.to_string(), "A;B = 1\n");
     }
 
     #[test]
@@ -3024,7 +3043,7 @@ mod tests {
             let makefile: Makefile = code.parse().unwrap();
             let mut var = makefile.variable_definitions().next().unwrap();
             assert!(var.try_set_name(name).is_err(), "{name:?}");
-            assert_eq!(makefile.code(), code, "{name:?}");
+            assert_eq!(makefile.to_string(), code, "{name:?}");
         }
     }
 
@@ -3035,7 +3054,7 @@ mod tests {
         var.try_set_name("A B").unwrap();
         assert_eq!(var.name(), Some("A B".to_string()));
         assert!(var.try_set_name("A#B").is_err());
-        assert_eq!(makefile.code(), "undefine A B\n");
+        assert_eq!(makefile.to_string(), "undefine A B\n");
     }
 
     #[test]
@@ -3044,7 +3063,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_name("A.$(B)").unwrap();
         assert_eq!(var.name(), Some("A.$(B)".to_string()));
-        assert_eq!(makefile.code(), "A.$(B) = 1\n");
+        assert_eq!(makefile.to_string(), "A.$(B) = 1\n");
         crate::test_util::assert_matches_reparse(&makefile);
     }
 
@@ -3053,7 +3072,7 @@ mod tests {
         let makefile: Makefile = "x{ = 1\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("y");
-        assert_eq!(makefile.code(), "y = 1\n");
+        assert_eq!(makefile.to_string(), "y = 1\n");
     }
 
     #[allow(deprecated)]
@@ -3097,7 +3116,7 @@ mod tests {
 
     fn name_references(text: &str) -> Vec<(String, Option<String>, std::ops::Range<usize>)> {
         let makefile: Makefile = text.parse().unwrap();
-        assert_eq!(makefile.code(), text);
+        assert_eq!(makefile.to_string(), text);
         makefile
             .variable_references()
             .map(|r| {
@@ -3199,7 +3218,7 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_name("C");
         assert_eq!(var.name(), Some("C".to_string()));
-        assert_eq!(makefile.code(), "define C =\nbody\nendef\n");
+        assert_eq!(makefile.to_string(), "define C =\nbody\nendef\n");
     }
 
     #[test]
@@ -3211,7 +3230,7 @@ mod tests {
         assert_eq!(&code[range], "A \\\nB");
         var.set_name("C");
         assert_eq!(var.name(), Some("C".to_string()));
-        assert_eq!(makefile.code(), "define C\nbody\nendef\n");
+        assert_eq!(makefile.to_string(), "define C\nbody\nendef\n");
     }
 
     #[test]
@@ -3229,7 +3248,7 @@ mod tests {
 
         // Verify the value changed
         assert_eq!(var.raw_value(), Some("new_value".to_string()));
-        assert!(makefile.code().contains("VAR = new_value"));
+        assert!(makefile.to_string().contains("VAR = new_value"));
     }
 
     #[test]
@@ -3247,7 +3266,7 @@ mod tests {
 
         // Verify the value changed but format preserved
         assert_eq!(var.raw_value(), Some("new_value".to_string()));
-        let code = makefile.code();
+        let code = makefile.to_string();
         assert!(code.contains("export"), "Should preserve export prefix");
         assert!(code.contains(":="), "Should preserve := operator");
         assert!(code.contains("new_value"), "Should have new value");
@@ -3260,7 +3279,7 @@ mod tests {
         var.set_value(value);
         assert_eq!(var.raw_value().as_deref().map(str::trim_end), Some(value));
         crate::test_util::assert_matches_reparse(&makefile);
-        makefile.code()
+        makefile.to_string()
     }
 
     #[test]
@@ -3294,11 +3313,17 @@ mod tests {
         let mut var = makefile.variable_definitions().next().unwrap();
         var.set_value(value);
         crate::test_util::assert_matches_reparse(&makefile);
-        assert_eq!(var.value(MakefileVariant::GNUMake).as_deref(), Some(value));
+        assert_eq!(
+            var.value_for(MakefileVariant::GNUMake).as_deref(),
+            Some(value)
+        );
         if bsd {
-            assert_eq!(var.value(MakefileVariant::BSDMake).as_deref(), Some(value));
+            assert_eq!(
+                var.value_for(MakefileVariant::BSDMake).as_deref(),
+                Some(value)
+            );
         }
-        makefile.code()
+        makefile.to_string()
     }
 
     #[test]
@@ -3320,7 +3345,7 @@ mod tests {
             .unwrap()
             .set_value("a#b");
         crate::test_util::assert_matches_reparse(&makefile);
-        assert_eq!(makefile.code(), "X = a\\#b # c\n");
+        assert_eq!(makefile.to_string(), "X = a\\#b # c\n");
         assert_eq!(
             set_value_escaped("export X\n", "a#b", true),
             "export X = a\\#b\n"
@@ -3338,17 +3363,17 @@ mod tests {
         let makefile = Makefile::parse_with_variant(text, variant).tree();
         let mut var = makefile.variable_definitions().next().unwrap();
         if let Err(e) = var.try_set_value_for(value, variant) {
-            assert_eq!(makefile.code(), text);
+            assert_eq!(makefile.to_string(), text);
             return Err(e);
         }
-        let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+        let reparsed = Makefile::parse_with_variant(&makefile.to_string(), variant);
         assert_eq!(reparsed.errors(), &[]);
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.tree().syntax())
         );
-        assert_eq!(var.value(variant).as_deref(), Some(value));
-        Ok(makefile.code())
+        assert_eq!(var.value_for(variant).as_deref(), Some(value));
+        Ok(makefile.to_string())
     }
 
     #[test]
@@ -3437,7 +3462,7 @@ mod tests {
                     format!("Cannot write {value:?} as a variable value")
                 )
             );
-            assert_eq!(makefile.code(), "X = old\n");
+            assert_eq!(makefile.to_string(), "X = old\n");
         }
     }
 
@@ -3464,7 +3489,7 @@ mod tests {
             var.set_value("new");
             assert!(var.add_endef().unwrap());
             crate::test_util::assert_matches_reparse(&makefile);
-            assert_eq!(makefile.code(), expected);
+            assert_eq!(makefile.to_string(), expected);
             assert_eq!(var.raw_value().as_deref(), Some("new\n"));
         }
     }
@@ -3492,7 +3517,7 @@ mod tests {
                     format!("{text:?} has no value to set")
                 )
             );
-            assert_eq!(makefile.code(), text);
+            assert_eq!(makefile.to_string(), text);
         }
     }
 
@@ -3505,7 +3530,7 @@ mod tests {
             let mut var = makefile.variable_definitions().next().unwrap();
             var.set_value(value);
             crate::test_util::assert_matches_reparse(&makefile);
-            makefile.code()
+            makefile.to_string()
         }
         assert_eq!(
             set_value_continued("export X \\\n", "new"),
@@ -3832,7 +3857,7 @@ mod tests {
             assert!(var.has_endef());
             crate::test_util::assert_matches_reparse(&makefile);
         }
-        (result, makefile.code())
+        (result, makefile.to_string())
     }
 
     #[test]
@@ -3921,7 +3946,7 @@ mod tests {
         let (makefile, _) = Makefile::from_str_relaxed("ifdef X\ndefine A\nx\nendif\n");
         let mut var = makefile.variable_definitions().next().unwrap();
         assert!(var.add_endef().unwrap());
-        assert_eq!(makefile.code(), "ifdef X\ndefine A\nx\nendif\nendef\n");
+        assert_eq!(makefile.to_string(), "ifdef X\ndefine A\nx\nendif\nendef\n");
     }
 
     #[test]
@@ -3978,7 +4003,7 @@ mod tests {
         let reference = expr.children().next().unwrap();
         let space = expr.last_token().unwrap();
         var.try_set_value("z  $(B)  c").unwrap();
-        assert_eq!(makefile.code(), "X  =  z  $(B)  c   # c\nY = 1\n");
+        assert_eq!(makefile.to_string(), "X  =  z  $(B)  c   # c\nY = 1\n");
         assert_eq!(var.value_expr(), Some(expr.clone()));
         assert_eq!(reference.parent(), Some(expr.clone()));
         assert_eq!(space.parent(), Some(expr));
@@ -3992,7 +4017,7 @@ mod tests {
         let body = var.value_expr().unwrap();
         let first = body.first_token().unwrap();
         var.try_set_value("  a\nc\n").unwrap();
-        assert_eq!(makefile.code(), "define X\n  a\nc\nendef\n");
+        assert_eq!(makefile.to_string(), "define X\n  a\nc\nendef\n");
         assert_eq!(var.value_expr(), Some(body.clone()));
         assert!(first.parent_ancestors().any(|n| n == body));
         crate::test_util::assert_matches_reparse(&makefile);
@@ -4005,8 +4030,8 @@ mod tests {
         let makefile = parsed.tree();
         let mut var = makefile.variable_definitions().next().unwrap();
         var.try_set_value("b").unwrap();
-        assert_eq!(makefile.code(), "X = b  # c\nifdef Y\nZ = 1\n");
-        let reparsed = Makefile::parse(&makefile.code()).tree();
+        assert_eq!(makefile.to_string(), "X = b  # c\nifdef Y\nZ = 1\n");
+        let reparsed = Makefile::parse(&makefile.to_string()).tree();
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.syntax())
@@ -4022,7 +4047,10 @@ mod tests {
         let other = makefile.variable_definitions().next().unwrap();
         let value = var.value_expr().unwrap();
         var.try_set_name("C").unwrap();
-        assert_eq!(makefile.code(), "export  C\t:=  x \\\n  y # c\nZ = 1\n");
+        assert_eq!(
+            makefile.to_string(),
+            "export  C\t:=  x \\\n  y # c\nZ = 1\n"
+        );
         assert_eq!(other.name(), Some("C".to_string()));
         assert_eq!(var.syntax(), other.syntax());
         assert_eq!(value.parent().as_ref(), Some(var.syntax()));
@@ -4036,7 +4064,7 @@ mod tests {
         let other = makefile.variable_definitions().next().unwrap();
         let value = var.value_expr().unwrap();
         var.try_set_assignment_operator("+=").unwrap();
-        assert_eq!(makefile.code(), "override  X\t+=  x \\\n  y # c\n");
+        assert_eq!(makefile.to_string(), "override  X\t+=  x \\\n  y # c\n");
         assert_eq!(other.assignment_operator(), Some("+=".to_string()));
         assert_eq!(var.syntax(), other.syntax());
         assert_eq!(value.parent().as_ref(), Some(var.syntax()));

@@ -310,7 +310,7 @@ VAR = value
         .0;
 
     // Should parse without crashing
-    assert!(makefile.code().contains("ifdef DEBUG"));
+    assert!(makefile.to_string().contains("ifdef DEBUG"));
 }
 
 #[test]
@@ -329,7 +329,7 @@ endif
         .0;
 
     // Should parse without crashing, though it's malformed
-    assert!(makefile.code().contains("ifdef DEBUG"));
+    assert!(makefile.to_string().contains("ifdef DEBUG"));
 }
 
 #[test]

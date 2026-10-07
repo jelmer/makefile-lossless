@@ -709,7 +709,7 @@ impl Recipe {
     /// let rule = makefile.rules().next().unwrap();
     /// let mut recipe = rule.recipe_nodes().next().unwrap();
     /// recipe.set_prefix_for("-2 !", MakefileVariant::NMake);
-    /// assert_eq!(makefile.code(), "all:\n\t-2 !echo hello\n");
+    /// assert_eq!(makefile.to_string(), "all:\n\t-2 !echo hello\n");
     /// ```
     pub fn set_prefix_for(&mut self, prefix: &str, variant: crate::MakefileVariant) {
         self.try_set_prefix_for(prefix, variant)
@@ -736,7 +736,7 @@ impl Recipe {
     /// assert!(recipe.try_set_prefix_for("+", MakefileVariant::NMake).is_err());
     /// assert!(recipe.try_set_prefix_for("-1", MakefileVariant::NMake).is_err());
     /// recipe.try_set_prefix_for("-1 ", MakefileVariant::NMake).unwrap();
-    /// assert_eq!(makefile.code(), "all:\n\t-1 echo hello\n");
+    /// assert_eq!(makefile.to_string(), "all:\n\t-1 echo hello\n");
     /// ```
     pub fn try_set_prefix_for(
         &mut self,
@@ -1369,7 +1369,7 @@ mod tests {
             let mut item = makefile.items().last().unwrap();
             item.insert_after(crate::MakefileItem::Rule(rule.clone()))
                 .unwrap();
-            assert_eq!(makefile.code(), format!("{text}{code}"));
+            assert_eq!(makefile.to_string(), format!("{text}{code}"));
             let inserted = makefile.rules().next().unwrap();
             assert_eq!(
                 inserted.recipe_nodes().next().unwrap().shell_text(),
@@ -1419,7 +1419,7 @@ mod tests {
             let mut item = makefile.items().last().unwrap();
             item.insert_after(crate::MakefileItem::Rule(rule.clone()))
                 .unwrap();
-            assert_eq!(makefile.code(), format!("{text}{code}"), "{source:?}");
+            assert_eq!(makefile.to_string(), format!("{text}{code}"), "{source:?}");
             let inserted = makefile.rules().next().unwrap();
             assert_eq!(
                 inserted.recipe_nodes().next().unwrap().shell_text(),
@@ -1881,16 +1881,16 @@ mod tests {
         let rule = makefile.rules().next().unwrap();
         let mut recipe = rule.recipe_nodes().next().unwrap();
         if let Err(e) = recipe.try_set_prefix_for(prefix, variant) {
-            assert_eq!(makefile.code(), code);
+            assert_eq!(makefile.to_string(), code);
             return Err(e);
         }
-        let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+        let reparsed = Makefile::parse_with_variant(&makefile.to_string(), variant);
         assert_eq!(reparsed.errors(), &[]);
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.tree().syntax())
         );
-        Ok(makefile.code())
+        Ok(makefile.to_string())
     }
 
     #[test]
@@ -2003,7 +2003,7 @@ mod tests {
             let rule = makefile.rules().next().unwrap();
             let mut recipe = rule.recipe_nodes().next().unwrap();
             recipe.try_set_prefix(prefix).unwrap();
-            assert_eq!(makefile.code(), expected, "{code:?}");
+            assert_eq!(makefile.to_string(), expected, "{code:?}");
             crate::test_util::assert_matches_reparse(&makefile);
         }
     }
@@ -2203,7 +2203,7 @@ mod tests {
         let other = rule.recipe_nodes().next().unwrap();
         let tokens = tokens_in(&recipe);
         recipe.try_replace_text("  echo a \\\n\t  c").unwrap();
-        assert_eq!(makefile.code(), "all:\n\t  echo a \\\n\t  c\n");
+        assert_eq!(makefile.to_string(), "all:\n\t  echo a \\\n\t  c\n");
         assert_eq!(other.text(), "  echo a \\\n  c");
         assert_eq!(recipe.syntax(), other.syntax());
         // Only the last line's text changes.
@@ -2223,7 +2223,10 @@ mod tests {
         let mut recipe = rule.recipe_nodes().next().unwrap();
         let tokens = tokens_in(&recipe);
         recipe.set_prefix("-");
-        assert_eq!(makefile.code(), "all:\n\t-$(CC) -o $@ \\\n\t  x.c # c\n");
+        assert_eq!(
+            makefile.to_string(),
+            "all:\n\t-$(CC) -o $@ \\\n\t  x.c # c\n"
+        );
         let replaced: Vec<_> = tokens
             .iter()
             .filter(|(t, node)| !is_kept(&makefile, t, node))
@@ -2239,7 +2242,7 @@ mod tests {
         let mut rule = makefile.rules().next().unwrap();
         let recipe = rule.recipe_nodes().next().unwrap();
         assert!(rule.try_replace_command(0, "echo c").unwrap());
-        assert_eq!(makefile.code(), "all:\n\techo c\n\techo b\n");
+        assert_eq!(makefile.to_string(), "all:\n\techo c\n\techo b\n");
         assert_eq!(recipe.text(), "echo c");
         crate::test_util::assert_matches_reparse(&makefile);
     }
@@ -2252,7 +2255,7 @@ mod tests {
         let tokens = tokens_in(&recipe);
         recipe.try_insert_before("echo y").unwrap();
         assert_eq!(
-            makefile.code(),
+            makefile.to_string(),
             "all: b\n\techo y\n\techo $(X)  # c\nZ = 1\n"
         );
         assert_eq!(recipe.text(), "echo $(X)  # c");
@@ -2312,7 +2315,7 @@ mod tests {
                 .filter_map(|it| it.into_token())
                 .find(|t| t.kind() == COMMENT);
             rule.recipe_nodes().nth(index).unwrap().remove();
-            assert_eq!(makefile.code(), expected, "{text:?}");
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
             crate::test_util::assert_matches_reparse(&makefile);
             // The comment is moved, not rebuilt.
             if let Some(comment) = comment {
@@ -2354,7 +2357,7 @@ mod tests {
             let makefile = parse(text);
             let rule = makefile.rules().next().unwrap();
             rule.recipe_nodes().last().unwrap().remove();
-            assert_eq!(makefile.code(), expected, "{text:?}");
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
             assert_eq!(
                 format!("{:#?}", makefile.syntax()),
                 format!("{:#?}", parse(expected).syntax()),
@@ -2370,7 +2373,7 @@ mod tests {
             .unwrap();
         let mut rule = makefile.rules().next().unwrap();
         rule.clear_commands();
-        assert_eq!(makefile.code(), "a:\n\n# c\nifdef X\nendif\n");
+        assert_eq!(makefile.to_string(), "a:\n\n# c\nifdef X\nendif\n");
         crate::test_util::assert_matches_reparse(&makefile);
     }
 
@@ -2381,7 +2384,7 @@ mod tests {
         let recipe = rule.recipe_nodes().next().unwrap();
         let newline = recipe.syntax().last_token().unwrap();
         recipe.remove();
-        assert_eq!(makefile.code(), "all: b\r\nZ = 1\r\n");
+        assert_eq!(makefile.to_string(), "all: b\r\nZ = 1\r\n");
         assert_eq!(newline.parent().as_ref(), Some(rule.syntax()));
         crate::test_util::assert_matches_reparse(&makefile);
     }
@@ -2402,7 +2405,7 @@ mod tests {
                 .next()
                 .unwrap();
             recipe.set_prefix(prefix);
-            assert_eq!(makefile.code(), expected);
+            assert_eq!(makefile.to_string(), expected);
             crate::test_util::assert_matches_reparse(&makefile);
         }
     }
@@ -2428,7 +2431,7 @@ mod tests {
                 .next()
                 .unwrap();
             recipe.set_prefix("-");
-            assert_eq!(makefile.code(), expected);
+            assert_eq!(makefile.to_string(), expected);
             crate::test_util::assert_matches_reparse(&makefile);
         }
     }
@@ -2444,11 +2447,11 @@ mod tests {
         recipes[0].try_insert_before("echo c").unwrap();
         assert!(rule.try_replace_command(2, "echo d").unwrap());
         assert_eq!(
-            makefile.code(),
+            makefile.to_string(),
             "all:\n\techo c\n\techo a\n\techo d\nifdef X\nY = 1\n"
         );
         assert_eq!(recipes[1].text(), "echo d");
-        let reparsed = Makefile::parse(&makefile.code()).tree();
+        let reparsed = Makefile::parse(&makefile.to_string()).tree();
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.syntax())
