@@ -1783,19 +1783,28 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Advance `tokens` past the rest of a variable reference whose `$`
         /// has just been consumed: `(...)`, `{...}` or the single character
         /// of `$X`. Returns false if the line ends before the reference does.
-        fn skip_variable_reference<'a>(
-            tokens: &mut impl Iterator<Item = &'a (SyntaxKind, String)>,
-        ) -> bool {
-            let close = match tokens.next() {
+        /// Like [`Self::parse_variable_reference`], this takes a `$` inside
+        /// the reference to start a nested one.
+        fn skip_variable_reference<'a, I>(tokens: &mut std::iter::Peekable<I>) -> bool
+        where
+            I: Iterator<Item = &'a (SyntaxKind, String)>,
+        {
+            let close = match tokens.peek() {
                 Some((LPAREN, _)) => RPAREN,
                 Some((LBRACE, _)) => RBRACE,
                 None | Some((NEWLINE, _)) => return false,
-                Some(_) => return true,
+                // A `)` or `}` ends an enclosing reference instead.
+                Some((RPAREN | RBRACE, _)) => return true,
+                Some(_) => {
+                    tokens.next();
+                    return true;
+                }
             };
+            tokens.next();
             let open = if close == RPAREN { LPAREN } else { LBRACE };
             let mut depth = 1;
             let mut backslashes = 0;
-            for (kind, _) in tokens {
+            while let Some((kind, _)) = tokens.next() {
                 if *kind == BACKSLASH {
                     backslashes += 1;
                     continue;
@@ -1806,6 +1815,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     // A line continuation inside a reference doesn't end it.
                     NEWLINE if continued => {}
                     NEWLINE => return false,
+                    DOLLAR if !Self::skip_variable_reference(tokens) => return false,
                     k if k == open => depth += 1,
                     k if k == close => {
                         depth -= 1;
@@ -1816,7 +1826,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     _ => {}
                 }
             }
-            true
+            false
         }
 
         /// Parse `VAR [op] value` after the rule's `:` colon, wrapped in a

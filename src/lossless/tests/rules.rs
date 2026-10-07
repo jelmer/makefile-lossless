@@ -946,3 +946,23 @@ fn test_rule_parse_not_a_single_rule() {
 fn test_rule_parse_tree_without_rule() {
     Rule::parse("X = 1\n").tree();
 }
+
+#[test]
+fn test_static_pattern_colon_inside_unclosed_nested_reference() {
+    // The `${` reference is not closed, so the `)` and `:` are inside it
+    // rather than ending the `$(` reference and starting a target pattern.
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        let code = "x: $(${): y\n";
+        let parsed = parse(code, variant);
+        assert_eq!(parsed.root().to_string(), code);
+        assert_eq!(
+            error_kinds(code, variant),
+            vec![
+                ParseErrorKind::UnclosedReference,
+                ParseErrorKind::UnclosedReference
+            ]
+        );
+        let rule = parsed.root().rules().next().unwrap();
+        assert_eq!(rule.static_pattern(), None);
+    }
+}
