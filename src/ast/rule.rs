@@ -22,9 +22,8 @@ fn name_text(
     tokens: impl IntoIterator<Item = SyntaxToken>,
     syntax: LineSyntax,
 ) -> String {
-    // nmake has no `\#` escape, so a `#` after a backslash starts a comment
-    // there, but the parser does not know that and keeps it in the name.
-    // TODO: Stop at `\#` for nmake once the parser does.
+    // nmake has no `\#` escape, so the nmake parser ends the name at such a
+    // `#`. Keep it as written in a tree parsed for another variant.
     logical_text(root, tokens, syntax, syntax != LineSyntax::NMake)
 }
 

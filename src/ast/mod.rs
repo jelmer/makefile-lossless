@@ -635,7 +635,8 @@ pub(crate) fn logical_text(
     let before_comment = last
         .and_then(|t| t.next_token())
         .is_some_and(|t| t.kind() == COMMENT);
-    if comments && before_comment {
+    // nmake does not take backslashes as escapes before a comment.
+    if comments && before_comment && syntax != LineSyntax::NMake {
         backslashes = halve(backslashes);
     }
     text.push_str(&"\\".repeat(backslashes));
