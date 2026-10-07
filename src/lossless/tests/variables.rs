@@ -746,7 +746,9 @@ LONG_VAR = This is a long variable \
 
     // For now, we'll use relaxed parsing since the backslash handling isn't fully implemented
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse multiline variable");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse multiline variable")
+        .0;
 
     // Check that we can extract the variable even with errors
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -777,8 +779,9 @@ CFLAGS := -Wall -O2 \
 "#;
     // Use relaxed parsing for now
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf)
-        .expect("Failed to parse multiline variable with operators");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse multiline variable with operators")
+        .0;
 
     // Check that we can extract variables even with errors
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -814,7 +817,9 @@ fn test_ambiguous_assignment_vs_rule() {
     const VAR_ASSIGNMENT: &str = "VARIABLE = value\n";
 
     let mut buf = std::io::Cursor::new(VAR_ASSIGNMENT);
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse variable assignment");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse variable assignment")
+        .0;
 
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
     let rules = makefile.rules().collect::<Vec<_>>();
@@ -828,7 +833,9 @@ fn test_ambiguous_assignment_vs_rule() {
     const SIMPLE_RULE: &str = "target: dependency\n";
 
     let mut buf = std::io::Cursor::new(SIMPLE_RULE);
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse simple rule");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse simple rule")
+        .0;
 
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
     let rules = makefile.rules().collect::<Vec<_>>();

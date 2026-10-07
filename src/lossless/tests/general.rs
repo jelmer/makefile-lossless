@@ -68,6 +68,55 @@ fn test_from_reader() {
 }
 
 #[test]
+fn test_from_reader_relaxed() {
+    let (makefile, errors) = Makefile::from_reader_relaxed("a: b\nbad\n".as_bytes()).unwrap();
+    assert_eq!(makefile.to_string(), "a: b\nbad\n");
+    assert_eq!(errors.iter().map(|e| e.line).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
+fn test_from_file() {
+    let path = std::env::temp_dir().join(format!(
+        "makefile-lossless-test-from-file-{}.mk",
+        std::process::id()
+    ));
+    std::fs::write(&path, "a: b\n").unwrap();
+    let valid = Makefile::from_file(&path);
+    std::fs::write(&path, "a: b\nbad\n").unwrap();
+    let invalid = Makefile::from_file(&path);
+    let relaxed = Makefile::from_file_relaxed(&path);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(valid.unwrap().to_string(), "a: b\n");
+    assert!(matches!(invalid, Err(Error::Parse(_))));
+    let (makefile, errors) = relaxed.unwrap();
+    assert_eq!(makefile.to_string(), "a: b\nbad\n");
+    assert_eq!(errors.iter().map(|e| e.line).collect::<Vec<_>>(), vec![2]);
+
+    let missing = std::env::temp_dir().join("makefile-lossless-nonexistent/Makefile");
+    assert!(matches!(
+        Makefile::from_file(&missing),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        Makefile::from_file_relaxed(missing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_deprecated_read() {
+    let makefile = Makefile::read("a: b\n".as_bytes()).unwrap();
+    assert_eq!(makefile.to_string(), "a: b\n");
+    assert!(matches!(
+        Makefile::read("a: b\nbad\n".as_bytes()),
+        Err(Error::Parse(_))
+    ));
+    let makefile = Makefile::read_relaxed("a: b\nbad\n".as_bytes()).unwrap();
+    assert_eq!(makefile.to_string(), "a: b\nbad\n");
+}
+
+#[test]
 fn test_parse_with_tab_after_last_newline() {
     let makefile = Makefile::from_reader("rule: dependency\n\tcommand\n\t".as_bytes()).unwrap();
     assert_eq!(makefile.rules().count(), 1);
@@ -145,7 +194,9 @@ export PATH := /usr/bin:/bin
 "#;
     // Use relaxed parsing to allow for special directives
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse special directives");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse special directives")
+        .0;
 
     // Check that we can extract rules even with errors
     let rules = makefile.rules().collect::<Vec<_>>();

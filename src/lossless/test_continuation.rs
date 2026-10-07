@@ -10,7 +10,9 @@ fn test_recipe_continuation_lines() {
 	dh_autoreconf
 "#;
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
 
     let recipes: Vec<_> = rule.recipe_nodes().collect();
@@ -31,7 +33,9 @@ fn test_recipe_continuation_lines() {
 fn test_simple_continuation() {
     let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
     let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -44,7 +48,9 @@ fn test_multiple_continuations() {
     let makefile_content =
         "test:\n\techo line1 && \\\n\t  echo line2 && \\\n\t  echo line3 && \\\n\t  echo line4\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
     let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -59,7 +65,9 @@ fn test_multiple_continuations() {
 fn test_continuation_round_trip() {
     let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let output = makefile.to_string();
 
     // Should preserve the exact content
@@ -70,7 +78,9 @@ fn test_continuation_round_trip() {
 fn test_continuation_with_silent_prefix() {
     let makefile_content = "test:\n\t@echo hello && \\\n\t  echo world\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
     let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -88,7 +98,9 @@ fn test_mixed_continued_and_non_continued() {
 	echo fourth
 "#;
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
     let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -102,7 +114,9 @@ fn test_mixed_continued_and_non_continued() {
 fn test_continuation_replace_command() {
     let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let mut rule = makefile.rules().next().unwrap();
 
     // Replace the multi-line command
@@ -118,7 +132,9 @@ fn test_continuation_replace_command() {
 fn test_continuation_count() {
     let makefile_content = "test:\n\techo hello && \\\n\t  echo world\n\techo done\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
 
     // Even though there are 3 physical lines, there should be 2 logical recipe nodes
@@ -138,7 +154,9 @@ fn test_backslash_in_middle_of_line() {
     // Backslash not at end should not trigger continuation
     let makefile_content = "test:\n\techo hello\\nworld\n\techo done\n";
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
     let recipes: Vec<_> = rule.recipe_nodes().collect();
 
@@ -158,7 +176,9 @@ fn test_shell_for_loop_with_continuation() {
 	done
 "#;
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let rule = makefile.rules().next().unwrap();
 
     // Should have exactly 1 recipe node containing the entire for loop
@@ -186,7 +206,9 @@ fn test_shell_for_loop_remove_command() {
 	echo "Done with man pages"
 "#;
 
-    let makefile = Makefile::read_relaxed(makefile_content.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_content.as_bytes())
+        .unwrap()
+        .0;
     let mut rule = makefile.rules().next().unwrap();
 
     // Should have 2 recipe nodes: the for loop and the echo
