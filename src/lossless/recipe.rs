@@ -448,8 +448,10 @@ impl Recipe {
     /// The prefix can contain `@` (silent), `-` (ignore errors), and/or `+` (always execute).
     /// Pass an empty string to remove all prefixes.
     ///
-    /// Panics if the prefix contains a newline, as [`Recipe::replace_text`]
-    /// does.
+    /// # Panics
+    ///
+    /// Panics if `prefix` contains any other character. Use
+    /// [`Recipe::try_set_prefix`] to get an error instead.
     ///
     /// # Example
     /// ```
@@ -463,15 +465,108 @@ impl Recipe {
     /// assert!(recipe.is_silent());
     /// ```
     pub fn set_prefix(&mut self, prefix: &str) {
-        let text = self.replacement_text();
+        self.try_set_prefix(prefix)
+            .unwrap_or_else(|e| panic!("invalid recipe prefix: {e}"))
+    }
 
-        // Strip existing prefix characters
-        let stripped = text.trim_start_matches(['@', '-', '+']);
-
-        // Build new text with the new prefix
-        let new_text = format!("{}{}", prefix, stripped);
-
-        self.replace_text(&new_text);
+    /// Set the command prefix for this recipe, like [`Recipe::set_prefix`]
+    ///
+    /// Returns an error, leaving the recipe unchanged, if `prefix` contains
+    /// anything other than `@`, `-` and `+`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let mut makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// assert!(recipe.try_set_prefix("x").is_err());
+    /// recipe.try_set_prefix("-@").unwrap();
+    /// assert_eq!(recipe.text(), "-@echo hello");
+    /// ```
+    pub fn try_set_prefix(&mut self, prefix: &str) -> Result<(), Error> {
+        // TODO: support nmake's command modifiers `!` and `-NUMBER` (which
+        // must be followed by a space or tab), which may also be separated
+        // by spaces or tabs, and reject `+`, which nmake lacks. This needs
+        // the variant, which the tree does not record.
+        if !prefix.chars().all(|c| matches!(c, '@' | '-' | '+')) {
+            return Err(Error::Parse(ParseError {
+                errors: vec![ErrorInfo {
+                    kind: crate::ParseErrorKind::Other,
+                    message: format!("{prefix:?} is not a recipe prefix"),
+                    line: 1,
+                    context: "set_prefix".to_string(),
+                }],
+            }));
+        }
+        const PREFIX_CHARS: [char; 3] = ['@', '-', '+'];
+        let node = self.syntax();
+        let skip = if self.is_inline() {
+            self.inline_prefix().len()
+        } else {
+            usize::from(self.starts_with_indent())
+        };
+        // The tokens with just prefix characters at the start of the
+        // command, and the token after them, if it is text.
+        let mut prefix_tokens = vec![];
+        let mut first_text = None;
+        let mut insert_at = node.children_with_tokens().count();
+        for element in node.children_with_tokens().skip(skip) {
+            let Some(token) = element
+                .as_token()
+                .filter(|t| matches!(t.kind(), TEXT | COMMENT))
+            else {
+                insert_at = element.index();
+                break;
+            };
+            if token.text().trim_start_matches(PREFIX_CHARS).is_empty() {
+                prefix_tokens.push(token.clone());
+            } else {
+                first_text = Some(token.clone());
+                break;
+            }
+        }
+        // TODO: splice them out once rowan's splice_children removes more
+        // than the first child of the range, as it does from 0.17 on.
+        // A recipe line starting with `#` is a comment, and one starting
+        // with a prefix character is text.
+        let replace = |token: &SyntaxToken, text: &str| {
+            let index = token.index();
+            token.detach();
+            if !text.is_empty() {
+                let kind = if text.starts_with('#') { COMMENT } else { TEXT };
+                node.splice_children(index..index, detached_elements(&[(kind, text)], None));
+            }
+        };
+        match (first_text, prefix_tokens.split_first()) {
+            (Some(token), _) => {
+                for old in &prefix_tokens {
+                    old.detach();
+                }
+                let rest = token.text().trim_start_matches(PREFIX_CHARS);
+                let text = format!("{prefix}{rest}");
+                if text != token.text() {
+                    replace(&token, &text);
+                }
+            }
+            (None, Some((first, others))) => {
+                for old in others {
+                    old.detach();
+                }
+                if first.text() != prefix {
+                    replace(first, prefix);
+                }
+            }
+            (None, None) if !prefix.is_empty() => {
+                node.splice_children(
+                    insert_at..insert_at,
+                    detached_elements(&[(TEXT, prefix)], None),
+                );
+            }
+            (None, None) => {}
+        }
+        Ok(())
     }
 
     /// Replace the text content of this recipe line
@@ -568,38 +663,6 @@ impl Recipe {
                 .collect(),
         );
         Ok(())
-    }
-
-    /// The text of this recipe line as [`Recipe::try_replace_text`] takes
-    /// it: without the indentation or `;` before it and its line ending,
-    /// and with the recipe prefix that starts continuation lines written as
-    /// a tab.
-    fn replacement_text(&self) -> String {
-        let node = self.syntax();
-        let inline_prefix = self.inline_prefix();
-        let mut children: Vec<_> = node.children_with_tokens().collect();
-        if children.last().is_some_and(|c| c.kind() == NEWLINE) {
-            children.pop();
-        }
-        let skip = if !inline_prefix.is_empty() {
-            inline_prefix.len()
-        } else {
-            usize::from(self.starts_with_indent())
-        };
-        // try_replace_text writes the prefix of the first line on
-        // continuation lines in place of a tab.
-        let prefix = Some(self.recipe_prefix()).filter(|p| skip == 1 && *p != '\t');
-        children
-            .into_iter()
-            .skip(skip)
-            .map(|child| {
-                let text = child.to_string();
-                match prefix.and_then(|p| text.strip_prefix(p)) {
-                    Some(rest) if child.kind() == INDENT => format!("\t{rest}"),
-                    _ => text,
-                }
-            })
-            .collect()
     }
 
     /// Insert a new recipe line before this one
@@ -1305,6 +1368,87 @@ mod tests {
     }
 
     #[test]
+    fn test_recipe_try_set_prefix_rejects_invalid() {
+        let makefile: Makefile = "all:\n\t@echo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+
+        for prefix in ["x", "@x", " ", "@ ", "\n", "!", "\\"] {
+            assert!(recipe.try_set_prefix(prefix).is_err(), "{prefix:?}");
+            assert_eq!(recipe.text(), "@echo hello");
+        }
+        recipe.try_set_prefix("+-@").unwrap();
+        assert_eq!(recipe.text(), "+-@echo hello");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid recipe prefix")]
+    fn test_recipe_set_prefix_panics_on_invalid() {
+        let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        recipe.set_prefix("x");
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_unusual_formatting() {
+        let cases = [
+            ("all:\n\t@-echo  hi\t# c\n", "+", "all:\n\t+echo  hi\t# c\n"),
+            (
+                "all:\n\techo a \\\n\t  b # c\n",
+                "@",
+                "all:\n\t@echo a \\\n\t  b # c\n",
+            ),
+            ("all:\n\t@$(X) y\n", "-", "all:\n\t-$(X) y\n"),
+            ("all:\n\t$(X) y\n", "@", "all:\n\t@$(X) y\n"),
+            ("all:\n\t+$(X) y\n", "", "all:\n\t$(X) y\n"),
+            ("all:\n\t@\n", "-", "all:\n\t-\n"),
+            ("all:\n\t@\n", "", "all:\n\t\n"),
+            ("all:  ;\t@echo x # c\n", "-@", "all:  ;\t-@echo x # c\n"),
+            ("all: ;echo x\n", "@", "all: ;@echo x\n"),
+            (
+                ".RECIPEPREFIX = >\nall:\n>@echo x\n",
+                "-",
+                ".RECIPEPREFIX = >\nall:\n>-echo x\n",
+            ),
+        ];
+        for (code, prefix, expected) in cases {
+            let makefile: Makefile = code.parse().unwrap();
+            let rule = makefile.rules().next().unwrap();
+            let mut recipe = rule.recipe_nodes().next().unwrap();
+            let text = recipe.text();
+            recipe.try_set_prefix(prefix).unwrap();
+            assert_eq!(makefile.to_string(), expected, "{code:?}");
+            assert_eq!(
+                recipe.text(),
+                format!("{prefix}{}", text.trim_start_matches(['@', '-', '+'])),
+                "{code:?}"
+            );
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_keeps_other_tokens() {
+        let makefile: Makefile = "all:\n\t@echo $(X) # c\n".parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        let node = recipe.syntax().clone();
+        let children: Vec<_> = node.children_with_tokens().collect();
+        recipe.set_prefix("-");
+        assert_eq!(makefile.to_string(), "all:\n\t-echo $(X) # c\n");
+        assert_eq!(recipe.syntax(), &node);
+        assert_eq!(node.parent(), Some(rule.syntax().clone()));
+        let after: Vec<_> = node.children_with_tokens().collect();
+        assert_eq!(after.len(), children.len());
+        for (i, (before, after)) in children.iter().zip(&after).enumerate() {
+            if i != 1 {
+                assert_eq!(before, after);
+            }
+        }
+    }
+
+    #[test]
     fn test_recipe_replace_text_basic() {
         let makefile: Makefile = "all:\n\techo hello\n".parse().unwrap();
         let rule = makefile.rules().next().unwrap();
@@ -1452,6 +1596,27 @@ mod tests {
         assert_eq!(makefile.code(), "all: b\r\nZ = 1\r\n");
         assert_eq!(newline.parent().as_ref(), Some(rule.syntax()));
         crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_prefix_comment_line() {
+        for (text, prefix, expected) in [
+            ("all:\n\t-# note\n", "", "all:\n\t# note\n"),
+            ("all:\n\t@-# note\n", "", "all:\n\t# note\n"),
+            ("all:\n\t-# note\n", "@", "all:\n\t@# note\n"),
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut recipe = makefile
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            recipe.set_prefix(prefix);
+            assert_eq!(makefile.code(), expected);
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]
