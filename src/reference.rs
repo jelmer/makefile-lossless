@@ -754,6 +754,7 @@ fn reference_prefix(
 /// does not.
 ///
 /// Returns `None` if the expression is malformed.
+#[cfg(test)]
 pub(crate) fn bsd_expr_extent(text: &str) -> Option<(usize, Vec<Range<usize>>)> {
     bsd_expr_extent_at(&UnescapedHash::new(text), 0)
 }
@@ -858,19 +859,26 @@ impl UnescapedHash {
     }
 
     fn map_error(&self, error: ReferenceError) -> ReferenceError {
-        match error {
+        error.map_offset(|offset| self.original_offset(offset))
+    }
+}
+
+impl ReferenceError {
+    /// Replace the offset of the error, if it has one, with `f(offset)`.
+    pub(crate) fn map_offset(self, f: impl FnOnce(usize) -> usize) -> Self {
+        match self {
             ReferenceError::Syntax {
                 offset,
                 kind,
                 message,
             } => ReferenceError::Syntax {
-                offset: self.original_offset(offset),
+                offset: f(offset),
                 kind,
                 message,
             },
             ReferenceError::UnknownModifier { offset, modifier } => {
                 ReferenceError::UnknownModifier {
-                    offset: self.original_offset(offset),
+                    offset: f(offset),
                     modifier,
                 }
             }
@@ -879,7 +887,7 @@ impl UnescapedHash {
     }
 }
 
-fn syntax_error(
+pub(crate) fn syntax_error(
     offset: usize,
     kind: ReferenceSyntaxErrorKind,
     message: impl Into<String>,

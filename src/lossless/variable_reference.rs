@@ -417,10 +417,17 @@ impl VariableReference {
     /// Parse this reference into the variable name and its modifiers.
     ///
     /// The variant determines which modifiers are recognized; see
-    /// [`crate::ParsedReference::parse`]. For BSD make, parse the makefile
-    /// with [`crate::MakefileVariant::BSDMake`] as well: otherwise the
-    /// reference may end at the wrong place, as described for
-    /// [`Makefile::parse`].
+    /// [`crate::ParsedReference::parse`]. Error offsets are relative to the
+    /// start of the reference.
+    ///
+    /// For [`crate::MakefileVariant::BSDMake`], the reference is parsed in
+    /// the context of the rest of its logical line, as the makefile parser
+    /// does: make only treats a modifier as a SysV substitution if a closing
+    /// brace follows, and looks for it past the end of the reference, so
+    /// `${S:a=b{}}` is the reference `${S:a=b{}` followed by `}`. Parse the
+    /// makefile with [`crate::MakefileVariant::BSDMake`] as well: otherwise
+    /// the reference may end at the wrong place, as described for
+    /// [`Makefile::parse`], and this returns an error.
     ///
     /// # Example
     /// ```
@@ -448,7 +455,43 @@ impl VariableReference {
         &self,
         variant: crate::MakefileVariant,
     ) -> Result<crate::ParsedReference, crate::ReferenceError> {
-        crate::ParsedReference::parse(&self.0.text().to_string(), variant)
+        if variant != crate::MakefileVariant::BSDMake {
+            return crate::ParsedReference::parse(&self.0.text().to_string(), variant);
+        }
+        let tokens = std::iter::successors(self.0.first_token(), |t| t.next_token())
+            .map(|t| (t.kind(), t.text().to_string(), t.text_range()));
+        let (line, starts, _) = super::parser::bsd_logical_line(tokens, false);
+        let start = self.0.text_range().start();
+        let end = self.0.text_range().end();
+        let len = starts
+            .iter()
+            .find(|(pos, _)| *pos == end)
+            .map_or(line.len(), |(_, offset)| *offset);
+        // The offset relative to the start of the reference in the source
+        // corresponding to `offset` in `line`.
+        let source_offset = |offset: usize| {
+            let i = starts
+                .partition_point(|(_, o)| *o <= offset)
+                .saturating_sub(1);
+            starts
+                .get(i)
+                .map_or(offset, |(pos, o)| usize::from(*pos - start) + (offset - o))
+        };
+        let (parsed, parsed_len) = crate::ParsedReference::parse_prefix(&line, variant)
+            .map_err(|e| e.map_offset(source_offset))?;
+        match parsed_len.cmp(&len) {
+            std::cmp::Ordering::Equal => Ok(parsed),
+            std::cmp::Ordering::Less => Err(crate::reference::syntax_error(
+                source_offset(parsed_len),
+                crate::ReferenceSyntaxErrorKind::TrailingText,
+                "unexpected text after reference",
+            )),
+            std::cmp::Ordering::Greater => Err(crate::reference::syntax_error(
+                usize::from(end - start),
+                crate::ReferenceSyntaxErrorKind::UnclosedExpression,
+                "reference continues past the end of the syntax node",
+            )),
+        }
     }
 
     /// Get the line number (0-indexed) where this reference starts.
