@@ -4,6 +4,7 @@ repository = "https://github.com/jelmer/makefile-lossless"
 description = "Lossless Parser for Makefiles"
 version = "0.4.1"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 readme = "README.md"
 authors = [ "Jelmer Vernooij <jelmer@jelmer.uk>",]
@@ -11,7 +12,6 @@ documentation = "https://docs.rs/makefile-lossless"
 homepage = "https://github.com/jelmer/makefile-lossless"
 
 [dependencies]
-log = "0.4"
 rowan = "^0.16"
 
 [dev-dependencies]
