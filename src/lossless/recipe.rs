@@ -1,21 +1,43 @@
 use super::*;
 use crate::ast::{
     detach_elements, line_ending, recipe_prefix_before, replace_children, replace_range,
-    replace_recipe_prefix, terminate_line_before,
+    terminate_line_before,
 };
 use rowan::{GreenNode, GreenToken};
 
 type GreenElement = rowan::NodeOrToken<GreenNode, GreenToken>;
 
-/// The elements of a recipe line holding the command `line`, between its
-/// indentation and its line ending, as the parser reads them.
+/// The RECIPE node holding the command `line` as the parser reads it
+/// where the recipe prefix is `prefix`: after `;` on the rule line if
+/// `inline`, and otherwise on a line of its own.
 ///
 /// Returns an error if `line` can not be written as a single recipe line:
 /// if it contains a newline outside of a line continuation, or ends in a
-/// line continuation that would join it with the next line.
-fn recipe_line_content(line: &str, context: &str) -> Result<Vec<GreenElement>, Error> {
-    let parsed = parse(&format!("x:\n\t{line}\n\tz\n"), None);
-    let mut rules = parsed.root().syntax().children();
+/// line continuation that would join it with the next line. Other parse
+/// errors in it are left for the caller to check, and `true` returned with
+/// the node if there are any.
+fn parse_recipe_line(
+    line: &str,
+    prefix: char,
+    inline: bool,
+    context: &str,
+) -> Result<(SyntaxNode, bool), Error> {
+    let header = if prefix == '\t' {
+        String::new()
+    } else {
+        format!("define .RECIPEPREFIX\n{prefix}\nendef\n")
+    };
+    let start = if inline {
+        String::from(": ;")
+    } else {
+        format!(":\n{prefix}")
+    };
+    let parsed = parse(&format!("{header}x{start}{line}\n{prefix}z\n"), None);
+    let mut rules = parsed
+        .root()
+        .syntax()
+        .children()
+        .filter(|n| n.kind() != VARIABLE);
     let recipes: Vec<_> = rules
         .next()
         .filter(|rule| rule.kind() == RULE && rules.next().is_none())
@@ -25,11 +47,88 @@ fn recipe_line_content(line: &str, context: &str) -> Result<Vec<GreenElement>, E
     let [recipe, last] = recipes.as_slice() else {
         return Err(recipe_line_error(line, context));
     };
-    if !parsed.errors.is_empty()
-        || recipe.text() != format!("\t{line}\n").as_str()
-        || last.text() != "\tz\n"
+    let first = if inline { ";" } else { &start[2..] };
+    if recipe.text() != format!("{first}{line}\n").as_str()
+        || last.text() != format!("{prefix}z\n").as_str()
     {
         return Err(recipe_line_error(line, context));
+    }
+    Ok((recipe.clone(), !parsed.errors.is_empty()))
+}
+
+/// The text of `recipe`, a recipe on a line of its own whose lines start
+/// with the recipe prefix `old`, without the prefix of its first line and
+/// its final line ending, written for the recipe prefix `new` so that make
+/// reads the same command: the prefix of each continuation line becomes
+/// `new`, and one that starts with `new` without the prefix gets another
+/// `new`, for make to strip. Line breaks inside references are left alone,
+/// since make keeps the recipe prefix there and takes a tab as whitespace.
+fn text_for_prefix(recipe: &SyntaxNode, old: char, new: char) -> String {
+    let mut text = String::new();
+    let mut line_start = false;
+    for (i, element) in recipe.children_with_tokens().enumerate() {
+        let element_text = element.to_string();
+        match element.kind() {
+            INDENT if i == 0 => {
+                text.push_str(element_text.strip_prefix(old).unwrap_or(&element_text))
+            }
+            INDENT if line_start && element_text.starts_with(old) => {
+                text.push(new);
+                text.push_str(&element_text[old.len_utf8()..]);
+            }
+            _ if line_start && element_text.starts_with(new) => {
+                text.push(new);
+                text.push_str(&element_text);
+            }
+            _ => text.push_str(&element_text),
+        }
+        line_start = element.kind() == NEWLINE;
+    }
+    if let Some(eol) = recipe.last_token().filter(|t| t.kind() == NEWLINE) {
+        text.truncate(text.len() - eol.text().len());
+    }
+    text
+}
+
+/// Rewrite `recipe`, a recipe on a line of its own whose lines start with
+/// the recipe prefix `old`, for the recipe prefix `new`, as described for
+/// [`text_for_prefix`].
+pub(crate) fn change_recipe_prefix(recipe: &SyntaxNode, old: char, new: char) {
+    if old == new {
+        return;
+    }
+    let text = text_for_prefix(recipe, old, new);
+    let (parsed, _) = parse_recipe_line(&text, new, false, "change_recipe_prefix")
+        .expect("a recipe line reads the same with another recipe prefix");
+    let mut children: Vec<GreenElement> = parsed.green().children().map(|c| c.to_owned()).collect();
+    children.pop();
+    if let Some(eol) = recipe.last_token().filter(|t| t.kind() == NEWLINE) {
+        children.push(GreenToken::new(NEWLINE.into(), eol.text()).into());
+    }
+    replace_children(recipe, children);
+}
+
+/// The elements of a recipe line holding the command `line`, between its
+/// indentation or the `;` before it and its line ending, as the parser reads
+/// them where the recipe prefix is `prefix`.
+///
+/// `line` is written as for a tab as the recipe prefix: a tab at the start
+/// of a continuation line is the recipe prefix, which make strips, and any
+/// other text there is part of the command. With another recipe prefix, it
+/// is rewritten as described for [`text_for_prefix`].
+fn recipe_line_content(
+    line: &str,
+    prefix: char,
+    inline: bool,
+    context: &str,
+) -> Result<Vec<GreenElement>, Error> {
+    let (mut recipe, errors) = parse_recipe_line(line, '\t', false, context)?;
+    if errors {
+        return Err(recipe_line_error(line, context));
+    }
+    if prefix != '\t' || inline {
+        let text = text_for_prefix(&recipe, '\t', prefix);
+        (recipe, _) = parse_recipe_line(&text, prefix, inline, context)?;
     }
     let children: Vec<_> = recipe.green().children().map(|c| c.to_owned()).collect();
     Ok(children[1..children.len() - 1].to_vec())
@@ -46,16 +145,20 @@ fn recipe_line_error(line: &str, context: &str) -> Error {
     })
 }
 
-/// A RECIPE node for the command `line`, starting with `prefix` and ending
-/// with the line ending `eol`.
+/// A RECIPE node for the command `line`, starting with `start`, the
+/// indentation or the `;` and whitespace of a recipe on the rule line, and
+/// ending with the line ending `eol`, where the recipe prefix is `prefix`.
+/// See [`recipe_line_content`] for how `line` is written.
 fn build_recipe(
-    prefix: Vec<GreenElement>,
+    start: Vec<GreenElement>,
+    prefix: char,
     line: &str,
     eol: &str,
     context: &str,
 ) -> Result<SyntaxNode, Error> {
-    let mut children = prefix;
-    children.extend(recipe_line_content(line, context)?);
+    let inline = start.first().is_some_and(|it| it.kind() == OPERATOR.into());
+    let mut children = start;
+    children.extend(recipe_line_content(line, prefix, inline, context)?);
     children.push(GreenToken::new(NEWLINE.into(), eol).into());
     Ok(SyntaxNode::new_root_mut(GreenNode::new(
         RECIPE.into(),
@@ -63,21 +166,16 @@ fn build_recipe(
     )))
 }
 
-fn tab() -> Vec<GreenElement> {
-    vec![GreenToken::new(INDENT.into(), "\t").into()]
-}
-
-/// A RECIPE node for the command `line` whose lines start with the recipe
-/// prefix `prefix`, as [`build_recipe`].
+/// A RECIPE node for the command `line` on a line of its own, where the
+/// recipe prefix is `prefix`, as [`build_recipe`].
 pub(crate) fn build_command(
     prefix: char,
     line: &str,
     eol: &str,
     context: &str,
 ) -> Result<SyntaxNode, Error> {
-    let recipe = build_recipe(tab(), line, eol, context)?;
-    replace_recipe_prefix(&recipe, '\t', prefix);
-    Ok(recipe)
+    let indent = vec![GreenToken::new(INDENT.into(), &prefix.to_string()).into()];
+    build_recipe(indent, prefix, line, eol, context)
 }
 
 /// The rest of `text` after the nmake command modifiers at its start: `@`,
@@ -206,7 +304,12 @@ impl Recipe {
                     }
                     // In a recipe after `;` on the rule line, the parser
                     // leaves a prefix other than a tab in the text.
-                    TEXT if after_newline && !nested && !self.starts_with_indent() => {
+                    TEXT | COMMENT
+                        if after_newline
+                            && !nested
+                            && !self.starts_with_indent()
+                            && (t.kind() == TEXT || include_comments) =>
+                    {
                         after_newline = false;
                         let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
                         let text = t.text();
@@ -819,16 +922,8 @@ impl Recipe {
             .last()
             .map_or_else(|| line_ending(node), |t| t.text().to_string());
 
-        let new_syntax = build_recipe(prefix, new_text, &eol, "replace_text")?;
-        // Continuation lines start with the same recipe prefix as the first.
-        let recipe_prefix = new_syntax
-            .first_token()
-            .filter(|t| t.kind() == INDENT)
-            .and_then(|t| t.text().chars().next())
-            .filter(|c| *c != ' ');
-        if let Some(recipe_prefix) = recipe_prefix {
-            replace_recipe_prefix(&new_syntax, '\t', recipe_prefix);
-        }
+        let new_syntax =
+            build_recipe(prefix, self.recipe_prefix(), new_text, &eol, "replace_text")?;
 
         replace_children(
             node,
@@ -1189,6 +1284,117 @@ fn find_reference_end(bytes: &[u8], start: usize, close: u8) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The text of the recipe each edit that takes a command writes,
+    /// after `header`, which may set `.RECIPEPREFIX`.
+    fn edited_commands(header: &str, prefix: char, line: &str) -> Vec<String> {
+        let parse = |text: &str| -> Makefile {
+            format!("{header}{}", text.replace('\t', &prefix.to_string()))
+                .parse()
+                .unwrap()
+        };
+        let mut results = vec![];
+        let mut check = |makefile: &Makefile, recipe: &Recipe| {
+            crate::test_util::assert_matches_reparse(makefile);
+            results.push(recipe.shell_text());
+        };
+
+        let makefile = parse("all:\n\techo x\n");
+        let mut rule = makefile.rules().next().unwrap();
+        rule.try_push_command(line).unwrap();
+        check(&makefile, &rule.recipe_nodes().nth(1).unwrap());
+
+        let makefile = parse("all:\n\techo x\n");
+        let mut rule = makefile.rules().next().unwrap();
+        rule.try_replace_command(0, line).unwrap();
+        check(&makefile, &rule.recipe_nodes().next().unwrap());
+
+        for text in ["all:\n\techo x\n", "all: ; echo x\n"] {
+            let makefile = parse(text);
+            let mut recipe = makefile
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            recipe.try_replace_text(line).unwrap();
+            check(&makefile, &recipe);
+        }
+
+        let makefile = parse("all:\n\techo x\n");
+        let recipe = makefile
+            .rules()
+            .next()
+            .unwrap()
+            .recipe_nodes()
+            .next()
+            .unwrap();
+        recipe.try_insert_before(line).unwrap();
+        recipe.try_insert_after(line).unwrap();
+        let recipes: Vec<_> = makefile.rules().next().unwrap().recipe_nodes().collect();
+        check(&makefile, &recipes[0]);
+        check(&makefile, &recipes[2]);
+        results
+    }
+
+    #[test]
+    fn test_insert_rule_custom_recipe_prefix() {
+        let source: Makefile = "all:\n\techo a \\\n b \\\n\tc \\\n>d\n".parse().unwrap();
+        let rule = source.rules().next().unwrap();
+        let expected = rule.recipe_nodes().next().unwrap().shell_text();
+        for (text, code) in [
+            (
+                "define .RECIPEPREFIX\n \nendef\nX = 1\n",
+                "all:\n echo a \\\n  b \\\n c \\\n>d\n",
+            ),
+            (
+                ".RECIPEPREFIX = >\nX = 1\n",
+                "all:\n>echo a \\\n b \\\n>c \\\n>>d\n",
+            ),
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let mut item = makefile.items().last().unwrap();
+            item.insert_after(crate::MakefileItem::Rule(rule.clone()))
+                .unwrap();
+            assert_eq!(makefile.code(), format!("{text}{code}"));
+            let inserted = makefile.rules().next().unwrap();
+            assert_eq!(
+                inserted.recipe_nodes().next().unwrap().shell_text(),
+                expected
+            );
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_edit_commands_custom_recipe_prefix() {
+        // Each edit writes the command so that make reads it the same way
+        // whatever the recipe prefix.
+        let lines = [
+            "echo a \\\n b",
+            "echo a \\\n\tb",
+            "echo a \\\n>b",
+            "echo a \\\n  b",
+            "echo a \\\n\t>b",
+            "echo a \\\n\t b",
+            "echo \"$(subst x,y,a\\\n x)\"",
+            "# c \\\n>d",
+        ];
+        for line in lines {
+            let expected = edited_commands("", '\t', line);
+            for (header, prefix) in [
+                (".RECIPEPREFIX = >\n", '>'),
+                ("define .RECIPEPREFIX\n \nendef\n", ' '),
+            ] {
+                assert_eq!(
+                    edited_commands(header, prefix, line),
+                    expected,
+                    "{header:?} {line:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_text_custom_recipe_prefix() {
         // make strips the recipe prefix, and only that, from the start of
@@ -1235,6 +1441,17 @@ mod tests {
             assert_eq!(recipe.text(), expected, "{text:?}");
             assert_eq!(recipe.shell_text(), expected, "{text:?}");
         }
+
+        // As GNU make passes it to the shell.
+        let makefile: Makefile = ".RECIPEPREFIX = >\nall: ; # c \\\n>>d\n".parse().unwrap();
+        let recipe = makefile
+            .rules()
+            .next()
+            .unwrap()
+            .recipe_nodes()
+            .next()
+            .unwrap();
+        assert_eq!(recipe.shell_text(), "# c \\\n>d");
 
         let makefile: Makefile = ".RECIPEPREFIX = >\nall:\n># a \\\n>b\n".parse().unwrap();
         let recipe = makefile
