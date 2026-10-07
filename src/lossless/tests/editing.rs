@@ -455,6 +455,23 @@ fn test_recipe_prefix_add_conditional() {
 }
 
 #[test]
+fn test_recipe_prefix_set_by_inserted_item() {
+    // The prefix set in the inserted conditional depends on the text before it.
+    let other: Makefile = "ifdef X\n.RECIPEPREFIX := $(P)\nb:\n\techo b\nendif\n"
+        .parse()
+        .unwrap();
+    let cond = other.items().next().unwrap();
+    let makefile: Makefile = "P := >\na:\n\techo a\n".parse().unwrap();
+    let mut item = makefile.items().last().unwrap();
+    item.insert_after(cond).unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "P := >\na:\n\techo a\nifdef X\n.RECIPEPREFIX := $(P)\nb:\n>echo b\nendif\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
 fn test_recipe_prefix_add_conditional_with_items() {
     // Items from a makefile with a different prefix.
     let other: Makefile = ".RECIPEPREFIX = >\nb:\n>echo b\n".parse().unwrap();

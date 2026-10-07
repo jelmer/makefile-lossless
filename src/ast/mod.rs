@@ -281,26 +281,104 @@ pub(crate) fn line_ending(node: &SyntaxNode) -> String {
         .map_or_else(|| "\n".to_string(), |t| t.text().to_string())
 }
 
-/// The text of the file containing `parent` before its child `index`.
-pub(crate) fn text_before(parent: &SyntaxNode, index: usize) -> String {
-    let offset = parent
+/// The root of the tree containing `node`, and the offset in it of the start
+/// of child `index` of `node`.
+fn root_offset(node: &SyntaxNode, index: usize) -> (SyntaxNode, rowan::TextSize) {
+    let offset = node
         .children_with_tokens()
         .nth(index)
-        .map_or(parent.text_range().end(), |it| it.text_range().start());
-    let root = parent
+        .map_or(node.text_range().end(), |it| it.text_range().start());
+    let root = node
         .ancestors()
         .last()
         .expect("ancestors() includes the node itself");
+    let offset = offset - root.text_range().start();
+    (root, offset)
+}
+
+/// The text of the file containing `parent` before its child `index`.
+fn text_before(parent: &SyntaxNode, index: usize) -> String {
+    let (root, offset) = root_offset(parent, index);
     let mut text = root.to_string();
-    text.truncate(usize::from(offset - root.text_range().start()));
+    text.truncate(usize::from(offset));
     text
+}
+
+/// Call `f` with the text of each token of `node` before offset `end`.
+fn for_each_text_before(
+    node: &rowan::GreenNodeData,
+    end: rowan::TextSize,
+    f: &mut impl FnMut(&str),
+) {
+    let mut start = rowan::TextSize::from(0);
+    for child in node.children() {
+        if start >= end {
+            break;
+        }
+        match child {
+            rowan::NodeOrToken::Node(node) => for_each_text_before(node, end - start, f),
+            rowan::NodeOrToken::Token(token) => {
+                f(&token.text()[..usize::from((end - start).min(token.text_len()))])
+            }
+        }
+        start += child.text_len();
+    }
+}
+
+/// Whether `.RECIPEPREFIX` appears in the text of the file containing
+/// `parent` before its child `index`, followed by `after`. Unlike
+/// [`text_before`], this does not build the text of the whole file.
+fn mentions_recipe_prefix(parent: &SyntaxNode, index: usize, after: &str) -> bool {
+    const NAME: &[u8] = b".RECIPEPREFIX";
+    let (root, offset) = root_offset(parent, index);
+    // The length of the start of the name at the end of the text so far, as
+    // it may span tokens. A `.` only appears at the start of the name, so a
+    // character that does not continue the name starts it again or not at
+    // all.
+    let mut matched = 0;
+    let mut search = |text: &str| {
+        for &c in text.as_bytes() {
+            if matched == NAME.len() {
+                return;
+            }
+            matched = if c == NAME[matched] {
+                matched + 1
+            } else {
+                usize::from(c == b'.')
+            };
+        }
+    };
+    for_each_text_before(&root.green(), offset, &mut search);
+    search(after);
+    matched == NAME.len()
 }
 
 /// The character that starts a recipe line inserted before child `index` of
 /// `parent`: a tab, or the one set with GNU make's `.RECIPEPREFIX` in the
 /// lines before it.
 pub(crate) fn recipe_prefix_before(parent: &SyntaxNode, index: usize) -> char {
+    if !mentions_recipe_prefix(parent, index, "") {
+        return '\t';
+    }
     crate::lex::recipe_prefix_after(&text_before(parent, index))
+}
+
+/// [`with_recipe_prefix`] for `node` inserted before child `index` of
+/// `parent`. As there, `node` should not be a copy taken out of its tree.
+pub(crate) fn with_recipe_prefix_before(
+    node: &SyntaxNode,
+    parent: &SyntaxNode,
+    index: usize,
+) -> SyntaxNode {
+    // Only recipes depend on the text before, and only if it or `node` sets
+    // `.RECIPEPREFIX`: otherwise they start with a tab wherever they are.
+    let has_recipes = node.descendants().any(|n| n.kind() == RECIPE);
+    let before = if has_recipes && mentions_recipe_prefix(parent, index, &node.to_string()) {
+        text_before(parent, index)
+    } else {
+        String::new()
+    };
+    with_recipe_prefix(node, &before)
 }
 
 /// `node`, or a copy of it in which the recipe lines start with the recipe

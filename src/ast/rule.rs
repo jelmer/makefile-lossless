@@ -1765,10 +1765,8 @@ impl Rule {
 
         // Trim the blank lines at the end of the last remaining rule if
         // nothing follows it any more.
-        let last_rule = parent
-            .children()
-            .filter(|child| child.kind() == RULE)
-            .last();
+        let last_rule = std::iter::successors(parent.last_child(), |child| child.prev_sibling())
+            .find(|child| child.kind() == RULE);
         if let Some(last_rule) = last_rule.filter(|rule| {
             rule.siblings_with_tokens(rowan::Direction::Next)
                 .skip(1)

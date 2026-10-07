@@ -1,7 +1,7 @@
 use super::bsd::{keyword_range, keyword_token};
 use super::makefile::MakefileItem;
 use super::{
-    line_ending, logical_text, terminate_line_before, text_before, with_recipe_prefix,
+    line_ending, logical_text, terminate_line_before, with_recipe_prefix_before,
     with_trailing_newline, LineSyntax,
 };
 use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
@@ -1125,7 +1125,7 @@ impl Conditional {
 
         let insert_pos =
             terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
-        let item_node = with_recipe_prefix(item.syntax(), &text_before(self.syntax(), insert_pos));
+        let item_node = with_recipe_prefix_before(item.syntax(), self.syntax(), insert_pos);
         let item_node = with_trailing_newline(&item_node, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
@@ -1157,7 +1157,7 @@ impl Conditional {
             else_node.index() + 1,
             &line_ending(self.syntax()),
         );
-        let item_node = with_recipe_prefix(item.syntax(), &text_before(self.syntax(), insert_pos));
+        let item_node = with_recipe_prefix_before(item.syntax(), self.syntax(), insert_pos);
         let item_node = with_trailing_newline(&item_node, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
