@@ -1,9 +1,11 @@
 //! Parse wrapper type following rust-analyzer's pattern for thread-safe storage in Salsa.
 
-use crate::lossless::{Error, ErrorInfo, Makefile, ParseError, PositionedParseError, Rule};
-use crate::MakefileVariant;
+use crate::lossless::{
+    Error, ErrorInfo, Lang, Makefile, ParseError, ParseErrorKind, PositionedParseError, Rule,
+};
+use crate::{MakefileVariant, SyntaxKind};
 use rowan::ast::AstNode;
-use rowan::{GreenNode, SyntaxNode};
+use rowan::{GreenNode, SyntaxNode, TextRange};
 use std::marker::PhantomData;
 
 /// The result of parsing: a syntax tree and a collection of errors.
@@ -72,8 +74,7 @@ impl<T> Parse<T> {
         T: AstNode<Language = crate::lossless::Lang>,
     {
         if self.errors.is_empty() {
-            let node = SyntaxNode::new_root_mut(self.green);
-            Ok(T::cast(node).expect("root node has wrong type"))
+            Ok(self.tree())
         } else {
             Err(Error::Parse(ParseError {
                 errors: self.errors,
@@ -86,12 +87,22 @@ impl<T> Parse<T> {
     /// Returns the tree even if there are parse errors. Use `errors()`,
     /// `positioned_errors()`, or `ok()` to check for errors separately if needed.
     /// This allows for error-resilient tooling that can work with partial/invalid input.
+    ///
+    /// For a `Parse<Rule>`, this is the rule within the tree of the whole
+    /// text, so surrounding comments and any other items are kept.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the text has no node of this type, which happens for a
+    /// `Parse<Rule>` of text without a rule. `ok()` is false in that case.
     pub fn tree(&self) -> T
     where
         T: AstNode<Language = crate::lossless::Lang>,
     {
-        let node = SyntaxNode::new_root_mut(self.green.clone());
-        T::cast(node).expect("root node has wrong type")
+        let root = SyntaxNode::new_root_mut(self.green.clone());
+        T::cast(root.clone())
+            .or_else(|| root.children().find_map(T::cast))
+            .expect("no node of the requested type in the parsed text")
     }
 
     /// Get the syntax node
@@ -116,36 +127,66 @@ impl Parse<Makefile> {
 }
 
 impl Parse<Rule> {
-    /// Parse rule text, returning a Parse result
+    /// Parse the text of a single rule, returning a Parse result
+    ///
+    /// The text may have comments and blank lines around the rule. Text
+    /// without a rule, or with other items such as a second rule or a
+    /// variable definition, is reported as an error. Either way the tree
+    /// holds all of the text.
     pub fn parse_rule(text: &str) -> Self {
         let parsed = crate::lossless::parse(text, None);
-        Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+        let root = SyntaxNode::<Lang>::new_root(parsed.green_node.clone());
+        let mut errors = parsed.errors;
+        let mut positioned_errors = parsed.positioned_errors;
+
+        let mut seen_rule = false;
+        let unexpected = root
+            .children_with_tokens()
+            .find(|item| match item.kind() {
+                SyntaxKind::RULE if !seen_rule => {
+                    seen_rule = true;
+                    false
+                }
+                SyntaxKind::BLANK_LINE
+                | SyntaxKind::COMMENT
+                | SyntaxKind::NEWLINE
+                | SyntaxKind::WHITESPACE => false,
+                _ => true,
+            })
+            .map(|item| item.text_range());
+        let range = match unexpected {
+            Some(range) => range,
+            None if seen_rule => {
+                return Parse::new(parsed.green_node, errors, positioned_errors);
+            }
+            None => TextRange::empty(0.into()),
+        };
+
+        let line = text[..usize::from(range.start())].matches('\n').count() + 1;
+        let kind = ParseErrorKind::Other;
+        let message = "expected a single rule".to_string();
+        errors.push(ErrorInfo {
+            message: message.clone(),
+            line,
+            context: text.lines().nth(line - 1).unwrap_or("").to_string(),
+            kind,
+        });
+        let mut error = PositionedParseError {
+            message,
+            range,
+            code: None,
+            kind,
+            line_range: range,
+            space_indent_range: None,
+        };
+        crate::lossless::locate_error_lines(&root, text, std::slice::from_mut(&mut error));
+        positioned_errors.push(error);
+        Parse::new(parsed.green_node, errors, positioned_errors)
     }
 
-    /// Convert to a Result, extracting a single rule from the makefile
+    /// Convert to a Result, returning the rule if there are no errors
     pub fn to_rule_result(self) -> Result<Rule, Error> {
-        if !self.errors.is_empty() {
-            return Err(Error::Parse(ParseError {
-                errors: self.errors,
-            }));
-        }
-
-        let makefile =
-            Makefile::cast(SyntaxNode::new_root_mut(self.green)).expect("root node has wrong type");
-        let rules: Vec<_> = makefile.rules().collect();
-
-        if rules.len() == 1 {
-            Ok(rules.into_iter().next().unwrap())
-        } else {
-            Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "expected a single rule".to_string(),
-                    line: 1,
-                    context: "".to_string(),
-                }],
-            }))
-        }
+        self.to_result()
     }
 }
 

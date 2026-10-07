@@ -858,3 +858,91 @@ fn test_rule_target_starting_with_lparen() {
     );
     assert_eq!(parsed.root().to_string(), "(: dep\n");
 }
+
+#[test]
+fn test_rule_parse_single_rule() {
+    let text = "all: dep\n\techo hi\n";
+    let parsed = Rule::parse(text);
+    assert!(parsed.ok());
+    let rule = parsed.tree();
+    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["all"]);
+    assert_eq!(rule.to_string(), text);
+    let rule = parsed.to_result().unwrap();
+    assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo hi"]);
+}
+
+#[test]
+fn test_rule_parse_with_comments_and_blank_lines() {
+    for text in [
+        "# c\na: b\n",
+        "\na: b\n",
+        "a: b\n\n# c\n",
+        "# c\n\na: b\n\n",
+    ] {
+        let parsed = Rule::parse(text);
+        assert!(parsed.ok(), "{:?}", text);
+        assert_eq!(parsed.syntax_node().to_string(), text);
+        let rule = parsed.tree();
+        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a"], "{:?}", text);
+        assert_eq!(rule.syntax().ancestors().last().unwrap().to_string(), text);
+        let rule: Rule = text.parse().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b"]);
+    }
+}
+
+#[test]
+fn test_rule_parse_not_a_single_rule() {
+    for (text, line, context, start, end, target) in [
+        ("", 1, "", 0, 0, None),
+        ("# c\n", 1, "# c", 0, 0, None),
+        ("X = 1\n", 1, "X = 1", 0, 6, None),
+        ("a: b\nc: d\n", 2, "c: d", 5, 10, Some("a")),
+        ("# c\na: b\nX = 1\n", 3, "X = 1", 9, 15, Some("a")),
+    ] {
+        let parsed = Rule::parse(text);
+        assert!(!parsed.ok(), "{:?}", text);
+        assert_eq!(parsed.syntax_node().to_string(), text);
+        assert_eq!(
+            parsed
+                .positioned_errors()
+                .iter()
+                .map(|e| (e.message.as_str(), e.range))
+                .collect::<Vec<_>>(),
+            vec![(
+                "expected a single rule",
+                rowan::TextRange::new(start.into(), end.into())
+            )],
+            "{:?}",
+            text
+        );
+        if let Some(target) = target {
+            assert_eq!(
+                parsed.tree().targets().collect::<Vec<_>>(),
+                vec![target],
+                "{:?}",
+                text
+            );
+        }
+        let Err(Error::Parse(err)) = parsed.to_result() else {
+            panic!("expected a parse error for {:?}", text);
+        };
+        assert_eq!(
+            err.errors,
+            vec![ErrorInfo {
+                message: "expected a single rule".to_string(),
+                line,
+                context: context.to_string(),
+                kind: ParseErrorKind::Other,
+            }],
+            "{:?}",
+            text
+        );
+        assert!(text.parse::<Rule>().is_err(), "{:?}", text);
+    }
+}
+
+#[test]
+#[should_panic(expected = "no node of the requested type in the parsed text")]
+fn test_rule_parse_tree_without_rule() {
+    Rule::parse("X = 1\n").tree();
+}
