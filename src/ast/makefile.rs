@@ -441,6 +441,9 @@ impl MakefileItem {
     /// This preserves the position of the original item but replaces its content
     /// with the new item. Preceding comments are preserved.
     ///
+    /// Returns an error if the new item can not go there, as described for
+    /// [`Self::insert_before`].
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Makefile, MakefileItem};
@@ -454,6 +457,13 @@ impl MakefileItem {
     /// ```
     pub fn replace(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("replace", "replace")?;
+        check_position(
+            new_item.syntax(),
+            self.syntax().prev_sibling(),
+            self.syntax().next_sibling(),
+            Some(self.syntax()),
+            "replace",
+        )?;
         let current_index = self.syntax().index();
         let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
         let new_node = with_recipe_prefix(&new_node, &text_before(&parent, current_index));
@@ -643,6 +653,10 @@ impl MakefileItem {
     /// line in between, the new item is inserted before them, since they
     /// document the current item.
     ///
+    /// Returns an error if the item would separate a [`MakefileItem::Recipe`]
+    /// from the rule it belongs to, or if the new item is a
+    /// [`MakefileItem::Recipe`] that would not be next to another one.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Makefile, MakefileItem};
@@ -656,6 +670,13 @@ impl MakefileItem {
     /// ```
     pub fn insert_before(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert before", "insert_before")?;
+        check_position(
+            new_item.syntax(),
+            self.syntax().prev_sibling(),
+            Some(self.syntax().clone()),
+            None,
+            "insert_before",
+        )?;
         let current_index = index_before_doc_comment(self.syntax());
         let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
         let new_node = with_recipe_prefix(&new_node, &text_before(&parent, current_index));
@@ -671,6 +692,9 @@ impl MakefileItem {
     /// The new item is inserted at the same level as the current item, and
     /// before any comment lines documenting the next item.
     ///
+    /// Returns an error if the new item can not go there, as described for
+    /// [`Self::insert_before`].
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::{Makefile, MakefileItem};
@@ -684,6 +708,13 @@ impl MakefileItem {
     /// ```
     pub fn insert_after(&mut self, new_item: MakefileItem) -> Result<(), Error> {
         let parent = self.get_parent_or_error("insert after", "insert_after")?;
+        check_position(
+            new_item.syntax(),
+            Some(self.syntax().clone()),
+            self.syntax().next_sibling(),
+            None,
+            "insert_after",
+        )?;
         let eol = line_ending(&parent);
         let new_node = with_trailing_newline(new_item.syntax(), &eol);
         let index = terminate_line_before(&parent, index_after(self.syntax()), &eol);
@@ -694,6 +725,40 @@ impl MakefileItem {
 
         Ok(())
     }
+}
+
+/// Check that `new` can go between the items `prev` and `next`, in place of
+/// `replaced` if given.
+///
+/// A recipe line outside a rule belongs to the rule before it, so a new one
+/// has to go next to another such recipe line, and anything else put before
+/// one would separate it from its rule.
+fn check_position(
+    new: &SyntaxNode,
+    prev: Option<SyntaxNode>,
+    next: Option<SyntaxNode>,
+    replaced: Option<&SyntaxNode>,
+    method: &str,
+) -> Result<(), Error> {
+    let is_recipe = |node: Option<&SyntaxNode>| node.is_some_and(|n| n.kind() == RECIPE);
+    let message = if new.kind() == RECIPE {
+        if is_recipe(prev.as_ref()) || is_recipe(next.as_ref()) || is_recipe(replaced) {
+            return Ok(());
+        }
+        "A recipe line can only go next to another recipe line"
+    } else if is_recipe(next.as_ref()) {
+        "Cannot put an item before a recipe line, which would no longer belong to its rule"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Parse(ParseError {
+        errors: vec![ErrorInfo {
+            kind: crate::ParseErrorKind::Other,
+            message: message.to_string(),
+            line: 1,
+            context: format!("MakefileItem::{method}"),
+        }],
+    }))
 }
 
 /// The index in the parent of `node` just after it. A comment that the
@@ -2473,6 +2538,97 @@ mod tests {
             "a:\n\techo\ninclude x.mk\n# doc\nc:\n"
         );
         assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_makefile_item_recipe_positions() {
+        let code = "ifdef X\na:\nelse\nb:\nendif\n\techo 1\n\techo 2\n";
+        let item = |text: &str| {
+            let makefile: Makefile = text.parse().unwrap();
+            makefile.items().last().unwrap()
+        };
+        let recipe = || item(code);
+        let cases: Vec<(&str, usize, &str, MakefileItem, Option<&str>)> = vec![
+            (code, 0, "after", item("X = 1\n"), None),
+            (code, 0, "after", item("c:\n"), None),
+            (code, 0, "replace", item("c:\n"), None),
+            (code, 1, "before", item("X = 1\n"), None),
+            (code, 1, "after", item("c:\n"), None),
+            (code, 2, "before", item("X = 1\n"), None),
+            (code, 1, "replace", item("X = 1\n"), None),
+            (
+                code,
+                2,
+                "after",
+                item("X = 1\n"),
+                Some("ifdef X\na:\nelse\nb:\nendif\n\techo 1\n\techo 2\nX = 1\n"),
+            ),
+            (
+                code,
+                2,
+                "replace",
+                item("c:\n"),
+                Some("ifdef X\na:\nelse\nb:\nendif\n\techo 1\nc:\n"),
+            ),
+            (
+                code,
+                1,
+                "after",
+                recipe(),
+                Some("ifdef X\na:\nelse\nb:\nendif\n\techo 1\n\techo 2\n\techo 2\n"),
+            ),
+            (
+                code,
+                1,
+                "before",
+                recipe(),
+                Some("ifdef X\na:\nelse\nb:\nendif\n\techo 2\n\techo 1\n\techo 2\n"),
+            ),
+            (
+                code,
+                1,
+                "replace",
+                recipe(),
+                Some("ifdef X\na:\nelse\nb:\nendif\n\techo 2\n\techo 2\n"),
+            ),
+            ("X = 1\n", 0, "after", recipe(), None),
+            ("X = 1\n", 0, "replace", recipe(), None),
+            ("a:\n\techo\n", 0, "after", recipe(), None),
+        ];
+        for (code, index, op, new_item, expected) in cases {
+            let makefile: Makefile = code.parse().unwrap();
+            let mut target = makefile.items().nth(index).unwrap();
+            let result = match op {
+                "before" => target.insert_before(new_item),
+                "after" => target.insert_after(new_item),
+                _ => target.replace(new_item),
+            };
+            assert_eq!(result.is_ok(), expected.is_some(), "{code:?} {index} {op}");
+            assert_eq!(
+                makefile.code(),
+                expected.unwrap_or(code),
+                "{code:?} {index} {op}"
+            );
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_makefile_item_insert_before_recipe_in_conditional() {
+        let code = "a:\nifdef X\n\techo\nendif\n";
+        let makefile: Makefile = code.parse().unwrap();
+        let node = makefile
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == RECIPE)
+            .unwrap();
+        let mut recipe = MakefileItem::cast(node).unwrap();
+        let temp: Makefile = "Y = 1\n".parse().unwrap();
+        let new_var = temp.variable_definitions().next().unwrap();
+        assert!(recipe
+            .insert_before(MakefileItem::Variable(new_var))
+            .is_err());
+        assert_eq!(makefile.code(), code);
     }
 
     #[test]
