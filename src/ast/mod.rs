@@ -1,3 +1,53 @@
+/// Define a fieldless enum of make keywords or operators, along with
+/// `as_str`, `Display` and a `FromStr` that accepts exactly the strings
+/// `as_str` returns.
+macro_rules! keyword_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident => $text:literal,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)*
+        }
+
+        impl $name {
+            #[cfg(test)]
+            const ALL: &'static [$name] = &[$($name::$variant,)*];
+
+            /// The text as written in a makefile.
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $($name::$variant => $text,)*
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = crate::ParseKeywordError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($text => Ok($name::$variant),)*
+                    _ => Err(crate::ParseKeywordError {
+                        keyword: s.to_string(),
+                    }),
+                }
+            }
+        }
+    };
+}
+
 pub mod archive;
 pub mod bsd;
 pub mod conditional;
