@@ -33,3 +33,24 @@ path = "fuzz_targets/incremental_edit.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "reference"
+path = "fuzz_targets/reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "split_references"
+path = "fuzz_targets/split_references.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bsd_condition"
+path = "fuzz_targets/bsd_condition.rs"
+test = false
+doc = false
+bench = false
