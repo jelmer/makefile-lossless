@@ -1291,6 +1291,26 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_command_after_target_local_assignment() {
+        for (text, expected) in [
+            ("a: X=1\n\n\techo $X\n", "a: X=1\n\n"),
+            ("a: X=1\n# c\n\techo $X\nB=2\n", "a: X=1\n# c\nB=2\n"),
+            (
+                "a: X=1\n\techo $X\n\n# c\n\techo\n",
+                "a: X=1\n\techo $X\n\n# c\n",
+            ),
+            ("a: X=1; echo $X\n\n# c\n", "a: X=1\n\n# c\n"),
+        ] {
+            let makefile = parse_bsd(text);
+            let mut rule = makefile.rules().next().unwrap();
+            let count = rule.recipe_count();
+            assert!(rule.remove_command(count - 1), "{text:?}");
+            assert_eq!(makefile.to_string(), expected, "{text:?}");
+            assert_matches_bsd_reparse(&makefile);
+        }
+    }
+
+    #[test]
     fn test_add_rule_after_target_local_assignment() {
         let mut makefile = parse_bsd("a: X=1\n");
         makefile.add_rule("b");
