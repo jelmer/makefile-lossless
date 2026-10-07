@@ -1,2 +1,6 @@
-- Handle split lines (https://www.gnu.org/software/make/manual/make.html#Splitting-Lines)
-- Support variables in rules
+- Store the make variant in the parsed tree, so methods without a _for variant can apply that variant's rules
+- API consistency pass for 0.5.0 (#406): enums instead of strings for keywords and operators, consistent remove and try_ method families, and deciding whether rowan is part of the public API
+- Check the nmake behaviour that was guessed rather than verified against real nmake (quoting, comments and case-sensitivity in directives and conditions)
+- Track .RECIPEPREFIX through function calls and indirect $(eval)
+- Report all syntax errors in BSD make conditions, not just trailing text and unbalanced parentheses
+- Upgrade to rowan 0.18 once it is released, and drop the workarounds for older versions
