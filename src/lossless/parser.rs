@@ -864,6 +864,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             {
                                 self.bump();
                             }
+                            // After a blank line, it ends the rule like an
+                            // unindented comment.
+                            Some(COMMENT) => break,
                             Some(NEWLINE) | None => self.bump(),
                             _ if self.at_space_indented_recipe() => {
                                 newline_count = 0;
