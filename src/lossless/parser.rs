@@ -346,21 +346,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn record_error(&mut self, kind: ParseErrorKind, msg: String) {
             let range = self.current_range();
             let line = self.line_at(range.start());
-            let (kind, message) = if self.current() == Some(INDENT)
-                && kind != ParseErrorKind::RecipeBeforeFirstTarget
-            {
-                if !self.tokens.is_empty() && self.tokens[self.tokens.len() - 1].0 == IDENTIFIER {
-                    (ParseErrorKind::MissingSeparator, "expected ':'".to_string())
-                } else {
-                    (
-                        ParseErrorKind::RecipeBeforeFirstTarget,
-                        "indented line not part of a rule".to_string(),
-                    )
-                }
-            } else {
-                (kind, msg)
-            };
-            self.push_error(kind, message, range, line);
+            debug_assert!(
+                self.current() != Some(INDENT) || kind == ParseErrorKind::RecipeBeforeFirstTarget,
+                "{kind:?} error at the indent of the next line"
+            );
+            self.push_error(kind, msg, range, line);
         }
 
         /// Record an error for a block that is still open at the end of the
@@ -778,7 +768,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.current() == Some(RPAREN) {
                 self.bump();
             } else {
-                self.error(
+                // Leave the token for the caller, which may be the line
+                // ending or the dependency operator.
+                self.record_error(
                     ParseErrorKind::UnclosedArchiveMember,
                     "expected ')' to close archive member".to_string(),
                 );
