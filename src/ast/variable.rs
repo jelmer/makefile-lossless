@@ -1,41 +1,16 @@
 use super::makefile::MakefileItem;
-use super::{is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax};
+use super::{
+    edit_error, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
+};
 use crate::lossless::{
     detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
     scan_recipe_variable_refs, Error, ErrorInfo, ParseError, RecipeVariableReference,
     VariableDefinition, VariableReference, ASSIGNMENT_OPERATORS,
 };
 use crate::MakefileVariant;
-use crate::SyntaxKind::*;
+use crate::SyntaxKind::{self, *};
 use rowan::ast::AstNode;
-use rowan::{GreenNodeBuilder, SyntaxNode};
-
-/// Recursively rebuild a syntax node into a GreenNodeBuilder.
-fn rebuild_node(builder: &mut GreenNodeBuilder, node: &crate::lossless::SyntaxNode) {
-    builder.start_node(node.kind().into());
-    for child in node.children_with_tokens() {
-        match child {
-            rowan::NodeOrToken::Token(token) => {
-                builder.token(token.kind().into(), token.text());
-            }
-            rowan::NodeOrToken::Node(child_node) => {
-                rebuild_node(builder, &child_node);
-            }
-        }
-    }
-    builder.finish_node();
-}
-
-fn value_error(context: &str, message: String) -> Error {
-    Error::Parse(ParseError {
-        errors: vec![ErrorInfo {
-            kind: crate::ParseErrorKind::Other,
-            message,
-            line: 1,
-            context: context.to_string(),
-        }],
-    })
-}
+use rowan::SyntaxNode;
 
 /// Whether `text` has a line break that is not part of a line continuation,
 /// or ends in a backslash that would continue the line.
@@ -1021,7 +996,7 @@ impl VariableDefinition {
         // TODO: nmake only has `=`, but the tree does not record which
         // variant it was parsed as, so other operators are not rejected
         // there.
-        let error = |message: String| value_error("set_assignment_operator", message);
+        let error = |message: String| edit_error("set_assignment_operator", message);
         if !is_assignment_operator(op) {
             return Err(error(format!("{op:?} is not an assignment operator")));
         }
@@ -1040,26 +1015,7 @@ impl VariableDefinition {
                 ))
             })?;
 
-        // Build a new VARIABLE node, copying all children but replacing the OPERATOR token
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(VARIABLE.into());
-
-        for child in self.syntax().children_with_tokens() {
-            match child {
-                rowan::NodeOrToken::Token(token) if token.index() == op_index => {
-                    builder.token(OPERATOR.into(), op);
-                }
-                rowan::NodeOrToken::Token(token) => {
-                    builder.token(token.kind().into(), token.text());
-                }
-                rowan::NodeOrToken::Node(node) => {
-                    rebuild_node(&mut builder, &node);
-                }
-            }
-        }
-
-        builder.finish_node();
-        let new_variable = SyntaxNode::new_root_mut(builder.finish());
+        let new_variable = self.with_children_replaced(op_index..op_index + 1, OPERATOR, op);
 
         // The name may end in characters that join the operator, so check
         // that GNU or BSD make reads the definition back.
@@ -1079,24 +1035,41 @@ impl VariableDefinition {
             )));
         }
 
-        // Replace the old VARIABLE node with the new one
-        let index = self.syntax().index();
-        if let Some(parent) = self.syntax().parent() {
-            parent.splice_children(index..index + 1, vec![new_variable.clone().into()]);
-
-            // Update self to point to the new node
-            *self = VariableDefinition::cast(
-                parent
-                    .children_with_tokens()
-                    .nth(index)
-                    .and_then(|it| it.into_node())
-                    .unwrap(),
-            )
-            .unwrap();
-        } else {
-            *self = VariableDefinition::cast(new_variable).expect("built a VARIABLE node");
-        }
+        self.replace_with(new_variable);
         Ok(())
+    }
+
+    /// A copy of this definition, with the children in `range` replaced by
+    /// a single token.
+    fn with_children_replaced(
+        &self,
+        range: std::ops::Range<usize>,
+        kind: SyntaxKind,
+        text: &str,
+    ) -> SyntaxNode<crate::lossless::Lang> {
+        let mut children: Vec<rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken>> = Vec::new();
+        for child in self.syntax().children_with_tokens() {
+            if child.index() == range.start {
+                children.push(rowan::GreenToken::new(kind.into(), text).into());
+            }
+            if !range.contains(&child.index()) {
+                children.push(match child {
+                    rowan::NodeOrToken::Token(token) => token.green().to_owned().into(),
+                    rowan::NodeOrToken::Node(node) => node.green().into_owned().into(),
+                });
+            }
+        }
+        SyntaxNode::new_root_mut(rowan::GreenNode::new(VARIABLE.into(), children))
+    }
+
+    /// Put `new_variable` in place of this definition, and point `self` at
+    /// it.
+    fn replace_with(&mut self, new_variable: SyntaxNode<crate::lossless::Lang>) {
+        if let Some(parent) = self.syntax().parent() {
+            let index = self.syntax().index();
+            parent.splice_children(index..index + 1, vec![new_variable.clone().into()]);
+        }
+        *self = VariableDefinition::cast(new_variable).expect("built a VARIABLE node");
     }
 
     /// Rename the variable, preserving the operator, value and any
@@ -1140,7 +1113,7 @@ impl VariableDefinition {
     /// ```
     pub fn try_set_name(&mut self, new_name: &str) -> Result<(), Error> {
         if new_name.contains(['\n', '\r']) {
-            return Err(value_error(
+            return Err(edit_error(
                 "set_name",
                 format!("Variable name {new_name:?} contains a newline"),
             ));
@@ -1154,44 +1127,9 @@ impl VariableDefinition {
         let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
             return;
         };
-        let name_indices = first.index()..=last.index();
-
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(VARIABLE.into());
-
-        for child in self.syntax().children_with_tokens() {
-            if name_indices.contains(&child.index()) {
-                if child.index() == *name_indices.start() {
-                    builder.token(IDENTIFIER.into(), new_name);
-                }
-                continue;
-            }
-            match child {
-                rowan::NodeOrToken::Token(token) => {
-                    builder.token(token.kind().into(), token.text());
-                }
-                rowan::NodeOrToken::Node(node) => {
-                    rebuild_node(&mut builder, &node);
-                }
-            }
-        }
-
-        builder.finish_node();
-        let new_variable = SyntaxNode::new_root_mut(builder.finish());
-
-        let index = self.syntax().index();
-        if let Some(parent) = self.syntax().parent() {
-            parent.splice_children(index..index + 1, vec![new_variable.clone().into()]);
-
-            *self = VariableDefinition::cast(
-                parent
-                    .children_with_tokens()
-                    .nth(index)
-                    .and_then(|it| it.into_node())
-                    .unwrap(),
-            )
-            .unwrap();
-        }
+        let new_variable =
+            self.with_children_replaced(first.index()..last.index() + 1, IDENTIFIER, new_name);
+        self.replace_with(new_variable);
     }
 
     /// Remove a trailing whitespace token at the tail of the value, if any.
@@ -1331,7 +1269,7 @@ impl VariableDefinition {
             let body = value.replace('\n', &eol);
             parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &value).ok_or_else(
                 || {
-                    value_error(
+                    edit_error(
                         "set_value",
                         format!("Cannot write {new_value:?} as the body of a define block"),
                     )
@@ -1339,13 +1277,13 @@ impl VariableDefinition {
             )?
         } else {
             if breaks_line(new_value) {
-                return Err(value_error(
+                return Err(edit_error(
                     "set_value",
                     format!("Cannot write {new_value:?} as a value on a single line"),
                 ));
             }
             single_line_value_expr(new_value).ok_or_else(|| {
-                value_error(
+                edit_error(
                     "set_value",
                     format!("Cannot write {new_value:?} as a variable value"),
                 )
@@ -1431,7 +1369,7 @@ impl VariableDefinition {
             .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE) || is_continuation(&it))
         });
         if is_undefine || self.is_define() || !rest_is_blank {
-            return Err(value_error(
+            return Err(edit_error(
                 "set_value",
                 format!("{:?} has no value to set", self.syntax().to_string()),
             ));
@@ -1671,6 +1609,15 @@ mod tests {
     }
 
     #[test]
+    fn test_set_name_detached() {
+        let makefile: Makefile = "VAR := value\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.remove();
+        var.set_name("OTHER");
+        assert_eq!(var.syntax().to_string(), "OTHER := value\n");
+    }
+
+    #[test]
     fn test_combined_operations() {
         let makefile: Makefile = "export VAR := old_value\n".parse().unwrap();
         let mut var = makefile.variable_definitions().next().unwrap();
@@ -1884,7 +1831,7 @@ mod tests {
 
     /// Build a VARIABLE node directly, bypassing the parser.
     fn variable_from_tokens(tokens: &[(crate::SyntaxKind, &str)]) -> VariableDefinition {
-        let mut builder = GreenNodeBuilder::new();
+        let mut builder = rowan::GreenNodeBuilder::new();
         builder.start_node(VARIABLE.into());
         for (kind, text) in tokens {
             builder.token((*kind).into(), text);

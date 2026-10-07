@@ -1,7 +1,7 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use super::{
-    escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
+    edit_error, escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
     terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
@@ -37,17 +37,6 @@ fn node_name_text(node: &SyntaxNode, syntax: LineSyntax) -> String {
 /// prerequisite name, as [`Rule::targets`] returns it.
 fn escape_name(name: &str, before_comment: bool) -> String {
     escape_hashes(name, false, before_comment)
-}
-
-fn name_error(context: &str, message: String) -> Error {
-    Error::Parse(ParseError {
-        errors: vec![ErrorInfo {
-            kind: crate::ParseErrorKind::Other,
-            message,
-            line: 1,
-            context: context.to_string(),
-        }],
-    })
 }
 
 /// Parse `line` as a makefile consisting of a single rule.
@@ -87,7 +76,7 @@ fn build_prerequisites_node(
             .filter(|rule| rule.prerequisites().eq(prereqs.iter().cloned()))
             .and_then(|rule| rule.prerequisites_node())
             .ok_or_else(|| {
-                name_error(
+                edit_error(
                     "set_prerequisites",
                     format!("Cannot write {prereqs:?} as prerequisites"),
                 )
@@ -120,7 +109,7 @@ pub(crate) fn build_targets_node(targets: &[String], context: &str) -> Result<Sy
         .filter(|rule| rule.targets().eq(targets.iter().cloned()))
         .and_then(|rule| rule.syntax().children().find(|n| n.kind() == TARGETS))
         .map(|node| SyntaxNode::new_root_mut(node.green().into_owned()))
-        .ok_or_else(|| name_error(context, format!("Cannot write {targets:?} as targets")))
+        .ok_or_else(|| edit_error(context, format!("Cannot write {targets:?} as targets")))
 }
 
 /// Represents different types of items that can appear in a Rule's body
@@ -686,7 +675,7 @@ impl Rule {
 
     /// The normal and order-only prerequisites of the rule, with line
     /// continuations collapsed as described by `syntax`.
-    fn prerequisite_lists(&self, syntax: LineSyntax) -> (Vec<String>, Vec<String>) {
+    pub(crate) fn prerequisite_lists(&self, syntax: LineSyntax) -> (Vec<String>, Vec<String>) {
         let text = |n: SyntaxNode| node_name_text(&n, syntax).trim().to_string();
         let (normal, order_only) = self.prerequisite_nodes();
         (
@@ -1507,36 +1496,7 @@ impl Rule {
             })
             .collect();
 
-        // Find the TARGETS node
-        let mut targets_index = None;
-        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
-            if let Some(node) = child.as_node() {
-                if node.kind() == TARGETS {
-                    targets_index = Some(idx);
-                    break;
-                }
-            }
-        }
-
-        let targets_index = targets_index.ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "No TARGETS node found in rule".to_string(),
-                    line: 1,
-                    context: "rename_target".to_string(),
-                }],
-            })
-        })?;
-
-        // Build new targets node
-        let new_targets_node = build_targets_node(&new_targets, "rename_target")?;
-
-        // Replace the TARGETS node
-        self.syntax().splice_children(
-            targets_index..targets_index + 1,
-            vec![new_targets_node.into()],
-        );
+        self.replace_targets_node(&new_targets, "rename_target")?;
 
         Ok(true)
     }
@@ -1584,40 +1544,22 @@ impl Rule {
             }));
         }
 
-        // Find the TARGETS node
-        let mut targets_index = None;
-        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
-            if let Some(node) = child.as_node() {
-                if node.kind() == TARGETS {
-                    targets_index = Some(idx);
-                    break;
-                }
-            }
-        }
+        let targets: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
+        self.replace_targets_node(&targets, "set_targets")?;
 
-        let targets_index = targets_index.ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "No TARGETS node found in rule".to_string(),
-                    line: 1,
-                    context: "set_targets".to_string(),
-                }],
-            })
-        })?;
+        Ok(())
+    }
 
-        // Build new targets node
-        let new_targets_node = build_targets_node(
-            &targets.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            "set_targets",
-        )?;
-
-        // Replace the TARGETS node
-        self.syntax().splice_children(
-            targets_index..targets_index + 1,
-            vec![new_targets_node.into()],
-        );
-
+    /// Replace the TARGETS node of the rule with one holding `targets`.
+    fn replace_targets_node(&self, targets: &[String], context: &str) -> Result<(), Error> {
+        let index = self
+            .syntax()
+            .children_with_tokens()
+            .position(|child| child.kind() == TARGETS)
+            .ok_or_else(|| edit_error(context, "No TARGETS node found in rule".to_string()))?;
+        let node = build_targets_node(targets, context)?;
+        self.syntax()
+            .splice_children(index..index + 1, vec![node.into()]);
         Ok(())
     }
 
@@ -1674,36 +1616,7 @@ impl Rule {
             }));
         }
 
-        // Find the TARGETS node
-        let mut targets_index = None;
-        for (idx, child) in self.syntax().children_with_tokens().enumerate() {
-            if let Some(node) = child.as_node() {
-                if node.kind() == TARGETS {
-                    targets_index = Some(idx);
-                    break;
-                }
-            }
-        }
-
-        let targets_index = targets_index.ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "No TARGETS node found in rule".to_string(),
-                    line: 1,
-                    context: "remove_target".to_string(),
-                }],
-            })
-        })?;
-
-        // Build new targets node
-        let new_targets_node = build_targets_node(&new_targets, "remove_target")?;
-
-        // Replace the TARGETS node
-        self.syntax().splice_children(
-            targets_index..targets_index + 1,
-            vec![new_targets_node.into()],
-        );
+        self.replace_targets_node(&new_targets, "remove_target")?;
 
         Ok(true)
     }

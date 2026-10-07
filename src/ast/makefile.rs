@@ -1,7 +1,8 @@
 use super::rule::build_targets_node;
 use super::{
-    detach_tokens, doc_comment_lines, index_before_doc_comment, line_ending, lines_above,
-    terminate_line_before, text_before, with_recipe_prefix, with_trailing_newline,
+    detach_tokens, doc_comment_lines, edit_error, hoist_doc_comment, index_before_doc_comment,
+    line_ending, lines_above, terminate_line_before, text_before, with_recipe_prefix,
+    with_trailing_newline, LineSyntax,
 };
 use crate::lossless::{
     line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
@@ -23,6 +24,14 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
         ".if" | ".ifdef" | ".ifndef" | ".ifmake" | ".ifnmake" => Some((".else", ".endif")),
         _ => None,
     }
+}
+
+fn invalid_conditional_type(conditional_type: &str, context: &str) -> Error {
+    let valid = "ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake";
+    edit_error(
+        context,
+        format!("Invalid conditional type: {conditional_type}. Must be one of: {valid}"),
+    )
 }
 
 /// The first line of a conditional, without a space after the keyword if
@@ -677,6 +686,7 @@ impl MakefileItem {
             None,
             "insert_before",
         )?;
+        hoist_doc_comment(self.syntax());
         let current_index = index_before_doc_comment(self.syntax());
         let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
         let new_node = with_recipe_prefix(&new_node, &text_before(&parent, current_index));
@@ -717,7 +727,8 @@ impl MakefileItem {
         )?;
         let eol = line_ending(&parent);
         let new_node = with_trailing_newline(new_item.syntax(), &eol);
-        let index = terminate_line_before(&parent, index_after(self.syntax()), &eol);
+        hoist_next_doc_comment(self.syntax());
+        let index = terminate_line_before(&parent, self.syntax().index() + 1, &eol);
         let new_node = with_recipe_prefix(&new_node, &text_before(&parent, index));
 
         // Insert the new item after the current item
@@ -761,14 +772,13 @@ fn check_position(
     }))
 }
 
-/// The index in the parent of `node` just after it. A comment that the
-/// parser put at the end of `node` but that documents the next item is moved
-/// out of `node` first, so that it stays with that item.
-fn index_after(node: &SyntaxNode) -> usize {
+/// Move a comment that the parser put at the end of `node` but that
+/// documents the next item out of `node`, so that anything inserted after
+/// `node` goes before it.
+fn hoist_next_doc_comment(node: &SyntaxNode) {
     if let Some(next) = node.next_sibling() {
-        index_before_doc_comment(&next);
+        hoist_doc_comment(&next);
     }
-    node.index() + 1
 }
 
 // Internal trait for extracting specific item types from MakefileItem
@@ -1392,8 +1402,6 @@ impl Makefile {
         ));
         append_with_blank_line(self.syntax(), syntax, &eol);
 
-        // Use children().count() - 1 to get the last added child node
-        // (not children_with_tokens().count() which includes tokens)
         Ok(Rule::cast(self.syntax().children().last().unwrap()).unwrap())
     }
 
@@ -1434,17 +1442,10 @@ impl Makefile {
     ) -> Result<Conditional, Error> {
         // Validate conditional type
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
- kind: crate::ParseErrorKind::Other,
-                    message: format!(
-                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
-                        conditional_type
-                    ),
-                    line: 1,
-                    context: "add_conditional".to_string(),
-                }],
-            }));
+            return Err(invalid_conditional_type(
+                conditional_type,
+                "add_conditional",
+            ));
         };
         check_conditional(
             (conditional_type, else_keyword, endif_keyword),
@@ -1512,17 +1513,10 @@ impl Makefile {
     {
         // Validate conditional type
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
- kind: crate::ParseErrorKind::Other,
-                    message: format!(
-                        "Invalid conditional type: {}. Must be one of: ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake",
-                        conditional_type
-                    ),
-                    line: 1,
-                    context: "add_conditional_with_items".to_string(),
-                }],
-            }));
+            return Err(invalid_conditional_type(
+                conditional_type,
+                "add_conditional_with_items",
+            ));
         };
         // Items can't start another branch, so only the condition needs
         // checking.
@@ -1590,26 +1584,11 @@ impl Makefile {
     pub fn replace_rule(&mut self, index: usize, new_rule: Rule) -> Result<(), Error> {
         let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
-        if rules.is_empty() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot replace rule in empty makefile".to_string(),
-                    line: 1,
-                    context: "replace_rule".to_string(),
-                }],
-            }));
-        }
-
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     kind: crate::ParseErrorKind::Other,
-                    message: format!(
-                        "Rule index {} out of bounds (max {})",
-                        index,
-                        rules.len() - 1
-                    ),
+                    message: format!("Rule index {index} out of bounds ({} rules)", rules.len()),
                     line: 1,
                     context: "replace_rule".to_string(),
                 }],
@@ -1645,26 +1624,11 @@ impl Makefile {
     pub fn remove_rule(&mut self, index: usize) -> Result<Rule, Error> {
         let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
-        if rules.is_empty() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot remove rule from empty makefile".to_string(),
-                    line: 1,
-                    context: "remove_rule".to_string(),
-                }],
-            }));
-        }
-
         if index >= rules.len() {
             return Err(Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     kind: crate::ParseErrorKind::Other,
-                    message: format!(
-                        "Rule index {} out of bounds (max {})",
-                        index,
-                        rules.len() - 1
-                    ),
+                    message: format!("Rule index {index} out of bounds ({} rules)", rules.len()),
                     line: 1,
                     context: "remove_rule".to_string(),
                 }],
@@ -1725,7 +1689,10 @@ impl Makefile {
         let (parent, target_index) = match rules.get(index) {
             // Insert before the rule at the given index, and any comment
             // documenting it
-            Some(rule) => (rule.parent().unwrap(), index_before_doc_comment(rule)),
+            Some(rule) => {
+                hoist_doc_comment(rule);
+                (rule.parent().unwrap(), index_before_doc_comment(rule))
+            }
             None => (
                 self.syntax().clone(),
                 self.syntax().children_with_tokens().count(),
@@ -1816,11 +1783,13 @@ impl Makefile {
     ///
     /// # Example
     /// ```
+    /// # #![allow(deprecated)]
     /// use makefile_lossless::Makefile;
     /// let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.find_rules_by_target("rule1").collect();
     /// assert_eq!(rules.len(), 2);
     /// ```
+    #[deprecated(note = "use rules_by_target")]
     pub fn find_rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
         self.rules_by_target(target)
     }
@@ -1953,7 +1922,7 @@ impl Makefile {
     pub fn phony_targets(&self) -> impl Iterator<Item = String> + '_ {
         // Collect from all .PHONY rules since there can be multiple
         self.rules_by_target(".PHONY")
-            .flat_map(|rule| rule.prerequisites().collect::<Vec<_>>())
+            .flat_map(|rule| rule.prerequisite_lists(LineSyntax::Gnu).0)
     }
 
     /// Add a new include directive at the beginning of the makefile
@@ -2030,7 +1999,10 @@ impl Makefile {
         let target_index = match items.get(index) {
             // Insert before the item at the given index, and any comment
             // documenting it
-            Some(item) => index_before_doc_comment(item.syntax()),
+            Some(item) => {
+                hoist_doc_comment(item.syntax());
+                index_before_doc_comment(item.syntax())
+            }
             None => self.syntax().children_with_tokens().count(),
         };
 
@@ -2087,7 +2059,8 @@ impl Makefile {
         let eol = line_ending(self.syntax());
         let syntax = Include::new(path, &eol)?.syntax().clone();
 
-        let target_index = terminate_line_before(&parent, index_after(after_syntax), &eol);
+        hoist_next_doc_comment(after_syntax);
+        let target_index = terminate_line_before(&parent, after_syntax.index() + 1, &eol);
         parent.splice_children(target_index..target_index, vec![syntax.clone().into()]);
 
         Ok(Include::cast(syntax).unwrap())
@@ -4229,6 +4202,7 @@ VAR3 = value3
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_makefile_find_rules_by_target() {
         let makefile: Makefile = "rule1:\n\tcommand1\nrule1:\n\tcommand2\nrule2:\n\tcommand3\n"
             .parse()
