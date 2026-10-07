@@ -179,7 +179,7 @@ impl Parse<Rule> {
             line_range: range,
             space_indent_range: None,
         };
-        crate::lossless::locate_error_lines(&root, text, std::slice::from_mut(&mut error));
+        crate::lossless::locate_error_line(&parsed.line_ends, text, &mut error);
         positioned_errors.push(error);
         Parse::new(parsed.green_node, errors, positioned_errors)
     }

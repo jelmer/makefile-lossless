@@ -6,7 +6,9 @@ fn error_line_texts(
     text: &str,
     variant: Option<MakefileVariant>,
 ) -> Vec<(ParseErrorKind, &str, Option<rowan::TextRange>)> {
-    parse(text, variant)
+    let parsed = parse(text, variant);
+    assert_eq!(parsed.root().to_string(), text);
+    parsed
         .positioned_errors
         .iter()
         .map(|e| (e.kind(), &text[e.line_range()], e.space_indent_range()))
@@ -72,6 +74,24 @@ fn test_error_line_range_continuation() {
             (ParseErrorKind::MissingSeparator, "x \\\\", None),
             (ParseErrorKind::MissingSeparator, "  y", range(10, 12)),
         ]
+    );
+}
+
+#[test]
+fn test_error_line_range_nmake_caret_continuation() {
+    // A caret at the end of a macro definition's line continues it.
+    assert_eq!(
+        error_line_texts("A = x^\n$(y\n", Some(MakefileVariant::NMake)),
+        vec![(ParseErrorKind::UnclosedReference, "A = x^\n$(y", None)]
+    );
+}
+
+#[test]
+fn test_error_line_range_before_empty_node() {
+    // The rule after the error starts with an empty TARGETS node.
+    assert_eq!(
+        error_line_texts("(: dep\n", Some(MakefileVariant::BSDMake)),
+        vec![(ParseErrorKind::UnexpectedToken, "(: dep", None)]
     );
 }
 

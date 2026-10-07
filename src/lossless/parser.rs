@@ -11,6 +11,8 @@ pub(crate) struct Parse {
     pub(crate) green_node: GreenNode,
     pub(crate) errors: Vec<ErrorInfo>,
     pub(crate) positioned_errors: Vec<PositionedParseError>,
+    /// The range of each line ending that ends a logical line, in order.
+    pub(crate) line_ends: Vec<rowan::TextRange>,
 }
 
 pub(crate) const ASSIGNMENT_OPERATORS: &[&str] = &["=", ":=", "::=", ":::=", "+=", "?=", "!="];
@@ -186,68 +188,34 @@ impl ConditionalRuleContext {
     }
 }
 
-/// Set the line range and space indent range of each of `errors` in the
-/// tree `root`, whose text is `text`.
-pub(crate) fn locate_error_lines(
-    root: &SyntaxNode,
-    text: &str,
-    errors: &mut [PositionedParseError],
-) {
-    for error in errors {
-        error.line_range = logical_line_range(root, error.range.start());
-        error.space_indent_range = None;
-        if error.kind == ParseErrorKind::MissingSeparator {
-            let line = &text[error.line_range];
-            let spaces = line.len() - line.trim_start_matches(' ').len();
-            if spaces > 0 {
-                error.space_indent_range = Some(rowan::TextRange::at(
-                    error.line_range.start(),
-                    rowan::TextSize::from(spaces as u32),
-                ));
-            }
-        }
-    }
+/// The range of the spaces indenting the line `line_range` of `text`, if
+/// any.
+fn space_indent_range(text: &str, line_range: rowan::TextRange) -> Option<rowan::TextRange> {
+    let line = &text[line_range];
+    let spaces = line.len() - line.trim_start_matches(' ').len();
+    (spaces > 0)
+        .then(|| rowan::TextRange::at(line_range.start(), rowan::TextSize::from(spaces as u32)))
 }
 
-/// The range of the logical line containing `offset`, excluding its final
-/// line ending. At the end of the text, this is the line after the last
-/// line ending.
-fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::TextRange {
-    // In recipe text, a continuation backslash is part of a TEXT token.
-    let ends_in_backslash = |t: &SyntaxToken| {
-        t.kind() == TEXT && (t.text().len() - t.text().trim_end_matches('\\').len()) % 2 == 1
-    };
-    let is_line_end = |t: &SyntaxToken| {
-        t.kind() == NEWLINE
-            && !crate::ast::is_continuation(&t.clone().into())
-            && !t.prev_token().is_some_and(|p| ends_in_backslash(&p))
-    };
-    // The token containing the byte at `offset`. Unlike
-    // `SyntaxNode::token_at_offset`, this finds children by binary search.
-    let token_at = |offset: rowan::TextSize| {
-        root.covering_element(rowan::TextRange::at(offset, 1.into()))
-            .into_token()
-            .expect("every byte is part of a token")
-    };
-    let text_end = root.text_range().end();
-    let (before, token) = if offset < text_end {
-        let token = token_at(offset);
-        let before = if is_line_end(&token) {
-            token.prev_token()
-        } else {
-            Some(token.clone())
-        };
-        (before, Some(token))
+/// Set the line range and space indent range of `error` in `text`, given
+/// the ranges of the line endings that end its logical lines.
+pub(crate) fn locate_error_line(
+    line_ends: &[rowan::TextRange],
+    text: &str,
+    error: &mut PositionedParseError,
+) {
+    // The first line ending after the start of the error.
+    let i = line_ends.partition_point(|end| end.end() <= error.range.start());
+    let start = i.checked_sub(1).map_or(0.into(), |i| line_ends[i].end());
+    let end = line_ends
+        .get(i)
+        .map_or(rowan::TextSize::of(text), |end| end.start());
+    error.line_range = rowan::TextRange::new(start, end);
+    error.space_indent_range = if error.kind == ParseErrorKind::MissingSeparator {
+        space_indent_range(text, error.line_range)
     } else {
-        (text_end.checked_sub(1.into()).map(token_at), None)
+        None
     };
-    let start = std::iter::successors(before, |t| t.prev_token())
-        .find(is_line_end)
-        .map_or(0.into(), |t| t.text_range().end());
-    let end = std::iter::successors(token, |t| t.next_token())
-        .find(is_line_end)
-        .map_or(text_end, |t| t.text_range().start());
-    rowan::TextRange::new(start, end)
 }
 
 /// A token's kind and text.
@@ -321,6 +289,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         token_edits: usize,
         /// The result of the last call to [`Parser::recipe_continues`].
         recipe_continues: std::cell::Cell<Option<RecipeContinues>>,
+        /// The range of each NEWLINE token consumed so far that ends a
+        /// logical line, rather than continuing it.
+        line_ends: Vec<rowan::TextRange>,
     }
 
     /// The result of [`Parser::recipe_continues`] at the start of a line. It
@@ -429,7 +400,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 range,
                 code: None,
                 kind,
-                // Set by `Parser::parse` once the tree is complete.
+                // Set by `Parser::parse` once all lines have been seen.
                 line_range: rowan::TextRange::empty(range.start()),
                 space_indent_range: None,
             });
@@ -542,9 +513,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                 }
 
-                // Consume the newline
                 if self.current() == Some(NEWLINE) {
-                    self.bump();
+                    if is_continuation {
+                        self.bump_continued_newline();
+                    } else {
+                        self.bump();
+                    }
                 }
 
                 if is_continuation {
@@ -633,7 +607,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     self.builder.token(kind.into(), &text);
                 }
                 if self.current() == Some(NEWLINE) {
-                    self.bump();
+                    if continued {
+                        self.bump_continued_newline();
+                    } else {
+                        self.bump();
+                    }
                 }
                 if !continued {
                     break;
@@ -1069,10 +1047,11 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.current() != Some(NEWLINE) {
                     break;
                 }
-                self.bump();
                 if !continued {
+                    self.bump();
                     break;
                 }
+                self.bump_continued_newline();
             }
         }
 
@@ -1995,7 +1974,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return false;
             }
             self.bump(); // backslash
-            self.bump(); // newline
+            self.bump_continued_newline();
             if self.current() == Some(INDENT) {
                 self.bump();
             }
@@ -2015,7 +1994,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return false;
             }
             self.bump(); // caret
-            self.bump(); // newline
+            self.bump_continued_newline();
             if self.current() == Some(INDENT) {
                 self.bump();
             }
@@ -4634,16 +4613,15 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.builder.finish_node();
 
             let green_node = self.builder.finish();
-            locate_error_lines(
-                &SyntaxNode::new_root(green_node.clone()),
-                self.original_text,
-                &mut self.positioned_errors,
-            );
+            for error in &mut self.positioned_errors {
+                locate_error_line(&self.line_ends, self.original_text, error);
+            }
 
             Parse {
                 green_node,
                 errors: self.errors,
                 positioned_errors: self.positioned_errors,
+                line_ends: self.line_ends,
             }
         }
 
@@ -4830,12 +4808,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             seen_directive
         }
 
-        /// Advance one token, adding it to the current branch of the tree builder.
+        /// Advance one token, adding it to the current branch of the tree
+        /// builder. A NEWLINE token ends the logical line.
         fn bump(&mut self) {
+            let range = self.current_range();
             let (kind, text) = self.pop_token().unwrap();
             // Track backslash-run parity: each backslash flips the flag, any
             // other token clears it. See `pending_backslash_escape`.
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
+            self.builder.token(kind.into(), text.as_str());
+            if kind == NEWLINE {
+                self.line_ends.push(range);
+            }
+        }
+
+        /// Advance past a NEWLINE token that continues the logical line.
+        fn bump_continued_newline(&mut self) {
+            let (kind, text) = self.pop_token().unwrap();
+            assert_eq!(kind, NEWLINE);
+            self.pending_backslash_escape = false;
             self.builder.token(kind.into(), text.as_str());
         }
         /// Advance one token, adding it to the tree as `kind`.
@@ -4973,6 +4964,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         bsd_line: None,
         token_edits: 0,
         recipe_continues: std::cell::Cell::new(None),
+        line_ends: Vec::new(),
     }
     .parse()
 }
