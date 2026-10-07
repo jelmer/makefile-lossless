@@ -1,55 +1,81 @@
 use super::*;
 
-/// A token's kind and text.
-type Token = (SyntaxKind, String);
+/// A token of the input, with its text borrowed from it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Token<'a> {
+    pub(super) kind: SyntaxKind,
+    pub(super) text: &'a str,
+    /// The offset of `text` in the input.
+    pub(super) start: rowan::TextSize,
+}
 
-/// A token's start and end.
-type TokenRange = (rowan::TextSize, rowan::TextSize);
+impl Token<'_> {
+    pub(super) fn range(&self) -> rowan::TextRange {
+        rowan::TextRange::at(self.start, rowan::TextSize::of(self.text))
+    }
+}
 
-/// Reverse `tokens`, which start at `start`, into the order of the parser's
-/// token stack, along with their positions in the same order.
-pub(super) fn token_stack(
+/// Reverse `tokens` from the lexer, which start at `start` in the input,
+/// into the order of the parser's token stack.
+pub(super) fn token_stack<'a>(
     start: rowan::TextSize,
-    mut tokens: Vec<Token>,
-) -> (Vec<Token>, Vec<TokenRange>) {
+    tokens: Vec<(SyntaxKind, &'a str)>,
+) -> Vec<Token<'a>> {
     let mut position = start;
-    let mut positions: Vec<_> = tokens
-        .iter()
-        .map(|(_, text)| {
-            let start = position;
-            position += rowan::TextSize::of(text.as_str());
-            (start, position)
+    let mut tokens: Vec<_> = tokens
+        .into_iter()
+        .map(|(kind, text)| {
+            let token = Token {
+                kind,
+                text,
+                start: position,
+            };
+            position += rowan::TextSize::of(text);
+            token
         })
         .collect();
     tokens.reverse();
-    positions.reverse();
-    (tokens, positions)
+    tokens
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     /// Text range of the current token, or an empty range at the end of
     /// the text if all tokens have been consumed.
     pub(super) fn current_range(&self) -> rowan::TextRange {
-        debug_assert_eq!(self.tokens.len(), self.token_positions.len());
-        match self.token_positions.last() {
-            Some(&(start, end)) => rowan::TextRange::new(start, end),
+        match self.tokens.last() {
+            Some(token) => token.range(),
             None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text)),
         }
     }
 
     /// Remove the current token without adding it to the tree.
-    pub(super) fn pop_token(&mut self) -> Option<(SyntaxKind, String)> {
-        self.token_positions.pop();
+    pub(super) fn pop_token(&mut self) -> Option<Token<'a>> {
         self.tokens.pop()
     }
 
-    /// Replace the current token with `tokens`, given in forward order.
-    pub(super) fn replace_current_token(&mut self, tokens: Vec<(SyntaxKind, String)>) {
-        let start = self.current_range().start();
-        self.pop_token();
-        let (tokens, positions) = token_stack(start, tokens);
-        self.tokens.extend(tokens);
-        self.token_positions.extend(positions);
+    /// Replace the current token with `tokens`, which make up its text,
+    /// given in forward order.
+    pub(super) fn replace_current_token(&mut self, tokens: Vec<(SyntaxKind, &'a str)>) {
+        let start = self.pop_token().unwrap().start;
+        self.tokens.extend(token_stack(start, tokens));
+    }
+
+    /// The kind and text of each token from the current one to the end
+    /// of the input.
+    pub(super) fn upcoming(&self) -> impl Iterator<Item = (SyntaxKind, &'a str)> + Clone + '_ {
+        self.upcoming_from(self.tokens.len())
+    }
+
+    /// Like [`Self::upcoming`], starting at the token at `end - 1` in the
+    /// token stack.
+    pub(super) fn upcoming_from(
+        &self,
+        end: usize,
+    ) -> impl Iterator<Item = (SyntaxKind, &'a str)> + Clone + '_ {
+        self.tokens[..end]
+            .iter()
+            .rev()
+            .map(|token| (token.kind, token.text))
     }
 
     /// Whether the current token's text is `text`.
@@ -65,7 +91,7 @@ impl Parser<'_> {
         !self.pending_backslash_escape
             && self.current() == Some(BACKSLASH)
             && self.tokens.len() >= 2
-            && self.tokens[self.tokens.len() - 2].0 == NEWLINE
+            && self.tokens[self.tokens.len() - 2].kind == NEWLINE
     }
 
     /// Skip to the end of the logical line, for error recovery, so that
@@ -107,12 +133,12 @@ impl Parser<'_> {
     /// As [`Self::bump_token_head`], but adding the head to the tree as
     /// `kind`.
     pub(super) fn bump_token_head_as(&mut self, len: usize, kind: SyntaxKind) {
-        let text = &mut self.tokens.last_mut().unwrap().1;
-        let tail = text.split_off(len);
-        let head = std::mem::replace(text, tail);
-        self.token_positions.last_mut().unwrap().0 += rowan::TextSize::of(head.as_str());
+        let token = self.tokens.last_mut().unwrap();
+        let (head, tail) = token.text.split_at(len);
+        token.text = tail;
+        token.start += rowan::TextSize::of(head);
         self.pending_backslash_escape = false;
-        self.builder.token(kind.into(), &head);
+        self.builder.token(kind.into(), head);
 
         let Some(tail) = self.current_text().filter(|tail| tail.starts_with('$')) else {
             return;
@@ -129,12 +155,26 @@ impl Parser<'_> {
 
     /// Consume `count` tokens as a single token of the given kind.
     pub(super) fn bump_merged(&mut self, kind: SyntaxKind, count: usize) {
-        let mut text = String::new();
-        for _ in 0..count {
-            text.push_str(&self.pop_token().unwrap().1);
-        }
+        let text = self.pop_tokens(count);
         self.pending_backslash_escape = false;
-        self.builder.token(kind.into(), &text);
+        self.builder.token(kind.into(), text);
+    }
+
+    /// The text of the next `count` tokens.
+    pub(super) fn next_tokens_text(&self, count: usize) -> &'a str {
+        let rest = self.tokens.len() - count;
+        match (self.tokens.last(), self.tokens.get(rest)) {
+            (Some(first), Some(last)) => &self.original_text[first.range().cover(last.range())],
+            _ => "",
+        }
+    }
+
+    /// Remove the next `count` tokens without adding them to the tree,
+    /// returning their text.
+    pub(super) fn pop_tokens(&mut self, count: usize) -> &'a str {
+        let text = self.next_tokens_text(count);
+        self.tokens.truncate(self.tokens.len() - count);
+        text
     }
 
     /// Consume the next `len` tokens, minus trailing whitespace, as a
@@ -142,66 +182,59 @@ impl Parser<'_> {
     pub(super) fn bump_as_identifier(&mut self, len: usize) -> bool {
         let trailing_ws = self.tokens[self.tokens.len() - len..]
             .iter()
-            .take_while(|(kind, _)| *kind == WHITESPACE)
+            .take_while(|token| token.kind == WHITESPACE)
             .count();
-        let mut name = String::new();
-        for _ in 0..len - trailing_ws {
-            let (_, text) = self.pop_token().unwrap();
-            name.push_str(&text);
-        }
+        let name = self.pop_tokens(len - trailing_ws);
         if name.is_empty() {
             return false;
         }
         self.pending_backslash_escape = false;
-        self.builder.token(IDENTIFIER.into(), &name);
+        self.builder.token(IDENTIFIER.into(), name);
         true
     }
 
     /// Advance one token, adding it to the current branch of the tree
     /// builder. A NEWLINE token ends the logical line.
     pub(super) fn bump(&mut self) {
-        let range = self.current_range();
-        let (kind, text) = self.pop_token().unwrap();
+        let token = self.pop_token().unwrap();
         // Track backslash-run parity: each backslash flips the flag, any
         // other token clears it. See `pending_backslash_escape`.
         self.pending_backslash_escape =
-            escapes_next(kind == BACKSLASH, self.pending_backslash_escape);
-        self.builder.token(kind.into(), text.as_str());
-        if kind == NEWLINE {
-            self.line_ends.push(range);
+            escapes_next(token.kind == BACKSLASH, self.pending_backslash_escape);
+        self.builder.token(token.kind.into(), token.text);
+        if token.kind == NEWLINE {
+            self.line_ends.push(token.range());
         }
     }
 
     /// Advance past a NEWLINE token that continues the logical line.
     pub(super) fn bump_continued_newline(&mut self) {
-        let (kind, text) = self.pop_token().unwrap();
-        assert_eq!(kind, NEWLINE);
+        let token = self.pop_token().unwrap();
+        assert_eq!(token.kind, NEWLINE);
         self.pending_backslash_escape = false;
-        self.builder.token(kind.into(), text.as_str());
+        self.builder.token(token.kind.into(), token.text);
     }
 
     /// Advance one token, adding it to the tree as `kind`.
     pub(super) fn bump_as(&mut self, kind: SyntaxKind) {
-        let (_, text) = self.pop_token().unwrap();
+        let token = self.pop_token().unwrap();
         self.pending_backslash_escape = false;
-        self.builder.token(kind.into(), text.as_str());
+        self.builder.token(kind.into(), token.text);
     }
 
     /// Peek at the first unprocessed token
     pub(super) fn current(&self) -> Option<SyntaxKind> {
-        self.tokens.last().map(|(kind, _)| *kind)
+        self.tokens.last().map(|token| token.kind)
     }
 
     /// The kind and text of the first unprocessed token.
-    pub(super) fn current_token(&self) -> Option<(SyntaxKind, &str)> {
-        self.tokens
-            .last()
-            .map(|(kind, text)| (*kind, text.as_str()))
+    pub(super) fn current_token(&self) -> Option<(SyntaxKind, &'a str)> {
+        self.tokens.last().map(|token| (token.kind, token.text))
     }
 
     /// The text of the first unprocessed token.
-    pub(super) fn current_text(&self) -> Option<&str> {
-        self.tokens.last().map(|(_, text)| text.as_str())
+    pub(super) fn current_text(&self) -> Option<&'a str> {
+        self.tokens.last().map(|token| token.text)
     }
 
     /// Whether the current token is of kind `kind` with text `text`.
@@ -211,11 +244,9 @@ impl Parser<'_> {
 
     /// Kind of the first non-whitespace token after the current one.
     pub(super) fn peek_past_ws(&self) -> Option<SyntaxKind> {
-        self.tokens
-            .iter()
-            .rev()
+        self.upcoming()
             .skip(1)
-            .map(|(kind, _)| *kind)
+            .map(|(kind, _)| kind)
             .find(|kind| *kind != WHITESPACE)
     }
 

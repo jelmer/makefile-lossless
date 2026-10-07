@@ -146,14 +146,14 @@ impl Parser<'_> {
             }
         };
         let mut prev = None;
-        for (kind, text) in self.tokens.iter().rev().skip(1) {
+        for (kind, text) in self.upcoming().skip(1) {
             match kind {
                 COMMENT => break,
                 NEWLINE if prev != Some(BACKSLASH) => break,
                 _ if text.contains(close) => return,
                 _ => {}
             }
-            prev = Some(*kind);
+            prev = Some(kind);
         }
         self.record_error(
             ParseErrorKind::UnclosedIncludePath,
@@ -335,8 +335,8 @@ impl Parser<'_> {
             return None;
         }
         let tokens = &self.tokens[..n];
-        let (kind, text) = tokens.last()?;
-        if *kind != IDENTIFIER {
+        let (kind, text) = self.upcoming_from(n).next()?;
+        if kind != IDENTIFIER {
             return None;
         }
         let (name, count) = if text == "." {
@@ -345,16 +345,16 @@ impl Parser<'_> {
             let mut i = n - 1;
             loop {
                 i = i.checked_sub(1)?;
-                match tokens[i].0 {
+                match tokens[i].kind {
                     WHITESPACE | INDENT => {}
-                    BACKSLASH if i > 0 && tokens[i - 1].0 == NEWLINE => i -= 1,
+                    BACKSLASH if i > 0 && tokens[i - 1].kind == NEWLINE => i -= 1,
                     _ => break,
                 }
             }
-            if i == n - 2 || tokens[i].0 != IDENTIFIER {
+            if i == n - 2 || tokens[i].kind != IDENTIFIER {
                 return None;
             }
-            (tokens[i].1.as_str(), n - i)
+            (tokens[i].text, n - i)
         } else {
             (text.strip_prefix('.')?, 1)
         };
@@ -385,7 +385,7 @@ impl Parser<'_> {
                     | "sinclude"
                     | "dinclude"
             );
-        let next = tokens[..n - count].last();
+        let next = self.upcoming_from(n - count).next();
         if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
             return None;
         }
@@ -408,16 +408,14 @@ impl Parser<'_> {
         // The index in `self.tokens` of the word after the one at `i`,
         // skipping whitespace.
         let next_word = |i: usize| {
-            let i = (0..i).rev().find(|&j| self.tokens[j].0 != WHITESPACE)?;
-            (self.tokens[i].0 == IDENTIFIER).then_some(i)
+            let i = (0..i).rev().find(|&j| self.tokens[j].kind != WHITESPACE)?;
+            (self.tokens[i].kind == IDENTIFIER).then_some(i)
         };
         let n = self.tokens.len();
         let first = next_word(n - 1)?;
         let second = next_word(first);
-        let (name, uses_second) = nmake_directive_name(
-            &self.tokens[first].1,
-            second.map(|i| self.tokens[i].1.as_str()),
-        )?;
+        let (name, uses_second) =
+            nmake_directive_name(self.tokens[first].text, second.map(|i| self.tokens[i].text))?;
         let last = if uses_second { second? } else { first };
         let count = n - last;
         // As for BSD make, require whitespace or the end of the line
@@ -425,7 +423,7 @@ impl Parser<'_> {
         // includes.
         let lenient =
             is_bsd_if(name) || is_bsd_elif(name) || matches!(name, "else" | "endif" | "include");
-        let next = self.tokens[..last].last();
+        let next = self.upcoming_from(last).next();
         if !lenient && !matches!(next, None | Some((WHITESPACE | NEWLINE | COMMENT, _))) {
             return None;
         }
@@ -453,7 +451,7 @@ impl Parser<'_> {
             "include" | "-include" | "sinclude" | "dinclude"
                 if self.is_bsd_make()
                     && self.tokens[self.tokens.len() - count]
-                        .1
+                        .text
                         .trim_start_matches('.')
                         != name =>
             {
@@ -612,18 +610,14 @@ impl Parser<'_> {
             // A line continuation also ends the word.
             let mut word_len = 0;
             for i in (0..self.tokens.len()).rev() {
-                let kind = self.tokens[i].0;
-                let continuation = kind == BACKSLASH && i > 0 && self.tokens[i - 1].0 == NEWLINE;
+                let kind = self.tokens[i].kind;
+                let continuation = kind == BACKSLASH && i > 0 && self.tokens[i - 1].kind == NEWLINE;
                 if matches!(kind, WHITESPACE | INDENT | NEWLINE | COMMENT) || continuation {
                     break;
                 }
                 word_len += 1;
             }
-            let word: String = self.tokens[self.tokens.len() - word_len..]
-                .iter()
-                .rev()
-                .map(|(_, text)| text.as_str())
-                .collect();
+            let word = self.next_tokens_text(word_len);
             if word.is_empty() || word == "in" {
                 break;
             }
@@ -636,10 +630,7 @@ impl Parser<'_> {
                 break;
             }
             found_variable = true;
-            self.tokens.truncate(self.tokens.len() - word_len);
-            self.token_positions.truncate(self.tokens.len());
-            self.pending_backslash_escape = false;
-            self.builder.token(IDENTIFIER.into(), &word);
+            self.bump_merged(IDENTIFIER, word_len);
             self.skip_ws_and_continuations();
         }
         if valid && !found_variable {

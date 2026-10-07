@@ -437,7 +437,7 @@ impl Emitter<'_, '_, '_> {
                         NEWLINE | INDENT | BACKSLASH | COMMENT => TEXT,
                         kind => kind,
                     };
-                    self.builder.token(kind.into(), &text);
+                    self.builder.token(kind.into(), text);
                 }
             }
             pos = end;

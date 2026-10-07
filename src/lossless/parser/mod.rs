@@ -21,7 +21,7 @@ mod tokens;
 
 pub(crate) use errors::locate_error_line;
 pub(crate) use reference::bsd_logical_line;
-use tokens::token_stack;
+use tokens::{token_stack, Token};
 
 /// The parse results are stored as a "green tree".
 #[derive(Debug)]
@@ -56,7 +56,7 @@ impl RuleContext {
 struct Parser<'a> {
     /// input tokens, including whitespace,
     /// in *reverse* order.
-    tokens: Vec<(SyntaxKind, String)>,
+    tokens: Vec<Token<'a>>,
     /// the in-progress tree.
     builder: GreenNodeBuilder<'static>,
     /// the list of syntax errors we've accumulated
@@ -64,8 +64,6 @@ struct Parser<'a> {
     errors: Vec<ErrorInfo>,
     /// positioned errors with location information
     positioned_errors: Vec<PositionedParseError>,
-    /// The position (start, end) of each of `tokens`, in the same order.
-    token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
     /// The original text
     original_text: &'a str,
     /// The offset of the start of each line in `original_text`.
@@ -122,11 +120,9 @@ struct RecipeContinues {
 }
 
 /// A logical line lexed again, from [`Parser::lex_as_non_recipe_line`].
-struct RelexedLine {
+struct RelexedLine<'a> {
     /// The new tokens, in reverse order.
-    tokens: Vec<(SyntaxKind, String)>,
-    /// The position of each of `tokens`, in the same order.
-    positions: Vec<(rowan::TextSize, rowan::TextSize)>,
+    tokens: Vec<Token<'a>>,
     /// The number of current tokens they replace.
     replaces: usize,
 }
@@ -321,13 +317,11 @@ impl Parser<'_> {
 }
 
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
-    let (tokens, token_positions) = token_stack(0.into(), lex(text, variant));
     Parser {
-        tokens,
+        tokens: token_stack(0.into(), lex(text, variant)),
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
         positioned_errors: Vec::new(),
-        token_positions,
         original_text: text,
         line_starts: std::iter::once(0)
             .chain(text.match_indices('\n').map(|(i, _)| i + 1))

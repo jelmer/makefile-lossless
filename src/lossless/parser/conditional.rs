@@ -220,7 +220,7 @@ impl Parser<'_> {
     /// `else ifdef:` as an `else` with extraneous text.
     pub(super) fn is_else_if_at(&self, end: usize) -> bool {
         let mut next = end - 1;
-        while next > 0 && self.tokens[next - 1].0 == WHITESPACE {
+        while next > 0 && self.tokens[next - 1].kind == WHITESPACE {
             next -= 1;
         }
         self.keyword_at(next, GNU_CONDITIONAL_STARTS)
@@ -563,15 +563,13 @@ impl Parser<'_> {
         }
         let end = self.tokens.len()
             - self
-                .tokens
-                .iter()
-                .rev()
+                .upcoming()
                 .take_while(|(kind, _)| *kind == WHITESPACE)
                 .count();
         if !self.conditional_line_at(end) {
             return None;
         }
-        match self.tokens[end - 1].1.as_str() {
+        match self.tokens[end - 1].text {
             "endif" => Some(false),
             token => is_gnu_conditional_start(token).then_some(true),
         }

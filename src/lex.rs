@@ -4,7 +4,6 @@ use crate::syntax_rules::{
 };
 use crate::{MakefileVariant, SyntaxKind};
 use std::collections::HashMap;
-use std::iter::Peekable;
 use std::str::Chars;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,8 +12,50 @@ enum LineType {
     Other,
 }
 
+/// The characters of the input not yet lexed. Unlike `Peekable<Chars>`,
+/// this knows which part of the input is left, so that tokens can borrow
+/// their text from the input.
+#[derive(Clone)]
+struct Input<'a>(Chars<'a>);
+
+impl<'a> Input<'a> {
+    fn peek(&self) -> Option<char> {
+        self.0.clone().next()
+    }
+
+    fn next_if(&mut self, predicate: impl FnOnce(&char) -> bool) -> Option<char> {
+        let c = self.peek().filter(predicate)?;
+        self.0.next();
+        Some(c)
+    }
+
+    fn next_if_eq(&mut self, expected: char) -> Option<char> {
+        self.next_if(|&c| c == expected)
+    }
+
+    /// Skip `count` characters.
+    fn advance(&mut self, count: usize) {
+        for _ in 0..count {
+            self.0.next();
+        }
+    }
+
+    /// The input not yet lexed.
+    fn rest(&self) -> &'a str {
+        self.0.as_str()
+    }
+}
+
+impl Iterator for Input<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        self.0.next()
+    }
+}
+
 pub struct Lexer<'a> {
-    input: Peekable<Chars<'a>>,
+    input: Input<'a>,
     line_type: Option<LineType>,
     continuation: bool,
     /// Parity of the current backslash run: true once an odd number have been
@@ -287,7 +328,7 @@ pub(crate) const NMAKE_ESCAPABLE: &[char] = &[
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str, variant: Option<MakefileVariant>) -> Self {
         Lexer {
-            input: input.chars().peekable(),
+            input: Input(input.chars()),
             continuation: false,
             line_type: None,
             pending_backslash_escape: false,
@@ -428,7 +469,7 @@ impl<'a> Lexer<'a> {
     /// to `.RECIPEPREFIX`: it doesn't start with `define`, `.RECIPEPREFIX`
     /// or a modifier such as `override`. Lines that might be assignments
     /// to other variables are kept while variables are tracked.
-    fn check_line_start(&mut self, token: &(SyntaxKind, String)) {
+    fn check_line_start(&mut self, token: &(SyntaxKind, &str)) {
         if self.line_checked
             || matches!(
                 token.0,
@@ -503,17 +544,19 @@ impl<'a> Lexer<'a> {
         Self::is_whitespace(c) || (self.bsd && !self.gnu && matches!(c, '\r' | '\x0b' | '\x0c'))
     }
 
-    /// Read word separators up to the end of the line.
-    fn read_word_separators(&mut self) -> String {
-        let mut result = String::new();
-        while let Some(&c) = self.input.peek() {
+    /// The input consumed since `start` was the rest of it.
+    fn consumed_since(&self, start: &'a str) -> &'a str {
+        &start[..start.len() - self.input.rest().len()]
+    }
+
+    /// Skip word separators up to the end of the line.
+    fn skip_word_separators(&mut self) {
+        while let Some(c) = self.input.peek() {
             if self.at_newline() || !self.is_word_separator(c) {
                 break;
             }
             self.input.next();
-            result.push(c);
         }
-        result
     }
 
     /// Whether the input is at a line ending. Like GNU make and BSD make,
@@ -540,20 +583,20 @@ impl<'a> Lexer<'a> {
             && probe.next() == Some('\n')
     }
 
-    /// Read the rest of a recipe line as text, noting whether it continues
-    /// on the next line.
-    fn read_recipe_text(&mut self) -> (SyntaxKind, String) {
+    /// Read the rest of a recipe line as a TEXT token, noting whether it
+    /// continues on the next line.
+    fn read_recipe_text(&mut self) -> SyntaxKind {
         let text = self.read_line();
-        self.recipe_continuation = ends_with_unescaped_backslash(&text);
+        self.recipe_continuation = ends_with_unescaped_backslash(text);
         if self.nmake {
             self.nmake_inline_files += text.matches("<<").count();
         }
-        (SyntaxKind::TEXT, text)
+        SyntaxKind::TEXT
     }
 
     /// Read up to the end of the line.
-    fn read_line(&mut self) -> String {
-        let mut result = String::new();
+    fn read_line(&mut self) -> &'a str {
+        let start = self.input.rest();
         let mut after_backslash = false;
         loop {
             if self.at_newline() && !self.at_escaped_cr(after_backslash) {
@@ -563,9 +606,8 @@ impl<'a> Lexer<'a> {
                 break;
             };
             after_backslash = c == '\\' && !after_backslash;
-            result.push(c);
         }
-        result
+        self.consumed_since(start)
     }
 
     /// For BSD make, the length of the identifier starting with `c` up to
@@ -583,11 +625,10 @@ impl<'a> Lexer<'a> {
         } else {
             return None;
         };
-        let word: String = self
-            .input
-            .clone()
-            .take_while(|&c| Self::is_valid_identifier_char(c))
-            .collect();
+        let rest = self.input.rest();
+        let word = rest
+            .find(|c| !Self::is_valid_identifier_char(c))
+            .map_or(rest, |end| &rest[..end]);
         let rest = &word[skip..];
         let name_len = rest
             .find(|c: char| !c.is_ascii_alphabetic())
@@ -608,38 +649,26 @@ impl<'a> Lexer<'a> {
 
     /// Read a comment up to the end of the line. Outside recipes, a comment
     /// ending in an unescaped backslash continues on the next line.
-    fn read_comment(&mut self) -> String {
-        let mut comment = self.read_line();
+    fn read_comment(&mut self) -> &'a str {
+        let start = self.input.rest();
+        self.read_line();
         while self.line_type == Some(LineType::Other)
-            && ends_with_unescaped_backslash(&comment)
+            && ends_with_unescaped_backslash(self.consumed_since(start))
             && self.at_newline()
         {
-            if let Some(cr) = self.input.next_if_eq(&'\r') {
-                comment.push(cr);
-            }
-            comment.extend(self.input.next());
-            comment.push_str(&self.read_line());
+            self.input.next_if_eq('\r');
+            self.input.next();
+            self.read_line();
         }
-        comment
+        self.consumed_since(start)
     }
 
-    fn read_while<F>(&mut self, predicate: F) -> String
-    where
-        F: Fn(char) -> bool,
-    {
-        let mut result = String::new();
-        while let Some(&c) = self.input.peek() {
-            if predicate(c) {
-                result.push(c);
-                self.input.next();
-            } else {
-                break;
-            }
-        }
-        result
+    fn skip_while(&mut self, predicate: impl Fn(char) -> bool) {
+        while self.input.next_if(|&c| predicate(c)).is_some() {}
     }
 
-    fn next_token(&mut self) -> Option<(SyntaxKind, String)> {
+    /// Read the next token, returning its kind.
+    fn next_token(&mut self) -> Option<SyntaxKind> {
         // A backslash continues the line only when it is not itself escaped by
         // a preceding backslash. `escaped` is the run parity carried over from
         // the previous token; clear the field here so any non-backslash token
@@ -648,7 +677,7 @@ impl<'a> Lexer<'a> {
         self.pending_backslash_escape = false;
         let after_lbracket = self.after_lbracket;
         self.after_lbracket = false;
-        if let Some(&c) = self.input.peek() {
+        if let Some(c) = self.input.peek() {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
             if self.line_type.is_none() {
@@ -659,11 +688,10 @@ impl<'a> Lexer<'a> {
                     // A line of an nmake inline file, up to a line starting
                     // with `<<`.
                     self.line_type = Some(LineType::Recipe);
-                    let text = self.read_line();
-                    if text.starts_with("<<") {
+                    if self.read_line().starts_with("<<") {
                         self.nmake_inline_files -= 1;
                     }
-                    return Some((SyntaxKind::TEXT, text));
+                    return Some(SyntaxKind::TEXT);
                 }
                 // A prefix set to a newline, by a `define` whose value starts
                 // with an empty line, allows no recipe lines.
@@ -672,32 +700,34 @@ impl<'a> Lexer<'a> {
                 {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
-                    return Some((SyntaxKind::INDENT, c.to_string()));
+                    return Some(SyntaxKind::INDENT);
                 }
                 ('\t', None)
                     if self.recipe_prefix != '\t' && !self.continuation && !recipe_continuation =>
                 {
                     // Only the recipe prefix introduces a recipe line.
                     self.line_type = Some(LineType::Other);
-                    return Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)));
+                    self.skip_while(Self::is_whitespace);
+                    return Some(SyntaxKind::WHITESPACE);
                 }
                 ('\t', None) if !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
-                    return Some((SyntaxKind::INDENT, "\t".to_string()));
+                    return Some(SyntaxKind::INDENT);
                 }
                 ('\t', None) => {
                     // Continuation line: tab is indent but not a recipe
                     self.input.next();
                     self.line_type = Some(LineType::Other);
                     self.continuation = false;
-                    return Some((SyntaxKind::INDENT, "\t".to_string()));
+                    return Some(SyntaxKind::INDENT);
                 }
                 (' ', None) if recipe_continuation || (self.nmake && !self.continuation) => {
                     // A space-indented continuation of a recipe line, or an
                     // nmake command line, which may start with spaces.
                     self.line_type = Some(LineType::Recipe);
-                    return Some((SyntaxKind::INDENT, self.read_while(|ch| ch == ' ')));
+                    self.skip_while(|ch| ch == ' ');
+                    return Some(SyntaxKind::INDENT);
                 }
                 (_, None) if recipe_continuation && !self.at_newline() => {
                     // An unindented continuation of a recipe line, which
@@ -709,14 +739,15 @@ impl<'a> Lexer<'a> {
                     // Only a tab introduces a recipe line; leading spaces are
                     // allowed before ordinary makefile lines.
                     self.line_type = Some(LineType::Other);
-                    return Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)));
+                    self.skip_while(Self::is_whitespace);
+                    return Some(SyntaxKind::WHITESPACE);
                 }
                 (' ', None) => {
                     // Continuation line: spaces are indent but not a recipe
-                    let spaces = self.read_while(|ch| ch == ' ');
+                    self.skip_while(|ch| ch == ' ');
                     self.line_type = Some(LineType::Other);
                     self.continuation = false;
-                    return Some((SyntaxKind::INDENT, spaces));
+                    return Some(SyntaxKind::INDENT);
                 }
                 (_, None) => {
                     self.line_type = Some(LineType::Other);
@@ -729,10 +760,9 @@ impl<'a> Lexer<'a> {
                 _ if self.at_newline() => {
                     self.line_type = None;
                     // Take CRLF as a single line ending.
-                    let mut text = String::new();
-                    text.extend(self.input.next_if_eq(&'\r'));
-                    text.extend(self.input.next());
-                    return Some((SyntaxKind::NEWLINE, text));
+                    self.input.next_if_eq('\r');
+                    self.input.next();
+                    return Some(SyntaxKind::NEWLINE);
                 }
                 '#' if self.line_type == Some(LineType::Other)
                     && (!self.comments
@@ -749,9 +779,9 @@ impl<'a> Lexer<'a> {
                     // `#` like any other, although nmake ends a comment at
                     // the end of the line.
                     if self.line_type == Some(LineType::Recipe) && !self.nmake {
-                        self.recipe_continuation = ends_with_unescaped_backslash(&comment);
+                        self.recipe_continuation = ends_with_unescaped_backslash(comment);
                     }
-                    return Some((SyntaxKind::COMMENT, comment));
+                    return Some(SyntaxKind::COMMENT);
                 }
                 _ => {}
             }
@@ -760,14 +790,15 @@ impl<'a> Lexer<'a> {
                 LineType::Recipe => Some(self.read_recipe_text()),
                 LineType::Other => match c {
                     c if self.is_word_separator(c) => {
-                        Some((SyntaxKind::WHITESPACE, self.read_word_separators()))
+                        self.skip_word_separators();
+                        Some(SyntaxKind::WHITESPACE)
                     }
                     c if Self::is_valid_identifier_char(c) => {
-                        let text = match self.bsd_conditional_name_len(c) {
-                            Some(len) => self.input.by_ref().take(len).collect(),
-                            None => self.read_while(Self::is_valid_identifier_char),
-                        };
-                        Some((SyntaxKind::IDENTIFIER, text))
+                        match self.bsd_conditional_name_len(c) {
+                            Some(len) => self.input.advance(len),
+                            None => self.skip_while(Self::is_valid_identifier_char),
+                        }
+                        Some(SyntaxKind::IDENTIFIER)
                     }
                     // Make does not treat quotes specially when reading a
                     // line, so each quote is a token of its own.
@@ -776,7 +807,7 @@ impl<'a> Lexer<'a> {
                         if c == '"' && self.nmake {
                             self.nmake_quoted = !self.nmake_quoted;
                         }
-                        Some((SyntaxKind::QUOTE, c.to_string()))
+                        Some(SyntaxKind::QUOTE)
                     }
                     ':' => {
                         // Only take as many characters as form a valid
@@ -784,16 +815,16 @@ impl<'a> Lexer<'a> {
                         // rest belongs to whatever follows, e.g. `X:==y`.
                         let mut probe = self.input.clone();
                         let mut colons = 0;
-                        while probe.next_if_eq(&':').is_some() {
+                        while probe.next_if_eq(':').is_some() {
                             colons += 1;
                         }
-                        let len = if colons <= 3 && probe.peek() == Some(&'=') {
+                        let len = if colons <= 3 && probe.peek() == Some('=') {
                             colons + 1
                         } else {
                             colons.min(2)
                         };
-                        let text = self.input.by_ref().take(len).collect();
-                        Some((SyntaxKind::OPERATOR, text))
+                        self.input.advance(len);
+                        Some(SyntaxKind::OPERATOR)
                     }
                     // Only GNU make has grouped targets; other makes take
                     // the `&` in `a b &: c` as a target.
@@ -803,101 +834,95 @@ impl<'a> Lexer<'a> {
                         let mut probe = self.input.clone();
                         probe.next();
                         let mut colons = 0;
-                        while probe.next_if_eq(&':').is_some() {
+                        while probe.next_if_eq(':').is_some() {
                             colons += 1;
                         }
-                        let len = if (1..=2).contains(&colons) && probe.peek() != Some(&'=') {
+                        let len = if (1..=2).contains(&colons) && probe.peek() != Some('=') {
                             colons + 1
                         } else {
                             1
                         };
-                        let text: String = self.input.by_ref().take(len).collect();
-                        let kind = if len > 1 {
-                            SyntaxKind::OPERATOR
+                        self.input.advance(len);
+                        if len > 1 {
+                            Some(SyntaxKind::OPERATOR)
                         } else {
-                            SyntaxKind::TEXT
-                        };
-                        Some((kind, text))
+                            Some(SyntaxKind::TEXT)
+                        }
                     }
                     // Only `?=` and `+=` are operators; a lone `?` or `+` is
                     // part of a name such as `c++filt`.
                     '?' | '+' => {
-                        let mut text = self.input.next().unwrap().to_string();
-                        if let Some(eq) = self.input.next_if_eq(&'=') {
-                            text.push(eq);
-                            Some((SyntaxKind::OPERATOR, text))
+                        self.input.next();
+                        if self.input.next_if_eq('=').is_some() {
+                            Some(SyntaxKind::OPERATOR)
                         } else {
-                            Some((SyntaxKind::TEXT, text))
+                            Some(SyntaxKind::TEXT)
                         }
                     }
                     '=' => {
                         self.input.next();
-                        Some((SyntaxKind::OPERATOR, "=".to_string()))
+                        Some(SyntaxKind::OPERATOR)
                     }
                     '!' => {
                         // `!=` is the shell assignment operator; a lone `!`
                         // is the BSD make "always rebuild" dependency
                         // operator, or negation in a conditional.
                         self.input.next();
-                        if self.input.peek() == Some(&'=') {
-                            self.input.next();
-                            Some((SyntaxKind::OPERATOR, "!=".to_string()))
-                        } else {
-                            Some((SyntaxKind::OPERATOR, "!".to_string()))
-                        }
+                        self.input.next_if_eq('=');
+                        Some(SyntaxKind::OPERATOR)
                     }
                     '(' => {
                         self.input.next();
-                        Some((SyntaxKind::LPAREN, "(".to_string()))
+                        Some(SyntaxKind::LPAREN)
                     }
                     ')' => {
                         self.input.next();
-                        Some((SyntaxKind::RPAREN, ")".to_string()))
+                        Some(SyntaxKind::RPAREN)
                     }
                     '{' => {
                         self.input.next();
-                        Some((SyntaxKind::LBRACE, "{".to_string()))
+                        Some(SyntaxKind::LBRACE)
                     }
                     '}' => {
                         self.input.next();
-                        Some((SyntaxKind::RBRACE, "}".to_string()))
+                        Some(SyntaxKind::RBRACE)
                     }
                     '$' => {
                         self.input.next();
-                        Some((SyntaxKind::DOLLAR, "$".to_string()))
+                        Some(SyntaxKind::DOLLAR)
                     }
                     ',' => {
                         self.input.next();
-                        Some((SyntaxKind::COMMA, ",".to_string()))
+                        Some(SyntaxKind::COMMA)
                     }
                     '^' if self.nmake => {
                         self.input.next();
                         // A caret in a quoted string is literal, except at the
                         // end of a line.
-                        if let Some(escaped) = self
+                        if self
                             .input
                             .next_if(|c| !self.nmake_quoted && NMAKE_ESCAPABLE.contains(c))
+                            .is_some()
                         {
-                            return Some((SyntaxKind::TEXT, format!("^{escaped}")));
+                            return Some(SyntaxKind::TEXT);
                         }
                         // In a macro definition, a caret at the end of the
                         // line continues the definition with a newline.
                         if self.nmake_definition == Some(true) && self.at_newline() {
                             self.continuation = true;
                         }
-                        Some((SyntaxKind::TEXT, "^".to_string()))
+                        Some(SyntaxKind::TEXT)
                     }
                     '\\' => {
                         self.input.next();
                         // `\#` is a literal hash rather than the start of a
                         // comment. nmake only has `^#` for that.
-                        if !escaped && !self.nmake && self.input.peek() == Some(&'#') {
-                            self.input.next();
-                            return Some((SyntaxKind::TEXT, "\\#".to_string()));
+                        if !escaped && !self.nmake && self.input.next_if_eq('#').is_some() {
+                            return Some(SyntaxKind::TEXT);
                         }
                         if self.at_escaped_cr(!escaped) {
                             self.input.next();
-                            return Some((SyntaxKind::TEXT, "\\\r".to_string()));
+                            return Some(SyntaxKind::TEXT);
                         }
                         // A backslash-newline is a continuation only if this
                         // backslash is not escaped by a preceding one.
@@ -905,23 +930,23 @@ impl<'a> Lexer<'a> {
                             self.continuation = true;
                         }
                         self.pending_backslash_escape = escapes_next(true, escaped);
-                        Some((SyntaxKind::BACKSLASH, "\\".to_string()))
+                        Some(SyntaxKind::BACKSLASH)
                     }
                     // nmake's `$**`, all dependents of the target.
                     '*' if self.nmake && self.dollars % 2 == 1 && {
                         let mut probe = self.input.clone();
                         probe.next();
-                        probe.peek() == Some(&'*')
+                        probe.peek() == Some('*')
                     } =>
                     {
-                        let text = self.input.by_ref().take(2).collect();
-                        Some((SyntaxKind::TEXT, text))
+                        self.input.advance(2);
+                        Some(SyntaxKind::TEXT)
                     }
                     // Any other character is plain text to make.
                     _ => {
                         self.input.next();
                         self.after_lbracket = c == '[';
-                        Some((SyntaxKind::TEXT, c.to_string()))
+                        Some(SyntaxKind::TEXT)
                     }
                 },
             }
@@ -931,11 +956,13 @@ impl<'a> Lexer<'a> {
     }
 }
 
-impl Iterator for Lexer<'_> {
-    type Item = (crate::SyntaxKind, String);
+impl<'a> Iterator for Lexer<'a> {
+    type Item = (crate::SyntaxKind, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let token = self.next_token()?;
+        let start = self.input.rest();
+        let kind = self.next_token()?;
+        let token = (kind, self.consumed_since(start));
         let at_line_start = std::mem::replace(&mut self.line_start, false);
         self.after_directive_dot = match token.0 {
             SyntaxKind::IDENTIFIER => at_line_start && token.1 == ".",
@@ -953,10 +980,10 @@ impl Iterator for Lexer<'_> {
                 .as_mut()
                 .filter(|_| token.0 != SyntaxKind::COMMENT)
             {
-                line.push_str(&token.1);
+                line.push_str(token.1);
             }
             if self.define.is_some() {
-                self.raw_line.push_str(&token.1);
+                self.raw_line.push_str(token.1);
             }
             if token.0 == SyntaxKind::NEWLINE && !self.continuation {
                 let line = self.line.replace(String::new());
@@ -996,7 +1023,7 @@ impl Iterator for Lexer<'_> {
     }
 }
 
-pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxKind, String)> {
+pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxKind, &str)> {
     Lexer::new(input, variant).collect()
 }
 
@@ -1016,7 +1043,7 @@ pub(crate) fn recipe_prefix_after(input: &str) -> char {
 pub(crate) fn lex_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
-) -> Vec<(SyntaxKind, String)> {
+) -> Vec<(SyntaxKind, &str)> {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
     lexer.collect()
@@ -1027,7 +1054,7 @@ pub(crate) fn lex_non_recipe_line(
 pub(crate) fn lex_first_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
-) -> Vec<(SyntaxKind, String)> {
+) -> Vec<(SyntaxKind, &str)> {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
     let mut tokens = vec![];
@@ -1047,7 +1074,7 @@ pub(crate) fn lex_first_non_recipe_line(
 pub(crate) fn lex_reference_text(
     input: &str,
     variant: Option<MakefileVariant>,
-) -> Vec<(SyntaxKind, String)> {
+) -> Vec<(SyntaxKind, &str)> {
     input
         .split_inclusive('\n')
         .flat_map(|line| {
@@ -1065,7 +1092,7 @@ mod tests {
 
     use crate::SyntaxKind::*;
 
-    fn lex_default(input: &str) -> Vec<(SyntaxKind, String)> {
+    fn lex_default(input: &str) -> Vec<(SyntaxKind, &str)> {
         lex(input, None)
     }
 
@@ -1083,10 +1110,7 @@ mod tests {
 rule: prerequisite
 	recipe
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -1112,23 +1136,23 @@ rule: prerequisite
         assert_eq!(
             lex_default("X = a \\\r\n\tb\r\nall:\r\n\techo\r\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (OPERATOR, "=".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (BACKSLASH, "\\".to_string()),
-                (NEWLINE, "\r\n".to_string()),
-                (INDENT, "\t".to_string()),
-                (IDENTIFIER, "b".to_string()),
-                (NEWLINE, "\r\n".to_string()),
-                (IDENTIFIER, "all".to_string()),
-                (OPERATOR, ":".to_string()),
-                (NEWLINE, "\r\n".to_string()),
-                (INDENT, "\t".to_string()),
-                (TEXT, "echo".to_string()),
-                (NEWLINE, "\r\n".to_string()),
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (WHITESPACE, " "),
+                (BACKSLASH, "\\"),
+                (NEWLINE, "\r\n"),
+                (INDENT, "\t"),
+                (IDENTIFIER, "b"),
+                (NEWLINE, "\r\n"),
+                (IDENTIFIER, "all"),
+                (OPERATOR, ":"),
+                (NEWLINE, "\r\n"),
+                (INDENT, "\t"),
+                (TEXT, "echo"),
+                (NEWLINE, "\r\n"),
             ]
         );
     }
@@ -1139,26 +1163,26 @@ rule: prerequisite
         assert_eq!(
             lex_default("X = a\rb\\\rc\r\r\n# d\re\nall:\n\tf\rg\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (OPERATOR, "=".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (TEXT, "\r".to_string()),
-                (IDENTIFIER, "b".to_string()),
-                (BACKSLASH, "\\".to_string()),
-                (TEXT, "\r".to_string()),
-                (IDENTIFIER, "c".to_string()),
-                (TEXT, "\r".to_string()),
-                (NEWLINE, "\r\n".to_string()),
-                (COMMENT, "# d\re".to_string()),
-                (NEWLINE, "\n".to_string()),
-                (IDENTIFIER, "all".to_string()),
-                (OPERATOR, ":".to_string()),
-                (NEWLINE, "\n".to_string()),
-                (INDENT, "\t".to_string()),
-                (TEXT, "f\rg".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (TEXT, "\r"),
+                (IDENTIFIER, "b"),
+                (BACKSLASH, "\\"),
+                (TEXT, "\r"),
+                (IDENTIFIER, "c"),
+                (TEXT, "\r"),
+                (NEWLINE, "\r\n"),
+                (COMMENT, "# d\re"),
+                (NEWLINE, "\n"),
+                (IDENTIFIER, "all"),
+                (OPERATOR, ":"),
+                (NEWLINE, "\n"),
+                (INDENT, "\t"),
+                (TEXT, "f\rg"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1168,10 +1192,10 @@ rule: prerequisite
         assert_eq!(
             lex_default("X!=cmd\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "!=".to_string()),
-                (IDENTIFIER, "cmd".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "!="),
+                (IDENTIFIER, "cmd"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1181,11 +1205,11 @@ rule: prerequisite
         assert_eq!(
             lex_default("a! b\n"),
             vec![
-                (IDENTIFIER, "a".to_string()),
-                (OPERATOR, "!".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "b".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "a"),
+                (OPERATOR, "!"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "b"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1195,14 +1219,14 @@ rule: prerequisite
         assert_eq!(
             lex_default("X=a\\#b # c\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "=".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (TEXT, "\\#".to_string()),
-                (IDENTIFIER, "b".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (COMMENT, "# c".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "="),
+                (IDENTIFIER, "a"),
+                (TEXT, "\\#"),
+                (IDENTIFIER, "b"),
+                (WHITESPACE, " "),
+                (COMMENT, "# c"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1213,13 +1237,13 @@ rule: prerequisite
         assert_eq!(
             lex_default("X=a\\\\#c\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "=".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (BACKSLASH, "\\".to_string()),
-                (BACKSLASH, "\\".to_string()),
-                (COMMENT, "#c".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "="),
+                (IDENTIFIER, "a"),
+                (BACKSLASH, "\\"),
+                (BACKSLASH, "\\"),
+                (COMMENT, "#c"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1227,17 +1251,17 @@ rule: prerequisite
     #[test]
     fn test_hash_after_bracket() {
         let bsd = vec![
-            (IDENTIFIER, "X".to_string()),
-            (OPERATOR, "=".to_string()),
-            (DOLLAR, "$".to_string()),
-            (LBRACE, "{".to_string()),
-            (IDENTIFIER, "L".to_string()),
-            (OPERATOR, ":".to_string()),
-            (TEXT, "[".to_string()),
-            (TEXT, "#".to_string()),
-            (TEXT, "]".to_string()),
-            (RBRACE, "}".to_string()),
-            (NEWLINE, "\n".to_string()),
+            (IDENTIFIER, "X"),
+            (OPERATOR, "="),
+            (DOLLAR, "$"),
+            (LBRACE, "{"),
+            (IDENTIFIER, "L"),
+            (OPERATOR, ":"),
+            (TEXT, "["),
+            (TEXT, "#"),
+            (TEXT, "]"),
+            (RBRACE, "}"),
+            (NEWLINE, "\n"),
         ];
         assert_eq!(lex("X=${L:[#]}\n", Some(MakefileVariant::BSDMake)), bsd);
         assert_eq!(lex("X=${L:[#]}\n", None), bsd);
@@ -1245,15 +1269,15 @@ rule: prerequisite
         assert_eq!(
             lex("X=${L:[#]}\n", Some(MakefileVariant::NMake)),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "=".to_string()),
-                (DOLLAR, "$".to_string()),
-                (LBRACE, "{".to_string()),
-                (IDENTIFIER, "L".to_string()),
-                (OPERATOR, ":".to_string()),
-                (TEXT, "[".to_string()),
-                (COMMENT, "#]}".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "="),
+                (DOLLAR, "$"),
+                (LBRACE, "{"),
+                (IDENTIFIER, "L"),
+                (OPERATOR, ":"),
+                (TEXT, "["),
+                (COMMENT, "#]}"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1261,28 +1285,28 @@ rule: prerequisite
     #[test]
     fn test_hash_in_reference() {
         let literal = vec![
-            (IDENTIFIER, "X".to_string()),
-            (OPERATOR, "=".to_string()),
-            (DOLLAR, "$".to_string()),
-            (LPAREN, "(".to_string()),
-            (IDENTIFIER, "a".to_string()),
-            (WHITESPACE, " ".to_string()),
-            (TEXT, "#".to_string()),
-            (IDENTIFIER, "b".to_string()),
-            (RPAREN, ")".to_string()),
-            (WHITESPACE, " ".to_string()),
-            (COMMENT, "#c".to_string()),
-            (NEWLINE, "\n".to_string()),
+            (IDENTIFIER, "X"),
+            (OPERATOR, "="),
+            (DOLLAR, "$"),
+            (LPAREN, "("),
+            (IDENTIFIER, "a"),
+            (WHITESPACE, " "),
+            (TEXT, "#"),
+            (IDENTIFIER, "b"),
+            (RPAREN, ")"),
+            (WHITESPACE, " "),
+            (COMMENT, "#c"),
+            (NEWLINE, "\n"),
         ];
         let comment = vec![
-            (IDENTIFIER, "X".to_string()),
-            (OPERATOR, "=".to_string()),
-            (DOLLAR, "$".to_string()),
-            (LPAREN, "(".to_string()),
-            (IDENTIFIER, "a".to_string()),
-            (WHITESPACE, " ".to_string()),
-            (COMMENT, "#b) #c".to_string()),
-            (NEWLINE, "\n".to_string()),
+            (IDENTIFIER, "X"),
+            (OPERATOR, "="),
+            (DOLLAR, "$"),
+            (LPAREN, "("),
+            (IDENTIFIER, "a"),
+            (WHITESPACE, " "),
+            (COMMENT, "#b) #c"),
+            (NEWLINE, "\n"),
         ];
         let input = "X=$(a #b) #c\n";
         assert_eq!(lex(input, None), literal);
@@ -1297,15 +1321,15 @@ rule: prerequisite
         assert_eq!(
             lex("X=$$(a #b)\n", Some(MakefileVariant::GNUMake)),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "=".to_string()),
-                (DOLLAR, "$".to_string()),
-                (DOLLAR, "$".to_string()),
-                (LPAREN, "(".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (COMMENT, "#b)".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "="),
+                (DOLLAR, "$"),
+                (DOLLAR, "$"),
+                (LPAREN, "("),
+                (IDENTIFIER, "a"),
+                (WHITESPACE, " "),
+                (COMMENT, "#b)"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1315,12 +1339,12 @@ rule: prerequisite
         assert_eq!(
             lex("a:\n\techo $(x #y)\n", Some(MakefileVariant::GNUMake)),
             vec![
-                (IDENTIFIER, "a".to_string()),
-                (OPERATOR, ":".to_string()),
-                (NEWLINE, "\n".to_string()),
-                (INDENT, "\t".to_string()),
-                (TEXT, "echo $(x #y)".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "a"),
+                (OPERATOR, ":"),
+                (NEWLINE, "\n"),
+                (INDENT, "\t"),
+                (TEXT, "echo $(x #y)"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1331,16 +1355,16 @@ rule: prerequisite
         assert_eq!(
             lex_default("${:U'}=a'\n"),
             vec![
-                (DOLLAR, "$".to_string()),
-                (LBRACE, "{".to_string()),
-                (OPERATOR, ":".to_string()),
-                (IDENTIFIER, "U".to_string()),
-                (QUOTE, "'".to_string()),
-                (RBRACE, "}".to_string()),
-                (OPERATOR, "=".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (QUOTE, "'".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (DOLLAR, "$"),
+                (LBRACE, "{"),
+                (OPERATOR, ":"),
+                (IDENTIFIER, "U"),
+                (QUOTE, "'"),
+                (RBRACE, "}"),
+                (OPERATOR, "="),
+                (IDENTIFIER, "a"),
+                (QUOTE, "'"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1352,17 +1376,17 @@ rule: prerequisite
         assert_eq!(
             lex_default("$(if a,')')\n"),
             vec![
-                (DOLLAR, "$".to_string()),
-                (LPAREN, "(".to_string()),
-                (IDENTIFIER, "if".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (COMMA, ",".to_string()),
-                (QUOTE, "'".to_string()),
-                (RPAREN, ")".to_string()),
-                (QUOTE, "'".to_string()),
-                (RPAREN, ")".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (DOLLAR, "$"),
+                (LPAREN, "("),
+                (IDENTIFIER, "if"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (COMMA, ","),
+                (QUOTE, "'"),
+                (RPAREN, ")"),
+                (QUOTE, "'"),
+                (RPAREN, ")"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1381,26 +1405,26 @@ rule: prerequisite
             assert_eq!(
                 lex("X = '$(Y) \\\n b' \"a#b\"\n", variant),
                 vec![
-                    (IDENTIFIER, "X".to_string()),
-                    (WHITESPACE, " ".to_string()),
-                    (OPERATOR, "=".to_string()),
-                    (WHITESPACE, " ".to_string()),
-                    (QUOTE, "'".to_string()),
-                    (DOLLAR, "$".to_string()),
-                    (LPAREN, "(".to_string()),
-                    (IDENTIFIER, "Y".to_string()),
-                    (RPAREN, ")".to_string()),
-                    (WHITESPACE, " ".to_string()),
-                    (BACKSLASH, "\\".to_string()),
-                    (NEWLINE, "\n".to_string()),
-                    (INDENT, " ".to_string()),
-                    (IDENTIFIER, "b".to_string()),
-                    (QUOTE, "'".to_string()),
-                    (WHITESPACE, " ".to_string()),
-                    (QUOTE, "\"".to_string()),
-                    (IDENTIFIER, "a".to_string()),
-                    (COMMENT, "#b\"".to_string()),
-                    (NEWLINE, "\n".to_string()),
+                    (IDENTIFIER, "X"),
+                    (WHITESPACE, " "),
+                    (OPERATOR, "="),
+                    (WHITESPACE, " "),
+                    (QUOTE, "'"),
+                    (DOLLAR, "$"),
+                    (LPAREN, "("),
+                    (IDENTIFIER, "Y"),
+                    (RPAREN, ")"),
+                    (WHITESPACE, " "),
+                    (BACKSLASH, "\\"),
+                    (NEWLINE, "\n"),
+                    (INDENT, " "),
+                    (IDENTIFIER, "b"),
+                    (QUOTE, "'"),
+                    (WHITESPACE, " "),
+                    (QUOTE, "\""),
+                    (IDENTIFIER, "a"),
+                    (COMMENT, "#b\""),
+                    (NEWLINE, "\n"),
                 ],
                 "{variant:?}"
             );
@@ -1412,14 +1436,14 @@ rule: prerequisite
         assert_eq!(
             lex_default("# a \\\nb\n# c \\\\\nX=1\n"),
             vec![
-                (COMMENT, "# a \\\nb".to_string()),
-                (NEWLINE, "\n".to_string()),
-                (COMMENT, "# c \\\\".to_string()),
-                (NEWLINE, "\n".to_string()),
-                (IDENTIFIER, "X".to_string()),
-                (OPERATOR, "=".to_string()),
-                (IDENTIFIER, "1".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (COMMENT, "# a \\\nb"),
+                (NEWLINE, "\n"),
+                (COMMENT, "# c \\\\"),
+                (NEWLINE, "\n"),
+                (IDENTIFIER, "X"),
+                (OPERATOR, "="),
+                (IDENTIFIER, "1"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1429,17 +1453,17 @@ rule: prerequisite
         assert_eq!(
             lex_default("X = a && b\n"),
             vec![
-                (IDENTIFIER, "X".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (OPERATOR, "=".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "a".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (TEXT, "&".to_string()),
-                (TEXT, "&".to_string()),
-                (WHITESPACE, " ".to_string()),
-                (IDENTIFIER, "b".to_string()),
-                (NEWLINE, "\n".to_string()),
+                (IDENTIFIER, "X"),
+                (WHITESPACE, " "),
+                (OPERATOR, "="),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "a"),
+                (WHITESPACE, " "),
+                (TEXT, "&"),
+                (TEXT, "&"),
+                (WHITESPACE, " "),
+                (IDENTIFIER, "b"),
+                (NEWLINE, "\n"),
             ]
         );
     }
@@ -1450,10 +1474,7 @@ rule: prerequisite
             lex_default(
                 r#"export
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![(IDENTIFIER, "export"), (NEWLINE, "\n"),]
         );
     }
@@ -1464,10 +1485,7 @@ rule: prerequisite
             lex_default(
                 r#"export VARIABLE
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![
                 (IDENTIFIER, "export"),
                 (WHITESPACE, " "),
@@ -1483,10 +1501,7 @@ rule: prerequisite
             lex_default(
                 r#"export VARIABLE := value
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![
                 (IDENTIFIER, "export"),
                 (WHITESPACE, " "),
@@ -1508,10 +1523,7 @@ rule: prerequisite
 	recipe
 
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![
                 (IDENTIFIER, "rule"),
                 (OPERATOR, ":"),
@@ -1531,10 +1543,7 @@ rule: prerequisite
     #[test]
     fn test_variable_question() {
         assert_eq!(
-            lex_default("VARIABLE ?= value\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("VARIABLE ?= value\n"),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -1553,10 +1562,7 @@ rule: prerequisite
                 r#"ifneq (a, b)
 endif
 "#
-            )
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
+            ),
             vec![
                 (IDENTIFIER, "ifneq"),
                 (WHITESPACE, " "),
@@ -1576,10 +1582,7 @@ endif
     #[test]
     fn test_variable_paren() {
         assert_eq!(
-            lex_default("VARIABLE = $(value)\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("VARIABLE = $(value)\n"),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -1597,10 +1600,7 @@ endif
     #[test]
     fn test_variable_paren2() {
         assert_eq!(
-            lex_default("VARIABLE = $(value)$(value2)\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("VARIABLE = $(value)$(value2)\n"),
             vec![
                 (IDENTIFIER, "VARIABLE"),
                 (WHITESPACE, " "),
@@ -1658,10 +1658,7 @@ override_dh_auto_clean:
     #[test]
     fn test_pattern_rule() {
         assert_eq!(
-            lex_default("%.o: %.c\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("%.o: %.c\n"),
             vec![
                 (IDENTIFIER, "%.o"),
                 (OPERATOR, ":"),
@@ -1675,10 +1672,7 @@ override_dh_auto_clean:
     #[test]
     fn test_include_directive() {
         assert_eq!(
-            lex_default("-include .env\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("-include .env\n"),
             vec![
                 (IDENTIFIER, "-include"),
                 (WHITESPACE, " "),
@@ -1691,10 +1685,7 @@ override_dh_auto_clean:
     #[test]
     fn test_slash_in_identifier() {
         assert_eq!(
-            lex_default("usr/bin/foo: src/main.o\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("usr/bin/foo: src/main.o\n"),
             vec![
                 (IDENTIFIER, "usr/bin/foo"),
                 (OPERATOR, ":"),
@@ -1710,19 +1701,19 @@ override_dh_auto_clean:
         let input = "VAR ?= $(shell cmd | \\\n\t\tsed -rne 's,^V: ([^-]+).*,\\1,p')\n";
         let tokens = lex_default(input);
         // Check that the backslash before '1' is preserved
-        let text: String = tokens.iter().map(|(_, t)| t.as_str()).collect();
+        let text: String = tokens.iter().map(|(_, t)| *t).collect();
         assert_eq!(input, text, "Token text reconstruction differs from input");
     }
 
     #[test]
     fn test_operator_not_greedy() {
-        let ops = |input: &str| {
+        fn ops(input: &str) -> Vec<&str> {
             lex_default(input)
                 .into_iter()
                 .filter(|(kind, _)| *kind == OPERATOR)
                 .map(|(_, text)| text)
-                .collect::<Vec<_>>()
-        };
+                .collect()
+        }
         assert_eq!(ops("X?==y\n"), vec!["?=", "="]);
         assert_eq!(ops("X+==y\n"), vec!["+=", "="]);
         assert_eq!(ops("X:==y\n"), vec![":=", "="]);
@@ -1751,10 +1742,7 @@ override_dh_auto_clean:
     #[test]
     fn test_operator_followed_by_equals_tokens() {
         assert_eq!(
-            lex_default("X?==y\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("X?==y\n"),
             vec![
                 (IDENTIFIER, "X"),
                 (OPERATOR, "?="),
@@ -1768,10 +1756,7 @@ override_dh_auto_clean:
     #[test]
     fn test_space_indented_line() {
         assert_eq!(
-            lex_default("  X = 1\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("  X = 1\n"),
             vec![
                 (WHITESPACE, "  "),
                 (IDENTIFIER, "X"),
@@ -1787,10 +1772,7 @@ override_dh_auto_clean:
     #[test]
     fn test_space_indented_recipe_continuation() {
         assert_eq!(
-            lex_default("\techo a \\\n    b\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex_default("\techo a \\\n    b\n"),
             vec![
                 (INDENT, "\t"),
                 (TEXT, "echo a \\"),
@@ -1805,10 +1787,7 @@ override_dh_auto_clean:
     #[test]
     fn test_nmake_space_indented_line() {
         assert_eq!(
-            lex("  echo a \\\n b\n", Some(MakefileVariant::NMake))
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
+            lex("  echo a \\\n b\n", Some(MakefileVariant::NMake)),
             vec![
                 (INDENT, "  "),
                 (TEXT, "echo a \\"),
@@ -1820,19 +1799,15 @@ override_dh_auto_clean:
         );
     }
 
-    fn lex_nmake(input: &str) -> Vec<(SyntaxKind, String)> {
+    fn lex_nmake(input: &str) -> Vec<(SyntaxKind, &str)> {
         lex(input, Some(MakefileVariant::NMake))
-    }
-
-    fn tokens(tokens: &[(SyntaxKind, &str)]) -> Vec<(SyntaxKind, String)> {
-        tokens.iter().map(|(k, t)| (*k, t.to_string())).collect()
     }
 
     #[test]
     fn test_nmake_caret_escapes() {
         assert_eq!(
             lex_nmake("X = a^#b # c\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "X"),
                 (WHITESPACE, " "),
                 (OPERATOR, "="),
@@ -1843,11 +1818,11 @@ override_dh_auto_clean:
                 (WHITESPACE, " "),
                 (COMMENT, "# c"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
         assert_eq!(
             lex_nmake("X = a^\\\nY = ^^#b\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "X"),
                 (WHITESPACE, " "),
                 (OPERATOR, "="),
@@ -1862,12 +1837,12 @@ override_dh_auto_clean:
                 (TEXT, "^^"),
                 (COMMENT, "#b"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
         // A caret before any other character is not an escape.
         assert_eq!(
             lex_nmake("X = ^a^$(Y)\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "X"),
                 (WHITESPACE, " "),
                 (OPERATOR, "="),
@@ -1879,7 +1854,7 @@ override_dh_auto_clean:
                 (IDENTIFIER, "Y"),
                 (RPAREN, ")"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
     }
 
@@ -1893,7 +1868,7 @@ override_dh_auto_clean:
         ] {
             assert_eq!(
                 lex("X = a^#b\n", variant),
-                tokens(&[
+                [
                     (IDENTIFIER, "X"),
                     (WHITESPACE, " "),
                     (OPERATOR, "="),
@@ -1902,7 +1877,7 @@ override_dh_auto_clean:
                     (TEXT, "^"),
                     (COMMENT, "#b"),
                     (NEWLINE, "\n"),
-                ]),
+                ],
                 "{variant:?}"
             );
         }
@@ -1914,7 +1889,7 @@ override_dh_auto_clean:
         // the definition on the next line.
         assert_eq!(
             lex_nmake("X = a^\n\tb\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "X"),
                 (WHITESPACE, " "),
                 (OPERATOR, "="),
@@ -1925,12 +1900,12 @@ override_dh_auto_clean:
                 (INDENT, "\t"),
                 (IDENTIFIER, "b"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
         // Elsewhere it does not.
         assert_eq!(
             lex_nmake("a: b^\n\tc\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "a"),
                 (OPERATOR, ":"),
                 (WHITESPACE, " "),
@@ -1940,7 +1915,7 @@ override_dh_auto_clean:
                 (INDENT, "\t"),
                 (TEXT, "c"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
     }
 
@@ -1949,14 +1924,14 @@ override_dh_auto_clean:
         // Commands are lexed as a whole, carets included.
         assert_eq!(
             lex_nmake("a:\n\techo ^#a^\\\n"),
-            tokens(&[
+            [
                 (IDENTIFIER, "a"),
                 (OPERATOR, ":"),
                 (NEWLINE, "\n"),
                 (INDENT, "\t"),
                 (TEXT, "echo ^#a^\\"),
                 (NEWLINE, "\n"),
-            ])
+            ]
         );
     }
 
@@ -2025,11 +2000,7 @@ override_dh_auto_clean:
         let makefile = "X := >\n.RECIPEPREFIX := $(X)\nall:\n>echo a\n";
         assert_eq!(
             lex(makefile, None)[18..],
-            [
-                (INDENT, ">".into()),
-                (TEXT, "echo a".into()),
-                (NEWLINE, "\n".into())
-            ]
+            [(INDENT, ">"), (TEXT, "echo a"), (NEWLINE, "\n")]
         );
     }
 
@@ -2094,11 +2065,7 @@ override_dh_auto_clean:
         // No line starts with that prefix, not even an empty one.
         assert_eq!(
             lex("define .RECIPEPREFIX\n\nfoo\nendef\n\nx\n", None)[9..],
-            [
-                (NEWLINE, "\n".into()),
-                (IDENTIFIER, "x".into()),
-                (NEWLINE, "\n".into())
-            ]
+            [(NEWLINE, "\n"), (IDENTIFIER, "x"), (NEWLINE, "\n")]
         );
         assert_eq!(prefix("define .RECIPEPREFIX ?=\n>\nendef\n"), '\t');
         assert_eq!(prefix("define .RECIPEPREFIX +=\n>\nendef\n"), '>');

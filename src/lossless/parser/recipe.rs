@@ -3,11 +3,11 @@ use super::*;
 
 /// Whether a token is only whitespace. The text after a recipe line's
 /// indent may be lexed as TEXT, even if it is only whitespace.
-fn is_blank_token((kind, text): &(SyntaxKind, String)) -> bool {
-    *kind == WHITESPACE || (*kind == TEXT && text.trim().is_empty())
+fn is_blank_token((kind, text): (SyntaxKind, &str)) -> bool {
+    kind == WHITESPACE || (kind == TEXT && text.trim().is_empty())
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn parse_recipe_line(&mut self) {
         self.with_references(
             RECIPE,
@@ -132,7 +132,7 @@ impl Parser<'_> {
             let mut text = String::new();
             while self.current().is_some_and(|kind| kind != NEWLINE) {
                 if !self.split_continued_comment() {
-                    text.push_str(&self.pop_token().unwrap().1);
+                    text.push_str(self.pop_token().unwrap().text);
                 }
             }
             self.pending_backslash_escape = false;
@@ -185,7 +185,7 @@ impl Parser<'_> {
         let eol_end = lf + 1;
         let rest = &text[eol_end..];
         let indent_end = eol_end + rest.len() - rest.trim_start_matches([' ', '\t']).len();
-        let pieces: Vec<(SyntaxKind, String)> = [
+        let pieces = [
             (COMMENT, &text[..eol]),
             (NEWLINE, &text[eol..eol_end]),
             (INDENT, &text[eol_end..indent_end]),
@@ -193,7 +193,6 @@ impl Parser<'_> {
         ]
         .into_iter()
         .filter(|(_, piece)| !piece.is_empty())
-        .map(|(kind, piece)| (kind, piece.to_string()))
         .collect();
         self.replace_current_token(pieces);
         self.token_edits += 1;
@@ -222,7 +221,7 @@ impl Parser<'_> {
                 }
                 Some(WHITESPACE) => {
                     // A space-indented comment or blank line doesn't end the rule
-                    let next = self.tokens.iter().rev().nth(1).map(|(kind, _)| *kind);
+                    let next = self.upcoming().nth(1).map(|(kind, _)| kind);
                     match next {
                         Some(COMMENT) if newline_count == 0 || self.recipe_continues() => {
                             self.bump();
@@ -293,8 +292,7 @@ impl Parser<'_> {
         {
             return false;
         }
-        let ws = self.tokens.pop().unwrap();
-        let ws_position = self.token_positions.pop().unwrap();
+        let ws = self.pop_token().unwrap();
         let is_recipe = self.directive().is_none()
             && !self.line_has_dependency_operator()
             && !self.has_assignment_operator_on_line()
@@ -306,7 +304,6 @@ impl Parser<'_> {
                     || matches!(word, "else" | "endif" | "define" | "endef")
             );
         self.tokens.push(ws);
-        self.token_positions.push(ws_position);
         is_recipe
     }
 
@@ -331,7 +328,7 @@ impl Parser<'_> {
         loop {
             let mut text = String::new();
             while self.current().is_some_and(|kind| kind != NEWLINE) {
-                text.push_str(&self.pop_token().unwrap().1);
+                text.push_str(self.pop_token().unwrap().text);
             }
             let continued = ends_with_unescaped_backslash(&text);
             if !text.is_empty() {
@@ -417,11 +414,9 @@ impl Parser<'_> {
     /// Whether the tab-indented line at the current position has only a
     /// comment, or nothing at all, which BSD make skips.
     fn at_bsd_comment_line(&self) -> bool {
-        self.tokens
-            .iter()
-            .rev()
+        self.upcoming()
             .skip(1)
-            .find(|token| !is_blank_token(token))
+            .find(|&token| !is_blank_token(token))
             .is_none_or(|(kind, text)| match kind {
                 COMMENT | NEWLINE => true,
                 TEXT => text.trim_start().starts_with('#'),
@@ -433,16 +428,15 @@ impl Parser<'_> {
     /// line, if it is valid as such outside of rule context in GNU make: a
     /// comment, blank line, directive or assignment. Expressions and rules
     /// are not.
-    fn lex_indented_statement(&mut self) -> Option<RelexedLine> {
+    fn lex_indented_statement(&mut self) -> Option<RelexedLine<'a>> {
         let mut line = self.lex_as_non_recipe_line();
         let tokens = std::mem::replace(&mut self.tokens, line.tokens);
-        let positions = std::mem::replace(&mut self.token_positions, line.positions);
         let mut indent = vec![];
         while let Some(token) = self
             .tokens
-            .pop_if(|(kind, _)| matches!(kind, WHITESPACE | INDENT))
+            .pop_if(|token| matches!(token.kind, WHITESPACE | INDENT))
         {
-            indent.push((token, self.token_positions.pop().unwrap()));
+            indent.push(token);
         }
         let is_statement = match self.current_token() {
             None | Some((NEWLINE | COMMENT, _)) => true,
@@ -457,12 +451,8 @@ impl Parser<'_> {
                     || self.at_load_keyword()
             }
         };
-        for (token, position) in indent.into_iter().rev() {
-            self.tokens.push(token);
-            self.token_positions.push(position);
-        }
+        self.tokens.extend(indent.into_iter().rev());
         line.tokens = std::mem::replace(&mut self.tokens, tokens);
-        line.positions = std::mem::replace(&mut self.token_positions, positions);
         is_statement.then_some(line)
     }
 
@@ -471,7 +461,7 @@ impl Parser<'_> {
     /// lines, becomes a single COMMENT token.
     fn parse_bsd_comment_line(&mut self) {
         self.bump_as(WHITESPACE);
-        while self.tokens.last().is_some_and(is_blank_token) {
+        while self.current_token().is_some_and(is_blank_token) {
             self.bump_as(WHITESPACE);
         }
         let mut comment = String::new();
@@ -495,14 +485,14 @@ impl Parser<'_> {
 
     /// Lex the rest of the current logical line as an ordinary makefile
     /// line.
-    pub(super) fn lex_as_non_recipe_line(&self) -> RelexedLine {
+    pub(super) fn lex_as_non_recipe_line(&self) -> RelexedLine<'a> {
         let start = self.current_range().start();
         let tokens =
             lex_first_non_recipe_line(&self.original_text[usize::from(start)..], self.variant);
         let len: usize = tokens.iter().map(|(_, text)| text.len()).sum();
         let mut replaced_len = 0;
         let mut replaces = 0;
-        for (_, text) in self.tokens.iter().rev() {
+        for (_, text) in self.upcoming() {
             if replaced_len >= len {
                 break;
             }
@@ -510,21 +500,17 @@ impl Parser<'_> {
             replaces += 1;
         }
         assert_eq!(replaced_len, len, "relexed line ends inside a token");
-        let (tokens, positions) = token_stack(start, tokens);
         RelexedLine {
-            tokens,
-            positions,
+            tokens: token_stack(start, tokens),
             replaces,
         }
     }
 
     /// Replace the tokens of the rest of the current logical line with
     /// `line`.
-    fn replace_line(&mut self, line: RelexedLine) {
+    fn replace_line(&mut self, line: RelexedLine<'a>) {
         self.tokens.truncate(self.tokens.len() - line.replaces);
-        self.token_positions.truncate(self.tokens.len());
         self.tokens.extend(line.tokens);
-        self.token_positions.extend(line.positions);
         self.token_edits += 1;
     }
 }
