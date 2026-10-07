@@ -182,10 +182,12 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            let modifier = ["override", "export", "private"].into_iter().find(|m| {
-                rest.strip_prefix(m)
-                    .is_some_and(|r| r.starts_with(Self::is_whitespace))
-            })?;
+            let modifier = ["override", "export", "unexport", "private"]
+                .into_iter()
+                .find(|m| {
+                    rest.strip_prefix(m)
+                        .is_some_and(|r| r.starts_with(Self::is_whitespace))
+                })?;
             rest = rest[modifier.len()..].trim_start();
         }
         if ASSIGNMENT_OPERATORS.iter().any(|op| rest.starts_with(op)) {
@@ -1759,6 +1761,11 @@ override_dh_auto_clean:
         assert_eq!(prefix("define .RECIPEPREFIX :=\n>x\nfoo\nendef\n"), '>');
         assert_eq!(prefix("define .RECIPEPREFIX=\n>\nendef\n"), '>');
         assert_eq!(prefix("override define .RECIPEPREFIX # c\n>\nendef\n"), '>');
+        assert_eq!(prefix("unexport define .RECIPEPREFIX\n>\nendef\n"), '>');
+        assert_eq!(
+            prefix("override unexport define .RECIPEPREFIX\n>\nendef\n"),
+            '>'
+        );
         assert_eq!(prefix("define .RECIPEPREFIX \\\n=\n>\nendef\n"), '>');
         assert_eq!(prefix("define .RECIPEPREFIX\r\n>\r\nendef\r\n"), '>');
         assert_eq!(prefix("define .RECIPEPREFIX\n  >\nendef\n"), ' ');
