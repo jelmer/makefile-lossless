@@ -80,6 +80,21 @@ pub(crate) fn build_command(
     Ok(recipe)
 }
 
+/// The rest of `text` after the nmake command modifiers at its start: `@`,
+/// `!` and `-` with an optional number, which may be separated by spaces
+/// or tabs.
+fn strip_nmake_modifiers(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        let modifier = rest.trim_start_matches([' ', '\t']);
+        rest = match modifier.chars().next() {
+            Some('@' | '!') => &modifier[1..],
+            Some('-') => modifier[1..].trim_start_matches(|c: char| c.is_ascii_digit()),
+            _ => return rest,
+        };
+    }
+}
+
 impl Recipe {
     /// Get the text content of this recipe line (the command to execute)
     ///
@@ -486,21 +501,110 @@ impl Recipe {
     /// assert_eq!(recipe.text(), "-@echo hello");
     /// ```
     pub fn try_set_prefix(&mut self, prefix: &str) -> Result<(), Error> {
-        // TODO: support nmake's command modifiers `!` and `-NUMBER` (which
-        // must be followed by a space or tab), which may also be separated
-        // by spaces or tabs, and reject `+`, which nmake lacks. This needs
-        // the variant, which the tree does not record.
-        if !prefix.chars().all(|c| matches!(c, '@' | '-' | '+')) {
-            return Err(Error::Parse(ParseError {
+        // TODO: accept nmake's command modifiers and reject `+` once the
+        // tree records the variant it was parsed as. Until then,
+        // try_set_prefix_for does.
+        self.set_prefix_with(prefix, None)
+    }
+
+    /// Set the command prefix for this recipe, like [`Recipe::set_prefix`],
+    /// with the command modifiers that `variant` has.
+    ///
+    /// GNU, POSIX and BSD make have `@`, `-` and `+`. nmake has `@`
+    /// (silent), `!` (run for each dependent file) and `-` (ignore
+    /// errors), which may be followed by a number to only ignore exit
+    /// codes up to it, and may separate them with spaces or tabs; it has no
+    /// `+`. A number has to be followed by a space or tab before the
+    /// command.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `variant` does not read `prefix` back as the command
+    /// modifiers, as described for [`Recipe::try_set_prefix_for`], which
+    /// returns an error instead.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    ///
+    /// let makefile = Makefile::parse_with_variant("all:\n\t@echo hello\n", MakefileVariant::NMake).tree();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// recipe.set_prefix_for("-2 !", MakefileVariant::NMake);
+    /// assert_eq!(makefile.code(), "all:\n\t-2 !echo hello\n");
+    /// ```
+    pub fn set_prefix_for(&mut self, prefix: &str, variant: crate::MakefileVariant) {
+        self.try_set_prefix_for(prefix, variant)
+            .unwrap_or_else(|e| panic!("invalid recipe prefix: {e}"))
+    }
+
+    /// Set the command prefix for this recipe, like
+    /// [`Recipe::set_prefix_for`]
+    ///
+    /// Returns an error, leaving the recipe unchanged, if `prefix` contains
+    /// anything other than the command modifiers of `variant`, or for
+    /// nmake, whitespace between them. For nmake, also returns an error if
+    /// the command would be read as part of the modifiers, as with `-` and
+    /// a command starting with a digit, or if a number is not followed by a
+    /// space or tab.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    ///
+    /// let makefile = Makefile::parse_with_variant("all:\n\techo hello\n", MakefileVariant::NMake).tree();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let mut recipe = rule.recipe_nodes().next().unwrap();
+    /// assert!(recipe.try_set_prefix_for("+", MakefileVariant::NMake).is_err());
+    /// assert!(recipe.try_set_prefix_for("-1", MakefileVariant::NMake).is_err());
+    /// recipe.try_set_prefix_for("-1 ", MakefileVariant::NMake).unwrap();
+    /// assert_eq!(makefile.code(), "all:\n\t-1 echo hello\n");
+    /// ```
+    pub fn try_set_prefix_for(
+        &mut self,
+        prefix: &str,
+        variant: crate::MakefileVariant,
+    ) -> Result<(), Error> {
+        self.set_prefix_with(prefix, Some(variant))
+    }
+
+    /// Internal: set the command prefix, with the command modifiers of
+    /// `variant`, or of GNU make without one.
+    fn set_prefix_with(
+        &mut self,
+        prefix: &str,
+        variant: Option<crate::MakefileVariant>,
+    ) -> Result<(), Error> {
+        let error = |message: String| {
+            Error::Parse(ParseError {
                 errors: vec![ErrorInfo {
                     kind: crate::ParseErrorKind::Other,
-                    message: format!("{prefix:?} is not a recipe prefix"),
+                    message,
                     line: 1,
                     context: "set_prefix".to_string(),
                 }],
-            }));
+            })
+        };
+        let nmake = variant == Some(crate::MakefileVariant::NMake);
+        let strip = |text: &str| -> String {
+            if nmake {
+                strip_nmake_modifiers(text).to_string()
+            } else {
+                text.trim_start_matches(['@', '-', '+']).to_string()
+            }
+        };
+        let valid = if nmake {
+            strip(prefix).trim_start_matches([' ', '\t']).is_empty()
+        } else {
+            strip(prefix).is_empty()
+        };
+        if !valid {
+            let message = match variant {
+                Some(variant) => format!("{prefix:?} is not a recipe prefix in {variant:?}"),
+                None => format!("{prefix:?} is not a recipe prefix"),
+            };
+            return Err(error(message));
         }
-        const PREFIX_CHARS: [char; 3] = ['@', '-', '+'];
         let node = self.syntax();
         let skip = if self.is_inline() {
             self.inline_prefix().len()
@@ -520,12 +624,33 @@ impl Recipe {
                 insert_at = element.index();
                 break;
             };
-            if token.text().trim_start_matches(PREFIX_CHARS).is_empty() {
+            if strip(token.text()).is_empty() {
                 prefix_tokens.push(token.clone());
             } else {
                 first_text = Some(token.clone());
                 break;
             }
+        }
+        // nmake reads digits after `-` as part of the modifier, and needs a
+        // space or tab after them.
+        let rest = first_text
+            .as_ref()
+            .map(|t| strip(t.text()))
+            .unwrap_or_default();
+        let followed = node
+            .children_with_tokens()
+            .nth(insert_at)
+            .is_some_and(|it| it.kind() != NEWLINE);
+        let separated = rest.starts_with([' ', '\t']) || (rest.is_empty() && !followed);
+        let combined = format!("{prefix}{rest}");
+        let modifiers = prefix.trim_end_matches([' ', '\t']);
+        if combined.len() - strip(&combined).len() != modifiers.len()
+            || (prefix.ends_with(|c: char| c.is_ascii_digit()) && !separated)
+        {
+            return Err(error(format!(
+                "Cannot write {prefix:?} as the prefix of {:?}",
+                self.text()
+            )));
         }
         // TODO: splice them out once rowan's splice_children removes more
         // than the first child of the range, as it does from 0.17 on.
@@ -544,7 +669,6 @@ impl Recipe {
                 for old in &prefix_tokens {
                     old.detach();
                 }
-                let rest = token.text().trim_start_matches(PREFIX_CHARS);
                 let text = format!("{prefix}{rest}");
                 if text != token.text() {
                     replace(&token, &text);
@@ -1379,6 +1503,92 @@ mod tests {
         }
         recipe.try_set_prefix("+-@").unwrap();
         assert_eq!(recipe.text(), "+-@echo hello");
+    }
+
+    /// Set the prefix of the first recipe in `code`, parsed as `variant`.
+    fn set_prefix_for(
+        code: &str,
+        prefix: &str,
+        variant: crate::MakefileVariant,
+    ) -> Result<String, Error> {
+        let makefile = Makefile::parse_with_variant(code, variant).tree();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        if let Err(e) = recipe.try_set_prefix_for(prefix, variant) {
+            assert_eq!(makefile.code(), code);
+            return Err(e);
+        }
+        let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+        assert_eq!(reparsed.errors(), &[]);
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.tree().syntax())
+        );
+        Ok(makefile.code())
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_for_nmake() {
+        use crate::MakefileVariant::NMake;
+        for (code, prefix, expected) in [
+            ("x:\n\techo hi\n", "@", "x:\n\t@echo hi\n"),
+            ("x:\n\techo hi\n", "!", "x:\n\t!echo hi\n"),
+            ("x:\n\techo hi\n", "-3 ", "x:\n\t-3 echo hi\n"),
+            ("x:\n\techo hi\n", "@ -12\t! ", "x:\n\t@ -12\t! echo hi\n"),
+            ("x:\n\t@ -3 ! echo hi\n", "-", "x:\n\t- echo hi\n"),
+            ("x:\n\t@ -3 ! echo hi\n", "-3", "x:\n\t-3 echo hi\n"),
+            ("x:\n\t@ -3 ! echo hi\n", "", "x:\n\t echo hi\n"),
+            ("x:\n\t-5\techo\n", "@ !", "x:\n\t@ !\techo\n"),
+            ("x:\n\t @echo  hi # c\n", "!@", "x:\n\t!@echo  hi # c\n"),
+            ("x:\n\t@$(X)\n", "-", "x:\n\t-$(X)\n"),
+            ("x:\n\t@\n", "-3", "x:\n\t-3\n"),
+        ] {
+            assert_eq!(
+                set_prefix_for(code, prefix, NMake).unwrap(),
+                expected,
+                "{code:?} {prefix:?}"
+            );
+        }
+        for (code, prefix) in [
+            ("x:\n\techo hi\n", "+"),
+            ("x:\n\techo hi\n", "x"),
+            ("x:\n\techo hi\n", "-a"),
+            ("x:\n\techo hi\n", "\n"),
+            // A number after `-` has to be followed by a space or tab.
+            ("x:\n\techo hi\n", "-3"),
+            ("x:\n\t@$(X)\n", "-3"),
+            // The command would be read as part of the modifier.
+            ("x:\n\t@123.exe\n", "-"),
+        ] {
+            assert!(
+                set_prefix_for(code, prefix, NMake).is_err(),
+                "{code:?} {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recipe_set_prefix_for_gnu_bsd() {
+        use crate::MakefileVariant::*;
+        for variant in [GNUMake, POSIXMake, BSDMake] {
+            assert_eq!(
+                set_prefix_for("x:\n\t@echo  hi # c\n", "+-", variant).unwrap(),
+                "x:\n\t+-echo  hi # c\n"
+            );
+            for prefix in ["!", "-3 ", "@ "] {
+                assert!(set_prefix_for("x:\n\techo hi\n", prefix, variant).is_err());
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "\"+\" is not a recipe prefix in NMake")]
+    fn test_recipe_set_prefix_for_panics_on_invalid() {
+        let makefile =
+            Makefile::parse_with_variant("x:\n\techo\n", crate::MakefileVariant::NMake).tree();
+        let rule = makefile.rules().next().unwrap();
+        let mut recipe = rule.recipe_nodes().next().unwrap();
+        recipe.set_prefix_for("+", crate::MakefileVariant::NMake);
     }
 
     #[test]
