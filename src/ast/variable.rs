@@ -156,6 +156,15 @@ fn is_assignment_operator(text: &str) -> bool {
     ASSIGNMENT_OPERATORS.contains(&text) || is_sunsh_operator(text)
 }
 
+/// Whether `variant` has the assignment operator `op`.
+fn has_assignment_operator(variant: MakefileVariant, op: &str) -> bool {
+    match variant {
+        MakefileVariant::GNUMake | MakefileVariant::POSIXMake => !is_sunsh_operator(op),
+        MakefileVariant::BSDMake => !matches!(op, "::=" | ":::="),
+        MakefileVariant::NMake => op == "=",
+    }
+}
+
 impl VariableDefinition {
     /// Internal: the leading directive keywords (`export`/`unexport`/
     /// `override`/`private`/`define`/`undefine`). A keyword only counts as
@@ -1046,12 +1055,80 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR += value\n");
     /// ```
     pub fn try_set_assignment_operator(&mut self, op: &str) -> Result<(), Error> {
-        // TODO: nmake only has `=`, but the tree does not record which
-        // variant it was parsed as, so other operators are not rejected
-        // there.
+        // TODO: reject operators the variant lacks, such as all but `=` in
+        // nmake, once the tree records the variant it was parsed as. Until
+        // then, try_set_assignment_operator_for does.
+        self.set_assignment_operator_with(op, None)
+    }
+
+    /// Change the assignment operator of this variable definition, like
+    /// [`Self::set_assignment_operator`], checking that `variant` has the
+    /// operator and reads the definition back with it.
+    ///
+    /// GNU make, and POSIX make, which is checked as GNU make with
+    /// `.POSIX:`, lack BSD make's `:sh=`. BSD make lacks `::=` and `:::=`,
+    /// and nmake only has `=`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `variant` does not have `op` or would not read the
+    /// definition back with it, as described for
+    /// [`Self::try_set_assignment_operator_for`], which returns an error
+    /// instead.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant("VAR = cmd\n", MakefileVariant::BSDMake).tree();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// var.set_assignment_operator_for(":sh=", MakefileVariant::BSDMake);
+    /// assert_eq!(makefile.code(), "VAR :sh= cmd\n");
+    /// ```
+    pub fn set_assignment_operator_for(&mut self, op: &str, variant: MakefileVariant) {
+        self.try_set_assignment_operator_for(op, variant)
+            .unwrap_or_else(|e| panic!("invalid assignment operator: {e}"))
+    }
+
+    /// Change the assignment operator of this variable definition, like
+    /// [`Self::set_assignment_operator_for`]
+    ///
+    /// Returns an error, leaving the definition unchanged, in the cases
+    /// described for [`Self::try_set_assignment_operator`], if `variant`
+    /// does not have `op`, or if `variant` would not read the definition
+    /// with `op` as its operator.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant("VAR = value\n", MakefileVariant::NMake).tree();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.try_set_assignment_operator_for(":=", MakefileVariant::NMake).is_err());
+    /// assert_eq!(makefile.code(), "VAR = value\n");
+    /// ```
+    pub fn try_set_assignment_operator_for(
+        &mut self,
+        op: &str,
+        variant: MakefileVariant,
+    ) -> Result<(), Error> {
+        self.set_assignment_operator_with(op, Some(variant))
+    }
+
+    /// Internal: set the assignment operator, checking that the parser
+    /// reads it back when parsing as `variant`, or as either GNU or BSD
+    /// make without one.
+    fn set_assignment_operator_with(
+        &mut self,
+        op: &str,
+        variant: Option<MakefileVariant>,
+    ) -> Result<(), Error> {
         let error = |message: String| edit_error("set_assignment_operator", message);
         if !is_assignment_operator(op) {
             return Err(error(format!("{op:?} is not an assignment operator")));
+        }
+        if let Some(variant) = variant.filter(|v| !has_assignment_operator(*v, op)) {
+            return Err(error(format!(
+                "{op:?} is not an assignment operator in {variant:?}"
+            )));
         }
         // The name may contain operator tokens too, as in BSD make's `a:b=c`.
         let op_index = self
@@ -1088,7 +1165,10 @@ impl VariableDefinition {
                 && children.next().is_none()
                 && node.is_some_and(|n| n.green() == copy.green())
         };
-        let reads_back = reads_back(None) || reads_back(Some(MakefileVariant::BSDMake));
+        let reads_back = match variant {
+            Some(variant) => reads_back(Some(variant)),
+            None => reads_back(None) || reads_back(Some(MakefileVariant::BSDMake)),
+        };
         if !reads_back {
             return Err(error(format!(
                 "Cannot write {text:?} with {op:?} as its operator"
@@ -1672,6 +1752,65 @@ mod tests {
             }
             crate::test_util::assert_matches_reparse(&makefile);
         }
+    }
+
+    #[test]
+    fn test_try_set_assignment_operator_for() {
+        use MakefileVariant::*;
+        for (code, op, variant, expected) in [
+            ("X = 1\n", ":sh=", GNUMake, None),
+            ("X = 1\n", ":sh=", POSIXMake, None),
+            ("X = 1\n", ":sh=", BSDMake, Some("X :sh= 1\n")),
+            ("X = 1\n", "::=", GNUMake, Some("X ::= 1\n")),
+            ("X = 1\n", ":::=", POSIXMake, Some("X :::= 1\n")),
+            ("X = 1\n", "::=", BSDMake, None),
+            ("X = 1\n", ":::=", BSDMake, None),
+            ("X=1\n", "::=", BSDMake, None),
+            ("X = 1\n", "!=", BSDMake, Some("X != 1\n")),
+            ("X\t:=  1 # c\n", "?=", GNUMake, Some("X\t?=  1 # c\n")),
+            ("X\t:= \\\n  1\n", "+=", BSDMake, Some("X\t+= \\\n  1\n")),
+            ("X = 1\n", "=", NMake, Some("X = 1\n")),
+            ("X = 1\n", ":=", NMake, None),
+            ("X = 1\n", "?=", NMake, None),
+            ("X = 1\n", "+=", NMake, None),
+            ("X = 1\n", "!=", NMake, None),
+            ("X = 1\n", "bogus", GNUMake, None),
+        ] {
+            let makefile = Makefile::parse_with_variant(code, variant).tree();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            let result = var.try_set_assignment_operator_for(op, variant);
+            let context = format!("{code:?} {op:?} {variant:?}");
+            assert_eq!(result.is_ok(), expected.is_some(), "{context}");
+            assert_eq!(makefile.code(), expected.unwrap_or(code), "{context}");
+            let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+            assert_eq!(reparsed.errors(), &[], "{context}");
+            assert_eq!(
+                format!("{:#?}", makefile.syntax()),
+                format!("{:#?}", reparsed.tree().syntax()),
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_set_assignment_operator_for_message() {
+        let makefile = Makefile::parse_with_variant("X = 1\n", MakefileVariant::NMake).tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let error = var
+            .try_set_assignment_operator_for(":=", MakefileVariant::NMake)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: Error at line 1: \":=\" is not an assignment operator in NMake\n1| set_assignment_operator\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "\"::=\" is not an assignment operator in BSDMake")]
+    fn test_set_assignment_operator_for_unsupported() {
+        let makefile = Makefile::parse_with_variant("X = 1\n", MakefileVariant::BSDMake).tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator_for("::=", MakefileVariant::BSDMake);
     }
 
     #[test]
