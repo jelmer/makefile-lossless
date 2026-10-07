@@ -99,8 +99,9 @@ impl Recipe {
     /// This is the line without its leading tab. Unlike [`Recipe::text`],
     /// lines starting with `#` are included: make does not treat `#` in a
     /// recipe as a comment, it passes it on to the shell. For lines split
-    /// with backslash-newline, the backslash and newline are kept and a single
-    /// leading tab is removed from each continuation line.
+    /// with backslash-newline, the backslash and newline are kept and the
+    /// recipe prefix, a tab unless set with `.RECIPEPREFIX`, is removed from
+    /// the start of each continuation line.
     ///
     /// Prefix characters (`@`, `-`, `+`) are not removed. make strips those
     /// after variable expansion, since they may come from a variable; see
@@ -125,6 +126,7 @@ impl Recipe {
     /// continuations as make passes them to the shell.
     fn logical_text(&self, include_comments: bool, from: Option<rowan::TextSize>) -> String {
         let mut after_newline = false;
+        let mut prefix = None;
         let comment = self.comment_start();
         self.body_tokens()
             .filter_map(|t| {
@@ -141,11 +143,31 @@ impl Recipe {
                         after_newline = true;
                         Some(lf_line_endings(t.text()))
                     }
-                    // Strip the leading tab from continuation-line indentation
+                    // make strips the recipe prefix from continuation lines.
+                    // In a reference it keeps it, but turns the line break
+                    // and the whitespace after it into a space, so a tab
+                    // goes either way.
                     INDENT if after_newline => {
                         after_newline = false;
+                        let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
                         let text = t.text();
-                        Some(text.strip_prefix('\t').unwrap_or(text).to_string())
+                        let text = match text.strip_prefix(prefix) {
+                            Some(rest) if !nested || prefix == '\t' => rest,
+                            _ => text,
+                        };
+                        Some(text.to_string())
+                    }
+                    // In a recipe after `;` on the rule line, the parser
+                    // leaves a prefix other than a tab in the text.
+                    TEXT if after_newline && !nested && !self.starts_with_indent() => {
+                        after_newline = false;
+                        let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
+                        let text = t.text();
+                        let text = match text.strip_prefix(prefix) {
+                            Some(rest) if prefix != '\t' => rest,
+                            _ => text,
+                        };
+                        Some(text.to_string())
                     }
                     COMMENT if include_comments => {
                         after_newline = false;
@@ -161,6 +183,34 @@ impl Recipe {
                 }
             })
             .collect()
+    }
+
+    /// Whether this recipe starts with indentation, unlike one after `;` on
+    /// the rule line.
+    fn starts_with_indent(&self) -> bool {
+        self.syntax()
+            .first_token()
+            .is_some_and(|t| t.kind() == INDENT)
+    }
+
+    /// The recipe prefix in effect for this recipe: the character that
+    /// starts its first line, or for a recipe after `;` on the rule line,
+    /// the one set with GNU make's `.RECIPEPREFIX` before it.
+    fn recipe_prefix(&self) -> char {
+        let node = self.syntax();
+        match node.first_token().filter(|t| t.kind() == INDENT) {
+            // TODO: Handle a `.RECIPEPREFIX` set to a space, which make
+            // strips from continuation lines too.
+            Some(indent) => indent
+                .text()
+                .chars()
+                .next()
+                .filter(|c| *c != ' ')
+                .unwrap_or('\t'),
+            None => node
+                .parent()
+                .map_or('\t', |parent| recipe_prefix_before(&parent, node.index())),
+        }
     }
 
     /// The start of the comment that this line consists of, if it starts
@@ -282,7 +332,7 @@ impl Recipe {
     /// Returns the comment text (including the '#' character) if this recipe
     /// line contains a comment, or None if there is no comment. A comment
     /// ending in a backslash takes in the lines it is continued onto, except
-    /// for nmake, with a leading tab removed from each as in
+    /// for nmake, with the recipe prefix removed from each as in
     /// [`Recipe::shell_text`].
     ///
     /// # Example
@@ -866,6 +916,50 @@ fn find_reference_end(bytes: &[u8], start: usize, close: u8) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_text_custom_recipe_prefix() {
+        // make strips the recipe prefix, and only that, from the start of
+        // each continuation line.
+        let cases = [
+            (
+                ".RECIPEPREFIX = >\nall:\n>echo a \\\n>b \\\n>>c \\\n\td\n",
+                "echo a \\\nb \\\n>c \\\n\td",
+            ),
+            (
+                ".RECIPEPREFIX = >\nall: ; echo a \\\n>b \\\n\tc\n",
+                "echo a \\\nb \\\n\tc",
+            ),
+            (
+                ".RECIPEPREFIX = >\nall:\n>echo \"$(subst x,y,a\\\n>x)\"\n",
+                "echo \"$(subst x,y,a\\\n>x)\"",
+            ),
+        ];
+        for (text, expected) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            let recipe = makefile
+                .rules()
+                .next()
+                .unwrap()
+                .recipe_nodes()
+                .next()
+                .unwrap();
+            assert_eq!(recipe.text(), expected, "{text:?}");
+            assert_eq!(recipe.shell_text(), expected, "{text:?}");
+        }
+
+        let makefile: Makefile = ".RECIPEPREFIX = >\nall:\n># a \\\n>b\n".parse().unwrap();
+        let recipe = makefile
+            .rules()
+            .next()
+            .unwrap()
+            .recipe_nodes()
+            .next()
+            .unwrap();
+        assert_eq!(recipe.text(), "");
+        assert_eq!(recipe.shell_text(), "# a \\\nb");
+        assert_eq!(recipe.comment(), Some("# a \\\nb".to_string()));
+    }
 
     #[test]
     fn test_comment_line_references() {
