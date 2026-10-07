@@ -456,36 +456,29 @@ pub(crate) fn terminate_line_before(parent: &SyntaxNode, index: usize, eol: &str
     }
 }
 
-/// The index in the parent of `node` before the comment lines directly
-/// above it: consecutive whole-line comments, other than a shebang, with no
-/// blank line between them and `node`. Such comments document `node`, so
-/// anything inserted before it should go before them.
+/// The comment lines that document `node`, nearest first: the lines from
+/// [`lines_above`] up to the first blank line. These are the whole-line
+/// comments directly above `node`, indented or not, other than a shebang,
+/// a trailing comment or a comment that continues the line before it.
+pub(crate) fn doc_comment_lines(node: &SyntaxNode) -> Vec<LineAbove> {
+    lines_above(node)
+        .into_iter()
+        .take_while(|line| line.comment.is_some())
+        .collect()
+}
+
+/// The index in the parent of `node` before the start of its line and the
+/// comment lines documenting it, as found by [`doc_comment_lines`], so
+/// that anything inserted before `node` goes before them.
 ///
 /// The parser puts comments that follow a recipe in the preceding rule, so
 /// they are moved out of it to the parent of `node` first.
 pub(crate) fn index_before_doc_comment(node: &SyntaxNode) -> usize {
     let parent = node.parent().expect("node must have a parent");
-    let mut start = None;
-    let mut token = node
-        .descendants_with_tokens()
-        .find_map(|it| it.into_token())
-        .and_then(|t| t.prev_token());
-    while let Some(newline) = token.filter(|t| t.kind() == NEWLINE) {
-        let Some(comment) = newline.prev_token().filter(|t| {
-            t.kind() == COMMENT
-                && !t.text().starts_with("#!")
-                && t.parent_ancestors().any(|a| a == parent)
-        }) else {
-            break;
-        };
-        // Only whole-line comments count, not trailing ones like `X = 1 # x`
-        let before = comment.prev_token();
-        if before.as_ref().is_some_and(|t| t.kind() != NEWLINE) {
-            break;
-        }
-        start = Some(comment);
-        token = before;
-    }
+    let start = doc_comment_lines(node)
+        .pop()
+        .map(|line| line.tokens[0].clone())
+        .or_else(|| line_indent(node));
     let Some(start) = start else {
         return node.index();
     };

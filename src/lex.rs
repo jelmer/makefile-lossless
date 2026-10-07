@@ -33,6 +33,9 @@ pub struct Lexer<'a> {
     /// Whether the previous line was a recipe line ending in a backslash, so
     /// that this line continues the recipe.
     recipe_continuation: bool,
+    /// Whether the current line continues a recipe line, so that a `#` at
+    /// its start is part of the command rather than a comment.
+    continues_recipe: bool,
     /// Number of parentheses and braces open inside `$(...)` and `${...}`
     /// references on the current logical line.
     reference_depth: usize,
@@ -63,6 +66,12 @@ pub struct Lexer<'a> {
     comments: bool,
 }
 
+/// Whether `text` ends in an odd number of backslashes, so that the last
+/// one is not escaped by the one before it.
+pub(crate) fn ends_with_unescaped_backslash(text: &str) -> bool {
+    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
 /// The characters that nmake takes literally after a `^`.
 pub(crate) const NMAKE_ESCAPABLE: &[char] = &[
     ':', ';', '#', '(', ')', '$', '^', '\\', '{', '}', '!', '@', '-',
@@ -84,6 +93,7 @@ impl<'a> Lexer<'a> {
             nmake: variant == Some(MakefileVariant::NMake),
             after_lbracket: false,
             recipe_continuation: false,
+            continues_recipe: false,
             reference_depth: 0,
             dollars: 0,
             recipe_prefix: '\t',
@@ -186,8 +196,7 @@ impl<'a> Lexer<'a> {
     /// on the next line.
     fn read_recipe_text(&mut self) -> (SyntaxKind, String) {
         let text = self.read_line();
-        let trailing_backslashes = text.chars().rev().take_while(|&c| c == '\\').count();
-        self.recipe_continuation = trailing_backslashes % 2 == 1;
+        self.recipe_continuation = ends_with_unescaped_backslash(&text);
         if self.nmake {
             self.nmake_inline_files += text.matches("<<").count();
         }
@@ -197,14 +206,15 @@ impl<'a> Lexer<'a> {
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
+        let mut after_backslash = false;
         loop {
-            let after_backslash = result.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
             if self.at_newline() && !self.at_escaped_cr(after_backslash) {
                 break;
             }
             let Some(c) = self.input.next() else {
                 break;
             };
+            after_backslash = c == '\\' && !after_backslash;
             result.push(c);
         }
         result
@@ -266,7 +276,7 @@ impl<'a> Lexer<'a> {
     fn read_comment(&mut self) -> String {
         let mut comment = self.read_line();
         while self.line_type == Some(LineType::Other)
-            && comment.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+            && ends_with_unescaped_backslash(&comment)
             && self.at_newline()
         {
             if let Some(cr) = self.input.next_if_eq(&'\r') {
@@ -306,6 +316,9 @@ impl<'a> Lexer<'a> {
         if let Some(&c) = self.input.peek() {
             let recipe_continuation =
                 self.line_type.is_none() && std::mem::take(&mut self.recipe_continuation);
+            if self.line_type.is_none() {
+                self.continues_recipe = recipe_continuation;
+            }
             match (c, self.line_type) {
                 (_, None) if self.nmake_inline_files > 0 && !self.at_newline() => {
                     // A line of an nmake inline file, up to a line starting
@@ -386,14 +399,18 @@ impl<'a> Lexer<'a> {
                     && (!self.comments
                         || (self.bsd && after_lbracket)
                         || (self.hash_in_references && self.reference_depth > 0)) => {}
+                // GNU and BSD make pass a `#` at the start of a continuation
+                // line on to the shell with the rest of the command.
+                '#' if self.line_type == Some(LineType::Recipe)
+                    && self.continues_recipe
+                    && !self.nmake => {}
                 '#' => {
                     let comment = self.read_comment();
                     // GNU and BSD make continue a recipe line starting with
                     // `#` like any other, although nmake ends a comment at
                     // the end of the line.
                     if self.line_type == Some(LineType::Recipe) && !self.nmake {
-                        let backslashes = comment.chars().rev().take_while(|&c| c == '\\').count();
-                        self.recipe_continuation = backslashes % 2 == 1;
+                        self.recipe_continuation = ends_with_unescaped_backslash(&comment);
                     }
                     return Some((SyntaxKind::COMMENT, comment));
                 }
