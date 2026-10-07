@@ -8,6 +8,7 @@ pub mod makefile;
 pub mod rule;
 pub mod variable;
 pub mod vpath;
+mod word_list;
 
 use crate::lex::NMAKE_ESCAPABLE;
 use crate::lossless::{
