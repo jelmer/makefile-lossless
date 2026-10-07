@@ -402,6 +402,15 @@ impl Recipe {
         self.syntax().ancestors().find_map(Rule::cast)
     }
 
+    /// Whether `flag` is among the `@`, `-` and `+` characters at the start
+    /// of the command, which make reads in any order.
+    fn has_prefix_flag(&self, flag: char) -> bool {
+        self.text()
+            .chars()
+            .take_while(|c| matches!(c, '@' | '-' | '+'))
+            .any(|c| c == flag)
+    }
+
     /// Check if this recipe has the silent prefix (@)
     ///
     /// # Example
@@ -415,8 +424,7 @@ impl Recipe {
     /// assert!(!recipes[1].is_silent());
     /// ```
     pub fn is_silent(&self) -> bool {
-        let text = self.text();
-        text.starts_with('@') || text.starts_with("-@") || text.starts_with("+@")
+        self.has_prefix_flag('@')
     }
 
     /// Check if this recipe has the ignore-errors prefix (-)
@@ -432,8 +440,7 @@ impl Recipe {
     /// assert!(!recipes[1].is_ignore_errors());
     /// ```
     pub fn is_ignore_errors(&self) -> bool {
-        let text = self.text();
-        text.starts_with('-') || text.starts_with("@-") || text.starts_with("+-")
+        self.has_prefix_flag('-')
     }
 
     /// Set the command prefix for this recipe
@@ -1167,6 +1174,19 @@ mod tests {
             );
             assert_eq!(makefile.comment_ranges().count(), 1);
         }
+    }
+
+    #[test]
+    fn test_recipe_prefix_flags_after_two_others() {
+        let makefile: Makefile = "all:\n\t+-@echo a\n\t@+-false\n\t+@echo b\n"
+            .parse()
+            .unwrap();
+        let rule = makefile.rules().next().unwrap();
+        let flags: Vec<_> = rule
+            .recipe_nodes()
+            .map(|r| (r.is_silent(), r.is_ignore_errors()))
+            .collect();
+        assert_eq!(flags, vec![(true, true), (true, true), (true, false)]);
     }
 
     #[test]
