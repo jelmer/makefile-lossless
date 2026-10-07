@@ -1267,6 +1267,30 @@ fn test_error_position_after_relexed_line() {
 }
 
 #[test]
+fn test_error_position_after_split_token() {
+    // The name of `$#` is the first character of the comment token `#y`,
+    // and the rest of it is relexed if it starts another reference.
+    assert_eq!(
+        error_locations("x $#y\n"),
+        vec![(
+            "expected ':'".to_string(),
+            1,
+            "x $#y".to_string(),
+            rowan::TextRange::new(4.into(), 5.into())
+        )]
+    );
+    assert_eq!(
+        error_locations("x $#$# c\n"),
+        vec![(
+            "expected ':'".to_string(),
+            1,
+            "x $#$# c".to_string(),
+            rowan::TextRange::new(6.into(), 8.into())
+        )]
+    );
+}
+
+#[test]
 fn test_invalid_line_reports_one_error() {
     // Error recovery skips the rest of the line rather than parsing it
     // as a new item.

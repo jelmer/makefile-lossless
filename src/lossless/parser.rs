@@ -251,6 +251,29 @@ fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::Text
     rowan::TextRange::new(start, end)
 }
 
+/// A token's kind and text.
+type Token = (SyntaxKind, String);
+
+/// A token's start and end.
+type TokenRange = (rowan::TextSize, rowan::TextSize);
+
+/// Reverse `tokens`, which start at `start`, into the order of the parser's
+/// token stack, along with their positions in the same order.
+fn token_stack(start: rowan::TextSize, mut tokens: Vec<Token>) -> (Vec<Token>, Vec<TokenRange>) {
+    let mut position = start;
+    let mut positions: Vec<_> = tokens
+        .iter()
+        .map(|(_, text)| {
+            let start = position;
+            position += rowan::TextSize::of(text.as_str());
+            (start, position)
+        })
+        .collect();
+    tokens.reverse();
+    positions.reverse();
+    (tokens, positions)
+}
+
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     struct Parser<'a> {
         /// input tokens, including whitespace,
@@ -263,7 +286,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec<ErrorInfo>,
         /// positioned errors with location information
         positioned_errors: Vec<PositionedParseError>,
-        /// Token positions (start, end) in forward order, indexed by forward token index
+        /// The position (start, end) of each of `tokens`, in the same order.
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
         /// The original text
         original_text: &'a str,
@@ -300,6 +323,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
     struct RelexedLine {
         /// The new tokens, in reverse order.
         tokens: Vec<(SyntaxKind, String)>,
+        /// The position of each of `tokens`, in the same order.
+        positions: Vec<(rowan::TextSize, rowan::TextSize)>,
         /// The number of current tokens they replace.
         replaces: usize,
     }
@@ -394,13 +419,26 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Text range of the current token, or an empty range at the end of
         /// the text if all tokens have been consumed.
         fn current_range(&self) -> rowan::TextRange {
-            // tokens is stored in reverse, so the number of tokens already
-            // consumed is the forward index of the current one.
-            let index = self.token_positions.len() - self.tokens.len();
-            match self.token_positions.get(index) {
+            debug_assert_eq!(self.tokens.len(), self.token_positions.len());
+            match self.token_positions.last() {
                 Some(&(start, end)) => rowan::TextRange::new(start, end),
                 None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text)),
             }
+        }
+
+        /// Remove the current token without adding it to the tree.
+        fn pop_token(&mut self) -> Option<(SyntaxKind, String)> {
+            self.token_positions.pop();
+            self.tokens.pop()
+        }
+
+        /// Replace the current token with `tokens`, given in forward order.
+        fn replace_current_token(&mut self, tokens: Vec<(SyntaxKind, String)>) {
+            let start = self.current_range().start();
+            self.pop_token();
+            let (tokens, positions) = token_stack(start, tokens);
+            self.tokens.extend(tokens);
+            self.token_positions.extend(positions);
         }
 
         /// The text of the given 1-based line, without its line ending.
@@ -554,7 +592,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 let mut text = String::new();
                 while self.current().is_some_and(|kind| kind != NEWLINE) {
                     if !self.split_continued_comment() {
-                        text.push_str(&self.tokens.pop().unwrap().1);
+                        text.push_str(&self.pop_token().unwrap().1);
                     }
                 }
                 self.pending_backslash_escape = false;
@@ -614,23 +652,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             .filter(|(_, piece)| !piece.is_empty())
             .map(|(kind, piece)| (kind, piece.to_string()))
             .collect();
-
-            // Keep token_positions in step with the new tokens.
-            let consumed = self.token_positions.len() - self.tokens.len();
-            let mut position = self.token_positions[consumed].0;
-            let positions: Vec<_> = pieces
-                .iter()
-                .map(|(_, piece)| {
-                    let start = position;
-                    position += rowan::TextSize::of(piece.as_str());
-                    (start, position)
-                })
-                .collect();
-            self.token_positions
-                .splice(consumed..consumed + 1, positions);
-
-            self.tokens.pop();
-            self.tokens.extend(pieces.into_iter().rev());
+            self.replace_current_token(pieces);
             self.token_edits += 1;
             true
         }
@@ -993,6 +1015,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return false;
             }
             let ws = self.tokens.pop().unwrap();
+            let ws_position = self.token_positions.pop().unwrap();
             let is_recipe = self.directive().is_none()
                 && !self.line_has_dependency_operator()
                 && !self.has_assignment_operator_on_line()
@@ -1004,6 +1027,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         || matches!(word.as_str(), "else" | "endif" | "define" | "endef")
                 );
             self.tokens.push(ws);
+            self.token_positions.push(ws_position);
             is_recipe
         }
 
@@ -1031,7 +1055,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     if *kind == NEWLINE {
                         break;
                     }
-                    text.push_str(&self.tokens.pop().unwrap().1);
+                    text.push_str(&self.pop_token().unwrap().1);
                 }
                 let continued = (text.len() - text.trim_end_matches('\\').len()) % 2 == 1;
                 if !text.is_empty() {
@@ -1457,7 +1481,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.skip_ws();
                 if let Some((OPERATOR, op)) = self.tokens.last() {
                     if matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=") {
-                        let (_, op) = self.tokens.pop().unwrap();
+                        let (_, op) = self.pop_token().unwrap();
                         let split = if op.starts_with("::") { 2 } else { 1 };
                         let (dependency_op, assignment_op) = op.split_at(split);
                         self.builder.token(OPERATOR.into(), dependency_op);
@@ -2291,7 +2315,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// line continuation and the indentation after it replaced by a
         /// space.
         fn bsd_logical_line(&self) -> BsdLine {
-            let consumed = self.token_positions.len() - self.tokens.len();
             let mut line = BsdLine {
                 text: String::new(),
                 unescaped: Default::default(),
@@ -2304,7 +2327,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .tokens
                 .iter()
                 .rev()
-                .zip(&self.token_positions[consumed..])
+                .zip(self.token_positions.iter().rev())
                 .peekable();
             while let Some(((kind, token), &(start, end))) = tokens.next() {
                 line.starts.push((start, line.text.len()));
@@ -2370,11 +2393,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// As [`Self::bump_token_head`], but adding the head to the tree as
         /// `kind`.
         fn bump_token_head_as(&mut self, len: usize, kind: SyntaxKind) {
-            let consumed = self.token_positions.len() - self.tokens.len();
             let text = &mut self.tokens.last_mut().unwrap().1;
             let tail = text.split_off(len);
             let head = std::mem::replace(text, tail);
-            self.token_positions[consumed].0 += rowan::TextSize::of(head.as_str());
+            self.token_positions.last_mut().unwrap().0 += rowan::TextSize::of(head.as_str());
             self.pending_backslash_escape = false;
             self.builder.token(kind.into(), &head);
 
@@ -2383,20 +2405,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 return;
             }
             let pieces = lex_non_recipe_line(tail, self.variant);
-            // Keep token_positions in step with the new tokens.
-            let mut position = self.token_positions[consumed].0;
-            let positions: Vec<_> = pieces
-                .iter()
-                .map(|(_, piece)| {
-                    let start = position;
-                    position += rowan::TextSize::of(piece.as_str());
-                    (start, position)
-                })
-                .collect();
-            self.token_positions
-                .splice(consumed..consumed + 1, positions);
-            self.tokens.pop();
-            self.tokens.extend(pieces.into_iter().rev());
+            self.replace_current_token(pieces);
         }
 
         /// Parse a BSD make expression, finding its end the way make does,
@@ -3569,7 +3578,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn bump_merged(&mut self, kind: SyntaxKind, count: usize) {
             let mut text = String::new();
             for _ in 0..count {
-                text.push_str(&self.tokens.pop().unwrap().1);
+                text.push_str(&self.pop_token().unwrap().1);
             }
             self.pending_backslash_escape = false;
             self.builder.token(kind.into(), &text);
@@ -3883,6 +3892,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
                 found_variable = true;
                 self.tokens.truncate(self.tokens.len() - word_len);
+                self.token_positions.truncate(self.tokens.len());
                 self.pending_backslash_escape = false;
                 self.builder.token(IDENTIFIER.into(), &word);
                 self.skip_ws_and_continuations();
@@ -4088,7 +4098,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             RPAREN | RBRACE => *depth = depth.saturating_sub(1),
                             _ => {}
                         }
-                        let (_, text) = self.tokens.pop().unwrap();
+                        let (_, text) = self.pop_token().unwrap();
                         self.pending_backslash_escape =
                             kind == BACKSLASH && !self.pending_backslash_escape;
                         word.push_str(&text);
@@ -4156,7 +4166,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .count();
             let mut name = String::new();
             for _ in 0..len - trailing_ws {
-                let (_, text) = self.tokens.pop().unwrap();
+                let (_, text) = self.pop_token().unwrap();
                 name.push_str(&text);
             }
             if name.is_empty() {
@@ -4468,12 +4478,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         fn lex_indented_statement(&mut self) -> Option<RelexedLine> {
             let mut line = self.lex_as_non_recipe_line();
             let tokens = std::mem::replace(&mut self.tokens, line.tokens);
+            let positions = std::mem::replace(&mut self.token_positions, line.positions);
             let mut indent = vec![];
             while let Some(token) = self
                 .tokens
                 .pop_if(|(kind, _)| matches!(kind, WHITESPACE | INDENT))
             {
-                indent.push(token);
+                indent.push((token, self.token_positions.pop().unwrap()));
             }
             let is_statement = match self.tokens.last() {
                 None | Some((NEWLINE | COMMENT, _)) => true,
@@ -4488,8 +4499,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         || self.at_load_keyword()
                 }
             };
-            self.tokens.extend(indent.into_iter().rev());
+            for (token, position) in indent.into_iter().rev() {
+                self.tokens.push(token);
+                self.token_positions.push(position);
+            }
             line.tokens = std::mem::replace(&mut self.tokens, tokens);
+            line.positions = std::mem::replace(&mut self.token_positions, positions);
             is_statement.then_some(line)
         }
 
@@ -4510,7 +4525,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                 }
                 comment.push_str(text);
-                self.tokens.pop();
+                self.pop_token();
             }
             if !comment.is_empty() {
                 self.pending_backslash_escape = false;
@@ -4524,8 +4539,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Lex the rest of the current logical line as an ordinary makefile
         /// line.
         fn lex_as_non_recipe_line(&self) -> RelexedLine {
-            let start = usize::from(self.current_range().start());
-            let mut tokens = lex_first_non_recipe_line(&self.original_text[start..], self.variant);
+            let start = self.current_range().start();
+            let tokens =
+                lex_first_non_recipe_line(&self.original_text[usize::from(start)..], self.variant);
             let len: usize = tokens.iter().map(|(_, text)| text.len()).sum();
             let mut replaced_len = 0;
             let mut replaces = 0;
@@ -4537,31 +4553,21 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 replaces += 1;
             }
             assert_eq!(replaced_len, len, "relexed line ends inside a token");
-            tokens.reverse();
-            RelexedLine { tokens, replaces }
+            let (tokens, positions) = token_stack(start, tokens);
+            RelexedLine {
+                tokens,
+                positions,
+                replaces,
+            }
         }
 
         /// Replace the tokens of the rest of the current logical line with
         /// `line`.
         fn replace_line(&mut self, line: RelexedLine) {
-            let consumed = self.token_positions.len() - self.tokens.len();
             self.tokens.truncate(self.tokens.len() - line.replaces);
-
-            // Keep token_positions in step with the new tokens.
-            let rest = self.token_positions.split_off(consumed);
-            let mut position = rest
-                .first()
-                .map(|(start, _)| *start)
-                .expect("relexed line has tokens");
-            for (_, token) in line.tokens.iter().rev() {
-                let end = position + rowan::TextSize::of(token.as_str());
-                self.token_positions.push((position, end));
-                position = end;
-            }
-            self.token_positions
-                .extend_from_slice(&rest[rest.len() - self.tokens.len()..]);
-
+            self.token_positions.truncate(self.tokens.len());
             self.tokens.extend(line.tokens);
+            self.token_positions.extend(line.positions);
             self.token_edits += 1;
         }
 
@@ -4771,7 +4777,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Advance one token, adding it to the current branch of the tree builder.
         fn bump(&mut self) {
-            let (kind, text) = self.tokens.pop().unwrap();
+            let (kind, text) = self.pop_token().unwrap();
             // Track backslash-run parity: each backslash flips the flag, any
             // other token clears it. See `pending_backslash_escape`.
             self.pending_backslash_escape = kind == BACKSLASH && !self.pending_backslash_escape;
@@ -4779,7 +4785,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
         /// Advance one token, adding it to the tree as `kind`.
         fn bump_as(&mut self, kind: SyntaxKind) {
-            let (_, text) = self.tokens.pop().unwrap();
+            let (_, text) = self.pop_token().unwrap();
             self.pending_backslash_escape = false;
             self.builder.token(kind.into(), text.as_str());
         }
@@ -4891,19 +4897,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
     }
 
-    let mut tokens = lex(text, variant);
-
-    // Build token positions in forward order before reversing
-    let mut token_positions = Vec::with_capacity(tokens.len());
-    let mut position = rowan::TextSize::from(0);
-    for (_kind, text) in &tokens {
-        let start = position;
-        let end = start + rowan::TextSize::of(text.as_str());
-        token_positions.push((start, end));
-        position = end;
-    }
-
-    tokens.reverse();
+    let (tokens, token_positions) = token_stack(0.into(), lex(text, variant));
     Parser {
         tokens,
         builder: GreenNodeBuilder::new(),
