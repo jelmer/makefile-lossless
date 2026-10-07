@@ -1,7 +1,7 @@
 use super::rule::build_targets_node;
 use super::{
-    detach_tokens, index_before_doc_comment, line_ending, lines_above, terminate_line_before,
-    with_trailing_newline,
+    detach_tokens, doc_comment_lines, index_before_doc_comment, line_ending, lines_above,
+    terminate_line_before, with_trailing_newline,
 };
 use crate::lossless::{
     line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
@@ -554,9 +554,9 @@ impl MakefileItem {
     /// );
     /// ```
     pub fn doc_comments(&self) -> impl Iterator<Item = String> {
-        let mut lines: Vec<_> = lines_above(self.syntax())
+        let mut lines: Vec<_> = doc_comment_lines(self.syntax())
             .into_iter()
-            .map_while(|line| line.comment)
+            .filter_map(|line| line.comment)
             .map(|comment| {
                 let text = comment.text().trim_start_matches('#');
                 text.strip_prefix(' ')
@@ -2395,6 +2395,9 @@ mod tests {
             ("X = 1\n# doc\nc:\n", "X = 1\nN = 1\n# doc\nc:\n"),
             ("X = 1\n# x\n\nc:\n", "X = 1\n# x\n\nN = 1\nc:\n"),
             ("X = 1 # x\nc:\n", "X = 1 # x\nN = 1\nc:\n"),
+            ("a:\n  # doc\nc:\n", "a:\nN = 1\n  # doc\nc:\n"),
+            // The comment is part of the line `X = a`.
+            ("X = a \\\n# x\nc:\n", "X = a \\\n# x\nN = 1\nc:\n"),
             (
                 "#!/usr/bin/make -f\nc:\n",
                 "#!/usr/bin/make -f\nN = 1\nc:\n",
@@ -3974,7 +3977,8 @@ VAR3 = value3
                 "X = 1\n# x\n\nb:\n\n# doc\nc:\n",
             ),
             ("X = 1\n# x\n\nc:\n", 0, "X = 1\n# x\n\nb:\n\nc:\n"),
-            ("a:\n  # x\nc:\n", 1, "a:\n  # x\n\nb:\n\nc:\n"),
+            ("a:\n  c:\n", 1, "a:\n\nb:\n\n  c:\n"),
+            ("X = a \\\n# x\nc:\n", 0, "X = a \\\n# x\n\nb:\n\nc:\n"),
             (
                 "ifdef X\n# doc\nc:\nendif\n",
                 0,
