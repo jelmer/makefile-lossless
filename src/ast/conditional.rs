@@ -9,6 +9,7 @@ use crate::lossless::{
     lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional, Error,
     ErrorInfo, Lang, ParseError, Recipe, Rule, VariableDefinition,
 };
+use crate::nmake_condition::{parse_nmake_condition, NmakeCondition, NmakeConditionError};
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
 use rowan::ast::AstNode;
@@ -447,14 +448,51 @@ impl ConditionalBranch {
     ///     ]
     /// );
     /// ```
-    // TODO: Parse the expressions of nmake's `!IF` and `!ELSEIF` in the same
-    // way, which have C-like operators, `DEFINED(macro)` and `EXIST(path)`.
     pub fn bsd_condition(&self) -> Option<Result<BsdCondition, BsdConditionError>> {
         if !self.conditional_type()?.starts_with('.') {
             return None;
         }
         let condition = self.condition_with(LineSyntax::Bsd).unwrap_or_default();
         Some(parse_bsd_condition(&condition))
+    }
+
+    /// Parse the expression of an nmake `!IF` or `!ELSEIF` branch.
+    ///
+    /// Returns `None` for other directives, including nmake's `!IFDEF` and
+    /// `!IFNDEF`, whose condition is a macro name.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant, NmakeBinaryOp, NmakeCondition};
+    /// let makefile = Makefile::parse_with_variant(
+    ///     "!IF $(VER) >= 5\n!ELSEIF DEFINED(OLD)\n!ELSE\n!ENDIF\n",
+    ///     MakefileVariant::NMake,
+    /// )
+    /// .tree();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let conditions: Vec<_> = cond
+    ///     .branches()
+    ///     .map(|b| b.nmake_condition().transpose().unwrap())
+    ///     .collect();
+    /// assert_eq!(
+    ///     conditions,
+    ///     vec![
+    ///         Some(NmakeCondition::Binary {
+    ///             lhs: Box::new(NmakeCondition::Macro("$(VER)".to_string())),
+    ///             op: NmakeBinaryOp::GreaterOrEqual,
+    ///             rhs: Box::new(NmakeCondition::Integer(5)),
+    ///         }),
+    ///         Some(NmakeCondition::Defined("OLD".to_string())),
+    ///         None,
+    ///     ]
+    /// );
+    /// ```
+    pub fn nmake_condition(&self) -> Option<Result<NmakeCondition, NmakeConditionError>> {
+        if self.conditional_type()? != "!IF" {
+            return None;
+        }
+        let condition = self.condition_with(LineSyntax::NMake).unwrap_or_default();
+        Some(parse_nmake_condition(&condition))
     }
 
     /// The items in this branch in source order, including recipe lines
@@ -1239,6 +1277,36 @@ mod tests {
         BsdOperand, MakefileItem, MakefileVariant, ParseErrorKind, RuleItem,
     };
     use rowan::ast::AstNode;
+
+    #[test]
+    fn test_nmake_condition() {
+        let text = concat!(
+            "!if \"$(CFG)\" == \"Debug\" || 1 ^^ \\\n  2\n",
+            "!ELSE IF EXIST(a.c) # c\n",
+            "!ELSEIFDEF X\n",
+            "!ELSEIF (1\n",
+            "!ENDIF\n",
+        );
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::NMake).tree();
+        let cond = makefile.conditionals().next().unwrap();
+        let conditions: Vec<_> = cond.branches().map(|b| b.nmake_condition()).collect();
+        let [Some(Ok(first)), Some(Ok(second)), None, Some(Err(error))] = &conditions[..] else {
+            panic!("{conditions:?}");
+        };
+        assert_eq!(
+            first,
+            &crate::parse_nmake_condition("\"$(CFG)\" == \"Debug\" || 1 ^ 2").unwrap()
+        );
+        assert_eq!(second, &crate::NmakeCondition::Exist("a.c".to_string()));
+        assert_eq!(
+            error.kind(),
+            crate::NmakeConditionErrorKind::UnclosedParenthesis
+        );
+
+        let makefile: Makefile = ".if 1\n.endif\n".parse().unwrap();
+        let branch = makefile.conditionals().next().unwrap().branches().next();
+        assert_eq!(branch.unwrap().nmake_condition(), None);
+    }
 
     #[test]
     fn test_conditional_item_line_col() {
