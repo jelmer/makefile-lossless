@@ -1,6 +1,7 @@
 //! Parse wrapper type following rust-analyzer's pattern for thread-safe storage in Salsa.
 
 use crate::lossless::{Error, ErrorInfo, Makefile, ParseError, PositionedParseError, Rule};
+use crate::MakefileVariant;
 use rowan::ast::AstNode;
 use rowan::{GreenNode, SyntaxNode};
 use std::marker::PhantomData;
@@ -14,6 +15,8 @@ pub struct Parse<T> {
     green: GreenNode,
     errors: Vec<ErrorInfo>,
     positioned_errors: Vec<PositionedParseError>,
+    /// The make variant the text was parsed for.
+    variant: Option<MakefileVariant>,
     _ty: PhantomData<T>,
 }
 
@@ -28,8 +31,19 @@ impl<T> Parse<T> {
             green,
             errors,
             positioned_errors,
+            variant: None,
             _ty: PhantomData,
         }
+    }
+
+    pub(crate) fn with_variant(mut self, variant: Option<MakefileVariant>) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// Get the make variant the text was parsed for, if any
+    pub fn variant(&self) -> Option<MakefileVariant> {
+        self.variant
     }
 
     /// Get the green node (thread-safe representation)
@@ -98,9 +112,10 @@ impl Parse<Makefile> {
     }
 
     /// Parse makefile text written for a specific make variant
-    pub fn parse_makefile_with_variant(text: &str, variant: crate::MakefileVariant) -> Self {
+    pub fn parse_makefile_with_variant(text: &str, variant: MakefileVariant) -> Self {
         let parsed = crate::lossless::parse(text, Some(variant));
         Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+            .with_variant(Some(variant))
     }
 }
 
