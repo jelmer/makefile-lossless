@@ -3986,6 +3986,7 @@ VAR3 = value3
             ),
             ("X = 1\n# x\n\nc:\n", 0, "X = 1\n# x\n\nb:\n\nc:\n"),
             ("a:\n  c:\n", 1, "a:\n\nb:\n\n  c:\n"),
+            ("a:\n  # x\nc:\n", 1, "a:\n\nb:\n\n  # x\nc:\n"),
             ("X = a \\\n# x\nc:\n", 0, "X = a \\\n# x\n\nb:\n\nc:\n"),
             (
                 "ifdef X\n# doc\nc:\nendif\n",
