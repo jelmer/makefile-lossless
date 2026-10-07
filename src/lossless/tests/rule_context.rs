@@ -549,6 +549,24 @@ fn test_recipe_after_blank_line_and_indented_comment() {
 }
 
 #[test]
+fn test_comments_after_blank_lines_in_recipe() {
+    // Comments after blank lines belong to the rule only if a recipe line
+    // follows them.
+    let rule = "all:\n\techo a\n\n# c1\n\n  # c2\n\n# c3\n\techo b\n";
+    let input = format!("{rule}\n# c4\n\n  # c5\n\n# c6\nX = 1\n");
+    let parsed = parse(&input, None);
+    assert_eq!(parsed.errors, vec![]);
+    let makefile = parsed.root();
+    assert_eq!(makefile.code(), input);
+    let rule_node = makefile.rules().next().unwrap();
+    assert_eq!(
+        rule_node.recipes().collect::<Vec<_>>(),
+        vec!["echo a", "echo b"]
+    );
+    assert_eq!(rule_node.syntax().to_string(), format!("{rule}\n"));
+}
+
+#[test]
 fn test_recipe_after_conditional_ending_in_rule_context() {
     use crate::ast::makefile::MakefileItem;
     let input = "ifdef X\na:\nelse\nb:\nendif\n\techo hi\n";

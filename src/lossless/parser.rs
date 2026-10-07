@@ -320,6 +320,23 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Number of times tokens were lexed again, which may change where
         /// a logical line ends.
         token_edits: usize,
+        /// The result of the last call to [`Parser::recipe_continues`].
+        recipe_continues: std::cell::Cell<Option<RecipeContinues>>,
+    }
+
+    /// The result of [`Parser::recipe_continues`] at the start of a line. It
+    /// is the same at the start of any later comment or blank line before
+    /// the first other line, as those don't change rule context.
+    #[derive(Clone, Copy)]
+    struct RecipeContinues {
+        /// The number of tokens left at the start of the line.
+        start: usize,
+        /// The number of tokens left at the first line that is not a
+        /// comment or blank line.
+        end: usize,
+        in_rule: RuleContext,
+        token_edits: usize,
+        result: bool,
     }
 
     /// A logical line lexed again, from [`Parser::lex_as_non_recipe_line`].
@@ -1127,6 +1144,35 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// line follows, the comment or conditional doesn't belong to the
         /// preceding rule.
         fn recipe_continues(&self) -> bool {
+            let len = self.tokens.len();
+            if let Some(cached) = self.recipe_continues.get() {
+                if cached.in_rule == self.in_rule
+                    && cached.token_edits == self.token_edits
+                    && cached.end < len
+                    && len <= cached.start
+                {
+                    return cached.result;
+                }
+            }
+            let mut end = None;
+            let result = self.scan_recipe_continues(&mut end);
+            if let Some(end) = end {
+                self.recipe_continues.set(Some(RecipeContinues {
+                    start: len,
+                    end,
+                    in_rule: self.in_rule,
+                    token_edits: self.token_edits,
+                    result,
+                }));
+            }
+            result
+        }
+
+        /// Do the work of [`Self::recipe_continues`]. Sets `comments_end` to
+        /// the number of tokens left at the first line that is not a comment
+        /// or blank line, or to 0 if there is none, unless the result is
+        /// known before reaching it.
+        fn scan_recipe_continues(&self, comments_end: &mut Option<usize>) -> bool {
             let bsd = self.bsd_directives_enabled();
             let nmake = self.variant == Some(MakefileVariant::NMake);
             let mut stack: Vec<ConditionalRuleContext> = Vec::new();
@@ -1160,6 +1206,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     _ => None,
                 };
+                if comments_end.is_none() && !matches!(kind, NEWLINE | COMMENT) {
+                    *comments_end = Some(end);
+                }
                 match (*kind, text.as_str()) {
                     (NEWLINE | COMMENT, _) => {}
                     (INDENT, _) if in_rule == RuleContext::Inside => return true,
@@ -1220,6 +1269,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     prev = Some(*kind);
                 }
             }
+            comments_end.get_or_insert(0);
             false
         }
 
@@ -4973,6 +5023,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         in_rule: RuleContext::Outside,
         bsd_line: None,
         token_edits: 0,
+        recipe_continues: std::cell::Cell::new(None),
     }
     .parse()
 }
