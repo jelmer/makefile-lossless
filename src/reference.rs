@@ -756,34 +756,57 @@ fn reference_prefix(
 /// Returns `None` if the expression is malformed.
 #[cfg(test)]
 pub(crate) fn bsd_expr_extent(text: &str) -> Option<(usize, Vec<Range<usize>>)> {
-    bsd_expr_extent_at(&UnescapedHash::new(text), 0)
+    BsdExprLine::new(UnescapedHash::new(text)).extent_at(0)
 }
 
-/// Like [`bsd_expr_extent`], for the expression at offset `start` of the
-/// original text of `line`. The offsets returned are relative to `start`.
-pub(crate) fn bsd_expr_extent_at(
-    line: &UnescapedHash,
-    start: usize,
-) -> Option<(usize, Vec<Range<usize>>)> {
-    let unescaped_start = line.unescaped_offset(start);
-    let mut parser = Parser::new(&line.text[unescaped_start..]);
-    parser.parse_expr().ok()?;
-    let mut spans = parser.spans;
-    spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
-    let mut nested: Vec<Range<usize>> = vec![];
-    for span in spans {
-        // Skip the expression itself and the expressions nested further.
-        if span.start == 0 || nested.last().is_some_and(|last| span.start < last.end) {
-            continue;
+/// A line of BSD make text to find expressions in, along with the
+/// expressions parsed in it so far, so that finding the expressions nested
+/// in one another does not parse the inner ones again.
+#[derive(Default)]
+pub(crate) struct BsdExprLine {
+    line: UnescapedHash,
+    parsed: ParsedExprs,
+}
+
+impl BsdExprLine {
+    pub(crate) fn new(line: UnescapedHash) -> Self {
+        BsdExprLine {
+            line,
+            parsed: ParsedExprs::default(),
         }
-        nested.push(span);
     }
-    let original = |offset: usize| line.original_offset(unescaped_start + offset) - start;
-    let nested = nested
-        .into_iter()
-        .map(|span| original(span.start)..original(span.end))
-        .collect();
-    Some((original(parser.pos), nested))
+
+    /// Like [`bsd_expr_extent`], for the expression at offset `start` of
+    /// the original text of the line. The offsets returned are relative to
+    /// `start`.
+    pub(crate) fn extent_at(&mut self, start: usize) -> Option<(usize, Vec<Range<usize>>)> {
+        let line = &self.line;
+        let unescaped_start = line.unescaped_offset(start);
+        let mut parser = Parser::new(&line.text);
+        parser.pos = unescaped_start;
+        parser.parsed = std::mem::take(&mut self.parsed);
+        let result = parser.skip_expr();
+        self.parsed = std::mem::take(&mut parser.parsed);
+        result.ok()?;
+        let mut spans = parser.spans;
+        spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+        let mut nested: Vec<Range<usize>> = vec![];
+        for span in spans {
+            // Skip the expression itself and the expressions nested further.
+            if span.start == unescaped_start
+                || nested.last().is_some_and(|last| span.start < last.end)
+            {
+                continue;
+            }
+            nested.push(span);
+        }
+        let original = |offset: usize| line.original_offset(offset) - start;
+        let nested = nested
+            .into_iter()
+            .map(|span| original(span.start)..original(span.end))
+            .collect();
+        Some((original(parser.pos), nested))
+    }
 }
 
 /// Text with `\#` replaced by `#`, as BSD make does before parsing a line
@@ -802,6 +825,8 @@ pub(crate) struct UnescapedHash {
 thread_local! {
     /// The number of bytes unescaped by [`UnescapedHash::new`] on this thread.
     static UNESCAPED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The number of braced BSD make expressions parsed on this thread.
+    static PARSED_EXPRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl UnescapedHash {
@@ -921,9 +946,48 @@ impl Delims {
 /// building and dropping the tree does not run out of stack.
 pub(crate) const MAX_DEPTH: usize = 128;
 
-/// The outcome of parsing the expression at some position: the result,
-/// the position after it and the spans found in it.
-type ParsedExpr = (Result<(), ReferenceError>, usize, Vec<Range<usize>>);
+/// The outcome of parsing the expression at some position.
+struct ParsedExpr {
+    result: Result<(), ReferenceError>,
+    /// The position after the expression.
+    end: usize,
+    /// The spans found in it.
+    spans: Vec<Range<usize>>,
+    /// Whether parsing it reached [`MAX_DEPTH`], so that the outcome
+    /// depends on the depth.
+    limited: bool,
+}
+
+/// The braced expressions parsed so far, by their start, the length of the
+/// text and the depth, since a modifier may be parsed in more than one way
+/// and the expressions in a pattern are parsed again on their own. Without
+/// this, parsing nested expressions takes time exponential in their depth.
+#[derive(Default)]
+struct ParsedExprs {
+    by_depth: HashMap<(usize, usize, usize), ParsedExpr>,
+    /// By start and length of the text, the greatest depth at which the
+    /// expression was parsed without reaching [`MAX_DEPTH`]. The outcome is
+    /// the same at any lesser depth, such as when the expressions nested
+    /// in an expression are looked at on their own.
+    unlimited: HashMap<(usize, usize), usize>,
+}
+
+impl ParsedExprs {
+    fn get(&self, pos: usize, len: usize, depth: usize) -> Option<&ParsedExpr> {
+        self.by_depth.get(&(pos, len, depth)).or_else(|| {
+            let max_depth = *self.unlimited.get(&(pos, len))?;
+            (max_depth >= depth).then(|| &self.by_depth[&(pos, len, max_depth)])
+        })
+    }
+
+    fn insert(&mut self, pos: usize, len: usize, depth: usize, parsed: ParsedExpr) {
+        if !parsed.limited {
+            let max_depth = self.unlimited.entry((pos, len)).or_insert(depth);
+            *max_depth = (*max_depth).max(depth);
+        }
+        self.by_depth.insert((pos, len, depth), parsed);
+    }
+}
 
 struct Parser<'a> {
     text: &'a str,
@@ -932,12 +996,10 @@ struct Parser<'a> {
     spans: Vec<Range<usize>>,
     /// The number of expressions being parsed that enclose the position.
     depth: usize,
-    /// The braced expressions parsed so far, by their start, the length of
-    /// the text and the depth, since a modifier may be parsed in more than
-    /// one way and the expressions in a pattern are parsed again on their
-    /// own. Without this, parsing nested expressions takes time exponential
-    /// in their depth.
-    parsed: HashMap<(usize, usize, usize), ParsedExpr>,
+    parsed: ParsedExprs,
+    /// The number of times [`MAX_DEPTH`] was reached, including where the
+    /// error was not reported.
+    depth_limit_reached: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -947,7 +1009,8 @@ impl<'a> Parser<'a> {
             pos: 0,
             spans: vec![],
             depth: 0,
-            parsed: HashMap::new(),
+            parsed: ParsedExprs::default(),
+            depth_limit_reached: 0,
         }
     }
 
@@ -961,11 +1024,13 @@ impl<'a> Parser<'a> {
             spans: vec![],
             depth: self.depth,
             parsed: std::mem::take(&mut self.parsed),
+            depth_limit_reached: self.depth_limit_reached,
         }
     }
 
     fn join(&mut self, other: &mut Parser<'a>) {
         self.parsed = std::mem::take(&mut other.parsed);
+        self.depth_limit_reached = other.depth_limit_reached;
     }
 
     fn rest(&self) -> &'a str {
@@ -995,6 +1060,7 @@ impl<'a> Parser<'a> {
     /// Parse a BSD make expression starting at `$`.
     fn parse_expr(&mut self) -> Result<ParsedReference, ReferenceError> {
         if self.depth >= MAX_DEPTH {
+            self.depth_limit_reached += 1;
             return Err(syntax_error(
                 self.pos,
                 ReferenceSyntaxErrorKind::TooDeeplyNested,
@@ -1010,18 +1076,25 @@ impl<'a> Parser<'a> {
     /// Parse a nested expression starting at `$`, like
     /// [`Self::parse_expr`], without the result.
     fn skip_expr(&mut self) -> Result<(), ReferenceError> {
-        let key = (self.pos, self.text.len(), self.depth);
-        if let Some((result, pos, spans)) = self.parsed.get(&key) {
-            self.pos = *pos;
-            self.spans.extend(spans.iter().cloned());
-            return result.clone();
+        let (pos, len, depth) = (self.pos, self.text.len(), self.depth);
+        if let Some(parsed) = self.parsed.get(pos, len, depth) {
+            self.pos = parsed.end;
+            self.spans.extend(parsed.spans.iter().cloned());
+            if parsed.limited {
+                self.depth_limit_reached += 1;
+            }
+            return parsed.result.clone();
         }
         let spans = self.spans.len();
+        let reached = self.depth_limit_reached;
         let result = self.parse_expr().map(|_| ());
-        self.parsed.insert(
-            key,
-            (result.clone(), self.pos, self.spans[spans..].to_vec()),
-        );
+        let parsed = ParsedExpr {
+            result: result.clone(),
+            end: self.pos,
+            spans: self.spans[spans..].to_vec(),
+            limited: self.depth_limit_reached != reached,
+        };
+        self.parsed.insert(pos, len, depth, parsed);
         result
     }
 
@@ -1060,6 +1133,8 @@ impl<'a> Parser<'a> {
                 });
             }
         };
+        #[cfg(test)]
+        PARSED_EXPRS.with(|n| n.set(n.get() + 1));
         let startc = self.bump();
         let parsed = self.parse_braced(Delims {
             startc,
@@ -3341,6 +3416,24 @@ mod tests {
             ParsedReference::parse_prefix("$(X:a=b) rest", GNUMake),
             Ok((reference("X", vec![sysv("a", "b")]), 8))
         );
+    }
+
+    #[test]
+    fn test_nested_extents_parse_each_expression_once() {
+        // Finding the expressions nested in each expression parsed the
+        // inner ones again for each level, taking time cubic in the depth.
+        let depth = 100;
+        for (open, close) in [("${X:M", "}"), ("${X:", "=b}"), ("${X:U", "}")] {
+            let nest = (0..depth).fold("a".to_string(), |inner, _| format!("{open}{inner}{close}"));
+            PARSED_EXPRS.with(|n| n.set(0));
+            let text = format!("Y = {nest}\n");
+            let parsed = crate::Makefile::parse_with_variant(&text, BSDMake);
+            assert!(parsed.ok());
+            assert_eq!(parsed.tree().variable_references().count(), depth);
+            assert_eq!(split_references(&nest, BSDMake).len(), 1);
+            let count = PARSED_EXPRS.with(|n| n.get());
+            assert!(count <= 8 * depth, "parsed {count} expressions for {open}");
+        }
     }
 
     #[test]

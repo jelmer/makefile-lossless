@@ -10,7 +10,7 @@
 
 use super::Lang;
 use crate::lex::lex_reference_text;
-use crate::reference::{bsd_expr_extent_at, UnescapedHash, MAX_DEPTH};
+use crate::reference::{BsdExprLine, UnescapedHash, MAX_DEPTH};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{self, *};
 use rowan::Language;
@@ -199,7 +199,7 @@ struct Finder<'a> {
     /// position of the matching delimiter of the same kind, if any.
     closes: Vec<Option<usize>>,
     /// For BSD make, the region as a line to find expressions in.
-    bsd_line: Option<UnescapedHash>,
+    bsd_line: Option<std::cell::RefCell<BsdExprLine>>,
 }
 
 impl<'a> Finder<'a> {
@@ -224,7 +224,7 @@ impl<'a> Finder<'a> {
             }
         }
         let bsd_line = (variant == Some(MakefileVariant::BSDMake))
-            .then(|| UnescapedHash::verbatim(&text[region.clone()]));
+            .then(|| BsdExprLine::new(UnescapedHash::verbatim(&text[region.clone()])).into());
         Finder {
             text,
             variant,
@@ -327,8 +327,13 @@ impl<'a> Finder<'a> {
     }
 
     /// The BSD make expression at `start`, found in `line`, the region.
-    fn bsd_reference(&self, start: usize, line: &UnescapedHash, depth: usize) -> Option<Reference> {
-        let (len, nested) = bsd_expr_extent_at(line, start - self.base)?;
+    fn bsd_reference(
+        &self,
+        start: usize,
+        line: &std::cell::RefCell<BsdExprLine>,
+        depth: usize,
+    ) -> Option<Reference> {
+        let (len, nested) = line.borrow_mut().extent_at(start - self.base)?;
         let nested = nested
             .into_iter()
             .filter_map(|span| {
