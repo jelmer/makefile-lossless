@@ -96,7 +96,9 @@ impl Parse<Makefile> {
 
         if children.is_empty() {
             // Empty tree — just do a full parse.
-            let new_parse = Parse::parse_makefile(&new_text);
+            let parsed = crate::lossless::parse(&new_text, self.variant());
+            let new_parse = Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+                .with_variant(self.variant());
             return (new_parse, new_text);
         }
 
@@ -125,7 +127,7 @@ impl Parse<Makefile> {
             &new_text[u32::from(reparse_start) as usize..u32::from(reparse_end_new) as usize];
 
         // Reparse just the affected region.
-        let reparsed = crate::lossless::parse(reparse_region, None);
+        let reparsed = crate::lossless::parse(reparse_region, self.variant());
         let reparsed_root = reparsed.green_node;
 
         // Build the new ROOT by splicing: [old children before] + [reparsed children] + [old children after]
@@ -217,7 +219,8 @@ impl Parse<Makefile> {
             &rowan::SyntaxNode::new_root(new_root.clone()),
             &mut new_positioned_errors,
         );
-        let new_parse = Parse::new(new_root, new_errors, new_positioned_errors);
+        let new_parse =
+            Parse::new(new_root, new_errors, new_positioned_errors).with_variant(self.variant());
         (new_parse, new_text)
     }
 }
@@ -342,6 +345,22 @@ mod tests {
             old_children[0], new_children[0],
             "VAR1 green node should be identical (reused)"
         );
+    }
+
+    #[test]
+    fn test_incremental_keeps_variant() {
+        use crate::MakefileVariant;
+        for old_text in ["!IF 1\nA = a\n!ENDIF\n", ""] {
+            let parse = Parse::parse_makefile_with_variant(old_text, MakefileVariant::NMake);
+            let edit = TextEdit::new(TextRange::empty(0.into()), "!IF 2\n!ENDIF\n".to_string());
+            let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+            let full = Parse::parse_makefile_with_variant(&new_text, MakefileVariant::NMake);
+            assert_eq!(
+                format!("{:#?}", new_parse.syntax_node()),
+                format!("{:#?}", full.syntax_node())
+            );
+            assert_eq!(new_parse.errors(), full.errors());
+        }
     }
 
     #[test]
