@@ -20,7 +20,7 @@ fn parse_recipe_line(
     line: &str,
     prefix: char,
     inline: bool,
-    context: &str,
+    operation: &'static str,
 ) -> Result<(SyntaxNode, bool), Error> {
     let header = if prefix == '\t' {
         String::new()
@@ -45,13 +45,13 @@ fn parse_recipe_line(
         .flat_map(|rule| rule.children().filter(|n| n.kind() == RECIPE))
         .collect();
     let [recipe, last] = recipes.as_slice() else {
-        return Err(recipe_line_error(line, context));
+        return Err(recipe_line_error(line, operation));
     };
     let first = if inline { ";" } else { &start[2..] };
     if recipe.text() != format!("{first}{line}\n").as_str()
         || last.text() != format!("{prefix}z\n").as_str()
     {
-        return Err(recipe_line_error(line, context));
+        return Err(recipe_line_error(line, operation));
     }
     Ok((recipe.clone(), !parsed.errors.is_empty()))
 }
@@ -120,29 +120,26 @@ fn recipe_line_content(
     line: &str,
     prefix: char,
     inline: bool,
-    context: &str,
+    operation: &'static str,
 ) -> Result<Vec<GreenElement>, Error> {
-    let (mut recipe, errors) = parse_recipe_line(line, '\t', false, context)?;
+    let (mut recipe, errors) = parse_recipe_line(line, '\t', false, operation)?;
     if errors {
-        return Err(recipe_line_error(line, context));
+        return Err(recipe_line_error(line, operation));
     }
     if prefix != '\t' || inline {
         let text = text_for_prefix(&recipe, '\t', prefix);
-        (recipe, _) = parse_recipe_line(&text, prefix, inline, context)?;
+        (recipe, _) = parse_recipe_line(&text, prefix, inline, operation)?;
     }
     let children: Vec<_> = recipe.green().children().map(|c| c.to_owned()).collect();
     Ok(children[1..children.len() - 1].to_vec())
 }
 
-fn recipe_line_error(line: &str, context: &str) -> Error {
-    Error::Parse(ParseError {
-        errors: vec![ErrorInfo {
-            kind: crate::ParseErrorKind::Other,
-            message: format!("Cannot write {line:?} as a single recipe line"),
-            line: 1,
-            context: context.to_string(),
-        }],
-    })
+fn recipe_line_error(line: &str, operation: &'static str) -> Error {
+    invalid_edit(
+        InvalidEditKind::NotRepresentable,
+        operation,
+        format!("Cannot write {line:?} as a single recipe line"),
+    )
 }
 
 /// A RECIPE node for the command `line`, starting with `start`, the
@@ -154,11 +151,11 @@ fn build_recipe(
     prefix: char,
     line: &str,
     eol: &str,
-    context: &str,
+    operation: &'static str,
 ) -> Result<SyntaxNode, Error> {
     let inline = start.first().is_some_and(|it| it.kind() == OPERATOR.into());
     let mut children = start;
-    children.extend(recipe_line_content(line, prefix, inline, context)?);
+    children.extend(recipe_line_content(line, prefix, inline, operation)?);
     children.push(GreenToken::new(NEWLINE.into(), eol).into());
     Ok(SyntaxNode::new_root_mut(GreenNode::new(
         RECIPE.into(),
@@ -172,10 +169,10 @@ pub(crate) fn build_command(
     prefix: char,
     line: &str,
     eol: &str,
-    context: &str,
+    operation: &'static str,
 ) -> Result<SyntaxNode, Error> {
     let indent = vec![GreenToken::new(INDENT.into(), &prefix.to_string()).into()];
-    build_recipe(indent, prefix, line, eol, context)
+    build_recipe(indent, prefix, line, eol, operation)
 }
 
 /// The rest of `text` after the nmake command modifiers at its start: `@`,
@@ -683,7 +680,7 @@ impl Recipe {
         // TODO: accept nmake's command modifiers and reject `+` once the
         // tree records the variant it was parsed as. Until then,
         // try_set_prefix_for does.
-        self.set_prefix_with(prefix, None)
+        self.set_prefix_with(prefix, None, "Recipe::try_set_prefix")
     }
 
     /// Set the command prefix for this recipe, like [`Recipe::set_prefix`],
@@ -744,7 +741,7 @@ impl Recipe {
         prefix: &str,
         variant: crate::MakefileVariant,
     ) -> Result<(), Error> {
-        self.set_prefix_with(prefix, Some(variant))
+        self.set_prefix_with(prefix, Some(variant), "Recipe::try_set_prefix_for")
     }
 
     /// Internal: set the command prefix, with the command modifiers of
@@ -753,17 +750,8 @@ impl Recipe {
         &mut self,
         prefix: &str,
         variant: Option<crate::MakefileVariant>,
+        operation: &'static str,
     ) -> Result<(), Error> {
-        let error = |message: String| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message,
-                    line: 1,
-                    context: "set_prefix".to_string(),
-                }],
-            })
-        };
         let strip = |text: &str| strip_modifiers(text, variant).to_string();
         // Without a variant, only write modifiers that GNU and BSD make
         // both read.
@@ -778,7 +766,11 @@ impl Recipe {
                 Some(variant) => format!("{prefix:?} is not a recipe prefix in {variant:?}"),
                 None => format!("{prefix:?} is not a recipe prefix"),
             };
-            return Err(error(message));
+            return Err(invalid_edit(
+                InvalidEditKind::InvalidArgument,
+                operation,
+                message,
+            ));
         }
         let node = self.syntax();
         let skip = if self.is_inline() {
@@ -822,10 +814,11 @@ impl Recipe {
         if combined.len() - strip(&combined).len() != modifiers.len()
             || (prefix.ends_with(|c: char| c.is_ascii_digit()) && !separated)
         {
-            return Err(error(format!(
-                "Cannot write {prefix:?} as the prefix of {:?}",
-                self.text()
-            )));
+            return Err(invalid_edit(
+                InvalidEditKind::NotRepresentable,
+                operation,
+                format!("Cannot write {prefix:?} as the prefix of {:?}", self.text()),
+            ));
         }
         let mut old = prefix_tokens;
         old.extend(first_text);
@@ -922,8 +915,13 @@ impl Recipe {
             .last()
             .map_or_else(|| line_ending(node), |t| t.text().to_string());
 
-        let new_syntax =
-            build_recipe(prefix, self.recipe_prefix(), new_text, &eol, "replace_text")?;
+        let new_syntax = build_recipe(
+            prefix,
+            self.recipe_prefix(),
+            new_text,
+            &eol,
+            "Recipe::try_replace_text",
+        )?;
 
         replace_children(
             node,
@@ -969,7 +967,12 @@ impl Recipe {
             &node.parent().expect("Recipe node must have a parent"),
             node.index(),
         );
-        let new_syntax = build_command(prefix, text, &line_ending(node), "insert_before")?;
+        let new_syntax = build_command(
+            prefix,
+            text,
+            &line_ending(node),
+            "Recipe::try_insert_before",
+        )?;
         // A recipe on the rule line has to move to its own line first.
         self.move_to_own_line();
         let parent = node.parent().expect("Recipe node must have a parent");
@@ -1010,7 +1013,7 @@ impl Recipe {
         let parent = node.parent().expect("Recipe node must have a parent");
         let eol = line_ending(node);
         let prefix = recipe_prefix_before(&parent, node.index() + 1);
-        let new_syntax = build_command(prefix, text, &eol, "insert_after")?;
+        let new_syntax = build_command(prefix, text, &eol, "Recipe::try_insert_after")?;
 
         let index = terminate_line_before(&parent, node.index() + 1, &eol);
         parent.splice_children(index..index, vec![new_syntax.into()]);
@@ -1802,7 +1805,14 @@ mod tests {
         let mut recipe = rule.recipe_nodes().next().unwrap();
 
         for prefix in ["x", "@x", " ", "@ ", "\n", "!", "\\"] {
-            assert!(recipe.try_set_prefix(prefix).is_err(), "{prefix:?}");
+            assert_eq!(
+                crate::test_util::expect_invalid_edit(recipe.try_set_prefix(prefix)),
+                InvalidEdit::new(
+                    InvalidEditKind::InvalidArgument,
+                    "Recipe::try_set_prefix",
+                    format!("{prefix:?} is not a recipe prefix")
+                )
+            );
             assert_eq!(recipe.text(), "@echo hello");
         }
         recipe.try_set_prefix("+-@").unwrap();

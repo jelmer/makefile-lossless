@@ -1,11 +1,12 @@
 use super::makefile::MakefileItem;
 use super::{
-    detach_elements, edit_error, is_continuation, line_ending, logical_text, replace_children,
+    detach_elements, is_continuation, line_ending, logical_text, replace_children,
     terminate_line_before, GreenElement, LineSyntax,
 };
 use crate::lossless::{
-    detached_elements, node_text, parse, remove_with_preceding_comments, scan_recipe_variable_refs,
-    Error, ErrorInfo, ParseError, RecipeVariableReference, VariableDefinition, VariableReference,
+    detached_elements, invalid_edit, node_text, parse, remove_with_preceding_comments,
+    scan_recipe_variable_refs, Error, InvalidEditKind, RecipeVariableReference, VariableDefinition,
+    VariableReference,
 };
 use crate::syntax_rules::{
     is_assignment_modifier, is_colons_before_subst, is_sunsh_operator, ASSIGNMENT_OPERATORS,
@@ -582,15 +583,11 @@ impl VariableDefinition {
     /// ```
     pub fn add_endef(&mut self) -> Result<bool, Error> {
         let Some(body) = self.define_body() else {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot add endef to a variable that is not a define block"
-                        .to_string(),
-                    line: self.line() + 1,
-                    context: "variable_add_endef".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                "VariableDefinition::add_endef",
+                "Cannot add endef to a variable that is not a define block",
+            ));
         };
         if self.has_endef() {
             return Ok(false);
@@ -1079,7 +1076,11 @@ impl VariableDefinition {
         // TODO: reject operators the variant lacks, such as all but `=` in
         // nmake, once the tree records the variant it was parsed as. Until
         // then, try_set_assignment_operator_for does.
-        self.set_assignment_operator_with(op, None)
+        self.set_assignment_operator_with(
+            op,
+            None,
+            "VariableDefinition::try_set_assignment_operator",
+        )
     }
 
     /// Change the assignment operator of this variable definition, like
@@ -1131,7 +1132,11 @@ impl VariableDefinition {
         op: &str,
         variant: MakefileVariant,
     ) -> Result<(), Error> {
-        self.set_assignment_operator_with(op, Some(variant))
+        self.set_assignment_operator_with(
+            op,
+            Some(variant),
+            "VariableDefinition::try_set_assignment_operator_for",
+        )
     }
 
     /// Internal: set the assignment operator, checking that the parser
@@ -1141,15 +1146,20 @@ impl VariableDefinition {
         &mut self,
         op: &str,
         variant: Option<MakefileVariant>,
+        operation: &'static str,
     ) -> Result<(), Error> {
-        let error = |message: String| edit_error("set_assignment_operator", message);
+        let error = |kind, message: String| invalid_edit(kind, operation, message);
         if !is_assignment_operator(op) {
-            return Err(error(format!("{op:?} is not an assignment operator")));
+            return Err(error(
+                InvalidEditKind::InvalidArgument,
+                format!("{op:?} is not an assignment operator"),
+            ));
         }
         if let Some(variant) = variant.filter(|v| !has_assignment_operator(*v, op)) {
-            return Err(error(format!(
-                "{op:?} is not an assignment operator in {variant:?}"
-            )));
+            return Err(error(
+                InvalidEditKind::InvalidArgument,
+                format!("{op:?} is not an assignment operator in {variant:?}"),
+            ));
         }
         // The name may contain operator tokens too, as in BSD make's `a:b=c`.
         let op_index = self
@@ -1160,10 +1170,10 @@ impl VariableDefinition {
             .map(|t| t.index())
             .filter(|_| !self.is_undefine())
             .ok_or_else(|| {
-                error(format!(
-                    "{:?} has no assignment operator",
-                    self.syntax().to_string()
-                ))
+                error(
+                    InvalidEditKind::Unsupported,
+                    format!("{:?} has no assignment operator", self.syntax().to_string()),
+                )
             })?;
 
         let set_operator = |node: &SyntaxNode<crate::lossless::Lang>| {
@@ -1191,9 +1201,10 @@ impl VariableDefinition {
             None => reads_back(None) || reads_back(Some(MakefileVariant::BSDMake)),
         };
         if !reads_back {
-            return Err(error(format!(
-                "Cannot write {text:?} with {op:?} as its operator"
-            )));
+            return Err(error(
+                InvalidEditKind::NotRepresentable,
+                format!("Cannot write {text:?} with {op:?} as its operator"),
+            ));
         }
 
         set_operator(self.syntax());
@@ -1245,9 +1256,11 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "BAZ := bar\n");
     /// ```
     pub fn try_set_name(&mut self, new_name: &str) -> Result<(), Error> {
+        let operation = "VariableDefinition::try_set_name";
         let name_range = self.name_range().ok_or_else(|| {
-            edit_error(
-                "set_name",
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
                 format!("{:?} has no name to set", self.syntax().to_string()),
             )
         })?;
@@ -1266,8 +1279,9 @@ impl VariableDefinition {
             .unwrap_or_default();
         let renamed =
             parse_renamed(&prefix, &original, &text, new_name, range.start).ok_or_else(|| {
-                edit_error(
-                    "set_name",
+                invalid_edit(
+                    InvalidEditKind::NotRepresentable,
+                    operation,
                     format!("Cannot write {new_name:?} as the variable name"),
                 )
             })?;
@@ -1416,7 +1430,7 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = a\\#b\n");
     /// ```
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
-        self.set_value_with(new_value, None)
+        self.set_value_with(new_value, None, "VariableDefinition::try_set_value")
     }
 
     /// Update the value of this variable definition, like
@@ -1471,7 +1485,11 @@ impl VariableDefinition {
         new_value: &str,
         variant: MakefileVariant,
     ) -> Result<(), Error> {
-        self.set_value_with(new_value, Some(variant))
+        self.set_value_with(
+            new_value,
+            Some(variant),
+            "VariableDefinition::try_set_value_for",
+        )
     }
 
     /// Internal: set the value, checking that the parser reads it back when
@@ -1480,6 +1498,7 @@ impl VariableDefinition {
         &mut self,
         new_value: &str,
         variant: Option<MakefileVariant>,
+        operation: &'static str,
     ) -> Result<(), Error> {
         let new_expr = if self.is_define() {
             let eol = line_ending(self.syntax());
@@ -1491,15 +1510,17 @@ impl VariableDefinition {
             let body = value.replace('\n', &eol);
             parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &value, variant)
                 .ok_or_else(|| {
-                    edit_error(
-                        "set_value",
+                    invalid_edit(
+                        InvalidEditKind::NotRepresentable,
+                        operation,
                         format!("Cannot write {new_value:?} as the body of a define block"),
                     )
                 })?
         } else {
             if breaks_line(new_value) {
-                return Err(edit_error(
-                    "set_value",
+                return Err(invalid_edit(
+                    InvalidEditKind::NotRepresentable,
+                    operation,
                     format!("Cannot write {new_value:?} as a value on a single line"),
                 ));
             }
@@ -1508,15 +1529,16 @@ impl VariableDefinition {
             single_line_value_expr(new_value, variant)
                 .filter(|_| !strips_trailing)
                 .ok_or_else(|| {
-                    edit_error(
-                        "set_value",
+                    invalid_edit(
+                        InvalidEditKind::NotRepresentable,
+                        operation,
                         format!("Cannot write {new_value:?} as a variable value"),
                     )
                 })?
         };
 
         let Some(mut expr) = self.value_expr() else {
-            return self.insert_value(&new_expr);
+            return self.insert_value(&new_expr, operation);
         };
         if self.is_define() {
             // A `define` line at the end of the file has no line break
@@ -1586,7 +1608,11 @@ impl VariableDefinition {
 
     /// Internal: add an `=` operator and `expr`, an EXPR node, to a
     /// definition without a value, as in `export X`.
-    fn insert_value(&mut self, expr: &SyntaxNode<crate::lossless::Lang>) -> Result<(), Error> {
+    fn insert_value(
+        &mut self,
+        expr: &SyntaxNode<crate::lossless::Lang>,
+        operation: &'static str,
+    ) -> Result<(), Error> {
         let name = self.name_elements();
         let is_undefine = self
             .directive_keywords()
@@ -1599,8 +1625,9 @@ impl VariableDefinition {
             .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE) || is_continuation(&it))
         });
         if is_undefine || self.is_define() || !rest_is_blank {
-            return Err(edit_error(
-                "set_value",
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
                 format!("{:?} has no value to set", self.syntax().to_string()),
             ));
         }
@@ -1672,7 +1699,8 @@ fn value_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lossless::Makefile;
+    use crate::lossless::{InvalidEdit, Makefile};
+    use crate::test_util::expect_invalid_edit;
 
     #[test]
     fn test_variable_parent() {
@@ -1885,12 +1913,13 @@ mod tests {
     fn test_try_set_assignment_operator_for_message() {
         let makefile = Makefile::parse_with_variant("X = 1\n", MakefileVariant::NMake).tree();
         let mut var = makefile.variable_definitions().next().unwrap();
-        let error = var
-            .try_set_assignment_operator_for(":=", MakefileVariant::NMake)
-            .unwrap_err();
         assert_eq!(
-            error.to_string(),
-            "Parse error: Error at line 1: \":=\" is not an assignment operator in NMake\n1| set_assignment_operator\n"
+            expect_invalid_edit(var.try_set_assignment_operator_for(":=", MakefileVariant::NMake)),
+            InvalidEdit::new(
+                InvalidEditKind::InvalidArgument,
+                "VariableDefinition::try_set_assignment_operator_for",
+                "\":=\" is not an assignment operator in NMake"
+            )
         );
     }
 
@@ -3360,11 +3389,12 @@ mod tests {
         use MakefileVariant::*;
         // BSD make strips trailing whitespace from a value.
         for value in ["a ", "a\t", "a \\\n "] {
-            let error = set_value_for("X = old\n", value, BSDMake).unwrap_err();
             assert_eq!(
-                error.to_string(),
-                format!(
-                    "Parse error: Error at line 1: Cannot write {value:?} as a variable value\n1| set_value\n"
+                expect_invalid_edit(set_value_for("X = old\n", value, BSDMake)),
+                InvalidEdit::new(
+                    InvalidEditKind::NotRepresentable,
+                    "VariableDefinition::try_set_value_for",
+                    format!("Cannot write {value:?} as a variable value")
                 )
             );
         }
@@ -3399,11 +3429,12 @@ mod tests {
         for value in [" a", "\ta", " ", "$(x", "$(f #"] {
             let makefile: Makefile = "X = old\n".parse().unwrap();
             let mut var = makefile.variable_definitions().next().unwrap();
-            let error = var.try_set_value(value).unwrap_err();
             assert_eq!(
-                error.to_string(),
-                format!(
-                    "Parse error: Error at line 1: Cannot write {value:?} as a variable value\n1| set_value\n"
+                expect_invalid_edit(var.try_set_value(value)),
+                InvalidEdit::new(
+                    InvalidEditKind::NotRepresentable,
+                    "VariableDefinition::try_set_value",
+                    format!("Cannot write {value:?} as a variable value")
                 )
             );
             assert_eq!(makefile.code(), "X = old\n");
@@ -3453,11 +3484,12 @@ mod tests {
         for text in ["undefine X\n", "export X Y\n"] {
             let (makefile, _) = Makefile::from_str_relaxed(text);
             let mut var = makefile.variable_definitions().next().unwrap();
-            let error = var.try_set_value("new").unwrap_err();
             assert_eq!(
-                error.to_string(),
-                format!(
-                    "Parse error: Error at line 1: {text:?} has no value to set\n1| set_value\n"
+                expect_invalid_edit(var.try_set_value("new")),
+                InvalidEdit::new(
+                    InvalidEditKind::Unsupported,
+                    "VariableDefinition::try_set_value",
+                    format!("{text:?} has no value to set")
                 )
             );
             assert_eq!(makefile.code(), text);
@@ -3877,8 +3909,8 @@ mod tests {
         assert_eq!(
             result,
             Err(
-                "Parse error: Error at line 1: Cannot add endef to a variable that is not a \
-                 define block\n1| variable_add_endef\n"
+                "Invalid edit: VariableDefinition::add_endef: Cannot add endef to a variable \
+                 that is not a define block"
                     .to_string()
             )
         );

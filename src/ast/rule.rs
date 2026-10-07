@@ -2,12 +2,13 @@ use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use super::word_list::{self, GreenElement, WordList};
 use super::{
-    edit_error, escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
+    escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
     terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
-    build_command, node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional,
-    Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
+    build_command, invalid_edit, node_text, remove_with_preceding_comments, trim_trailing_newlines,
+    Conditional, Error, InvalidEditKind, Makefile, Recipe, Rule, SyntaxElement, SyntaxNode,
+    SyntaxToken,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -60,6 +61,7 @@ fn build_prerequisites_node(
     prereqs: &[String],
     trailing_space: Option<&str>,
     before_comment: bool,
+    operation: &'static str,
 ) -> Result<SyntaxNode, Error> {
     let mut children = Vec::new();
     if !prereqs.is_empty() {
@@ -77,8 +79,9 @@ fn build_prerequisites_node(
             .filter(|rule| rule.prerequisites().eq(prereqs.iter().cloned()))
             .and_then(|rule| rule.prerequisites_node())
             .ok_or_else(|| {
-                edit_error(
-                    "set_prerequisites",
+                invalid_edit(
+                    InvalidEditKind::NotRepresentable,
+                    operation,
                     format!("Cannot write {prereqs:?} as prerequisites"),
                 )
             })?;
@@ -104,24 +107,37 @@ fn build_prerequisites_node(
 
 /// A TARGETS node for `targets`, escaped as needed. Returns an error if
 /// [`Rule::targets`] would not read them back.
-pub(crate) fn build_targets_node(targets: &[String], context: &str) -> Result<SyntaxNode, Error> {
+pub(crate) fn build_targets_node(
+    targets: &[String],
+    operation: &'static str,
+) -> Result<SyntaxNode, Error> {
     let escaped: Vec<_> = targets.iter().map(|t| escape_name(t, false)).collect();
     parse_rule_line(&format!("{}:\n", escaped.join(" ")))
         .filter(|rule| rule.targets().eq(targets.iter().cloned()))
         .and_then(|rule| rule.syntax().children().find(|n| n.kind() == TARGETS))
         .map(|node| SyntaxNode::new_root_mut(node.green().into_owned()))
-        .ok_or_else(|| edit_error(context, format!("Cannot write {targets:?} as targets")))
+        .ok_or_else(|| {
+            invalid_edit(
+                InvalidEditKind::NotRepresentable,
+                operation,
+                format!("Cannot write {targets:?} as targets"),
+            )
+        })
 }
 
 /// The elements of a single prerequisite, as in a PREREQUISITES node.
-fn prerequisite_word(name: &str, before_comment: bool) -> Result<Vec<GreenElement>, Error> {
-    let node = build_prerequisites_node(&[name.to_string()], None, before_comment)?;
+fn prerequisite_word(
+    name: &str,
+    before_comment: bool,
+    operation: &'static str,
+) -> Result<Vec<GreenElement>, Error> {
+    let node = build_prerequisites_node(&[name.to_string()], None, before_comment, operation)?;
     Ok(node.green().children().map(|c| c.to_owned()).collect())
 }
 
 /// The elements of a single target, as in a TARGETS node.
-fn target_word(name: &str, _before_comment: bool) -> Result<Vec<GreenElement>, Error> {
-    let node = build_targets_node(&[name.to_string()], "set_targets")?;
+fn target_word(name: &str, operation: &'static str) -> Result<Vec<GreenElement>, Error> {
+    let node = build_targets_node(&[name.to_string()], operation)?;
     Ok(node.green().children().map(|c| c.to_owned()).collect())
 }
 
@@ -264,8 +280,9 @@ impl Rule {
             children.push(GreenToken::new(WHITESPACE.into(), " ").into());
         }
         // The parser creates a PREREQUISITES node even when it is empty.
-        let prerequisites = build_prerequisites_node(&owned(prerequisites), None, false)
-            .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
+        let prerequisites =
+            build_prerequisites_node(&owned(prerequisites), None, false, "Rule::new")
+                .unwrap_or_else(|e| panic!("invalid prerequisites: {e}"));
         children.push(prerequisites.green().into_owned().into());
         children.push(GreenToken::new(NEWLINE.into(), "\n").into());
         for recipe in recipes {
@@ -1174,7 +1191,12 @@ impl Rule {
             .expect("Recipe node must have a parent");
 
         let prefix = recipe_prefix_before(&parent, target_node.index());
-        let syntax = build_command(prefix, line, &line_ending(self.syntax()), "replace_command")?;
+        let syntax = build_command(
+            prefix,
+            line,
+            &line_ending(self.syntax()),
+            "Rule::try_replace_command",
+        )?;
         super::replace_children(
             target_node,
             syntax.green().children().map(|c| c.to_owned()).collect(),
@@ -1220,7 +1242,7 @@ impl Rule {
         let eol = line_ending(self.syntax());
         let index = self.recipe_end_index();
         let prefix = recipe_prefix_before(self.syntax(), index);
-        let syntax = build_command(prefix, line, &eol, "push_command")?;
+        let syntax = build_command(prefix, line, &eol, "Rule::try_push_command")?;
         let index = terminate_line_before(self.syntax(), index, &eol);
         self.syntax()
             .splice_children(index..index, vec![syntax.into()]);
@@ -1347,14 +1369,17 @@ impl Rule {
             .prerequisites_node()
             .expect("a rule with prerequisites has a PREREQUISITES node");
         let mut list = WordList::new(&node);
+        let operation = "Rule::remove_prerequisite";
         if indices.len() == old.len() || list.len() != old.len() {
-            let new = old.iter().map(|p| p.as_str()).filter(|p| *p != target);
-            self.set_prerequisites(new.collect())?;
+            let new = old.into_iter().filter(|p| p != target).collect();
+            self.edit_prerequisites(new, operation)?;
             return Ok(true);
         }
-        list.remove_all(&indices, &old, prerequisite_word)?;
+        list.remove_all(&indices, &old, |name, before_comment| {
+            prerequisite_word(name, before_comment, operation)
+        })?;
         let new: Vec<String> = old.into_iter().filter(|p| p != target).collect();
-        self.apply_list(&node, list, &new, "remove_prerequisite")?;
+        self.apply_list(&node, list, &new, operation)?;
         Ok(true)
     }
 
@@ -1373,9 +1398,9 @@ impl Rule {
     /// assert_eq!(rule.to_string(), "target: dep1 dep2 | dir\n");
     /// ```
     pub fn add_prerequisite(&mut self, target: &str) -> Result<(), Error> {
-        let mut current_prereqs: Vec<String> = self.prerequisites().collect();
-        current_prereqs.push(target.to_string());
-        self.set_prerequisites(current_prereqs.iter().map(|s| s.as_str()).collect())
+        let mut prereqs: Vec<String> = self.prerequisites().collect();
+        prereqs.push(target.to_string());
+        self.edit_prerequisites(prereqs, "Rule::add_prerequisite")
     }
 
     /// Set the prerequisites for this rule, replacing any existing ones
@@ -1401,22 +1426,35 @@ impl Rule {
     /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["dir"]);
     /// ```
     pub fn set_prerequisites(&mut self, prereqs: Vec<&str>) -> Result<(), Error> {
-        let new: Vec<String> = prereqs.iter().map(|s| s.to_string()).collect();
+        let new = prereqs.iter().map(|s| s.to_string()).collect();
+        self.edit_prerequisites(new, "Rule::set_prerequisites")
+    }
+
+    /// Replace the normal prerequisites with `new` for the editing method
+    /// `operation`.
+    fn edit_prerequisites(
+        &mut self,
+        new: Vec<String>,
+        operation: &'static str,
+    ) -> Result<(), Error> {
         let old: Vec<String> = self.prerequisites().collect();
         let node = match self.prerequisites_node() {
             Some(node) if !old.is_empty() && !new.is_empty() => node,
-            _ => return self.rewrite_prerequisites(new),
+            _ => return self.rewrite_prerequisites(new, operation),
         };
         let mut list = WordList::new(&node);
         if list.len() != old.len() {
-            return Err(edit_error(
-                "set_prerequisites",
-                "Cannot edit the prerequisites in place".to_string(),
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                "Cannot edit the prerequisites in place",
             ));
         }
-        build_prerequisites_node(&new, None, list.ends_before_comment())?;
-        list.edit(&old, &new, prerequisite_word)?;
-        self.apply_list(&node, list, &new, "set_prerequisites")
+        build_prerequisites_node(&new, None, list.ends_before_comment(), operation)?;
+        list.edit(&old, &new, |name, before_comment| {
+            prerequisite_word(name, before_comment, operation)
+        })?;
+        self.apply_list(&node, list, &new, operation)
     }
 
     /// Edit `node`, the TARGETS or PREREQUISITES node of the rule, to hold
@@ -1426,7 +1464,7 @@ impl Rule {
         node: &SyntaxNode,
         list: WordList,
         expected: &[String],
-        context: &str,
+        operation: &'static str,
     ) -> Result<(), Error> {
         let pieces = list.into_pieces();
         let copy = Rule::cast(SyntaxNode::new_root_mut(self.syntax().green().into_owned()))
@@ -1444,8 +1482,9 @@ impl Rule {
             copy.prerequisites().collect()
         };
         if read != expected {
-            return Err(edit_error(
-                context,
+            return Err(invalid_edit(
+                InvalidEditKind::NotRepresentable,
+                operation,
                 format!("Cannot write {expected:?} in place"),
             ));
         }
@@ -1455,7 +1494,11 @@ impl Rule {
 
     /// Replace the normal prerequisites when there are none before or
     /// after the change, keeping whatever follows them in the line.
-    fn rewrite_prerequisites(&mut self, prereqs: Vec<String>) -> Result<(), Error> {
+    fn rewrite_prerequisites(
+        &mut self,
+        prereqs: Vec<String>,
+        operation: &'static str,
+    ) -> Result<(), Error> {
         if let Some(node) = self.prerequisites_node() {
             let has_external_whitespace = node
                 .prev_sibling_or_token()
@@ -1489,7 +1532,12 @@ impl Rule {
             } else {
                 None
             };
-            let fresh = build_prerequisites_node(&prereqs, separator, next_kind == Some(COMMENT))?;
+            let fresh = build_prerequisites_node(
+                &prereqs,
+                separator,
+                next_kind == Some(COMMENT),
+                operation,
+            )?;
             super::replace_range(&node, 0..keep, fresh.children_with_tokens().collect());
             if !has_external_whitespace && !prereqs.is_empty() {
                 let index = node.index();
@@ -1508,14 +1556,11 @@ impl Rule {
             .position(|t| t.as_token().map(|t| t.kind() == OPERATOR).unwrap_or(false))
             .map(|p| p + 1)
             .ok_or_else(|| {
-                Error::Parse(ParseError {
-                    errors: vec![ErrorInfo {
-                        kind: crate::ParseErrorKind::Other,
-                        message: "No operator found in rule".to_string(),
-                        line: 1,
-                        context: "set_prerequisites".to_string(),
-                    }],
-                })
+                invalid_edit(
+                    InvalidEditKind::Unsupported,
+                    operation,
+                    "No operator found in rule",
+                )
             })?;
 
         let before_comment = self
@@ -1523,7 +1568,7 @@ impl Rule {
             .children_with_tokens()
             .nth(insert_pos)
             .is_some_and(|e| e.kind() == COMMENT);
-        let new_prereqs = build_prerequisites_node(&prereqs, None, before_comment)?;
+        let new_prereqs = build_prerequisites_node(&prereqs, None, before_comment, operation)?;
         let mut elements = if prereqs.is_empty() {
             vec![]
         } else {
@@ -1556,7 +1601,7 @@ impl Rule {
             .iter()
             .map(|t| if t == old_name { new_name } else { t }.to_string())
             .collect();
-        self.edit_targets(&old, new, "rename_target")?;
+        self.edit_targets(&old, new, "Rule::rename_target")?;
         Ok(true)
     }
 
@@ -1566,21 +1611,26 @@ impl Rule {
         &mut self,
         old: &[String],
         new: Vec<String>,
-        context: &str,
+        operation: &'static str,
     ) -> Result<(), Error> {
-        let node = self
-            .targets_node()
-            .ok_or_else(|| edit_error(context, "No TARGETS node found in rule".to_string()))?;
-        build_targets_node(&new, context)?;
+        let node = self.targets_node().ok_or_else(|| {
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                "No TARGETS node found in rule",
+            )
+        })?;
+        build_targets_node(&new, operation)?;
         let mut list = WordList::new(&node);
         if list.len() != old.len() {
-            return Err(edit_error(
-                context,
-                "Cannot edit the targets in place".to_string(),
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                "Cannot edit the targets in place",
             ));
         }
-        list.edit(old, &new, target_word)?;
-        self.apply_list(&node, list, &new, context)
+        list.edit(old, &new, |name, _| target_word(name, operation))?;
+        self.apply_list(&node, list, &new, operation)
     }
 
     /// Add a target to this rule
@@ -1593,9 +1643,10 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target1", "target2"]);
     /// ```
     pub fn add_target(&mut self, target: &str) -> Result<(), Error> {
-        let mut current_targets: Vec<String> = self.targets().collect();
-        current_targets.push(target.to_string());
-        self.set_targets(current_targets.iter().map(|s| s.as_str()).collect())
+        let old: Vec<String> = self.targets().collect();
+        let mut new = old.clone();
+        new.push(target.to_string());
+        self.edit_targets(&old, new, "Rule::add_target")
     }
 
     /// Set the targets for this rule, replacing any existing ones
@@ -1618,14 +1669,15 @@ impl Rule {
     /// ```
     pub fn set_targets(&mut self, targets: Vec<&str>) -> Result<(), Error> {
         if targets.is_empty() {
-            return Err(edit_error(
-                "set_targets",
-                "Cannot set empty targets list for a rule".to_string(),
+            return Err(invalid_edit(
+                InvalidEditKind::InvalidArgument,
+                "Rule::set_targets",
+                "Cannot set empty targets list for a rule",
             ));
         }
         let old: Vec<String> = self.targets().collect();
         let new = targets.iter().map(|s| s.to_string()).collect();
-        self.edit_targets(&old, new, "set_targets")
+        self.edit_targets(&old, new, "Rule::set_targets")
     }
 
     /// Check if this rule has a specific target
@@ -1660,29 +1712,42 @@ impl Rule {
         if indices.is_empty() {
             return Ok(false);
         }
+        let operation = "Rule::remove_target";
         if indices.len() == old.len() {
-            return Err(edit_error(
-                "remove_target",
-                "Cannot remove all targets from a rule".to_string(),
+            return Err(invalid_edit(
+                InvalidEditKind::NotRepresentable,
+                operation,
+                "Cannot remove all targets from a rule",
             ));
         }
         let node = self.targets_node().ok_or_else(|| {
-            edit_error("remove_target", "No TARGETS node found in rule".to_string())
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                "No TARGETS node found in rule",
+            )
         })?;
         let mut list = WordList::new(&node);
         if list.len() != old.len() {
-            return Err(edit_error(
-                "remove_target",
-                "Cannot edit the targets in place".to_string(),
+            return Err(invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                "Cannot edit the targets in place",
             ));
         }
-        list.remove_all(&indices, &old, target_word)?;
+        list.remove_all(&indices, &old, |name, _| target_word(name, operation))?;
         let new: Vec<String> = old.into_iter().filter(|t| t != target_name).collect();
-        self.apply_list(&node, list, &new, "remove_target")?;
+        self.apply_list(&node, list, &new, operation)?;
         Ok(true)
     }
 
     /// Remove this rule from its parent Makefile
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::Unsupported`] if the rule is not part of a
+    /// makefile.
     ///
     /// # Example
     /// ```
@@ -1701,14 +1766,11 @@ impl Rule {
     /// its end are removed too.
     pub fn remove(self) -> Result<(), Error> {
         let parent = self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Rule has no parent".to_string(),
-                    line: 1,
-                    context: "remove".to_string(),
-                }],
-            })
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                "Rule::remove",
+                "Rule has no parent",
+            )
         })?;
 
         remove_with_preceding_comments(self.syntax(), &parent);
@@ -1739,9 +1801,10 @@ impl Default for Makefile {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_util::assert_matches_reparse;
+    use crate::test_util::{assert_matches_reparse, expect_invalid_edit};
     use crate::{
-        ConditionalItem, Makefile, MakefileItem, MakefileVariant, Rule, RuleItem, RuleOperator,
+        ConditionalItem, InvalidEdit, InvalidEditKind, Makefile, MakefileItem, MakefileVariant,
+        Rule, RuleItem, RuleOperator,
     };
     use rowan::ast::AstNode;
 
@@ -3963,10 +4026,62 @@ mod tests {
     #[test]
     fn test_rule_set_targets_empty() {
         let mut rule: Rule = "target: dep1\n".parse().unwrap();
-        let result = rule.set_targets(vec![]);
-        assert!(result.is_err());
+        assert_eq!(
+            expect_invalid_edit(rule.set_targets(vec![])),
+            InvalidEdit::new(
+                InvalidEditKind::InvalidArgument,
+                "Rule::set_targets",
+                "Cannot set empty targets list for a rule"
+            )
+        );
         // Verify target wasn't changed
         assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target"]);
+    }
+
+    #[test]
+    fn test_rule_edit_errors() {
+        let mut rule: Rule = "target: dep\n".parse().unwrap();
+        assert_eq!(
+            expect_invalid_edit(rule.remove_target("target")),
+            InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Rule::remove_target",
+                "Cannot remove all targets from a rule"
+            )
+        );
+        assert_eq!(
+            expect_invalid_edit(rule.add_target("a:b")),
+            InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Rule::add_target",
+                "Cannot write [\"target\", \"a:b\"] as targets"
+            )
+        );
+        assert_eq!(
+            expect_invalid_edit(rule.add_prerequisite("a|b")),
+            InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Rule::add_prerequisite",
+                "Cannot write [\"dep\", \"a|b\"] as prerequisites"
+            )
+        );
+        assert_eq!(
+            expect_invalid_edit(rule.try_push_command("a\nb")),
+            InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Rule::try_push_command",
+                "Cannot write \"a\\nb\" as a single recipe line"
+            )
+        );
+        assert_eq!(
+            expect_invalid_edit(Rule::new(&["a"], &[], &[]).remove()),
+            InvalidEdit::new(
+                InvalidEditKind::Unsupported,
+                "Rule::remove",
+                "Rule has no parent"
+            )
+        );
+        assert_eq!(rule.to_string(), "target: dep\n");
     }
 
     #[test]

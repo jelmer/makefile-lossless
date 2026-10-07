@@ -1,13 +1,13 @@
 use super::rule::build_targets_node;
 use super::{
-    detach_tokens, doc_comment_lines, edit_error, hoist_doc_comment, index_before_doc_comment,
-    line_ending, lines_above, terminate_line_before, text_before, with_recipe_prefix,
-    with_trailing_newline, LineSyntax,
+    detach_tokens, doc_comment_lines, hoist_doc_comment, index_before_doc_comment, line_ending,
+    lines_above, terminate_line_before, text_before, with_recipe_prefix, with_trailing_newline,
+    LineSyntax,
 };
 use crate::lossless::{
-    line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
-    ForLoop, Include, Load, Makefile, ParseError, Recipe, Rule, SyntaxNode, VariableDefinition,
-    VariableReference, Vpath,
+    invalid_edit, line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo,
+    ExpressionStatement, ForLoop, Include, InvalidEditKind, Load, Makefile, ParseError, Recipe,
+    Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
 use crate::pattern::matches_pattern;
 use crate::syntax_rules::{is_bsd_if, is_gnu_conditional_start};
@@ -27,10 +27,11 @@ fn conditional_keywords(conditional_type: &str) -> Option<(&'static str, &'stati
     }
 }
 
-fn invalid_conditional_type(conditional_type: &str, context: &str) -> Error {
+fn invalid_conditional_type(conditional_type: &str, operation: &'static str) -> Error {
     let valid = "ifdef, ifndef, ifeq, ifneq, .if, .ifdef, .ifndef, .ifmake, .ifnmake";
-    edit_error(
-        context,
+    invalid_edit(
+        InvalidEditKind::InvalidArgument,
+        operation,
         format!("Invalid conditional type: {conditional_type}. Must be one of: {valid}"),
     )
 }
@@ -54,18 +55,9 @@ fn check_conditional(
     condition: &str,
     if_body: &str,
     else_body: Option<&str>,
-    context: &str,
+    operation: &'static str,
 ) -> Result<(), Error> {
-    let error = |message: String| {
-        Error::Parse(ParseError {
-            errors: vec![ErrorInfo {
-                kind: crate::ParseErrorKind::Other,
-                message,
-                line: 1,
-                context: context.to_string(),
-            }],
-        })
-    };
+    let error = |kind, message: String| invalid_edit(kind, operation, message);
     let if_line = conditional_if_line(conditional_type, condition);
     let mut lines = vec![if_line.as_str()];
     lines.extend(if_body.lines());
@@ -88,23 +80,30 @@ fn check_conditional(
         .next()
         .and_then(Conditional::cast)
         .filter(|_| items.next().is_none())
-        .ok_or_else(|| error(format!("{text:?} does not parse as a single conditional")))?;
+        .ok_or_else(|| {
+            error(
+                InvalidEditKind::NotRepresentable,
+                format!("{text:?} does not parse as a single conditional"),
+            )
+        })?;
     let else_branches = conditional
         .syntax()
         .children()
         .filter(|n| n.kind() == CONDITIONAL_ELSE)
         .count();
     if else_branches != usize::from(else_body.is_some()) {
-        return Err(error(format!(
-            "A body of {text:?} starts another branch of the conditional"
-        )));
+        return Err(error(
+            InvalidEditKind::NotRepresentable,
+            format!("A body of {text:?} starts another branch of the conditional"),
+        ));
     }
     // The parser accepts these, but make reports "invalid syntax in
     // conditional".
     if matches!(conditional_type, "ifeq" | "ifneq") && conditional.ifeq_args().is_none() {
-        return Err(error(format!(
-            "Invalid condition for {conditional_type}: {condition:?}"
-        )));
+        return Err(error(
+            InvalidEditKind::InvalidArgument,
+            format!("Invalid condition for {conditional_type}: {condition:?}"),
+        ));
     }
     Ok(())
 }
@@ -199,7 +198,7 @@ fn build_conditional(
     else_branch: Option<(&str, &str)>,
     endif_keyword: &str,
     eol: &str,
-    context: &str,
+    operation: &'static str,
 ) -> Result<SyntaxNode, Error> {
     let mut lines = vec![if_line];
     lines.extend(if_body.lines());
@@ -222,14 +221,11 @@ fn build_conditional(
         (Some(rowan::NodeOrToken::Node(node)), None) if node.kind() == CONDITIONAL => {
             Ok(SyntaxNode::new_root_mut(node.green().into_owned()))
         }
-        _ => Err(Error::Parse(ParseError {
-            errors: vec![ErrorInfo {
-                kind: crate::ParseErrorKind::Other,
-                message: format!("{text:?} does not parse as a single conditional"),
-                line: 1,
-                context: context.to_string(),
-            }],
-        })),
+        _ => Err(invalid_edit(
+            InvalidEditKind::NotRepresentable,
+            operation,
+            format!("{text:?} does not parse as a single conditional"),
+        )),
     }
 }
 
@@ -372,16 +368,17 @@ impl MakefileItem {
     }
 
     /// Helper to get parent node or return an appropriate error
-    fn get_parent_or_error(&self, action: &str, method: &str) -> Result<SyntaxNode, Error> {
+    fn get_parent_or_error(
+        &self,
+        action: &str,
+        operation: &'static str,
+    ) -> Result<SyntaxNode, Error> {
         self.syntax().parent().ok_or_else(|| {
-            Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Cannot {} item without parent", action),
-                    line: 1,
-                    context: format!("MakefileItem::{}", method),
-                }],
-            })
+            invalid_edit(
+                InvalidEditKind::Unsupported,
+                operation,
+                format!("Cannot {} item without parent", action),
+            )
         })
     }
 
@@ -411,7 +408,7 @@ impl MakefileItem {
     fn parse_comment_tokens(
         comment_text: &str,
         eol: &str,
-        context: &str,
+        operation: &'static str,
     ) -> Result<
         (
             rowan::SyntaxToken<crate::lossless::Lang>,
@@ -433,14 +430,11 @@ impl MakefileItem {
             {
                 Ok((c.clone(), n.clone()))
             }
-            _ => Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Cannot write {comment_text:?} as a single comment line"),
-                    line: 1,
-                    context: format!("MakefileItem::{context}"),
-                }],
-            })),
+            _ => Err(invalid_edit(
+                InvalidEditKind::NotRepresentable,
+                operation,
+                format!("Cannot write {comment_text:?} as a single comment line"),
+            )),
         }
     }
 
@@ -449,7 +443,11 @@ impl MakefileItem {
     /// This preserves the position of the original item but replaces its content
     /// with the new item. Preceding comments are preserved.
     ///
-    /// Returns an error if the new item can not go there, as described for
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::InvalidPosition`](crate::InvalidEditKind::InvalidPosition)
+    /// if the new item can not go there, as described for
     /// [`Self::insert_before`].
     ///
     /// # Example
@@ -464,13 +462,13 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("VAR1"));
     /// ```
     pub fn replace(&mut self, new_item: MakefileItem) -> Result<(), Error> {
-        let parent = self.get_parent_or_error("replace", "replace")?;
+        let parent = self.get_parent_or_error("replace", "MakefileItem::replace")?;
         check_position(
             new_item.syntax(),
             self.syntax().prev_sibling(),
             self.syntax().next_sibling(),
             Some(self.syntax()),
-            "replace",
+            "MakefileItem::replace",
         )?;
         let current_index = self.syntax().index();
         let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
@@ -504,12 +502,15 @@ impl MakefileItem {
     /// assert!(makefile.to_string().contains("# This is a variable"));
     /// ```
     pub fn add_comment(&mut self, comment_text: &str) -> Result<(), Error> {
-        let parent = self.get_parent_or_error("add comment to", "add_comment")?;
+        let parent = self.get_parent_or_error("add comment to", "MakefileItem::add_comment")?;
         let current_index = self.syntax().index();
 
         // Get properly formatted comment tokens
-        let (comment_token, newline_token) =
-            Self::parse_comment_tokens(comment_text, &line_ending(self.syntax()), "add_comment")?;
+        let (comment_token, newline_token) = Self::parse_comment_tokens(
+            comment_text,
+            &line_ending(self.syntax()),
+            "MakefileItem::add_comment",
+        )?;
 
         let elements = vec![
             rowan::NodeOrToken::Token(comment_token),
@@ -605,7 +606,7 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Comment"));
     /// ```
     pub fn remove_comments(&mut self) -> Result<usize, Error> {
-        self.get_parent_or_error("remove comments from", "remove_comments")?;
+        self.get_parent_or_error("remove comments from", "MakefileItem::remove_comments")?;
         let lines: Vec<_> = lines_above(self.syntax())
             .into_iter()
             .filter(|line| line.comment.is_some())
@@ -633,11 +634,11 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Old comment"));
     /// ```
     pub fn modify_comment(&mut self, new_comment_text: &str) -> Result<bool, Error> {
-        self.get_parent_or_error("modify comment for", "modify_comment")?;
+        self.get_parent_or_error("modify comment for", "MakefileItem::modify_comment")?;
         let (new_comment_token, _) = Self::parse_comment_tokens(
             new_comment_text,
             &line_ending(self.syntax()),
-            "modify_comment",
+            "MakefileItem::modify_comment",
         )?;
 
         // The comment closest to the item
@@ -661,9 +662,13 @@ impl MakefileItem {
     /// line in between, the new item is inserted before them, since they
     /// document the current item.
     ///
-    /// Returns an error if the item would separate a [`MakefileItem::Recipe`]
-    /// from the rule it belongs to, or if the new item is a
-    /// [`MakefileItem::Recipe`] that would not be next to another one.
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::InvalidPosition`](crate::InvalidEditKind::InvalidPosition)
+    /// if the item would separate a [`MakefileItem::Recipe`] from the rule it
+    /// belongs to, or if the new item is a [`MakefileItem::Recipe`] that
+    /// would not be next to another one.
     ///
     /// # Example
     /// ```
@@ -677,13 +682,13 @@ impl MakefileItem {
     /// assert!(result.contains("VAR1 = first\nVAR_NEW = inserted\nVAR2 = second"));
     /// ```
     pub fn insert_before(&mut self, new_item: MakefileItem) -> Result<(), Error> {
-        let parent = self.get_parent_or_error("insert before", "insert_before")?;
+        let parent = self.get_parent_or_error("insert before", "MakefileItem::insert_before")?;
         check_position(
             new_item.syntax(),
             self.syntax().prev_sibling(),
             Some(self.syntax().clone()),
             None,
-            "insert_before",
+            "MakefileItem::insert_before",
         )?;
         hoist_doc_comment(self.syntax());
         let current_index = index_before_doc_comment(self.syntax());
@@ -701,7 +706,11 @@ impl MakefileItem {
     /// The new item is inserted at the same level as the current item, and
     /// before any comment lines documenting the next item.
     ///
-    /// Returns an error if the new item can not go there, as described for
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::InvalidPosition`](crate::InvalidEditKind::InvalidPosition)
+    /// if the new item can not go there, as described for
     /// [`Self::insert_before`].
     ///
     /// # Example
@@ -716,13 +725,13 @@ impl MakefileItem {
     /// assert!(result.contains("VAR1 = first\nVAR_NEW = inserted\nVAR2 = second"));
     /// ```
     pub fn insert_after(&mut self, new_item: MakefileItem) -> Result<(), Error> {
-        let parent = self.get_parent_or_error("insert after", "insert_after")?;
+        let parent = self.get_parent_or_error("insert after", "MakefileItem::insert_after")?;
         check_position(
             new_item.syntax(),
             Some(self.syntax().clone()),
             self.syntax().next_sibling(),
             None,
-            "insert_after",
+            "MakefileItem::insert_after",
         )?;
         let eol = line_ending(&parent);
         let new_node = with_trailing_newline(new_item.syntax(), &eol);
@@ -748,7 +757,7 @@ fn check_position(
     prev: Option<SyntaxNode>,
     next: Option<SyntaxNode>,
     replaced: Option<&SyntaxNode>,
-    method: &str,
+    operation: &'static str,
 ) -> Result<(), Error> {
     let is_recipe = |node: Option<&SyntaxNode>| node.is_some_and(|n| n.kind() == RECIPE);
     let message = if new.kind() == RECIPE {
@@ -761,14 +770,11 @@ fn check_position(
     } else {
         return Ok(());
     };
-    Err(Error::Parse(ParseError {
-        errors: vec![ErrorInfo {
-            kind: crate::ParseErrorKind::Other,
-            message: message.to_string(),
-            line: 1,
-            context: format!("MakefileItem::{method}"),
-        }],
-    }))
+    Err(invalid_edit(
+        InvalidEditKind::InvalidPosition,
+        operation,
+        message,
+    ))
 }
 
 /// Move a comment that the parser put at the end of `node` but that
@@ -1428,7 +1434,7 @@ impl Makefile {
     /// ```
     pub fn try_add_rule(&mut self, target: &str) -> Result<Rule, Error> {
         let eol = line_ending(self.syntax());
-        let targets = build_targets_node(&[target.to_string()], "add_rule")?;
+        let targets = build_targets_node(&[target.to_string()], "Makefile::try_add_rule")?;
         let syntax = SyntaxNode::new_root_mut(rowan::GreenNode::new(
             RULE.into(),
             [
@@ -1482,7 +1488,7 @@ impl Makefile {
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(invalid_conditional_type(
                 conditional_type,
-                "add_conditional",
+                "Makefile::add_conditional",
             ));
         };
         check_conditional(
@@ -1490,7 +1496,7 @@ impl Makefile {
             condition,
             if_body,
             else_body,
-            "add_conditional",
+            "Makefile::add_conditional",
         )?;
 
         let eol = line_ending(self.syntax());
@@ -1500,7 +1506,7 @@ impl Makefile {
             else_body.map(|body| (else_keyword, body)),
             endif_keyword,
             &eol,
-            "add_conditional",
+            "Makefile::add_conditional",
         )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
@@ -1553,7 +1559,7 @@ impl Makefile {
         let Some((else_keyword, endif_keyword)) = conditional_keywords(conditional_type) else {
             return Err(invalid_conditional_type(
                 conditional_type,
-                "add_conditional_with_items",
+                "Makefile::add_conditional_with_items",
             ));
         };
         // Items can't start another branch, so only the condition needs
@@ -1563,7 +1569,7 @@ impl Makefile {
             condition,
             "",
             else_items.as_ref().map(|_| ""),
-            "add_conditional_with_items",
+            "Makefile::add_conditional_with_items",
         )?;
 
         let eol = line_ending(self.syntax());
@@ -1582,7 +1588,7 @@ impl Makefile {
             else_text.as_deref().map(|text| (else_keyword, text)),
             endif_keyword,
             &eol,
-            "add_conditional_with_items",
+            "Makefile::add_conditional_with_items",
         )?;
         append_with_blank_line(self.syntax(), syntax, &eol);
 
@@ -1611,6 +1617,12 @@ impl Makefile {
     ///
     /// Comments above the rule are kept.
     ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::IndexOutOfRange`](crate::InvalidEditKind::IndexOutOfRange)
+    /// if there is no rule at `index`.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1623,14 +1635,11 @@ impl Makefile {
         let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if index >= rules.len() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Rule index {index} out of bounds ({} rules)", rules.len()),
-                    line: 1,
-                    context: "replace_rule".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::replace_rule",
+                format!("Rule index {index} out of bounds ({} rules)", rules.len()),
+            ));
         }
 
         let target_node = &rules[index];
@@ -1651,6 +1660,12 @@ impl Makefile {
     ///
     /// Comments above the rule are kept; [`Rule::remove`] removes them too.
     ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::IndexOutOfRange`](crate::InvalidEditKind::IndexOutOfRange)
+    /// if there is no rule at `index`.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1663,14 +1678,11 @@ impl Makefile {
         let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if index >= rules.len() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Rule index {index} out of bounds ({} rules)", rules.len()),
-                    line: 1,
-                    context: "remove_rule".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::remove_rule",
+                format!("Rule index {index} out of bounds ({} rules)", rules.len()),
+            ));
         }
 
         let target_node = rules[index].clone();
@@ -1701,6 +1713,12 @@ impl Makefile {
     /// conditional branch or loop body, and from the following rule by a
     /// blank line, unless the new rule already ends in one.
     ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::IndexOutOfRange`](crate::InvalidEditKind::IndexOutOfRange)
+    /// if `index` is greater than the number of rules.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Makefile;
@@ -1714,14 +1732,11 @@ impl Makefile {
         let rules: Vec<_> = self.rules().map(|r| r.syntax().clone()).collect();
 
         if index > rules.len() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Rule index {} out of bounds (max {})", index, rules.len()),
-                    line: 1,
-                    context: "insert_rule".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::insert_rule",
+                format!("Rule index {} out of bounds (max {})", index, rules.len()),
+            ));
         }
 
         let (parent, target_index) = match rules.get(index) {
@@ -1980,7 +1995,7 @@ impl Makefile {
     /// assert_eq!(makefile.included_files().collect::<Vec<_>>(), vec!["config.mk"]);
     /// ```
     pub fn add_include(&mut self, path: &str) -> Result<Include, Error> {
-        let syntax = Include::new(path, &line_ending(self.syntax()))?
+        let syntax = Include::new(path, &line_ending(self.syntax()), "Makefile::add_include")?
             .syntax()
             .clone();
 
@@ -2006,8 +2021,15 @@ impl Makefile {
     /// * `path` - The file path to include (e.g., "config.mk")
     ///
     /// `#` is escaped as needed, so that [`Include::path`] returns `path`.
-    /// Returns an error if `path` can not be written in an include
-    /// directive, such as a path containing a newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::IndexOutOfRange`](crate::InvalidEditKind::IndexOutOfRange)
+    /// if `index` is greater than the number of items, or of kind
+    /// [`InvalidEditKind::NotRepresentable`](crate::InvalidEditKind::NotRepresentable)
+    /// if `path` can not be written in an include directive, such as a path
+    /// containing a newline.
     ///
     /// # Example
     /// ```
@@ -2021,18 +2043,17 @@ impl Makefile {
         let items: Vec<_> = self.items().collect();
 
         if index > items.len() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: format!("Index {} out of bounds (max {})", index, items.len()),
-                    line: 1,
-                    context: "insert_include".to_string(),
-                }],
-            }));
+            return Err(invalid_edit(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::insert_include",
+                format!("Index {} out of bounds (max {})", index, items.len()),
+            ));
         }
 
         let eol = line_ending(self.syntax());
-        let syntax = Include::new(path, &eol)?.syntax().clone();
+        let syntax = Include::new(path, &eol, "Makefile::insert_include")?
+            .syntax()
+            .clone();
 
         let target_index = match items.get(index) {
             // Insert before the item at the given index, and any comment
@@ -2062,8 +2083,15 @@ impl Makefile {
     /// * `path` - The file path to include (e.g., "config.mk")
     ///
     /// `#` is escaped as needed, so that [`Include::path`] returns `path`.
-    /// Returns an error if `path` can not be written in an include
-    /// directive, such as a path containing a newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidEdit`] of kind
+    /// [`InvalidEditKind::InvalidArgument`](crate::InvalidEditKind::InvalidArgument)
+    /// if `after` is not in this makefile, or of kind
+    /// [`InvalidEditKind::NotRepresentable`](crate::InvalidEditKind::NotRepresentable)
+    /// if `path` can not be written in an include directive, such as a path
+    /// containing a newline.
     ///
     /// # Example
     /// ```
@@ -2084,18 +2112,17 @@ impl Makefile {
             .parent()
             .filter(|_| after_syntax.ancestors().last().as_ref() == Some(self.syntax()))
             .ok_or_else(|| {
-                Error::Parse(ParseError {
-                    errors: vec![ErrorInfo {
-                        kind: crate::ParseErrorKind::Other,
-                        message: "Could not find the reference item".to_string(),
-                        line: 1,
-                        context: "insert_include_after".to_string(),
-                    }],
-                })
+                invalid_edit(
+                    InvalidEditKind::InvalidArgument,
+                    "Makefile::insert_include_after",
+                    "Could not find the reference item",
+                )
             })?;
 
         let eol = line_ending(self.syntax());
-        let syntax = Include::new(path, &eol)?.syntax().clone();
+        let syntax = Include::new(path, &eol, "Makefile::insert_include_after")?
+            .syntax()
+            .clone();
 
         hoist_next_doc_comment(after_syntax);
         let target_index = terminate_line_before(&parent, after_syntax.index() + 1, &eol);
@@ -2108,7 +2135,8 @@ impl Makefile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{assert_matches_reparse, item_without_newline};
+    use crate::test_util::{assert_matches_reparse, expect_invalid_edit, item_without_newline};
+    use crate::{InvalidEdit, InvalidEditKind};
 
     #[test]
     fn test_makefile_item_line_col() {
@@ -2632,9 +2660,14 @@ mod tests {
         let mut recipe = MakefileItem::cast(node).unwrap();
         let temp: Makefile = "Y = 1\n".parse().unwrap();
         let new_var = temp.variable_definitions().next().unwrap();
-        assert!(recipe
-            .insert_before(MakefileItem::Variable(new_var))
-            .is_err());
+        assert_eq!(
+            expect_invalid_edit(recipe.insert_before(MakefileItem::Variable(new_var))),
+            InvalidEdit::new(
+                InvalidEditKind::InvalidPosition,
+                "MakefileItem::insert_before",
+                "Cannot put an item before a recipe line, which would no longer belong to its rule"
+            )
+        );
         assert_eq!(makefile.code(), code);
     }
 
@@ -3235,12 +3268,13 @@ override_dh_auto_configure:
     #[test]
     fn test_insert_rule_in_conditional_out_of_bounds() {
         let mut makefile: Makefile = "ifdef X\nall:\nendif\n".parse().unwrap();
-        let err = makefile
-            .insert_rule(2, "b:\n".parse().unwrap())
-            .unwrap_err();
         assert_eq!(
-            err.to_string(),
-            "Parse error: Error at line 1: Rule index 2 out of bounds (max 1)\n1| insert_rule\n"
+            expect_invalid_edit(makefile.insert_rule(2, "b:\n".parse().unwrap())),
+            InvalidEdit::new(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::insert_rule",
+                "Rule index 2 out of bounds (max 1)"
+            )
         );
     }
 
@@ -3877,18 +3911,13 @@ override_dh_auto_configure:
     fn test_try_add_rule_invalid() {
         let mut makefile: Makefile = "all: x\n".parse().unwrap();
         for target in ["", "a b", "a:b", "a\nb", "a=b", "$(X", "a\\"] {
-            let Err(Error::Parse(e)) = makefile.try_add_rule(target) else {
-                panic!("expected an error for {target:?}");
-            };
             assert_eq!(
-                e.errors
-                    .iter()
-                    .map(|e| (e.message.clone(), e.context.as_str()))
-                    .collect::<Vec<_>>(),
-                vec![(
-                    format!("Cannot write {:?} as targets", [target]),
-                    "add_rule"
-                )]
+                expect_invalid_edit(makefile.try_add_rule(target)),
+                InvalidEdit::new(
+                    InvalidEditKind::NotRepresentable,
+                    "Makefile::try_add_rule",
+                    format!("Cannot write {:?} as targets", [target])
+                )
             );
         }
         assert_eq!(makefile.to_string(), "all: x\n");
@@ -3972,8 +4001,14 @@ build-indep: build
         let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
         let new_rule: Rule = "new_rule:\n\tnew_command\n".parse().unwrap();
 
-        let result = makefile.replace_rule(5, new_rule);
-        assert!(result.is_err());
+        assert_eq!(
+            expect_invalid_edit(makefile.replace_rule(5, new_rule)),
+            InvalidEdit::new(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::replace_rule",
+                "Rule index 5 out of bounds (1 rules)"
+            )
+        );
     }
 
     #[test]
@@ -3997,8 +4032,14 @@ build-indep: build
     fn test_remove_rule_out_of_bounds() {
         let mut makefile: Makefile = "rule1:\n\tcommand1\n".parse().unwrap();
 
-        let result = makefile.remove_rule(5);
-        assert!(result.is_err());
+        assert_eq!(
+            expect_invalid_edit(makefile.remove_rule(5)),
+            InvalidEdit::new(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::remove_rule",
+                "Rule index 5 out of bounds (1 rules)"
+            )
+        );
     }
 
     #[test]
@@ -4949,12 +4990,13 @@ VAR3 = value3
     #[test]
     fn test_insert_include_index_out_of_bounds_with_blank_lines() {
         let mut makefile: Makefile = "X = 1\n\nY = 2\n".parse().unwrap();
-        let Err(err) = makefile.insert_include(3, "a.mk") else {
-            panic!("expected an error");
-        };
         assert_eq!(
-            err.to_string(),
-            "Parse error: Error at line 1: Index 3 out of bounds (max 2)\n1| insert_include\n"
+            expect_invalid_edit(makefile.insert_include(3, "a.mk")),
+            InvalidEdit::new(
+                InvalidEditKind::IndexOutOfRange,
+                "Makefile::insert_include",
+                "Index 3 out of bounds (max 2)"
+            )
         );
         assert_eq!(makefile.to_string(), "X = 1\n\nY = 2\n");
     }
@@ -5001,12 +5043,13 @@ VAR3 = value3
         let mut makefile: Makefile = "A = 1\n".parse().unwrap();
         let other: Makefile = "B = 2\n".parse().unwrap();
         let b = other.items().next().unwrap();
-        let Err(err) = makefile.insert_include_after(&b, "a.mk") else {
-            panic!("expected an error");
-        };
         assert_eq!(
-            err.to_string(),
-            "Parse error: Error at line 1: Could not find the reference item\n1| insert_include_after\n"
+            expect_invalid_edit(makefile.insert_include_after(&b, "a.mk")),
+            InvalidEdit::new(
+                InvalidEditKind::InvalidArgument,
+                "Makefile::insert_include_after",
+                "Could not find the reference item"
+            )
         );
         assert_eq!(makefile.to_string(), "A = 1\n");
         assert_eq!(other.to_string(), "B = 2\n");
@@ -5022,8 +5065,29 @@ VAR3 = value3
     #[test]
     fn test_add_conditional_invalid_type() {
         let mut makefile = Makefile::new();
-        let result = makefile.add_conditional("invalid", "DEBUG", "VAR = debug\n", None);
-        assert!(result.is_err());
+        assert_eq!(
+            expect_invalid_edit(makefile.add_conditional(
+                "invalid",
+                "DEBUG",
+                "VAR = debug\n",
+                None
+            )),
+            InvalidEdit::new(
+                InvalidEditKind::InvalidArgument,
+                "Makefile::add_conditional",
+                "Invalid conditional type: invalid. Must be one of: ifdef, ifndef, ifeq, ifneq, \
+                 .if, .ifdef, .ifndef, .ifmake, .ifnmake"
+            )
+        );
+        assert_eq!(
+            expect_invalid_edit(makefile.add_conditional("ifdef", "X", "else\n", None)),
+            InvalidEdit::new(
+                InvalidEditKind::NotRepresentable,
+                "Makefile::add_conditional",
+                "A body of \"ifdef X\\nelse\\nendif\\n\" starts another branch of the conditional"
+            )
+        );
+        assert_eq!(makefile.to_string(), "");
     }
 
     #[test]

@@ -7,6 +7,9 @@ pub enum Error {
 
     /// A parse error occurred
     Parse(ParseError),
+
+    /// An editing method could not make the requested change
+    InvalidEdit(InvalidEdit),
 }
 
 impl std::fmt::Display for Error {
@@ -14,6 +17,7 @@ impl std::fmt::Display for Error {
         match &self {
             Error::Io(e) => write!(f, "IO error: {}", e),
             Error::Parse(e) => write!(f, "Parse error: {}", e),
+            Error::InvalidEdit(e) => write!(f, "Invalid edit: {}", e),
         }
     }
 }
@@ -25,6 +29,110 @@ impl From<std::io::Error> for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<InvalidEdit> for Error {
+    fn from(e: InvalidEdit) -> Self {
+        Error::InvalidEdit(e)
+    }
+}
+
+/// The class of an [`InvalidEdit`].
+///
+/// Use this rather than matching on error messages, which are meant for
+/// humans and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InvalidEditKind {
+    /// An argument is not valid for this edit, such as an empty list of
+    /// targets or an unknown conditional type.
+    InvalidArgument,
+    /// An index is past the end of the items it refers to.
+    IndexOutOfRange,
+    /// The result of the edit cannot be written so that it reads back as
+    /// requested, such as a value containing a newline that would start
+    /// another line.
+    NotRepresentable,
+    /// An item cannot go at the requested position, such as a variable
+    /// between two recipe lines of a rule.
+    InvalidPosition,
+    /// The item being edited does not support this edit, for example
+    /// because it is not attached to a makefile or lacks the part the
+    /// edit changes.
+    Unsupported,
+}
+
+/// An error from an editing method that could not make the requested
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InvalidEdit {
+    kind: InvalidEditKind,
+    operation: &'static str,
+    message: String,
+}
+
+impl InvalidEdit {
+    pub(crate) fn new(
+        kind: InvalidEditKind,
+        operation: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        InvalidEdit {
+            kind,
+            operation,
+            message: message.into(),
+        }
+    }
+
+    /// The class of this error.
+    pub fn kind(&self) -> InvalidEditKind {
+        self.kind
+    }
+
+    /// The editing method that failed, such as `Rule::set_targets`.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// A description of why the edit failed, meant for humans.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for InvalidEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.message)
+    }
+}
+
+impl std::error::Error for InvalidEdit {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalid_edit_display() {
+        let error = invalid_edit(
+            InvalidEditKind::InvalidArgument,
+            "Rule::set_targets",
+            "Cannot set empty targets list for a rule",
+        );
+        assert_eq!(
+            error.to_string(),
+            "Invalid edit: Rule::set_targets: Cannot set empty targets list for a rule"
+        );
+    }
+}
+
+/// An [`Error::InvalidEdit`] for the editing method `operation`.
+pub(crate) fn invalid_edit(
+    kind: InvalidEditKind,
+    operation: &'static str,
+    message: impl Into<String>,
+) -> Error {
+    Error::InvalidEdit(InvalidEdit::new(kind, operation, message))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// An error that occurred while parsing a makefile
