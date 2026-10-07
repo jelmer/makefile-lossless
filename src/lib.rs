@@ -1,5 +1,6 @@
 #![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
 #![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 //! A lossless parser for Makefiles
 //!
@@ -96,6 +97,71 @@ pub enum MakefileVariant {
     POSIXMake,
 }
 
+impl MakefileVariant {
+    fn short_name(self) -> &'static str {
+        match self {
+            MakefileVariant::GNUMake => "gnu",
+            MakefileVariant::BSDMake => "bsd",
+            MakefileVariant::NMake => "nmake",
+            MakefileVariant::POSIXMake => "posix",
+        }
+    }
+}
+
+/// The name of the make variant, such as `GNU make`.
+impl std::fmt::Display for MakefileVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MakefileVariant::GNUMake => "GNU make",
+            MakefileVariant::BSDMake => "BSD make",
+            MakefileVariant::NMake => "nmake",
+            MakefileVariant::POSIXMake => "POSIX make",
+        })
+    }
+}
+
+/// Parse a make variant from its name as written by `Display`, such as
+/// `GNU make`, or a short name: `gnu`, `bsd`, `nmake` or `posix`. Case is
+/// ignored.
+///
+/// # Example
+/// ```
+/// use makefile_lossless::MakefileVariant;
+/// assert_eq!("bsd".parse(), Ok(MakefileVariant::BSDMake));
+/// assert_eq!("GNU make".parse(), Ok(MakefileVariant::GNUMake));
+/// assert!("gmake".parse::<MakefileVariant>().is_err());
+/// ```
+impl std::str::FromStr for MakefileVariant {
+    type Err = ParseVariantError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        [
+            MakefileVariant::GNUMake,
+            MakefileVariant::BSDMake,
+            MakefileVariant::NMake,
+            MakefileVariant::POSIXMake,
+        ]
+        .into_iter()
+        .find(|variant| {
+            s.eq_ignore_ascii_case(variant.short_name())
+                || s.eq_ignore_ascii_case(&variant.to_string())
+        })
+        .ok_or_else(|| ParseVariantError(s.to_string()))
+    }
+}
+
+/// The error returned when parsing an unknown [`MakefileVariant`] name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseVariantError(String);
+
+impl std::fmt::Display for ParseVariantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown make variant: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ParseVariantError {}
+
 /// Define `SyntaxKind` along with `SyntaxKind::ALL`, which lists every
 /// variant in discriminant order.
 macro_rules! syntax_kinds {
@@ -184,5 +250,28 @@ impl TryFrom<u16> for SyntaxKind {
 impl From<SyntaxKind> for rowan::SyntaxKind {
     fn from(kind: SyntaxKind) -> Self {
         Self(kind as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MakefileVariant;
+
+    #[test]
+    fn test_variant_display_round_trip() {
+        for variant in [
+            MakefileVariant::GNUMake,
+            MakefileVariant::BSDMake,
+            MakefileVariant::NMake,
+            MakefileVariant::POSIXMake,
+        ] {
+            assert_eq!(variant.to_string().parse(), Ok(variant));
+            assert_eq!(variant.to_string().to_uppercase().parse(), Ok(variant));
+        }
+        assert_eq!(MakefileVariant::GNUMake.to_string(), "GNU make");
+        assert_eq!("NMAKE".parse(), Ok(MakefileVariant::NMake));
+        assert_eq!("posix".parse(), Ok(MakefileVariant::POSIXMake));
+        let err = "gmake".parse::<MakefileVariant>().unwrap_err();
+        assert_eq!(err.to_string(), "unknown make variant: \"gmake\"");
     }
 }

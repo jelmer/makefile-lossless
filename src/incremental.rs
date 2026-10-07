@@ -10,7 +10,7 @@ use crate::parse::Parse;
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 /// A text edit applied to the source, as typically received from an LSP.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextEdit {
     /// The byte range in the old text to replace.
     pub range: TextRange,
@@ -47,7 +47,7 @@ impl TextEdit {
 }
 
 /// An error from applying a [`TextEdit`] that does not fit the text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EditError {
     /// The edit range ends past the end of the text, of length `len`.
     OutOfBounds {

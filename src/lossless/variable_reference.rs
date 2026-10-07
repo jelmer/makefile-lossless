@@ -520,7 +520,7 @@ impl VariableReference {
 ///
 /// A reference nested in another one gives the part of that reference it is
 /// in. Otherwise it gives the part of the makefile item that contains it.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReferenceLocation {
     /// In an argument of a function call, as `$(SRCS)` in
@@ -577,5 +577,11 @@ pub enum ReferenceLocation {
 impl core::fmt::Display for VariableReference {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
         write!(f, "{}", self.0.text())
+    }
+}
+
+impl core::fmt::Debug for VariableReference {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        crate::lossless::debug_node(f, "VariableReference", &self.0)
     }
 }

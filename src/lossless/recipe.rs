@@ -1180,7 +1180,7 @@ impl Recipe {
 ///
 /// These are found by scanning text rather than in the syntax tree, so this
 /// type carries just the variable name and its absolute source range.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RecipeVariableReference {
     name: String,
     range: rowan::TextRange,
