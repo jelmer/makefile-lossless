@@ -10,13 +10,27 @@ pub mod variable;
 pub mod vpath;
 
 use crate::lex::NMAKE_ESCAPABLE;
-use crate::lossless::{detached_elements, SyntaxElement, SyntaxNode, SyntaxToken};
+use crate::lossless::{
+    detached_elements, Error, ErrorInfo, ParseError, SyntaxElement, SyntaxNode, SyntaxToken,
+};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{
     self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
     DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
     LBRACE, LOAD, LPAREN, NEWLINE, PREREQUISITE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
 };
+
+/// An error for invalid input to the method `context`.
+pub(crate) fn edit_error(context: &str, message: String) -> Error {
+    Error::Parse(ParseError {
+        errors: vec![ErrorInfo {
+            kind: crate::ParseErrorKind::Other,
+            message,
+            line: 1,
+            context: context.to_string(),
+        }],
+    })
+}
 
 /// Whether `token` is the backslash of a backslash-newline line
 /// continuation. A backslash escaped by an odd run of preceding backslashes
@@ -467,26 +481,32 @@ pub(crate) fn doc_comment_lines(node: &SyntaxNode) -> Vec<LineAbove> {
         .collect()
 }
 
-/// The index in the parent of `node` before the start of its line and the
-/// comment lines documenting it, as found by [`doc_comment_lines`], so
-/// that anything inserted before `node` goes before them.
-///
-/// The parser puts comments that follow a recipe in the preceding rule, so
-/// they are moved out of it to the parent of `node` first.
-pub(crate) fn index_before_doc_comment(node: &SyntaxNode) -> usize {
-    let parent = node.parent().expect("node must have a parent");
-    let start = doc_comment_lines(node)
+/// The first token of the line of `node` or of the comment lines
+/// documenting it, as found by [`doc_comment_lines`], if that is not the
+/// first token of `node` itself.
+fn doc_comment_start(node: &SyntaxNode) -> Option<SyntaxToken> {
+    doc_comment_lines(node)
         .pop()
         .map(|line| line.tokens[0].clone())
-        .or_else(|| line_indent(node));
-    let Some(start) = start else {
-        return node.index();
+        .or_else(|| line_indent(node))
+}
+
+/// Move the comment lines documenting `node` and its indentation into the
+/// parent of `node`, out of the preceding item.
+///
+/// The parser puts comments that follow a recipe in the preceding rule, so
+/// they need moving before anything can be inserted between them and the
+/// end of that rule.
+pub(crate) fn hoist_doc_comment(node: &SyntaxNode) {
+    let parent = node.parent().expect("node must have a parent");
+    let Some(start) = doc_comment_start(node) else {
+        return;
     };
     let mut element = SyntaxElement::Token(start);
     loop {
         let container = element.parent().expect("element is below parent");
         if container == parent {
-            return element.index();
+            return;
         }
         let index = element.index();
         let tail: Vec<_> = container.children_with_tokens().skip(index).collect();
@@ -500,6 +520,22 @@ pub(crate) fn index_before_doc_comment(node: &SyntaxNode) -> usize {
             .next_sibling_or_token()
             .expect("tail was moved after container");
     }
+}
+
+/// The index in the parent of `node` before the start of its line and the
+/// comment lines documenting it, so that anything inserted there goes
+/// before them. The comment lines must have been moved into the parent of
+/// `node` with [`hoist_doc_comment`].
+pub(crate) fn index_before_doc_comment(node: &SyntaxNode) -> usize {
+    let Some(start) = doc_comment_start(node) else {
+        return node.index();
+    };
+    assert_eq!(
+        start.parent(),
+        node.parent(),
+        "doc comment must be hoisted first"
+    );
+    start.index()
 }
 
 /// How a make implementation forms a logical line from physical lines.
