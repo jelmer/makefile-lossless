@@ -3081,7 +3081,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             // Parse the conditional keyword
             let Some(token) = self.parse_conditional_keyword() else {
-                self.skip_until_newline();
+                self.skip_logical_line();
                 self.builder.finish_node(); // finish CONDITIONAL_IF
                 self.builder.finish_node(); // finish CONDITIONAL
                 return;
@@ -3455,7 +3455,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     ParseErrorKind::ExtraneousText,
                     format!("expected newline after {}", directive),
                 );
-                self.skip_until_newline();
+                self.skip_logical_line();
             }
         }
 
@@ -3783,7 +3783,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     );
                     self.record_error(kind, message);
                     self.builder.start_node(ERROR.into());
-                    self.skip_until_newline();
+                    self.skip_logical_line();
                     self.builder.finish_node();
                 }
                 _ => {
@@ -3871,7 +3871,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// as `.else` or `.endif`, allowing a trailing comment. BSD make
         /// ignores anything after `.endfor`.
         fn parse_bare_directive_end(&mut self, name: &str) {
-            self.skip_ws();
+            self.skip_ws_and_continuations();
             if self.current() == Some(COMMENT) {
                 self.bump();
             }
@@ -3887,7 +3887,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             self.directive_display(name)
                         ),
                     );
-                    self.skip_until_newline();
+                    self.skip_logical_line();
                 }
             }
         }
@@ -4930,8 +4930,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn expect_eol(&mut self) {
-            // Skip any whitespace before looking for a newline
-            self.skip_ws();
+            // Skip any whitespace before looking for a newline. A line
+            // continuation is whitespace too.
+            self.skip_ws_and_continuations();
 
             // GNU Make allows a comment at the end of a directive line.
             if self.current() == Some(COMMENT) {
@@ -4950,8 +4951,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         ParseErrorKind::ExtraneousText,
                         format!("expected newline, got {:?}", n),
                     );
-                    // Try to recover by skipping to the next newline
-                    self.skip_until_newline();
+                    self.skip_logical_line();
                 }
             }
         }
@@ -4973,15 +4973,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if !self.consume_line_continuation() {
                     break;
                 }
-            }
-        }
-
-        fn skip_until_newline(&mut self) {
-            while !self.is_at_eof() && self.current() != Some(NEWLINE) {
-                self.bump();
-            }
-            if self.current() == Some(NEWLINE) {
-                self.bump();
             }
         }
 

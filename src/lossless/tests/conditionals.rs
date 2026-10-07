@@ -170,6 +170,54 @@ fn test_conditional_extraneous_text() {
 }
 
 #[test]
+fn test_comparison_extraneous_text_on_continuation_line() {
+    // GNU make: "extraneous text after 'ifeq' directive", reported for
+    // the logical line, which is not followed by a recipe line.
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        for (code, line) in [
+            ("ifeq (a,b) \\\n  junk\nA = 1\nelse\nA = 2\nendif\n", 2),
+            ("ifeq (a,b)\\\n  junk\nA = 1\nelse\nA = 2\nendif\n", 2),
+            (
+                "ifeq (a,b) \\\n  \\\n  junk\nA = 1\nelse\nA = 2\nendif\n",
+                3,
+            ),
+            (
+                "ifeq \"a\" \"b\" \\\n  junk\nA = 1\nelse\nA = 2\nendif\n",
+                2,
+            ),
+            (
+                "ifdef X\nelse ifeq (a,b) \\\n  junk\nA = 1\nelse\nA = 2\nendif\n",
+                3,
+            ),
+        ] {
+            assert_eq!(
+                parse_single_conditional(code, variant).0,
+                vec![(ParseErrorKind::ExtraneousText, line)],
+                "{code:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_comparison_continued_onto_blank_line() {
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        for code in [
+            "ifeq (a,b) \\\n\nA = 1\nelse\nA = 2\nendif\n",
+            "ifeq (a,b) \\\n   \nA = 1\nelse\nA = 2\nendif\n",
+            "ifeq (a,b) \\\n  # c\nA = 1\nelse\nA = 2\nendif\n",
+        ] {
+            let (errors, _, else_body) = parse_single_conditional(code, variant);
+            assert_eq!(
+                (errors, else_body),
+                (vec![], Some("A = 2\n".to_string())),
+                "{code:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_conditional_extraneous_text_tree() {
     let code = "ifdef X\nelse junk\nendif junk\n";
     let parsed = parse(code, None);
@@ -265,6 +313,31 @@ fn test_nested_else_extraneous_text() {
         parse_single_conditional(code, None).0,
         vec![(ParseErrorKind::ExtraneousText, 3)]
     );
+}
+
+#[test]
+fn test_block_directive_extraneous_text_on_continuation_line() {
+    for (variant, code, expected) in [
+        (
+            Some(MakefileVariant::BSDMake),
+            ".if 1\n.endif \\\n  junk\n",
+            vec![ParseErrorKind::ExtraneousText],
+        ),
+        (
+            Some(MakefileVariant::BSDMake),
+            ".endif \\\n  junk\n",
+            vec![ParseErrorKind::ExtraneousEndif],
+        ),
+        (
+            Some(MakefileVariant::NMake),
+            "!IF 1\n!ENDIF \\\n  junk\n",
+            vec![ParseErrorKind::ExtraneousText],
+        ),
+    ] {
+        let parsed = parse(code, variant);
+        assert_eq!(parsed.root().to_string(), code);
+        assert_eq!(error_kinds(code, variant), expected, "{code:?}");
+    }
 }
 
 #[test]
