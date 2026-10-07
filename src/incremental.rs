@@ -1,12 +1,13 @@
 //! Incremental reparsing support for efficient handling of text edits.
 //!
-//! Instead of reparsing the entire file after each edit, this module identifies
-//! which top-level items are affected and reparses only those, splicing the
-//! results back into the existing green tree.
+//! Instead of reparsing the entire file after each edit, this module reparses
+//! only the top-level items between the nearest points around the edit where
+//! the parser state is known, splicing the results back into the existing
+//! green tree.
 
 use crate::lossless::{ErrorInfo, Makefile, PositionedParseError};
 use crate::parse::Parse;
-use rowan::TextRange;
+use rowan::{NodeOrToken, TextRange, TextSize};
 
 /// A text edit applied to the source, as typically received from an LSP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,154 +77,150 @@ impl Parse<Makefile> {
     /// ```
     pub fn apply_edit(&self, old_text: &str, edit: &TextEdit) -> (Self, String) {
         let new_text = apply_edit_to_text(old_text, edit);
-        let delta = edit.delta();
+        let new_parse = self.reparse(old_text, &new_text, edit).unwrap_or_else(|| {
+            let parsed = crate::lossless::parse(&new_text, self.variant());
+            Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+                .with_variant(self.variant())
+        });
+        (new_parse, new_text)
+    }
 
-        // Walk the ROOT green node's children to find which ones overlap the edit range.
+    /// Reparse the part of `new_text` affected by `edit`, or return `None`
+    /// if only a full parse is known to give the right result.
+    ///
+    /// The reparsed region starts and ends at sync points: top-level
+    /// children after which the parser and lexer are in their initial state,
+    /// so that parsing the region on its own gives the same result as
+    /// parsing it as part of the whole text.
+    fn reparse(&self, old_text: &str, new_text: &str, edit: &TextEdit) -> Option<Self> {
+        // A .RECIPEPREFIX assignment changes how all later lines are lexed.
+        if old_text.contains(".RECIPEPREFIX") || new_text.contains(".RECIPEPREFIX") {
+            return None;
+        }
+
         let old_green = self.green();
         let children: Vec<_> = old_green.children().map(|c| c.to_owned()).collect();
-
-        // Compute the text range of each direct child of ROOT.
         let mut child_ranges: Vec<TextRange> = Vec::with_capacity(children.len());
-        let mut offset = rowan::TextSize::from(0);
+        let mut offset = TextSize::from(0);
         for child in &children {
             let len = match child {
-                rowan::NodeOrToken::Node(n) => n.text_len(),
-                rowan::NodeOrToken::Token(t) => t.text_len(),
+                NodeOrToken::Node(n) => n.text_len(),
+                NodeOrToken::Token(t) => t.text_len(),
             };
-            child_ranges.push(TextRange::new(offset, offset + len));
+            child_ranges.push(TextRange::at(offset, len));
             offset += len;
         }
+        let is_sync = |i: usize| is_sync_point(&children[i], &old_text[child_ranges[i]]);
 
-        if children.is_empty() {
-            // Empty tree — just do a full parse.
-            let parsed = crate::lossless::parse(&new_text, self.variant());
-            let new_parse = Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
-                .with_variant(self.variant());
-            return (new_parse, new_text);
-        }
+        // Start after the last sync point that the edit leaves untouched.
+        let first = (0..children.len())
+            .rev()
+            .find(|&i| child_ranges[i].end() <= edit.range.start() && is_sync(i))
+            .map_or(0, |i| i + 1);
+        let start = child_ranges
+            .get(first)
+            .map_or(TextSize::of(old_text), |r| r.start());
 
-        // Find the first and last children that overlap or are adjacent to the edit range.
-        let first_affected = child_ranges
-            .iter()
-            .position(|r| r.end() > edit.range.start())
-            .unwrap_or(children.len().saturating_sub(1));
+        // End at the first sync point after the edit, if it is parsed the same
+        // way as before. Otherwise parse up to the end of the text.
+        let sync_end = (first..children.len())
+            .find(|&i| child_ranges[i].start() >= edit.range.end() && is_sync(i))
+            .and_then(|last| {
+                let end = shift(child_ranges[last].end(), edit.delta());
+                let reparsed =
+                    crate::lossless::parse(&new_text[TextRange::new(start, end)], self.variant());
+                let same_end = reparsed.green_node.children().last().map(|c| c.to_owned())
+                    == Some(children[last].clone());
+                same_end.then_some((last + 1, reparsed))
+            });
+        let to_eof = sync_end.is_none();
+        let (end_index, reparsed) = sync_end.unwrap_or_else(|| {
+            (
+                children.len(),
+                crate::lossless::parse(&new_text[usize::from(start)..], self.variant()),
+            )
+        });
+        let old_end = if to_eof {
+            TextSize::of(old_text)
+        } else {
+            child_ranges[end_index - 1].end()
+        };
+        let new_end = shift(old_end, edit.delta());
 
-        let last_affected = child_ranges
-            .iter()
-            .rposition(|r| r.start() < edit.range.end())
-            .unwrap_or(first_affected);
-
-        // The reparse region in the *old* text.
-        let reparse_start = child_ranges[first_affected].start();
-        let reparse_end_old = child_ranges[last_affected].end();
-
-        // The corresponding region in the *new* text.
-        // Everything before first_affected is unchanged, so reparse_start is the same.
-        // The end shifts by the delta.
-        let reparse_end_new =
-            rowan::TextSize::from((u32::from(reparse_end_old) as i64 + delta) as u32);
-
-        let reparse_region =
-            &new_text[u32::from(reparse_start) as usize..u32::from(reparse_end_new) as usize];
-
-        // Reparse just the affected region.
-        let reparsed = crate::lossless::parse(reparse_region, self.variant());
-        let reparsed_root = reparsed.green_node;
-
-        // Build the new ROOT by splicing: [old children before] + [reparsed children] + [old children after]
         let new_root = old_green.splice_children(
-            first_affected..last_affected + 1,
-            reparsed_root.children().map(|c| c.to_owned()),
+            first..end_index,
+            reparsed.green_node.children().map(|c| c.to_owned()),
         );
 
-        // Rebuild errors: keep errors outside the affected region, add reparsed errors with adjusted positions.
-        let mut new_errors = Vec::new();
-        let mut new_positioned_errors = Vec::new();
-
-        // ErrorInfo uses line numbers, not byte offsets, so count the lines
-        // before the reparse region.
-        let line_offset = old_text[..u32::from(reparse_start) as usize]
+        // ErrorInfo uses line numbers, so count the lines before the region
+        // and the change in the number of lines in it.
+        let line_offset = old_text[..usize::from(start)].matches('\n').count();
+        let line_delta = new_text[TextRange::new(start, new_end)]
             .matches('\n')
-            .count();
+            .count() as i64
+            - old_text[TextRange::new(start, old_end)]
+                .matches('\n')
+                .count() as i64;
 
-        // Errors before the affected region (unchanged).
-        new_errors.extend(
-            self.errors()
-                .iter()
-                .filter(|err| err.line <= line_offset)
-                .cloned(),
-        );
-
-        // Errors from the reparsed region (adjusted line numbers).
-        for err in &reparsed.errors {
-            new_errors.push(ErrorInfo {
+        let old_errors = self.errors().iter().zip(self.positioned_errors());
+        let mut errors = Vec::new();
+        let mut positioned_errors = Vec::new();
+        for (err, positioned) in old_errors.clone() {
+            if positioned.range.start() < start {
+                errors.push(err.clone());
+                positioned_errors.push(positioned.clone());
+            }
+        }
+        for (err, positioned) in reparsed.errors.iter().zip(&reparsed.positioned_errors) {
+            errors.push(ErrorInfo {
                 line: err.line + line_offset,
                 ..err.clone()
             });
+            positioned_errors.push(PositionedParseError {
+                range: positioned.range + start,
+                ..positioned.clone()
+            });
         }
-
-        // Errors after the affected region (adjusted line numbers).
-        let old_lines_in_region = old_text
-            [u32::from(reparse_start) as usize..u32::from(reparse_end_old) as usize]
-            .matches('\n')
-            .count();
-        let new_lines_in_region = reparse_region.matches('\n').count();
-        let line_delta = new_lines_in_region as i64 - old_lines_in_region as i64;
-        let lines_after_start = line_offset + old_lines_in_region;
-        for err in self.errors() {
-            if err.line > lines_after_start {
-                new_errors.push(ErrorInfo {
+        for (err, positioned) in old_errors {
+            if !to_eof && positioned.range.start() >= old_end {
+                errors.push(ErrorInfo {
                     line: (err.line as i64 + line_delta) as usize,
                     ..err.clone()
                 });
-            }
-        }
-
-        // Positioned errors before.
-        for err in self.positioned_errors() {
-            if err.range.end() <= reparse_start {
-                new_positioned_errors.push(err.clone());
-            }
-        }
-
-        // Positioned errors from reparsed region (shifted by reparse_start).
-        for err in &reparsed.positioned_errors {
-            new_positioned_errors.push(PositionedParseError {
-                range: TextRange::new(
-                    err.range.start() + reparse_start,
-                    err.range.end() + reparse_start,
-                ),
-                ..err.clone()
-            });
-        }
-
-        // Positioned errors after (shifted by delta).
-        for err in self.positioned_errors() {
-            if err.range.start() >= reparse_end_old {
-                let shift = rowan::TextSize::from(delta.unsigned_abs() as u32);
-                let (new_start, new_end) = if delta >= 0 {
-                    (err.range.start() + shift, err.range.end() + shift)
-                } else {
-                    (err.range.start() - shift, err.range.end() - shift)
-                };
-                new_positioned_errors.push(PositionedParseError {
-                    range: TextRange::new(new_start, new_end),
-                    ..err.clone()
+                positioned_errors.push(PositionedParseError {
+                    range: TextRange::new(
+                        shift(positioned.range.start(), edit.delta()),
+                        shift(positioned.range.end(), edit.delta()),
+                    ),
+                    ..positioned.clone()
                 });
             }
         }
 
-        // The reparsed region need not start at a line start, and lines may
-        // have shifted, so find the lines in the new tree.
+        // Lines may have shifted, so find the lines in the new tree.
         crate::lossless::locate_error_lines(
             &rowan::SyntaxNode::new_root(new_root.clone()),
-            &new_text,
-            &mut new_positioned_errors,
+            new_text,
+            &mut positioned_errors,
         );
-        let new_parse =
-            Parse::new(new_root, new_errors, new_positioned_errors).with_variant(self.variant());
-        (new_parse, new_text)
+        Some(Parse::new(new_root, errors, positioned_errors).with_variant(self.variant()))
     }
+}
+
+/// Whether the parser and lexer are back in their initial state after the
+/// top-level child `child` with text `text`. That is the case after a
+/// variable assignment that ends in a newline that does not continue it.
+fn is_sync_point(child: &NodeOrToken<rowan::GreenNode, rowan::GreenToken>, text: &str) -> bool {
+    child
+        .as_node()
+        .is_some_and(|n| n.kind() == crate::SyntaxKind::VARIABLE.into())
+        && text
+            .strip_suffix('\n')
+            .is_some_and(|line| !line.trim_end_matches('\r').ends_with('\\'))
+}
+
+fn shift(offset: TextSize, delta: i64) -> TextSize {
+    TextSize::from((u32::from(offset) as i64 + delta) as u32)
 }
 
 #[cfg(test)]
@@ -346,6 +343,27 @@ mod tests {
             old_children[0], new_children[0],
             "VAR1 green node should be identical (reused)"
         );
+    }
+
+    #[test]
+    fn test_incremental_reuses_nodes_after_edit() {
+        let old_text = "VAR1 = one\nVAR2 = two\nVAR3 = three\nVAR4 = four\n";
+        let parse = Parse::parse_makefile(old_text);
+        let edit = TextEdit::new(TextRange::new(18.into(), 21.into()), "TWO".to_string());
+        let (new_parse, _) = parse.apply_edit(old_text, &edit);
+
+        let node = |parse: &Parse<Makefile>, i: usize| {
+            parse
+                .green()
+                .children()
+                .nth(i)
+                .unwrap()
+                .into_node()
+                .unwrap() as *const _
+        };
+        assert!(std::ptr::eq(node(&parse, 0), node(&new_parse, 0)));
+        assert!(!std::ptr::eq(node(&parse, 1), node(&new_parse, 1)));
+        assert!(std::ptr::eq(node(&parse, 3), node(&new_parse, 3)));
     }
 
     #[test]
@@ -559,5 +577,138 @@ mod tests {
                 ParseErrorKind::ExtraneousEndif
             ]
         );
+    }
+
+    const SAMPLES: &[&str] = &[
+        "all:\n\techo\nA = a\n",
+        "A = a\nB = b\n",
+        "VAR1 = one\n# comment\nall: dep\n\techo $(VAR1) \\\n\t  more\n\nVAR2 = two\nclean:\n\trm -f x\n",
+        "ifdef DEBUG\nCFLAGS = -g\nelse\nCFLAGS = -O2\nendif\nA = a\nall:\n\t@echo $(A)\n",
+        "define FOO\necho a\nendef\nB := $(FOO)\ninclude x.mk\nC = c \\\n  d\n",
+        "all: a b\n\n\techo\n# c\n\techo2\nx = 1\n-include y.mk\n$(info hi)\n",
+        ".RECIPEPREFIX = >\nall:\n>echo a\nB = b\nc:\n>echo c\n",
+        "A = 1\n\n  foo bar\n\nB = 2\n\n  baz \\\n  qux\nendif\nC = 3",
+        "# c \\\nA = a\nall:\n B = b\n\techo\nexport C = c\r\nD = d\r\n",
+        ".if 1\nA = a\n.for x in a b\nB = b\n.endfor\n.endif\nC = c\n!IF 1\nD = d\n!ENDIF\n",
+        "override E = e\nundefine E\nall: F = f\nG = $(shell \\\n  ls)\nH = h\n",
+    ];
+
+    const INSERTIONS: &[&str] = &[
+        "\n", "\t", " ", "\\", ":", "=", "#", "x", "$", "(", ")", ";", "\r",
+    ];
+
+    fn assert_matches_full_parse(old_text: &str, edit: &TextEdit) {
+        let parse = Parse::<Makefile>::parse_makefile(old_text);
+        let (incremental, new_text) = parse.apply_edit(old_text, edit);
+        let full = Parse::<Makefile>::parse_makefile(&new_text);
+        assert_eq!(
+            format!("{:#?}", incremental.syntax_node()),
+            format!("{:#?}", full.syntax_node()),
+            "tree differs for {:?} with {:?}",
+            old_text,
+            edit
+        );
+        assert_eq!(
+            incremental.errors(),
+            full.errors(),
+            "errors differ for {:?} with {:?}",
+            old_text,
+            edit
+        );
+        assert_eq!(
+            incremental.positioned_errors(),
+            full.positioned_errors(),
+            "positioned errors differ for {:?} with {:?}",
+            old_text,
+            edit
+        );
+    }
+
+    fn insert(offset: u32, text: &str) -> TextEdit {
+        TextEdit::new(TextRange::empty(offset.into()), text.to_string())
+    }
+
+    #[test]
+    fn test_recipe_line_after_rule() {
+        assert_matches_full_parse("all:\n\techo\nA = a\n", &insert(11, "\techo2\n"));
+    }
+
+    #[test]
+    fn test_continuation_joins_next_line() {
+        assert_matches_full_parse("A = a\nB = b\n", &insert(5, " \\"));
+    }
+
+    #[test]
+    fn test_conditional_inserted_at_start() {
+        assert_matches_full_parse("A = a\nB = b\n", &insert(0, "ifdef X\n"));
+    }
+
+    #[test]
+    fn test_endif_inserted() {
+        assert_matches_full_parse("ifdef X\nA = a\nB = b\nendif\n", &insert(6, "\nendif\n"));
+    }
+
+    #[test]
+    fn test_define_opened() {
+        assert_matches_full_parse("A = a\nB = b\nC = c\n", &insert(6, "define B\n"));
+    }
+
+    #[test]
+    fn test_recipe_prefix_changed() {
+        assert_matches_full_parse(
+            ".RECIPEPREFIX = >\nall:\n>echo a\nB = b\nc:\n>echo c\n",
+            &TextEdit::new(TextRange::new(16.into(), 17.into()), "|".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_append_at_end_without_newline() {
+        assert_matches_full_parse("A = a\nB = b", &insert(11, " \\\nC = c\n"));
+    }
+
+    #[test]
+    fn test_all_single_char_edits() {
+        for sample in SAMPLES {
+            for offset in 0..=sample.len() as u32 {
+                for text in INSERTIONS {
+                    assert_matches_full_parse(sample, &insert(offset, text));
+                }
+                if (offset as usize) < sample.len() {
+                    let delete =
+                        TextEdit::new(TextRange::at(offset.into(), 1.into()), String::new());
+                    assert_matches_full_parse(sample, &delete);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_line_edits() {
+        let insertions = [
+            "ifdef X\n",
+            "endif\n",
+            "else\n",
+            "\techo\n",
+            "all:\n",
+            "define V\n",
+            "endef\n",
+            ".RECIPEPREFIX = >\n",
+            "A = \\\n",
+            "x: ; y\n",
+        ];
+        for sample in SAMPLES {
+            for offset in 0..=sample.len() as u32 {
+                for text in insertions {
+                    assert_matches_full_parse(sample, &insert(offset, text));
+                }
+                for len in 2..12u32 {
+                    if (offset + len) as usize <= sample.len() {
+                        let delete =
+                            TextEdit::new(TextRange::at(offset.into(), len.into()), String::new());
+                        assert_matches_full_parse(sample, &delete);
+                    }
+                }
+            }
+        }
     }
 }
