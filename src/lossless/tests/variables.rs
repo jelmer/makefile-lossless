@@ -230,6 +230,136 @@ fn test_target_specific_assignment_continuation_before_operator() {
 }
 
 #[test]
+fn test_target_specific_unexport() {
+    // (code, target, name, operator, value, unexport, export, override, private)
+    let cases = [
+        (
+            "all: unexport FOO = x\n",
+            "all",
+            "FOO",
+            "=",
+            "x",
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "%.o: unexport FOO = x\n",
+            "%.o",
+            "FOO",
+            "=",
+            "x",
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "all: override unexport FOO := x\n",
+            "all",
+            "FOO",
+            ":=",
+            "x",
+            true,
+            false,
+            true,
+            false,
+        ),
+        (
+            "all: unexport export FOO = x\n",
+            "all",
+            "FOO",
+            "=",
+            "x",
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "all: private unexport FOO += x\n",
+            "all",
+            "FOO",
+            "+=",
+            "x",
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            "all: unexport \\\n FOO = x\n",
+            "all",
+            "FOO",
+            "=",
+            "x",
+            true,
+            false,
+            false,
+            false,
+        ),
+    ];
+    for (code, target, name, op, value, unexport, export, override_, private) in cases {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?} {code:?}");
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            let rules: Vec<_> = root.rules().collect();
+            assert_eq!(1, rules.len(), "{variant:?} {code:?}");
+            assert_eq!(
+                vec![target.to_string()],
+                rules[0].targets().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                Vec::<String>::new(),
+                rules[0].prerequisites().collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
+            let var = rules[0].scoped_assignment().unwrap();
+            assert_eq!(
+                (
+                    Some(name.to_string()),
+                    Some(op.to_string()),
+                    Some(value.to_string()),
+                    unexport,
+                    export,
+                    override_,
+                    private,
+                ),
+                (
+                    var.name(),
+                    var.assignment_operator(),
+                    var.raw_value(),
+                    var.is_unexport(),
+                    var.is_export(),
+                    var.is_override(),
+                    var.is_private(),
+                ),
+                "{variant:?} {code:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_target_specific_unexport_without_value() {
+    // Without an assignment GNU make treats the words as prerequisites.
+    let code = "all: unexport FOO\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    let root = parsed.root();
+    assert_eq!(code, root.to_string());
+    let rule = root.rules().next().unwrap();
+    assert!(rule.scoped_assignment().is_none());
+    assert_eq!(
+        vec!["unexport".to_string(), "FOO".to_string()],
+        rule.prerequisites().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn test_no_target_specific_assignment_outside_gnu_and_bsd_make() {
     // POSIX make and nmake have no target-specific variables, so these
     // are prerequisites.

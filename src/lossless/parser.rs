@@ -1614,15 +1614,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.skip_ws();
         }
 
-        /// Whether `tokens` starts with an `export`/`override`/`private`
-        /// modifier followed by whitespace and the start of a variable name,
-        /// as in `all: export CFLAGS = -O2`.
+        /// Whether `tokens` starts with an `export`/`unexport`/`override`/
+        /// `private` modifier followed by whitespace and the start of a
+        /// variable name, as in `all: export CFLAGS = -O2`.
         fn at_assignment_modifier<'a, I>(mut tokens: std::iter::Peekable<I>) -> bool
         where
             I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
         {
             tokens.next().is_some_and(|(kind, text)| {
-                *kind == IDENTIFIER && matches!(text.as_str(), "export" | "override" | "private")
+                *kind == IDENTIFIER
+                    && matches!(
+                        text.as_str(),
+                        "export" | "unexport" | "override" | "private"
+                    )
             }) && Self::skip_ws_and_continuation_tokens(&mut tokens)
                 && matches!(tokens.peek(), Some((IDENTIFIER | DOLLAR | BACKSLASH, _)))
         }
