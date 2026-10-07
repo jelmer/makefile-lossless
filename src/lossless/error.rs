@@ -49,7 +49,8 @@ pub enum ParseErrorKind {
     /// A rule without a target.
     MissingTarget,
     /// An archive member reference such as `lib(member` without a closing
-    /// parenthesis.
+    /// parenthesis. Only BSD make rejects this; GNU make takes `lib(member`
+    /// as a plain file name.
     UnclosedArchiveMember,
     /// A variable reference such as `$(FOO` without a closing delimiter.
     UnclosedReference,
