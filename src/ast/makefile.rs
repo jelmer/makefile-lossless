@@ -4325,10 +4325,7 @@ VAR3 = value3
         let mut makefile: Makefile = "a:\n\techo\n".parse().unwrap();
         makefile.add_rule("b");
         assert_eq!(makefile.to_string(), "a:\n\techo\n\nb:\n");
-        // TODO: compare with a reparse once add_rule creates the
-        // PREREQUISITES node the parser does.
-        let rule = makefile.rules().next().unwrap();
-        assert_eq!(rule.syntax().to_string(), "a:\n\techo\n\n");
+        assert_matches_reparse(&makefile);
     }
 
     #[test]
