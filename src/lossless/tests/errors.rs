@@ -1084,11 +1084,29 @@ fn test_error_kind_variables_and_directives() {
     );
     assert_eq!(
         error_kinds("lib(member: foo\n", None),
-        vec![
-            ParseErrorKind::UnclosedArchiveMember,
-            ParseErrorKind::MissingSeparator
-        ]
+        vec![ParseErrorKind::UnclosedArchiveMember]
     );
+}
+
+#[test]
+fn test_unclosed_archive_member_at_line_end() {
+    // GNU make: "missing separator" on line 1.
+    for code in ["t(\nA = 1\n", "t(\n"] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.root().to_string(), code);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|e| (e.kind(), e.line))
+                .collect::<Vec<_>>(),
+            vec![
+                (ParseErrorKind::UnclosedArchiveMember, 1),
+                (ParseErrorKind::MissingSeparator, 1)
+            ],
+            "{code:?}"
+        );
+    }
 }
 
 #[test]
