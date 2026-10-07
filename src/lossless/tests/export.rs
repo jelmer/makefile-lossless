@@ -332,3 +332,86 @@ fn test_export_names_with_comment() {
     assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["A", "B"]);
     assert_eq!(vars[1].names().collect::<Vec<_>>(), Vec::<String>::new());
 }
+
+#[test]
+fn test_export_state() {
+    use crate::ExportState::{Export, Unexport};
+    // (code, is_export, is_unexport, export_state)
+    let cases = [
+        ("X = 1\n", false, false, None),
+        ("export X = 1\n", true, false, Some(Export)),
+        ("unexport X = 1\n", false, true, Some(Unexport)),
+        ("unexport export X = 1\n", true, true, Some(Export)),
+        ("export unexport X = 1\n", true, true, Some(Unexport)),
+        ("export unexport export X = 1\n", true, true, Some(Export)),
+        (
+            "unexport export unexport X = 1\n",
+            true,
+            true,
+            Some(Unexport),
+        ),
+        ("export export X = 1\n", true, false, Some(Export)),
+        (
+            "override unexport export X := 1\n",
+            true,
+            true,
+            Some(Export),
+        ),
+        (
+            "export override unexport X ?= 1\n",
+            true,
+            true,
+            Some(Unexport),
+        ),
+        ("unexport \\\n export X = 1\n", true, true, Some(Export)),
+        (
+            "unexport export define X\n1\nendef\n",
+            true,
+            true,
+            Some(Export),
+        ),
+        (
+            "export unexport define X =\n1\nendef\n",
+            true,
+            true,
+            Some(Unexport),
+        ),
+        (
+            "unexport override export define X\n1\nendef\n",
+            true,
+            true,
+            Some(Export),
+        ),
+        ("all: export X = 1\n", true, false, Some(Export)),
+        (
+            "all: private export override X = 1\n",
+            true,
+            false,
+            Some(Export),
+        ),
+        ("all: override X = 1\n", false, false, None),
+        ("export X\n", true, false, Some(Export)),
+        ("export\n", true, false, Some(Export)),
+        ("unexport\n", false, true, Some(Unexport)),
+        ("unexport export X\n", true, true, Some(Unexport)),
+        ("export unexport X\n", true, true, Some(Export)),
+        ("export undefine X\n", true, false, None),
+    ];
+    for (code, is_export, is_unexport, state) in cases {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let vars: Vec<_> = root.variable_definitions().collect();
+        assert_eq!(1, vars.len(), "{code:?}");
+        assert_eq!(
+            (is_export, is_unexport, state),
+            (
+                vars[0].is_export(),
+                vars[0].is_unexport(),
+                vars[0].export_state()
+            ),
+            "{code:?}"
+        );
+    }
+}

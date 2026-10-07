@@ -128,6 +128,17 @@ fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
     depth
 }
 
+/// Whether a variable is exported to recipe environments, as returned by
+/// [`VariableDefinition::export_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExportState {
+    /// `export`: the variable is passed to recipes.
+    Export,
+    /// `unexport`: the variable is not passed to recipes.
+    Unexport,
+}
+
 /// Whether `text` is an assignment operator token.
 fn is_assignment_operator(text: &str) -> bool {
     ASSIGNMENT_OPERATORS.contains(&text) || is_sunsh_operator(text)
@@ -641,7 +652,12 @@ impl VariableDefinition {
             .any(|t| t.text() == "undefine")
     }
 
-    /// Check if this variable definition is exported
+    /// Check if this variable definition uses the `export` directive
+    ///
+    /// This only reports whether the keyword is present. A line can have
+    /// both `export` and `unexport`, in which case both this and
+    /// [`Self::is_unexport`] return true; use [`Self::export_state`] for
+    /// whether GNU make actually exports the variable.
     pub fn is_export(&self) -> bool {
         self.directive_keywords()
             .iter()
@@ -649,6 +665,9 @@ impl VariableDefinition {
     }
 
     /// Check if this variable definition uses the `unexport` directive
+    ///
+    /// Like [`Self::is_export`], this only reports whether the keyword is
+    /// present; see [`Self::export_state`] for its effect.
     ///
     /// # Example
     /// ```
@@ -662,6 +681,48 @@ impl VariableDefinition {
         self.directive_keywords()
             .iter()
             .any(|t| t.text() == "unexport")
+    }
+
+    /// Whether GNU make exports this variable to recipe environments, as
+    /// set by the `export` and `unexport` keywords on this line, or None if
+    /// the line has neither (or is an `undefine` directive, which ignores
+    /// them). This applies to target-specific assignments too.
+    ///
+    /// In an assignment, including a `define` block, the last of the two
+    /// keywords wins, so `unexport export X = 1` exports X. In a bare
+    /// directive without an assignment, only the first word is a keyword:
+    /// `unexport export X` unexports both "export" and "X".
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{ExportState, Makefile};
+    /// let makefile: Makefile = "export unexport X = 1\nunexport export Y = 2\nZ = 3\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let states: Vec<_> = makefile
+    ///     .variable_definitions()
+    ///     .map(|v| v.export_state())
+    ///     .collect();
+    /// assert_eq!(
+    ///     states,
+    ///     vec![Some(ExportState::Unexport), Some(ExportState::Export), None]
+    /// );
+    /// ```
+    pub fn export_state(&self) -> Option<ExportState> {
+        if self.is_undefine() {
+            return None;
+        }
+        let state = |t: &crate::lossless::SyntaxToken| match t.text() {
+            "export" => Some(ExportState::Export),
+            "unexport" => Some(ExportState::Unexport),
+            _ => None,
+        };
+        let keywords = self.directive_keywords();
+        if self.is_define() || self.assignment_operator().is_some() {
+            keywords.iter().rev().find_map(state)
+        } else {
+            keywords.first().and_then(state)
+        }
     }
 
     /// Check if this variable definition uses the `override` directive

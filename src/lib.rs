@@ -49,6 +49,7 @@ mod text;
 pub use ast::conditional::{ConditionalBranch, ConditionalItem};
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::{RuleItem, RuleOperator};
+pub use ast::variable::ExportState;
 pub use bsd_condition::{
     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
     BsdConditionError, BsdConditionErrorKind, BsdFunction, BsdOperand,
