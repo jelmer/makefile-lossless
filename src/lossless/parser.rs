@@ -736,6 +736,29 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// Whether the `(` at the current token starts an archive member
+        /// list. GNU make takes a `(` without a matching `)` as part of a
+        /// plain file name, while BSD make rejects it.
+        fn at_archive_member_list(&self) -> bool {
+            if self.is_bsd_make() {
+                return true;
+            }
+            // Look for the `)` as `parse_archive_member_list` would.
+            let mut tokens = self.tokens.iter().rev().skip(1).peekable();
+            while let Some((kind, _)) = tokens.next() {
+                match kind {
+                    RPAREN => return true,
+                    IDENTIFIER | TEXT | WHITESPACE => {}
+                    BACKSLASH if tokens.next_if(|(k, _)| *k == NEWLINE).is_some() => {
+                        tokens.next_if(|(k, _)| *k == INDENT);
+                    }
+                    DOLLAR if Self::skip_variable_reference(&mut tokens) => {}
+                    _ => return false,
+                }
+            }
+            false
+        }
+
         /// Parse the parenthesized member list of an archive member
         /// reference such as `libfoo.a(bar.o baz.o)`, starting at the `(`.
         /// The archive name before it is left to the caller, as it may
@@ -847,7 +870,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // physical line.
             while let Some(kind) = self.current() {
                 match kind {
-                    LPAREN if archive_allowed && !seen_archive => {
+                    LPAREN if archive_allowed && !seen_archive && self.at_archive_member_list() => {
                         self.parse_archive_member_list();
                         seen_archive = true;
                         // BSD make ends the word at the `)`.
@@ -1925,7 +1948,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 match self.current() {
                     Some(OPERATOR) if self.at_literal_bang() => self.bump(),
                     Some(INDENT | NEWLINE | COMMENT | OPERATOR) | None => break,
-                    Some(LPAREN) if archive_allowed && !seen_archive => {
+                    Some(LPAREN)
+                        if archive_allowed && !seen_archive && self.at_archive_member_list() =>
+                    {
                         self.parse_archive_member_list();
                         seen_archive = true;
                     }

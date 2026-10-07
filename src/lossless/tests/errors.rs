@@ -1103,29 +1103,79 @@ fn test_error_kind_variables_and_directives() {
         vec![ParseErrorKind::MissingIncludePath]
     );
     assert_eq!(
-        error_kinds("lib(member: foo\n", None),
+        error_kinds("lib(member: foo\n", Some(MakefileVariant::BSDMake)),
         vec![ParseErrorKind::UnclosedArchiveMember]
     );
 }
 
 #[test]
 fn test_unclosed_archive_member_at_line_end() {
-    // GNU make: "missing separator" on line 1.
+    // GNU make: "missing separator" on line 1. BSD make: "No closing
+    // parenthesis in archive specification".
     for code in ["t(\nA = 1\n", "t(\n"] {
-        let parsed = parse(code, Some(MakefileVariant::GNUMake));
-        assert_eq!(parsed.root().to_string(), code);
-        assert_eq!(
-            parsed
-                .errors
-                .iter()
-                .map(|e| (e.kind(), e.line))
-                .collect::<Vec<_>>(),
-            vec![
-                (ParseErrorKind::UnclosedArchiveMember, 1),
-                (ParseErrorKind::MissingSeparator, 1)
-            ],
-            "{code:?}"
-        );
+        for (variant, expected) in [
+            (
+                Some(MakefileVariant::GNUMake),
+                vec![(ParseErrorKind::MissingSeparator, 1)],
+            ),
+            (
+                Some(MakefileVariant::BSDMake),
+                vec![
+                    (ParseErrorKind::UnclosedArchiveMember, 1),
+                    (ParseErrorKind::MissingSeparator, 1),
+                ],
+            ),
+        ] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.root().to_string(), code);
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.kind(), e.line))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{code:?} {variant:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_unclosed_archive_member_gnu() {
+    // GNU make takes a `(` without a `)` as part of a plain file name,
+    // ending it at whitespace as usual, while BSD make rejects it.
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        ("lib(member: foo\n\techo hi\n", &["lib(member"], &["foo"]),
+        ("all: lib(member\n", &["all"], &["lib(member"]),
+        ("lib(a b: foo\n", &["lib(a", "b"], &["foo"]),
+        ("x lib(m: lib(a b\n", &["x", "lib(m"], &["lib(a", "b"]),
+        ("lib(a \\\n b: foo\n", &["lib(a", "b"], &["foo"]),
+        ("lib($(X): foo\n", &["lib($(X)"], &["foo"]),
+    ];
+    for &(code, targets, prerequisites) in cases {
+        for variant in [None, Some(MakefileVariant::GNUMake)] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.root().to_string(), code);
+            assert_eq!(parsed.errors, vec![], "{code:?} {variant:?}");
+            let rule = parsed.root().rules().next().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), targets, "{code:?}");
+            assert_eq!(
+                rule.prerequisites().collect::<Vec<_>>(),
+                prerequisites,
+                "{code:?}"
+            );
+            assert_eq!(
+                rule.syntax()
+                    .descendants()
+                    .filter(|n| n.kind() == ARCHIVE_MEMBERS)
+                    .count(),
+                0,
+                "{code:?}"
+            );
+        }
+        let kinds = error_kinds(code, Some(MakefileVariant::BSDMake));
+        assert_eq!(kinds[0], ParseErrorKind::UnclosedArchiveMember, "{code:?}");
     }
 }
 
