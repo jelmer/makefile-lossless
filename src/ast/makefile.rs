@@ -133,10 +133,8 @@ fn needs_blank_line_before(root: &SyntaxNode, index: usize) -> bool {
 
 /// Whether the parser puts the blank lines after `node` in it: a rule's
 /// recipe continues after blank lines, unless the rule is a target-specific
-/// assignment.
-// TODO: BSD make target-local assignments, as in `a: X=1`, can be followed
-// by commands, so the parser puts blank lines after them in the rule too,
-// but the tree doesn't say which make it was parsed for.
+/// assignment. A BSD make target-local assignment with commands after it
+/// ends in those commands.
 fn takes_blank_lines(node: &SyntaxNode) -> bool {
     node.kind() == RULE
         && node

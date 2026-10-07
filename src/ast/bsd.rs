@@ -221,6 +221,7 @@ impl Directive {
 #[cfg(test)]
 mod tests {
     use crate::{Makefile, MakefileItem, MakefileVariant, ParseErrorKind, Rule, TextRange};
+    use rowan::ast::AstNode;
 
     fn parse_ok(text: &str) -> Makefile {
         let parsed = Makefile::parse(text);
@@ -1255,6 +1256,51 @@ mod tests {
             (None, "=".to_string(), "three".to_string())
         );
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo $@"]);
+    }
+
+    /// Check that `makefile` has the same tree as when its text is parsed
+    /// again for BSD make.
+    fn assert_matches_bsd_reparse(makefile: &Makefile) {
+        let reparsed = parse_bsd(&makefile.to_string());
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.syntax())
+        );
+    }
+
+    #[test]
+    fn test_target_local_assignment_blank_lines() {
+        // Commands after blank lines belong to the rule, as in other rules.
+        let makefile = parse_bsd("a: X=1\n\n\techo $X\n");
+        let rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo $X"]);
+        assert_eq!(rule.syntax().to_string(), "a: X=1\n\n\techo $X\n");
+
+        // Without commands, the blank lines and comments after it are not
+        // part of the rule.
+        for (text, rule_text) in [
+            ("a: X=1\n\nB=2\n", "a: X=1\n"),
+            ("a: X=1\n# c\nB=2\n", "a: X=1\n"),
+            ("a b:=1\n\nB=2\n", "a b:=1\n"),
+            ("a: X=1; echo\n\nB=2\n", "a: X=1; echo\n\n"),
+        ] {
+            let makefile = parse_bsd(text);
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(rule.syntax().to_string(), rule_text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_add_rule_after_target_local_assignment() {
+        let mut makefile = parse_bsd("a: X=1\n");
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "a: X=1\n\nb:\n");
+        assert_matches_bsd_reparse(&makefile);
+
+        let mut makefile = parse_bsd("a: X=1\n\techo $X\n");
+        makefile.add_rule("b");
+        assert_eq!(makefile.to_string(), "a: X=1\n\techo $X\n\nb:\n");
+        assert_matches_bsd_reparse(&makefile);
     }
 
     #[test]

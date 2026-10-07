@@ -1576,9 +1576,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.builder.token(OPERATOR.into(), assignment_op);
                         self.skip_ws();
                         if self.is_bsd_make() {
-                            self.parse_bsd_target_local_value();
-                            self.in_rule = RuleContext::Inside;
-                            self.parse_rule_recipes();
+                            let inline_recipe = self.parse_bsd_target_local_value();
+                            self.parse_target_local_recipes(inline_recipe);
                         } else {
                             self.parse_assignment_value();
                             self.builder.finish_node(); // VARIABLE
@@ -1616,16 +1615,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_rule_dependencies(target_locals);
                     }
                     if target_locals && self.is_bsd_target_local_assignment() {
-                        self.parse_bsd_target_local_assignment();
-                    } else if self.current() == Some(TEXT) && self.at_text(";") {
-                        self.parse_inline_recipe();
+                        let inline_recipe = self.parse_bsd_target_local_assignment();
+                        self.parse_target_local_recipes(inline_recipe);
                     } else {
-                        self.expect_eol();
+                        if self.current() == Some(TEXT) && self.at_text(";") {
+                            self.parse_inline_recipe();
+                        } else {
+                            self.expect_eol();
+                        }
+                        self.in_rule = RuleContext::Inside;
+                        self.parse_rule_recipes();
                     }
-
-                    // Parse recipe lines
-                    self.in_rule = RuleContext::Inside;
-                    self.parse_rule_recipes();
                 }
             } else if has_target && self.is_bsd_make() {
                 // BSD make starts a new, empty list of targets before parsing
@@ -1902,8 +1902,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// GNU make, it may follow other sources and the line may have
         /// commands. Whether make actually assigns the variable depends on
         /// `.MAKE.TARGET_LOCAL_VARIABLES` at that point, which is left to
-        /// the caller.
-        fn parse_bsd_target_local_assignment(&mut self) {
+        /// the caller. Returns whether the line has a command after `;`.
+        fn parse_bsd_target_local_assignment(&mut self) -> bool {
             self.builder.start_node(VARIABLE.into());
             self.skip_ws_and_continuations();
             self.parse_bsd_variable_name();
@@ -1926,12 +1926,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
             self.skip_ws();
-            self.parse_bsd_target_local_value();
+            self.parse_bsd_target_local_value()
         }
 
         /// Parse the value of a BSD make target-local assignment, which ends
         /// at a `;` that starts a command, and finish the `VARIABLE` node.
-        fn parse_bsd_target_local_value(&mut self) {
+        /// Returns whether there is such a command.
+        fn parse_bsd_target_local_value(&mut self) -> bool {
             self.builder.start_node(EXPR.into());
             loop {
                 match self.current() {
@@ -1946,9 +1947,22 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if self.at_text(";") {
                 self.builder.finish_node(); // VARIABLE
                 self.parse_inline_recipe();
+                true
             } else {
                 self.expect_eol();
                 self.builder.finish_node(); // VARIABLE
+                false
+            }
+        }
+
+        /// Parse the commands after a BSD make target-local assignment line.
+        /// Unless the line has a command, the blank lines and comments after
+        /// it only go in the rule if more commands follow, so that the tree
+        /// is the same as for a GNU make target-specific assignment.
+        fn parse_target_local_recipes(&mut self, inline_recipe: bool) {
+            self.in_rule = RuleContext::Inside;
+            if inline_recipe || self.recipe_continues() {
+                self.parse_rule_recipes();
             }
         }
 
