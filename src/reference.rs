@@ -6,6 +6,7 @@
 //! `$(SRCS:.c=.o)`.
 
 use crate::MakefileVariant;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// A piece of a [`ModifierArg`].
@@ -904,6 +905,10 @@ impl Delims {
 /// building and dropping the tree does not run out of stack.
 pub(crate) const MAX_DEPTH: usize = 128;
 
+/// The outcome of parsing the expression at some position: the result,
+/// the position after it and the spans found in it.
+type ParsedExpr = (Result<(), ReferenceError>, usize, Vec<Range<usize>>);
+
 struct Parser<'a> {
     text: &'a str,
     pos: usize,
@@ -911,6 +916,12 @@ struct Parser<'a> {
     spans: Vec<Range<usize>>,
     /// The number of expressions being parsed that enclose the position.
     depth: usize,
+    /// The braced expressions parsed so far, by their start, the length of
+    /// the text and the depth, since a modifier may be parsed in more than
+    /// one way and the expressions in a pattern are parsed again on their
+    /// own. Without this, parsing nested expressions takes time exponential
+    /// in their depth.
+    parsed: HashMap<(usize, usize, usize), ParsedExpr>,
 }
 
 impl<'a> Parser<'a> {
@@ -920,7 +931,25 @@ impl<'a> Parser<'a> {
             pos: 0,
             spans: vec![],
             depth: 0,
+            parsed: HashMap::new(),
         }
+    }
+
+    /// A parser for `text`, a prefix of the text of this one, at the same
+    /// depth, sharing the expressions parsed so far. Hand them back with
+    /// [`Self::join`].
+    fn fork(&mut self, text: &'a str, pos: usize) -> Parser<'a> {
+        Parser {
+            text,
+            pos,
+            spans: vec![],
+            depth: self.depth,
+            parsed: std::mem::take(&mut self.parsed),
+        }
+    }
+
+    fn join(&mut self, other: &mut Parser<'a>) {
+        self.parsed = std::mem::take(&mut other.parsed);
     }
 
     fn rest(&self) -> &'a str {
@@ -959,6 +988,24 @@ impl<'a> Parser<'a> {
         self.depth += 1;
         let result = self.parse_expr_inner();
         self.depth -= 1;
+        result
+    }
+
+    /// Parse a nested expression starting at `$`, like
+    /// [`Self::parse_expr`], without the result.
+    fn skip_expr(&mut self) -> Result<(), ReferenceError> {
+        let key = (self.pos, self.text.len(), self.depth);
+        if let Some((result, pos, spans)) = self.parsed.get(&key) {
+            self.pos = *pos;
+            self.spans.extend(spans.iter().cloned());
+            return result.clone();
+        }
+        let spans = self.spans.len();
+        let result = self.parse_expr().map(|_| ());
+        self.parsed.insert(
+            key,
+            (result.clone(), self.pos, self.spans[spans..].to_vec()),
+        );
         result
     }
 
@@ -1055,7 +1102,7 @@ impl<'a> Parser<'a> {
             }
             match self.peek_nth(1) {
                 Some('(' | '{') => {
-                    self.parse_expr()?;
+                    self.skip_expr()?;
                 }
                 None => {
                     return Err(syntax_error(
@@ -1729,7 +1776,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         match self.peek_nth(1) {
             Some('(' | '{') => {
-                self.parse_expr()?;
+                self.skip_expr()?;
                 arg.push_expr(&self.text[start..self.pos]);
             }
             Some('$') => {
@@ -1756,19 +1803,17 @@ impl<'a> Parser<'a> {
     /// Record the expressions in the raw text at `raw`, which make expands
     /// only after parsing the modifier.
     fn record_raw_spans(&mut self, raw: Range<usize>) {
-        let mut parser = Parser::new(&self.text[..raw.end]);
-        parser.pos = raw.start;
-        parser.depth = self.depth;
+        let mut parser = self.fork(&self.text[..raw.end], raw.start);
         while let Some(offset) = parser.rest().find('$') {
             parser.pos += offset;
             let dollar = parser.pos;
             match parser.peek_nth(1) {
                 None => break,
                 Some('(' | '{') => {
-                    let mut nested = Parser::new(parser.text);
-                    nested.pos = dollar;
-                    nested.depth = parser.depth;
-                    if nested.parse_expr().is_ok() {
+                    let mut nested = parser.fork(parser.text, dollar);
+                    let ok = nested.skip_expr().is_ok();
+                    parser.join(&mut nested);
+                    if ok {
                         parser.spans.extend(nested.spans);
                         parser.pos = nested.pos;
                     } else {
@@ -1782,6 +1827,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        self.join(&mut parser);
         self.spans.extend(parser.spans);
     }
 
@@ -3648,5 +3694,32 @@ mod tests {
                 "{open}"
             );
         }
+    }
+
+    #[test]
+    fn test_deeply_nested() {
+        // Parsing these took time exponential in the nesting depth.
+        let nest = |open: &str, close: &str| {
+            (0..40).fold("a".to_string(), |inner, _| format!("{open}{inner}{close}"))
+        };
+        let sysv = nest("${X:", "=b}");
+        let parsed = bsd(&sysv);
+        assert_eq!(parsed.name, "X");
+        assert_eq!(
+            parsed.modifiers,
+            vec![Modifier::SysVSubstitute {
+                from: ModifierArg::new([expr(&sysv[4..sysv.len() - 3])]),
+                to: lit("b"),
+            }]
+        );
+        let matches = nest("${X:M", "}");
+        assert_eq!(
+            bsd(&matches).modifiers,
+            vec![Modifier::Match(matches[5..matches.len() - 1].to_string())]
+        );
+        let unclosed = &matches[..matches.len() - 1];
+        assert!(ParsedReference::parse(unclosed, BSDMake).is_err());
+        assert!(crate::Makefile::parse_with_variant(&format!("Y = {sysv}\n"), BSDMake).ok());
+        assert!(crate::Makefile::parse_with_variant(&format!("Y = {matches}\n"), BSDMake).ok());
     }
 }
