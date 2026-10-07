@@ -66,9 +66,14 @@ fn breaks_line(text: &str) -> bool {
 }
 
 /// The EXPR node of the single variable definition in `text`, followed by
-/// another line, if it parses without errors and its raw value is `value`.
-fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossless::Lang>> {
-    let parsed = parse(&format!("{text}Z = 1\n"), None);
+/// another line, if it parses as `variant` without errors and its raw value
+/// is `value`.
+fn parse_value_expr(
+    text: &str,
+    value: &str,
+    variant: Option<MakefileVariant>,
+) -> Option<SyntaxNode<crate::lossless::Lang>> {
+    let parsed = parse(&format!("{text}Z = 1\n"), variant);
     if !parsed.errors.is_empty() {
         return None;
     }
@@ -83,28 +88,44 @@ fn parse_value_expr(text: &str, value: &str) -> Option<SyntaxNode<crate::lossles
 }
 
 /// The EXPR node for `value` as the value of an assignment on a single
-/// line, with each `#` that would start a comment escaped.
+/// line, parsed as `variant`, with each `#` that would start a comment
+/// escaped.
 ///
 /// GNU make halves the backslashes before a `#`, and an odd one left over
 /// escapes it, so the backslashes before such a `#` are doubled and one is
-/// added. BSD make keeps all but the last of them.
-fn single_line_value_expr(value: &str) -> Option<SyntaxNode<crate::lossless::Lang>> {
+/// added. BSD make keeps all but the last of them, so for BSD make only one
+/// is added. nmake escapes `#` with a caret instead.
+fn single_line_value_expr(
+    value: &str,
+    variant: Option<MakefileVariant>,
+) -> Option<SyntaxNode<crate::lossless::Lang>> {
     let mut value = value.to_string();
+    // Where the next comment has to start for an escape to have worked.
+    let mut escaped_end = 0;
     loop {
         let text = format!("X = {value}\n");
-        if let Some(expr) = parse_value_expr(&text, &value) {
+        if let Some(expr) = parse_value_expr(&text, &value, variant) {
             return Some(expr);
         }
-        let comment = parse(&text, None)
+        let comment = parse(&text, variant)
             .root()
             .syntax()
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .find(|t| t.kind() == COMMENT)?;
         let pos = usize::from(comment.text_range().start()) - "X = ".len();
+        if pos < escaped_end {
+            return None;
+        }
         let before = &value[..pos];
         let backslashes = before.len() - before.trim_end_matches('\\').len();
-        value.insert_str(pos, &"\\".repeat(backslashes + 1));
+        let escape = match variant {
+            Some(MakefileVariant::BSDMake) => "\\".to_string(),
+            Some(MakefileVariant::NMake) => "^".to_string(),
+            _ => "\\".repeat(backslashes + 1),
+        };
+        value.insert_str(pos, &escape);
+        escaped_end = pos + escape.len() + 1;
     }
 }
 
@@ -1315,6 +1336,71 @@ impl VariableDefinition {
     /// assert_eq!(makefile.code(), "VAR = a\\#b\n");
     /// ```
     pub fn try_set_value(&mut self, new_value: &str) -> Result<(), Error> {
+        self.set_value_with(new_value, None)
+    }
+
+    /// Update the value of this variable definition, like
+    /// [`Self::set_value`], checking that `variant` reads it back.
+    ///
+    /// [`Self::set_value`] checks the value the way the parser reads it
+    /// without a variant, which may differ from how `variant` reads it:
+    /// BSD make, for one, reads a `#` inside a variable reference as the
+    /// start of a comment. Each `#` that would start a comment is escaped
+    /// the way `variant` reads it: for BSD make with a single backslash,
+    /// as it does not halve the backslashes before it, and for nmake with
+    /// a caret.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `variant` would not read `new_value` back, as described
+    /// for [`Self::try_set_value_for`], which returns an error instead.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// var.set_value_for("${A:S/a/#/}", MakefileVariant::BSDMake);
+    /// assert_eq!(makefile.code(), "X = ${A:S/a/\\#/}\n");
+    /// ```
+    pub fn set_value_for(&mut self, new_value: &str, variant: MakefileVariant) {
+        self.try_set_value_for(new_value, variant)
+            .unwrap_or_else(|e| panic!("invalid variable value: {e}"))
+    }
+
+    /// Update the value of this variable definition, like
+    /// [`Self::set_value_for`]
+    ///
+    /// Returns an error, leaving the definition unchanged, in the cases
+    /// described for [`Self::try_set_value`], with the text read as
+    /// `variant` reads it. For BSD make, which strips trailing whitespace
+    /// from a value, also returns an error if `new_value` ends in
+    /// whitespace. For nmake, a `#` in a quoted string can not be escaped.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.try_set_value_for("a ", MakefileVariant::BSDMake).is_err());
+    /// var.try_set_value_for("a#b", MakefileVariant::BSDMake).unwrap();
+    /// assert_eq!(makefile.code(), "X = a\\#b\n");
+    /// ```
+    pub fn try_set_value_for(
+        &mut self,
+        new_value: &str,
+        variant: MakefileVariant,
+    ) -> Result<(), Error> {
+        self.set_value_with(new_value, Some(variant))
+    }
+
+    /// Internal: set the value, checking that the parser reads it back when
+    /// parsing as `variant`.
+    fn set_value_with(
+        &mut self,
+        new_value: &str,
+        variant: Option<MakefileVariant>,
+    ) -> Result<(), Error> {
         let new_expr = if self.is_define() {
             let eol = line_ending(self.syntax());
             // The body as raw_value returns it, with LF line endings.
@@ -1323,14 +1409,13 @@ impl VariableDefinition {
                 value.push('\n');
             }
             let body = value.replace('\n', &eol);
-            parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &value).ok_or_else(
-                || {
+            parse_value_expr(&format!("define X{eol}{body}endef{eol}"), &value, variant)
+                .ok_or_else(|| {
                     edit_error(
                         "set_value",
                         format!("Cannot write {new_value:?} as the body of a define block"),
                     )
-                },
-            )?
+                })?
         } else {
             if breaks_line(new_value) {
                 return Err(edit_error(
@@ -1338,12 +1423,16 @@ impl VariableDefinition {
                     format!("Cannot write {new_value:?} as a value on a single line"),
                 ));
             }
-            single_line_value_expr(new_value).ok_or_else(|| {
-                edit_error(
-                    "set_value",
-                    format!("Cannot write {new_value:?} as a variable value"),
-                )
-            })?
+            let strips_trailing =
+                variant == Some(MakefileVariant::BSDMake) && new_value.ends_with([' ', '\t']);
+            single_line_value_expr(new_value, variant)
+                .filter(|_| !strips_trailing)
+                .ok_or_else(|| {
+                    edit_error(
+                        "set_value",
+                        format!("Cannot write {new_value:?} as a variable value"),
+                    )
+                })?
         };
 
         let Some(mut expr) = self.value_expr() else {
@@ -3073,6 +3162,88 @@ mod tests {
             set_value_escaped("X = old\n", "a\\\\#b", false),
             "X = a\\\\\\\\\\#b\n"
         );
+    }
+
+    /// Set the value of the only variable definition in `text`, parsed as
+    /// `variant`, and check that `variant` reads `value` back.
+    fn set_value_for(text: &str, value: &str, variant: MakefileVariant) -> Result<String, Error> {
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        if let Err(e) = var.try_set_value_for(value, variant) {
+            assert_eq!(makefile.code(), text);
+            return Err(e);
+        }
+        let reparsed = Makefile::parse_with_variant(&makefile.code(), variant);
+        assert_eq!(reparsed.errors(), &[]);
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.tree().syntax())
+        );
+        assert_eq!(var.value(variant).as_deref(), Some(value));
+        Ok(makefile.code())
+    }
+
+    #[test]
+    fn test_set_value_for_escapes_hash() {
+        use MakefileVariant::*;
+        for variant in [GNUMake, POSIXMake] {
+            assert_eq!(
+                set_value_for("X = old\n", "a#b", variant).unwrap(),
+                "X = a\\#b\n"
+            );
+            assert_eq!(
+                set_value_for("X = old\n", "a\\\\#b", variant).unwrap(),
+                "X = a\\\\\\\\\\#b\n"
+            );
+        }
+        assert_eq!(
+            set_value_for("X  =\told # c\n", "a#b", BSDMake).unwrap(),
+            "X  =\ta\\#b # c\n"
+        );
+        // BSD make keeps all but the last backslash before a `#`.
+        assert_eq!(
+            set_value_for("X = old\n", "a\\\\#b", BSDMake).unwrap(),
+            "X = a\\\\\\#b\n"
+        );
+        // BSD make reads a `#` in a reference as a comment too.
+        assert_eq!(
+            set_value_for("X = old\n", "$(subst a,b,#)", BSDMake).unwrap(),
+            "X = $(subst a,b,\\#)\n"
+        );
+        assert_eq!(
+            set_value_for("X = old\n", "a#b", NMake).unwrap(),
+            "X = a^#b\n"
+        );
+    }
+
+    #[test]
+    fn test_try_set_value_for_unrepresentable() {
+        use MakefileVariant::*;
+        // BSD make strips trailing whitespace from a value.
+        for value in ["a ", "a\t", "a \\\n "] {
+            let error = set_value_for("X = old\n", value, BSDMake).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Parse error: Error at line 1: Cannot write {value:?} as a variable value\n1| set_value\n"
+                )
+            );
+        }
+        assert_eq!(
+            set_value_for("X = old\n", "a ", GNUMake).unwrap(),
+            "X = a \n"
+        );
+        // A caret does not escape a `#` in a quoted string in nmake.
+        assert!(set_value_for("X = old\n", "\"a#b\"", NMake).is_err());
+        assert!(set_value_for("X = old\n", " a", GNUMake).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot write \"a \" as a variable value")]
+    fn test_set_value_for_trailing_whitespace() {
+        let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_value_for("a ", MakefileVariant::BSDMake);
     }
 
     #[test]
