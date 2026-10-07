@@ -45,9 +45,14 @@ pub struct Lexer<'a> {
     /// The character that starts a recipe line, set with GNU make's
     /// `.RECIPEPREFIX`.
     recipe_prefix: char,
-    /// Text of the current logical line, if it is not a recipe line.
+    /// Text of the current logical line, unless it is a recipe line or
+    /// its first word shows that it can't start a `define` block or assign
+    /// to `.RECIPEPREFIX`.
     line: Option<String>,
-    /// Text of the current logical line, including recipe lines.
+    /// Whether the first word of the current logical line has been seen.
+    line_checked: bool,
+    /// Text of the current logical line, including recipe lines, if it is
+    /// in a `define` block.
     raw_line: String,
     /// The GNU make `define` whose body is being read, if any.
     define: Option<Define>,
@@ -113,6 +118,7 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             line: Some(String::new()),
+            line_checked: false,
             raw_line: String::new(),
             define: None,
             nmake_definition: None,
@@ -205,6 +211,28 @@ impl<'a> Lexer<'a> {
                 .into_iter()
                 .find(|op| rest.starts_with(op)),
         )
+    }
+
+    /// Stop collecting the text of the current line if `token` is the
+    /// first word on it, and the line can't start a `define` block or assign
+    /// to `.RECIPEPREFIX`: it doesn't start with `define`, `.RECIPEPREFIX`
+    /// or a modifier such as `override`.
+    fn check_line_start(&mut self, token: &(SyntaxKind, String)) {
+        if self.line_checked
+            || matches!(
+                token.0,
+                SyntaxKind::WHITESPACE
+                    | SyntaxKind::INDENT
+                    | SyntaxKind::BACKSLASH
+                    | SyntaxKind::NEWLINE
+            )
+        {
+            return;
+        }
+        self.line_checked = true;
+        if !token.1.starts_with(['d', '.', 'o', 'e', 'u', 'p']) {
+            self.line = None;
+        }
     }
 
     /// Update the recipe prefix if `line` assigns to `.RECIPEPREFIX`.
@@ -718,12 +746,18 @@ impl Iterator for Lexer<'_> {
         if self.gnu {
             if self.line_type == Some(LineType::Recipe) {
                 self.line = None;
-            } else if let Some(line) = &mut self.line {
+            } else if self.line.is_some() {
+                self.check_line_start(&token);
+            }
+            if let Some(line) = &mut self.line {
                 line.push_str(&token.1);
             }
-            self.raw_line.push_str(&token.1);
+            if self.define.is_some() {
+                self.raw_line.push_str(&token.1);
+            }
             if token.0 == SyntaxKind::NEWLINE && !self.continuation {
                 let line = self.line.replace(String::new());
+                self.line_checked = false;
                 let raw = std::mem::take(&mut self.raw_line);
                 self.end_logical_line(line, raw);
             }
