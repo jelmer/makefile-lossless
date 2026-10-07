@@ -1,6 +1,6 @@
 use super::makefile::MakefileItem;
 use super::{
-    edit_error, is_continuation, line_ending, logical_text, replace_children,
+    detach_elements, edit_error, is_continuation, line_ending, logical_text, replace_children,
     terminate_line_before, GreenElement, LineSyntax,
 };
 use crate::lossless::{
@@ -1210,11 +1210,7 @@ impl VariableDefinition {
         for element in &new_elements {
             element.detach();
         }
-        // TODO: splice them out once rowan's splice_children removes more
-        // than the first child of the range, as it does from 0.17 on.
-        for element in &elements {
-            element.detach();
-        }
+        detach_elements(elements);
         self.syntax().splice_children(index..index, new_elements);
     }
 
@@ -1491,11 +1487,7 @@ impl VariableDefinition {
             trailing = tail;
         }
         let elements = value_elements(&tokens, expr, trailing);
-        // TODO: splice them out once rowan's splice_children removes more
-        // than the first child of the range, as it does from 0.17 on.
-        for token in &rest {
-            token.detach();
-        }
+        detach_elements(rest.into_iter().map(Into::into));
         self.syntax().splice_children(index..index, elements);
         Ok(())
     }
