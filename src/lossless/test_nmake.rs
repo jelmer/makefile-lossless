@@ -437,3 +437,40 @@ fn test_all_dependents_reference() {
         .collect();
     assert_eq!(references, vec![r("$*", "*")]);
 }
+
+#[test]
+fn test_target_as_dependent() {
+    // On a dependency line, `$$@` is the current target and `$$(@B)` a part
+    // of it; the reference is the `$@` or `$(@B)` after the first `$`.
+    let code = "a.obj b.obj: $$(@B).c $$@.h $$x\n\tcl $$@\n";
+    let makefile = parse_nmake(code);
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.name(), r.text_range()))
+        .collect();
+    assert_eq!(
+        references,
+        vec![
+            (
+                "$(@B)".to_string(),
+                Some("@B".to_string()),
+                rowan::TextRange::new(14.into(), 19.into())
+            ),
+            (
+                "$@".to_string(),
+                Some("@".to_string()),
+                rowan::TextRange::new(23.into(), 25.into())
+            ),
+        ]
+    );
+    let rule = makefile.rules().next().unwrap();
+    assert_eq!(
+        rule.prerequisites_for(MakefileVariant::NMake)
+            .collect::<Vec<_>>(),
+        vec!["$$(@B).c", "$$@.h", "$$x"]
+    );
+
+    // Other variants read `$$` as an escaped dollar.
+    let makefile: Makefile = "a.obj: $$@.h\n".parse().unwrap();
+    assert_eq!(makefile.variable_references().count(), 0);
+}
