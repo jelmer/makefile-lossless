@@ -225,7 +225,7 @@ impl Variables {
             word if GNU_INCLUDE_KEYWORDS.contains(&word) || matches!(word, "load" | "-load") => {
                 self.known.clear()
             }
-            _ if line.contains("eval") => self.known.clear(),
+            _ if calls_eval(line) => self.known.clear(),
             _ => {
                 if let Some((name, op, value)) = Self::split_assignment(line) {
                     self.assign(name.trim_end(), op, value.trim_start());
@@ -254,6 +254,19 @@ impl Variables {
         }
         None
     }
+}
+
+/// Whether `line` calls GNU make's `eval` function, which can set any
+/// variable. Like make, this requires whitespace after the function name, so
+/// `$(eval)` is a reference to a variable named "eval".
+///
+/// TODO: Detect `eval` called indirectly, as in `$(call f)` with `f`
+/// defined as `$(eval X := y)`.
+fn calls_eval(line: &str) -> bool {
+    ["$(eval", "${eval"].into_iter().any(|call| {
+        line.match_indices(call)
+            .any(|(i, _)| line[i + call.len()..].starts_with([' ', '\t', '\\', '\n', '\r']))
+    })
 }
 
 /// A GNU make `define` block whose body is being read.
@@ -2001,6 +2014,10 @@ override_dh_auto_clean:
             ("X := >\n.RECIPEPREFIX =\n.RECIPEPREFIX += $(X)\n", '$'),
             ("X := >\ndefine .RECIPEPREFIX :=\n$(X)\nendef\n", '>'),
             ("ifdef A\nendif\nX := >\n.RECIPEPREFIX := $(X)\n", '>'),
+            // Only a call of the eval function can set variables.
+            ("X := >\nmedieval := 1\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X := >\nY := $(evaluate)\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X := >\nY := $(eval)\n.RECIPEPREFIX := $(X)\n", '>'),
         ];
         for (text, expected) in cases {
             assert_eq!(recipe_prefix_after(text), expected, "{text:?}");
@@ -2033,6 +2050,8 @@ override_dh_auto_clean:
             "ifdef A\nX := >\nendif\n.RECIPEPREFIX := $(X)\n",
             "X := >\ninclude x.mk\n.RECIPEPREFIX := $(X)\n",
             "X := >\n$(eval X := <)\n.RECIPEPREFIX := $(X)\n",
+            "X := >\nE := ${eval\tX := <}\n.RECIPEPREFIX := $(X)\n",
+            "X := >\n$(foreach v,a,$(eval X := <))\n.RECIPEPREFIX := $(X)\n",
             "Y := X\nX := >\n$(Y) := <\n.RECIPEPREFIX := $(X)\n",
             "X := >\nundefine X\n.RECIPEPREFIX := $(X)\n",
             "X := >\ndefine $(Y)\n<\nendef\n.RECIPEPREFIX := $(X)\n",
