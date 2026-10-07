@@ -114,10 +114,11 @@ mod text;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-pub use ast::conditional::{ConditionalBranch, ConditionalItem};
+pub use ast::conditional::{ConditionalBranch, ConditionalItem, ConditionalKind};
+pub use ast::include::IncludeKind;
 pub use ast::makefile::MakefileItem;
 pub use ast::rule::{RuleItem, RuleOperator};
-pub use ast::variable::ExportState;
+pub use ast::variable::{AssignmentOperator, ExportState};
 pub use bsd_condition::{
     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
     BsdConditionError, BsdConditionErrorKind, BsdFunction, BsdOperand,
@@ -126,8 +127,8 @@ pub use incremental::{apply_edit_to_text, EditError, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Identifier, Include, InvalidEdit, InvalidEditKind, Lang, Load, Makefile, ParseError,
-    ParseErrorKind, PositionedParseError, Recipe, RecipeVariableReference, ReferenceLocation, Rule,
-    VariableDefinition, VariableReference, Vpath,
+    ParseErrorKind, ParseKeywordError, PositionedParseError, Recipe, RecipeVariableReference,
+    ReferenceLocation, Rule, VariableDefinition, VariableReference, Vpath,
 };
 pub use nmake_condition::{
     parse_nmake_condition, NmakeBinaryOp, NmakeCondition, NmakeConditionError,

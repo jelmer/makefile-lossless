@@ -47,6 +47,41 @@ fn escape_nmake(path: &str) -> String {
     escaped
 }
 
+keyword_enum! {
+    /// The keyword of an include directive, as returned by
+    /// [`Include::include_kind`].
+    pub enum IncludeKind {
+        /// `include`.
+        Include => "include",
+        /// `-include`, which ignores missing files.
+        DashInclude => "-include",
+        /// `sinclude`, GNU make's alternative spelling of `-include`.
+        Sinclude => "sinclude",
+        /// BSD make `.include`.
+        BsdInclude => ".include",
+        /// BSD make `.-include`, which ignores missing files.
+        BsdDashInclude => ".-include",
+        /// BSD make `.sinclude`, which ignores missing files.
+        BsdSinclude => ".sinclude",
+        /// BSD make `.dinclude`, which ignores missing files and stale
+        /// dependencies in the included file.
+        BsdDinclude => ".dinclude",
+        /// nmake `!INCLUDE`.
+        NmakeInclude => "!INCLUDE",
+    }
+}
+
+impl IncludeKind {
+    /// Whether a missing file is ignored rather than an error; see
+    /// [`Include::is_optional`].
+    pub fn is_optional(&self) -> bool {
+        !matches!(
+            self,
+            IncludeKind::Include | IncludeKind::BsdInclude | IncludeKind::NmakeInclude
+        )
+    }
+}
+
 impl Include {
     /// Internal: a detached `include` directive for `path`, ending in `eol`,
     /// for the editing method `operation`.
@@ -325,6 +360,25 @@ impl Include {
         directive_keyword(self.syntax())
     }
 
+    /// The include keyword; see [`Self::keyword`].
+    ///
+    /// Returns `None` if the keyword is missing or not recognized because
+    /// of a syntax error, which is reported as a parse error.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{IncludeKind, Makefile};
+    /// let makefile: Makefile = "-include a.mk\n.dinclude \"b.mk\"\n".parse().unwrap();
+    /// let kinds: Vec<_> = makefile.includes().map(|i| i.include_kind()).collect();
+    /// assert_eq!(
+    ///     kinds,
+    ///     vec![Some(IncludeKind::DashInclude), Some(IncludeKind::BsdDinclude)]
+    /// );
+    /// ```
+    pub fn include_kind(&self) -> Option<IncludeKind> {
+        self.keyword()?.parse().ok()
+    }
+
     /// The source range of the include keyword, including a leading dot or
     /// `!` and any whitespace after it.
     ///
@@ -565,6 +619,70 @@ mod tests {
 
     use super::*;
     use crate::lossless::Makefile;
+
+    #[test]
+    fn test_include_kind() {
+        for (variant, text, kind) in [
+            (
+                MakefileVariant::GNUMake,
+                "include a\n",
+                IncludeKind::Include,
+            ),
+            (
+                MakefileVariant::GNUMake,
+                "-include a\n",
+                IncludeKind::DashInclude,
+            ),
+            (
+                MakefileVariant::GNUMake,
+                "sinclude a\n",
+                IncludeKind::Sinclude,
+            ),
+            (
+                MakefileVariant::BSDMake,
+                ".include <a>\n",
+                IncludeKind::BsdInclude,
+            ),
+            (
+                MakefileVariant::BSDMake,
+                ". -include <a>\n",
+                IncludeKind::BsdDashInclude,
+            ),
+            (
+                MakefileVariant::BSDMake,
+                ".sinclude <a>\n",
+                IncludeKind::BsdSinclude,
+            ),
+            (
+                MakefileVariant::BSDMake,
+                ".dinclude <a>\n",
+                IncludeKind::BsdDinclude,
+            ),
+            (
+                MakefileVariant::NMake,
+                "!include a\n",
+                IncludeKind::NmakeInclude,
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert_eq!(parsed.errors(), &[], "{text:?}");
+            let include = parsed.tree().includes().next().unwrap();
+            assert_eq!(include.include_kind(), Some(kind), "{text:?}");
+            assert_eq!(kind.is_optional(), include.is_optional(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_include_kind_round_trip() {
+        for &kind in IncludeKind::ALL {
+            assert_eq!(kind.as_str().parse::<IncludeKind>(), Ok(kind));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(
+            "!INCLUDE ".parse::<IncludeKind>().unwrap_err().keyword(),
+            "!INCLUDE "
+        );
+    }
 
     #[test]
     fn test_include_parent() {

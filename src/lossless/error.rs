@@ -317,3 +317,26 @@ impl std::fmt::Display for PositionedParseError {
 }
 
 impl std::error::Error for PositionedParseError {}
+
+/// An error from parsing a keyword enum such as
+/// [`AssignmentOperator`](crate::AssignmentOperator) from a string that is
+/// not one of its keywords.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseKeywordError {
+    pub(crate) keyword: String,
+}
+
+impl ParseKeywordError {
+    /// The text that is not a known keyword.
+    pub fn keyword(&self) -> &str {
+        &self.keyword
+    }
+}
+
+impl std::fmt::Display for ParseKeywordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown keyword: {:?}", self.keyword)
+    }
+}
+
+impl std::error::Error for ParseKeywordError {}

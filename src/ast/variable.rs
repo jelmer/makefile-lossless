@@ -175,6 +175,32 @@ pub enum ExportState {
     Unexport,
 }
 
+keyword_enum! {
+    /// The operator of a variable assignment, as returned by
+    /// [`VariableDefinition::assignment_operator_kind`].
+    ///
+    /// This is unrelated to [`AssignOp`](crate::AssignOp), the operator of
+    /// a BSD make `::=` variable modifier.
+    pub enum AssignmentOperator {
+        /// `=`, a recursively expanded variable.
+        Recursive => "=",
+        /// `:=`, a simply expanded variable.
+        Simple => ":=",
+        /// `::=`, the POSIX spelling of a simply expanded variable.
+        PosixSimple => "::=",
+        /// `:::=`, an immediately expanded variable.
+        Immediate => ":::=",
+        /// `+=`, appending to the value.
+        Append => "+=",
+        /// `?=`, assigning only if the variable is not yet defined.
+        IfUndefined => "?=",
+        /// `!=`, assigning the output of a shell command.
+        Shell => "!=",
+        /// `:sh=`, BSD make's alternative spelling of `!=`.
+        BsdShell => ":sh=",
+    }
+}
+
 /// Whether `text` is an assignment operator token.
 fn is_assignment_operator(text: &str) -> bool {
     ASSIGNMENT_OPERATORS.contains(&text) || is_sunsh_operator(text)
@@ -861,6 +887,27 @@ impl VariableDefinition {
     /// assert_eq!(var.assignment_operator(), Some(":=".to_string()));
     /// ```
     pub fn assignment_operator(&self) -> Option<String> {
+        self.assignment_operator_kind().map(|op| op.to_string())
+    }
+
+    /// Get the assignment operator used in this variable definition
+    ///
+    /// This is the same as [`Self::assignment_operator`], as an enum.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{AssignmentOperator, Makefile};
+    /// let makefile: Makefile = "VAR := value\nX += y\n".parse().unwrap();
+    /// let ops: Vec<_> = makefile
+    ///     .variable_definitions()
+    ///     .map(|v| v.assignment_operator_kind())
+    ///     .collect();
+    /// assert_eq!(
+    ///     ops,
+    ///     vec![Some(AssignmentOperator::Simple), Some(AssignmentOperator::Append)]
+    /// );
+    /// ```
+    pub fn assignment_operator_kind(&self) -> Option<AssignmentOperator> {
         if self.is_undefine() {
             return None;
         }
@@ -870,9 +917,11 @@ impl VariableDefinition {
             .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
             .map(|t| {
                 if is_sunsh_operator(t.text()) {
-                    ":sh=".to_string()
+                    AssignmentOperator::BsdShell
                 } else {
-                    t.text().to_string()
+                    t.text()
+                        .parse()
+                        .expect("assignment operator tokens are all known")
                 }
             })
     }
@@ -1701,6 +1750,47 @@ mod tests {
     use super::*;
     use crate::lossless::{InvalidEdit, Makefile};
     use crate::test_util::expect_invalid_edit;
+
+    #[test]
+    fn test_assignment_operator_kind() {
+        for (text, op) in [
+            ("A = 1\n", AssignmentOperator::Recursive),
+            ("A := 1\n", AssignmentOperator::Simple),
+            ("A ::= 1\n", AssignmentOperator::PosixSimple),
+            ("A :::= 1\n", AssignmentOperator::Immediate),
+            ("A += 1\n", AssignmentOperator::Append),
+            ("A ?= 1\n", AssignmentOperator::IfUndefined),
+            ("A != echo 1\n", AssignmentOperator::Shell),
+            ("define A +=\n1\nendef\n", AssignmentOperator::Append),
+            ("export A ?= 1\n", AssignmentOperator::IfUndefined),
+        ] {
+            let makefile: Makefile = text.parse().unwrap();
+            let var = makefile.variable_definitions().next().unwrap();
+            assert_eq!(var.assignment_operator_kind(), Some(op), "{text:?}");
+            assert_eq!(var.assignment_operator(), Some(op.to_string()), "{text:?}");
+        }
+        let makefile =
+            Makefile::parse_with_variant("A :sh :sh = echo 1\n", MakefileVariant::BSDMake).tree();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(
+            var.assignment_operator_kind(),
+            Some(AssignmentOperator::BsdShell)
+        );
+        let makefile: Makefile = "undefine A = b\n".parse().unwrap();
+        let var = makefile.variable_definitions().next().unwrap();
+        assert_eq!(var.assignment_operator_kind(), None);
+    }
+
+    #[test]
+    fn test_assignment_operator_round_trip() {
+        for &op in AssignmentOperator::ALL {
+            assert_eq!(op.as_str().parse::<AssignmentOperator>(), Ok(op));
+            assert_eq!(op.to_string(), op.as_str());
+        }
+        let err = "::?=".parse::<AssignmentOperator>().unwrap_err();
+        assert_eq!(err.keyword(), "::?=");
+        assert_eq!(err.to_string(), "unknown keyword: \"::?=\"");
+    }
 
     #[test]
     fn test_variable_parent() {
