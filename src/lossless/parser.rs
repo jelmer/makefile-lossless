@@ -3953,7 +3953,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let start = self.current_range();
             self.builder.start_node(VARIABLE.into());
 
-            // Consume any `override`/`export`/`private` modifiers and the
+            // Consume any `override`/`export`/`unexport`/`private` modifiers and the
             // `define` keyword itself.
             while self.current() == Some(IDENTIFIER)
                 && Self::is_define_modifier(&self.tokens.last().unwrap().1)
@@ -4214,7 +4214,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn is_define_modifier(token: &str) -> bool {
-            matches!(token, "override" | "export" | "private")
+            matches!(token, "override" | "export" | "unexport" | "private")
         }
 
         /// Whether the current line starts a `define` block, optionally

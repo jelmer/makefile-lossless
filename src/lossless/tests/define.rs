@@ -644,6 +644,43 @@ fn test_define_with_combined_modifiers() {
 }
 
 #[test]
+fn test_define_with_unexport() {
+    let code = "unexport define FOO\nhello\nendef\noverride unexport define BAR :=\nx\nendef\nunexport export define BAZ\ny\nendef\nprivate unexport define P\nz\nendef\n";
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        let parsed = parse(code, variant);
+        assert_eq!(parsed.errors, vec![], "{variant:?}");
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        assert_eq!(0, makefile.rules().count());
+        let vars: Vec<_> = makefile.variable_definitions().collect();
+        let summary: Vec<_> = vars
+            .iter()
+            .map(|v| {
+                (
+                    v.name(),
+                    v.assignment_operator(),
+                    v.raw_value(),
+                    v.is_define(),
+                    v.is_unexport(),
+                    v.is_override(),
+                    v.is_export(),
+                )
+            })
+            .collect();
+        let s = |s: &str| Some(s.to_string());
+        assert_eq!(
+            summary,
+            vec![
+                (s("FOO"), None, s("hello\n"), true, true, false, false),
+                (s("BAR"), s(":="), s("x\n"), true, true, true, false),
+                (s("BAZ"), None, s("y\n"), true, true, false, true),
+                (s("P"), None, s("z\n"), true, true, false, false),
+            ]
+        );
+    }
+}
+
+#[test]
 fn test_modifier_keyword_as_variable_name() {
     let makefile: Makefile = "private = 1\n".parse().unwrap();
     let vars: Vec<_> = makefile.variable_definitions().collect();
