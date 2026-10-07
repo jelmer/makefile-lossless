@@ -1703,7 +1703,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 tokens.next();
                 Self::skip_ws_and_continuation_tokens(&mut tokens);
             }
-            if Self::skip_variable_name(&mut tokens) != Some(true) {
+            // GNU make starts the recipe at a `;` before the operator.
+            if Self::skip_variable_name(&mut tokens, true) != Some(true) {
                 return false;
             }
             Self::skip_ws_and_continuation_tokens(&mut tokens);
@@ -1713,9 +1714,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Advance `tokens` past a variable name, as accepted by
-        /// [`Self::parse_variable_name`]. Returns whether there was a name,
-        /// or None if the line ends inside a variable reference.
-        fn skip_variable_name<'a, I>(tokens: &mut std::iter::Peekable<I>) -> Option<bool>
+        /// [`Self::parse_variable_name`], or if `semicolon_ends` up to an
+        /// unescaped `;`. Returns whether there was a name, or None if the
+        /// line ends inside a variable reference.
+        fn skip_variable_name<'a, I>(
+            tokens: &mut std::iter::Peekable<I>,
+            semicolon_ends: bool,
+        ) -> Option<bool>
         where
             I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
         {
@@ -1739,6 +1744,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         seen_name = true;
                         escaped = false;
                         continue;
+                    }
+                    Some((_, text))
+                        if semicolon_ends
+                            && text
+                                .char_indices()
+                                .any(|(i, c)| c == ';' && (i > 0 || !escaped)) =>
+                    {
+                        return Some(seen_name)
                     }
                     Some((kind, text)) if Self::is_gnu_name_token(*kind, text) => {
                         escaped = *kind == BACKSLASH && !escaped;
@@ -4878,7 +4891,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         .peek()
                         .is_some_and(|(kind, text)| *kind == IDENTIFIER && is_directive(text))
                 {
-                    match Self::skip_variable_name(&mut tokens) {
+                    match Self::skip_variable_name(&mut tokens, false) {
                         None => return false,
                         Some(found) => seen_name |= found,
                     }
