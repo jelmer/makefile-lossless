@@ -411,6 +411,8 @@ pub enum ReferenceSyntaxErrorKind {
     /// A part of a modifier such as `:S/from/to/` is not terminated by its
     /// delimiter (make: "Unfinished modifier").
     UnfinishedModifier,
+    /// Expressions are nested more deeply than this crate supports.
+    TooDeeplyNested,
 }
 
 /// An error parsing a variable reference.
@@ -898,11 +900,17 @@ impl Delims {
     }
 }
 
+/// How deeply references are nested at most, so that parsing them and
+/// building and dropping the tree does not run out of stack.
+pub(crate) const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     text: &'a str,
     pos: usize,
     /// The byte ranges of the expressions found so far, including `$$`.
     spans: Vec<Range<usize>>,
+    /// The number of expressions being parsed that enclose the position.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -911,6 +919,7 @@ impl<'a> Parser<'a> {
             text,
             pos: 0,
             spans: vec![],
+            depth: 0,
         }
     }
 
@@ -940,6 +949,20 @@ impl<'a> Parser<'a> {
 
     /// Parse a BSD make expression starting at `$`.
     fn parse_expr(&mut self) -> Result<ParsedReference, ReferenceError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(syntax_error(
+                self.pos,
+                ReferenceSyntaxErrorKind::TooDeeplyNested,
+                "expressions nested too deeply",
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_expr_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_expr_inner(&mut self) -> Result<ParsedReference, ReferenceError> {
         let start = self.pos;
         if self.bump() != Some('$') {
             return Err(syntax_error(
@@ -1735,6 +1758,7 @@ impl<'a> Parser<'a> {
     fn record_raw_spans(&mut self, raw: Range<usize>) {
         let mut parser = Parser::new(&self.text[..raw.end]);
         parser.pos = raw.start;
+        parser.depth = self.depth;
         while let Some(offset) = parser.rest().find('$') {
             parser.pos += offset;
             let dollar = parser.pos;
@@ -1743,6 +1767,7 @@ impl<'a> Parser<'a> {
                 Some('(' | '{') => {
                     let mut nested = Parser::new(parser.text);
                     nested.pos = dollar;
+                    nested.depth = parser.depth;
                     if nested.parse_expr().is_ok() {
                         parser.spans.extend(nested.spans);
                         parser.pos = nested.pos;
@@ -3576,5 +3601,52 @@ mod tests {
             .to_string(),
             "unknown modifier ':Z' at offset 4"
         );
+    }
+
+    #[test]
+    fn test_deeply_nested_expression() {
+        let nested = |depth: usize| format!("{}X{}", "${".repeat(depth), "}".repeat(depth));
+        assert!(ParsedReference::parse(&nested(MAX_DEPTH), MakefileVariant::BSDMake).is_ok());
+        for depth in [MAX_DEPTH + 1, 2000] {
+            assert_eq!(
+                ParsedReference::parse(&nested(depth), MakefileVariant::BSDMake),
+                Err(syntax_error(
+                    2 * MAX_DEPTH,
+                    ReferenceSyntaxErrorKind::TooDeeplyNested,
+                    "expressions nested too deeply"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_modifier_arguments() {
+        for (open, close) in [
+            ("${X:S/a/", "/}"),
+            ("${X:C/a/", "/}"),
+            ("${X:U", "}"),
+            ("${X:D", "}"),
+            ("${X:a=", "}"),
+            ("${X:?", ":b}"),
+            ("${X:?a:", "}"),
+            ("${X:!", "!}"),
+            ("${X::=", "}"),
+            ("${X:[", "]}"),
+            ("${X:gmtime=", "}"),
+            ("${X", "}"),
+        ] {
+            let nested = |depth: usize| format!("{}$X{}", open.repeat(depth), close.repeat(depth));
+            assert!(
+                ParsedReference::parse(&nested(MAX_DEPTH), MakefileVariant::BSDMake).is_ok(),
+                "{open}"
+            );
+            assert_eq!(
+                ParsedReference::parse(&nested(2000), MakefileVariant::BSDMake)
+                    .unwrap_err()
+                    .syntax_kind(),
+                Some(ReferenceSyntaxErrorKind::TooDeeplyNested),
+                "{open}"
+            );
+        }
     }
 }

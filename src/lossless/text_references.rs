@@ -10,7 +10,7 @@
 
 use super::Lang;
 use crate::lex::lex_reference_text;
-use crate::reference::{bsd_expr_extent_at, UnescapedHash};
+use crate::reference::{bsd_expr_extent_at, UnescapedHash, MAX_DEPTH};
 use crate::MakefileVariant;
 use crate::SyntaxKind::{self, *};
 use rowan::Language;
@@ -40,10 +40,6 @@ enum Shape {
     /// `$(...)` or `${...}`
     Delimited,
 }
-
-/// How deeply references are nested at most. Deeper ones are left as text,
-/// so that building and dropping the tree does not run out of stack.
-const MAX_DEPTH: usize = 256;
 
 #[derive(Debug)]
 struct Reference {
@@ -238,7 +234,8 @@ impl<'a> Finder<'a> {
         }
     }
 
-    /// Find the references in `text[lo..hi]`.
+    /// Find the references in `text[lo..hi]`. References nested more
+    /// deeply than [`MAX_DEPTH`] are left as text.
     fn find(&self, lo: usize, hi: usize, depth: usize) -> Vec<Reference> {
         if depth > MAX_DEPTH {
             return vec![];

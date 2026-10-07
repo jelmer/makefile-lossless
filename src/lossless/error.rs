@@ -97,6 +97,8 @@ pub enum ParseErrorKind {
     ExtraneousText,
     /// A token that cannot start any construct.
     UnexpectedToken,
+    /// Variable references nested more deeply than this crate supports.
+    TooDeeplyNested,
     /// Any other error.
     Other,
 }

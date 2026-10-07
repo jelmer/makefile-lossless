@@ -298,6 +298,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         for_depth: usize,
         /// Number of enclosing BSD `.if` or nmake `!IF` conditionals.
         block_conditional_depth: usize,
+        /// Number of variable references being parsed that enclose the
+        /// current token.
+        reference_depth: usize,
         /// Parity of the current run of bumped BACKSLASH tokens: true once an
         /// odd number have been seen, meaning the next backslash is escaped
         /// (`\\`) and a following newline is a literal backslash, not a line
@@ -2444,6 +2447,59 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_variable_reference(&mut self) {
+            if self.reference_depth >= crate::reference::MAX_DEPTH {
+                self.record_error(
+                    ParseErrorKind::TooDeeplyNested,
+                    "variable reference nested too deeply".to_string(),
+                );
+                self.parse_variable_reference_as_text();
+                return;
+            }
+            self.reference_depth += 1;
+            self.parse_variable_reference_inner();
+            self.reference_depth -= 1;
+        }
+
+        /// Add the variable reference at the current `$` as an EXPR node
+        /// without looking at what it contains, ending it at the brace that
+        /// matches its opening one.
+        fn parse_variable_reference_as_text(&mut self) {
+            self.builder.start_node(EXPR.into());
+            self.bump(); // Consume $
+            let (open, close) = match self.current() {
+                Some(LPAREN) => (LPAREN, RPAREN),
+                Some(LBRACE) => (LBRACE, RBRACE),
+                _ => {
+                    self.builder.finish_node();
+                    return;
+                }
+            };
+            let mut depth = 0;
+            loop {
+                if self.consume_line_continuation() {
+                    continue;
+                }
+                if self.at_reference_end() {
+                    self.record_error(
+                        ParseErrorKind::UnclosedReference,
+                        "unclosed variable reference".to_string(),
+                    );
+                    break;
+                }
+                match self.current() {
+                    Some(kind) if kind == open => depth += 1,
+                    Some(kind) if kind == close => depth -= 1,
+                    _ => {}
+                }
+                self.bump();
+                if depth == 0 {
+                    break;
+                }
+            }
+            self.builder.finish_node();
+        }
+
+        fn parse_variable_reference_inner(&mut self) {
             if self.variant == Some(MakefileVariant::BSDMake) && self.parse_bsd_variable_reference()
             {
                 return;
@@ -4911,6 +4967,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         variant,
         for_depth: 0,
         block_conditional_depth: 0,
+        reference_depth: 0,
         pending_backslash_escape: false,
         argument_quote: None,
         in_rule: RuleContext::Outside,
