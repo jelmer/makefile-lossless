@@ -946,8 +946,9 @@ fn test_deeply_nested_blocks() {
         ".endfor\n.endif\nendif\n",
         None,
     );
-    let cases = NESTED_BLOCKS.iter().map(|&block| (block, 25_000));
-    for ((open, close, variant), depth) in cases.chain([(mixed, 200_000)]) {
+    // Without the limit, 2000 levels already overflow the 2 MB stack.
+    let depth = 5_000;
+    for &(open, close, variant) in NESTED_BLOCKS.iter().chain([&mixed]) {
         let text = format!(
             "{}x = {}{}\n{}",
             open.repeat(depth),
