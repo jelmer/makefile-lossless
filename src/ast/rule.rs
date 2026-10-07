@@ -3211,6 +3211,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_define_recipe_prefix() {
+        let text = "define FOO\n.RECIPEPREFIX = ;\nendef\ndefine .RECIPEPREFIX\n>\nendef\nall:\n>echo one\n";
+        let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::GNUMake);
+        assert!(parsed.ok(), "{:?}", parsed.errors());
+        let makefile = parsed.tree();
+        let rules: Vec<_> = makefile.rules().collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["echo one"]);
+        assert_eq!(makefile.to_string(), text);
+    }
+
     /// Parse `text` as `variant`, check it round trips without errors and
     /// return the targets and prerequisites of its single rule.
     fn parse_rule_names(text: &str, variant: crate::MakefileVariant) -> (Vec<String>, Vec<String>) {
