@@ -209,12 +209,15 @@ impl<'a> Lexer<'a> {
     fn update_recipe_prefix(&mut self, line: &str) {
         let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
         let mut rest = line.trim_start();
-        for keyword in ["override", "export"] {
-            if let Some(r) = rest.strip_prefix(keyword) {
-                if r.starts_with(Self::is_whitespace) {
-                    rest = r.trim_start();
-                }
-            }
+        // GNU make takes these modifiers in any order, and repeated.
+        while let Some(r) = ["override", "export", "unexport", "private"]
+            .into_iter()
+            .find_map(|m| {
+                rest.strip_prefix(m)
+                    .filter(|r| r.starts_with(Self::is_whitespace))
+            })
+        {
+            rest = r.trim_start();
         }
         let Some(rest) = rest.strip_prefix(".RECIPEPREFIX") else {
             return;
@@ -1724,6 +1727,12 @@ override_dh_auto_clean:
         assert_eq!(prefix(".RECIPEPREFIX = >\n"), '>');
         assert_eq!(prefix(".RECIPEPREFIX := ab # comment\n"), 'a');
         assert_eq!(prefix("override .RECIPEPREFIX ::= >\n"), '>');
+        assert_eq!(prefix("private .RECIPEPREFIX := >\n"), '>');
+        assert_eq!(prefix("unexport .RECIPEPREFIX = >\n"), '>');
+        assert_eq!(prefix("export override .RECIPEPREFIX = >\n"), '>');
+        assert_eq!(prefix("override private\texport .RECIPEPREFIX = >\n"), '>');
+        assert_eq!(prefix("override override .RECIPEPREFIX = >\n"), '>');
+        assert_eq!(prefix("exported .RECIPEPREFIX = >\n"), '\t');
         assert_eq!(prefix(".RECIPEPREFIX \\\n  = >\n"), '>');
         assert_eq!(prefix(".RECIPEPREFIX = >\n.RECIPEPREFIX =\n"), '\t');
         assert_eq!(prefix(".RECIPEPREFIX = > # c\n"), '>');

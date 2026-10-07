@@ -3215,6 +3215,29 @@ mod tests {
     }
 
     #[test]
+    fn test_recipe_prefix_modifiers() {
+        // GNU make takes any of these modifiers, in any order.
+        for modifiers in [
+            "override",
+            "export",
+            "unexport",
+            "private",
+            "export override",
+            "private override export",
+            "unexport private",
+        ] {
+            let text = format!("{modifiers} .RECIPEPREFIX := >\nall:\n>echo one\n");
+            let parsed = Makefile::parse_with_variant(&text, crate::MakefileVariant::GNUMake);
+            assert!(parsed.ok(), "{text:?}: {:?}", parsed.errors());
+            let makefile = parsed.tree();
+            let rules: Vec<_> = makefile.rules().collect();
+            assert_eq!(rules.len(), 1, "{text:?}");
+            assert_eq!(rules[0].recipes().collect::<Vec<_>>(), vec!["echo one"]);
+            assert_eq!(makefile.to_string(), text);
+        }
+    }
+
+    #[test]
     fn test_define_recipe_prefix() {
         let text = "define FOO\n.RECIPEPREFIX = ;\nendef\ndefine .RECIPEPREFIX\n>\nendef\nall:\n>echo one\n";
         let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::GNUMake);
