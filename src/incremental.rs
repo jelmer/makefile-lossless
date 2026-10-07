@@ -24,21 +24,86 @@ impl TextEdit {
         Self { range, new_text }
     }
 
+    /// Check that the range of this edit lies within `text` and falls on
+    /// character boundaries.
+    fn check(&self, text: &str) -> Result<(), EditError> {
+        let len = TextSize::of(text);
+        if self.range.end() > len {
+            return Err(EditError::OutOfBounds {
+                range: self.range,
+                len,
+            });
+        }
+        [self.range.start(), self.range.end()]
+            .into_iter()
+            .find(|&offset| !text.is_char_boundary(offset.into()))
+            .map_or(Ok(()), |offset| Err(EditError::NotCharBoundary(offset)))
+    }
+
     /// The length delta introduced by this edit.
     fn delta(&self) -> i64 {
         self.new_text.len() as i64 - u32::from(self.range.len()) as i64
     }
 }
 
+/// An error from applying a [`TextEdit`] that does not fit the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// The edit range ends past the end of the text, of length `len`.
+    OutOfBounds {
+        /// The range of the edit.
+        range: TextRange,
+        /// The length of the text.
+        len: TextSize,
+    },
+    /// The edit range starts or ends inside a character.
+    NotCharBoundary(TextSize),
+    /// The text passed to [`Parse::apply_edit`] has a different length
+    /// from the text that was parsed.
+    TextMismatch {
+        /// The length of the parsed text.
+        expected: TextSize,
+        /// The length of the text passed.
+        actual: TextSize,
+    },
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            EditError::OutOfBounds { range, len } => {
+                write!(
+                    f,
+                    "edit range {:?} is out of bounds for text of length {:?}",
+                    range, len
+                )
+            }
+            EditError::NotCharBoundary(offset) => {
+                write!(f, "edit offset {:?} is not on a character boundary", offset)
+            }
+            EditError::TextMismatch { expected, actual } => write!(
+                f,
+                "text has length {:?}, but the parsed text has length {:?}",
+                actual, expected
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
 /// Apply a text edit to the old source, producing the new source text.
-pub fn apply_edit_to_text(old_text: &str, edit: &TextEdit) -> String {
+///
+/// Returns an error if the edit range does not fit `old_text`.
+pub fn apply_edit_to_text(old_text: &str, edit: &TextEdit) -> Result<String, EditError> {
+    edit.check(old_text)?;
     let start: usize = u32::from(edit.range.start()) as usize;
     let end: usize = u32::from(edit.range.end()) as usize;
     let mut new = String::with_capacity(old_text.len().wrapping_add_signed(edit.delta() as isize));
     new.push_str(&old_text[..start]);
     new.push_str(&edit.new_text);
     new.push_str(&old_text[end..]);
-    new
+    Ok(new)
 }
 
 impl Parse<Makefile> {
@@ -52,7 +117,9 @@ impl Parse<Makefile> {
     /// * `edit` - The edit to apply
     ///
     /// # Returns
-    /// A new `Parse<Makefile>` with the edit applied, and the new full text.
+    /// A new `Parse<Makefile>` with the edit applied, and the new full text,
+    /// or an error if `old_text` is not the parsed text or the edit range
+    /// does not fit it.
     ///
     /// # Example
     /// ```
@@ -66,7 +133,7 @@ impl Parse<Makefile> {
     ///     TextRange::new(7.into(), 10.into()),
     ///     "new".to_string(),
     /// );
-    /// let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+    /// let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
     /// assert_eq!(new_text, "VAR1 = new\nVAR2 = value\n");
     ///
     /// let makefile: Makefile = new_parse.tree();
@@ -75,14 +142,19 @@ impl Parse<Makefile> {
     /// assert_eq!(vars[0].raw_value(), Some("new".to_string()));
     /// assert_eq!(vars[1].raw_value(), Some("value".to_string()));
     /// ```
-    pub fn apply_edit(&self, old_text: &str, edit: &TextEdit) -> (Self, String) {
-        let new_text = apply_edit_to_text(old_text, edit);
+    pub fn apply_edit(&self, old_text: &str, edit: &TextEdit) -> Result<(Self, String), EditError> {
+        let expected = self.green().text_len();
+        let actual = TextSize::of(old_text);
+        if expected != actual {
+            return Err(EditError::TextMismatch { expected, actual });
+        }
+        let new_text = apply_edit_to_text(old_text, edit)?;
         let new_parse = self.reparse(old_text, &new_text, edit).unwrap_or_else(|| {
             let parsed = crate::lossless::parse(&new_text, self.variant());
             Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
                 .with_variant(self.variant())
         });
-        (new_parse, new_text)
+        Ok((new_parse, new_text))
     }
 
     /// Reparse the part of `new_text` affected by `edit`, or return `None`
@@ -233,21 +305,77 @@ mod tests {
     fn test_apply_edit_to_text() {
         let old = "hello world";
         let edit = TextEdit::new(TextRange::new(6.into(), 11.into()), "rust".to_string());
-        assert_eq!(apply_edit_to_text(old, &edit), "hello rust");
+        assert_eq!(apply_edit_to_text(old, &edit).unwrap(), "hello rust");
     }
 
     #[test]
     fn test_apply_edit_to_text_insert() {
         let old = "hello world";
         let edit = TextEdit::new(TextRange::new(5.into(), 5.into()), " beautiful".to_string());
-        assert_eq!(apply_edit_to_text(old, &edit), "hello beautiful world");
+        assert_eq!(
+            apply_edit_to_text(old, &edit).unwrap(),
+            "hello beautiful world"
+        );
     }
 
     #[test]
     fn test_apply_edit_to_text_delete() {
         let old = "hello world";
         let edit = TextEdit::new(TextRange::new(5.into(), 11.into()), String::new());
-        assert_eq!(apply_edit_to_text(old, &edit), "hello");
+        assert_eq!(apply_edit_to_text(old, &edit).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_apply_edit_to_text_invalid_range() {
+        let edit = |start: u32, end: u32| {
+            TextEdit::new(TextRange::new(start.into(), end.into()), "x".to_string())
+        };
+        assert_eq!(
+            apply_edit_to_text("A = \u{e9}\n", &edit(5, 8)),
+            Err(EditError::OutOfBounds {
+                range: TextRange::new(5.into(), 8.into()),
+                len: 7.into()
+            })
+        );
+        assert_eq!(
+            apply_edit_to_text("A = \u{e9}\n", &edit(5, 6)),
+            Err(EditError::NotCharBoundary(5.into()))
+        );
+        assert_eq!(
+            apply_edit_to_text("A = \u{e9}\n", &edit(4, 5)),
+            Err(EditError::NotCharBoundary(5.into()))
+        );
+        assert_eq!(
+            apply_edit_to_text("A = \u{e9}\n", &edit(4, 6)),
+            Ok("A = x\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_edit_invalid_range() {
+        let old_text = "A = \u{e9}\n";
+        let parse = Parse::<Makefile>::parse_makefile(old_text);
+        let edit = |start: u32, end: u32| {
+            TextEdit::new(TextRange::new(start.into(), end.into()), "x".to_string())
+        };
+        assert_eq!(
+            parse.apply_edit(old_text, &edit(9, 10)).err(),
+            Some(EditError::OutOfBounds {
+                range: TextRange::new(9.into(), 10.into()),
+                len: 7.into()
+            })
+        );
+        assert_eq!(
+            parse.apply_edit(old_text, &edit(5, 6)).err(),
+            Some(EditError::NotCharBoundary(5.into()))
+        );
+        assert_eq!(
+            parse.apply_edit("A = b\n", &edit(0, 1)).err(),
+            Some(EditError::TextMismatch {
+                expected: 7.into(),
+                actual: 6.into()
+            })
+        );
     }
 
     #[test]
@@ -257,7 +385,7 @@ mod tests {
 
         // Change "old" to "new"
         let edit = TextEdit::new(TextRange::new(7.into(), 10.into()), "new".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR1 = new\nVAR2 = value\n");
         let makefile = new_parse.tree();
@@ -276,7 +404,7 @@ mod tests {
 
         // Change "hello" to "goodbye"
         let edit = TextEdit::new(TextRange::new(11.into(), 16.into()), "goodbye".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "all:\n\techo goodbye\n");
         let makefile = new_parse.tree();
@@ -293,7 +421,7 @@ mod tests {
             TextRange::new(11.into(), 11.into()),
             "NEW = inserted\n".to_string(),
         );
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR1 = one\nNEW = inserted\nVAR2 = two\n");
         let makefile = new_parse.tree();
@@ -311,7 +439,7 @@ mod tests {
 
         // Delete VAR2 line
         let edit = TextEdit::new(TextRange::new(11.into(), 22.into()), String::new());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR1 = one\nVAR3 = three\n");
         let makefile = new_parse.tree();
@@ -328,7 +456,7 @@ mod tests {
 
         // Only change VAR2's value
         let edit = TextEdit::new(TextRange::new(18.into(), 21.into()), "TWO".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR1 = one\nVAR2 = TWO\nVAR3 = three\n");
         let makefile = new_parse.tree();
@@ -351,7 +479,7 @@ mod tests {
         let old_text = "VAR1 = one\nVAR2 = two\nVAR3 = three\nVAR4 = four\n";
         let parse = Parse::parse_makefile(old_text);
         let edit = TextEdit::new(TextRange::new(18.into(), 21.into()), "TWO".to_string());
-        let (new_parse, _) = parse.apply_edit(old_text, &edit);
+        let (new_parse, _) = parse.apply_edit(old_text, &edit).unwrap();
 
         let node = |parse: &Parse<Makefile>, i: usize| {
             parse
@@ -373,7 +501,7 @@ mod tests {
         for old_text in ["!IF 1\nA = a\n!ENDIF\n", ""] {
             let parse = Parse::parse_makefile_with_variant(old_text, MakefileVariant::NMake);
             let edit = TextEdit::new(TextRange::empty(0.into()), "!IF 2\n!ENDIF\n".to_string());
-            let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+            let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
             let full = Parse::parse_makefile_with_variant(&new_text, MakefileVariant::NMake);
             assert_eq!(
                 format!("{:#?}", new_parse.syntax_node()),
@@ -392,7 +520,7 @@ mod tests {
             TextRange::new(0.into(), 0.into()),
             "VAR = value\n".to_string(),
         );
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR = value\n");
         let makefile = new_parse.tree();
@@ -406,7 +534,7 @@ mod tests {
 
         // Change "= value" to ":"
         let edit = TextEdit::new(TextRange::new(7.into(), 14.into()), ":".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "target :\n");
         let makefile = new_parse.tree();
@@ -421,7 +549,7 @@ mod tests {
 
         // Edit inside the rule
         let edit = TextEdit::new(TextRange::new(26.into(), 30.into()), "VAR2".to_string());
-        let (incremental, new_text) = parse.apply_edit(old_text, &edit);
+        let (incremental, new_text) = parse.apply_edit(old_text, &edit).unwrap();
         let full = Parse::parse_makefile(&new_text);
 
         // Both should produce the same tree.
@@ -443,7 +571,7 @@ mod tests {
             TextRange::new(12.into(), 12.into()),
             "all:\n\techo done\n".to_string(),
         );
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "VAR = value\nall:\n\techo done\n");
         let makefile = new_parse.tree();
@@ -463,7 +591,7 @@ mod tests {
             TextRange::new(11.into(), 11.into()),
             "\tbad line\n".to_string(),
         );
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
         assert_eq!(new_text, "VAR1 = one\n\tbad line\nVAR2 = two\n");
 
         // Full reparse should produce the same error count
@@ -478,7 +606,7 @@ mod tests {
 
         // Change include path
         let edit = TextEdit::new(TextRange::new(8.into(), 14.into()), "bar.mk".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "include bar.mk\nVAR = value\n");
         let makefile = new_parse.tree();
@@ -495,7 +623,7 @@ mod tests {
 
         // Change variable inside conditional
         let edit = TextEdit::new(TextRange::new(21.into(), 23.into()), "-O2".to_string());
-        let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+        let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
 
         assert_eq!(new_text, "ifdef DEBUG\nCFLAGS = -O2\nendif\nVAR = value\n");
         let makefile = new_parse.tree();
@@ -511,11 +639,11 @@ mod tests {
 
         // First edit: change VAR1
         let edit1 = TextEdit::new(TextRange::new(7.into(), 10.into()), "ONE".to_string());
-        let (parse2, text2) = parse.apply_edit(old_text, &edit1);
+        let (parse2, text2) = parse.apply_edit(old_text, &edit1).unwrap();
 
         // Second edit: change VAR3 (in the new text)
         let edit2 = TextEdit::new(TextRange::new(29.into(), 34.into()), "THREE".to_string());
-        let (parse3, text3) = parse2.apply_edit(&text2, &edit2);
+        let (parse3, text3) = parse2.apply_edit(&text2, &edit2).unwrap();
 
         assert_eq!(text3, "VAR1 = ONE\nVAR2 = two\nVAR3 = THREE\n");
         let makefile = parse3.tree();
@@ -541,7 +669,7 @@ mod tests {
             TextEdit::new(TextRange::new(4.into(), 5.into()), "".to_string()),
             TextEdit::new(TextRange::new(9.into(), 12.into()), "x".to_string()),
         ] {
-            let (new_parse, new_text) = parse.apply_edit(old_text, &edit);
+            let (new_parse, new_text) = parse.apply_edit(old_text, &edit).unwrap();
             let full = Parse::<Makefile>::parse_makefile(&new_text);
             assert_eq!(ranges(&new_parse), ranges(&full));
             assert_eq!(ranges(&full).len(), 2);
@@ -555,7 +683,7 @@ mod tests {
         let parse = Parse::<Makefile>::parse_makefile(old_text);
         // Edit the middle error, leaving the last one after the edit.
         let edit = TextEdit::new(TextRange::new(7.into(), 10.into()), "baz".to_string());
-        let (new_parse, _) = parse.apply_edit(old_text, &edit);
+        let (new_parse, _) = parse.apply_edit(old_text, &edit).unwrap();
         assert_eq!(
             new_parse
                 .errors()
@@ -600,7 +728,7 @@ mod tests {
 
     fn assert_matches_full_parse(old_text: &str, edit: &TextEdit) {
         let parse = Parse::<Makefile>::parse_makefile(old_text);
-        let (incremental, new_text) = parse.apply_edit(old_text, edit);
+        let (incremental, new_text) = parse.apply_edit(old_text, edit).unwrap();
         let full = Parse::<Makefile>::parse_makefile(&new_text);
         assert_eq!(
             format!("{:#?}", incremental.syntax_node()),

@@ -57,7 +57,7 @@ pub use bsd_condition::{
     parse_bsd_condition, parse_bsd_if_else_condition, BsdComparisonOp, BsdCondition,
     BsdConditionError, BsdConditionErrorKind, BsdFunction, BsdOperand,
 };
-pub use incremental::{apply_edit_to_text, TextEdit};
+pub use incremental::{apply_edit_to_text, EditError, TextEdit};
 pub use lossless::{
     ArchiveMember, ArchiveMembers, Conditional, Directive, Error, ErrorInfo, ExpressionStatement,
     ForLoop, Identifier, Include, Lang, Load, Makefile, ParseError, ParseErrorKind,

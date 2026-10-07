@@ -12,9 +12,8 @@ use makefile_lossless::{apply_edit_to_text, TextEdit, TextRange};
 //   u16 (LE) split point between original text and replacement text
 //   remainder: original text || replacement text
 //
-// Offsets are clamped to char boundaries so we never construct a TextEdit
-// that splits a UTF-8 codepoint (something the public API does not promise
-// to handle, so we shouldn't fuzz it).
+// Offsets are not clamped, so edits that are out of bounds or split a
+// UTF-8 codepoint must be rejected with an error.
 fuzz_target!(|data: &[u8]| {
     let Some((&selector, data)) = data.split_first() else {
         return;
@@ -40,27 +39,27 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let start = start.min(orig.len());
-    let end = end.min(orig.len());
     let (lo, hi) = if start <= end {
         (start, end)
     } else {
         (end, start)
     };
-    if !orig.is_char_boundary(lo) || !orig.is_char_boundary(hi) {
-        return;
-    }
-
     let edit = TextEdit::new(
         TextRange::new((lo as u32).into(), (hi as u32).into()),
         new_text.to_string(),
     );
 
     let parse = variant::parse(orig, variant);
-    let (incremental_parse, incremental_text) = parse.apply_edit(orig, &edit);
+    let valid = hi <= orig.len() && orig.is_char_boundary(lo) && orig.is_char_boundary(hi);
+    let Ok((incremental_parse, incremental_text)) = parse.apply_edit(orig, &edit) else {
+        assert!(!valid);
+        assert!(apply_edit_to_text(orig, &edit).is_err());
+        return;
+    };
+    assert!(valid);
 
     // apply_edit_to_text and apply_edit must agree on the resulting text.
-    let expected_text = apply_edit_to_text(orig, &edit);
+    let expected_text = apply_edit_to_text(orig, &edit).unwrap();
     assert_eq!(incremental_text, expected_text);
 
     // Incremental reparse must produce the same text as a full reparse,
