@@ -274,7 +274,9 @@ endif
 fn test_broken_conditional_endif_without_if() {
     // endif without matching if - parser should handle gracefully
     let text = "VAR = value\nendif\n";
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     // Should parse without crashing
     let vars: Vec<_> = makefile.variable_definitions().collect();
@@ -286,7 +288,9 @@ fn test_broken_conditional_endif_without_if() {
 fn test_broken_conditional_else_without_if() {
     // else without matching if
     let text = "VAR = value\nelse\nVAR2 = other\n";
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     // Should parse without crashing
     let vars: Vec<_> = makefile.variable_definitions().collect();
@@ -301,7 +305,9 @@ fn test_broken_conditional_missing_endif() {
 DEBUG_FLAGS = -g
 VAR = value
 "#;
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     // Should parse without crashing
     assert!(makefile.code().contains("ifdef DEBUG"));
@@ -318,7 +324,9 @@ else
 C = 3
 endif
 "#;
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     // Should parse without crashing, though it's malformed
     assert!(makefile.code().contains("ifdef DEBUG"));
@@ -332,7 +340,9 @@ VAR = value
 endif
 endif
 "#;
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     // Should parse without crashing
     // The extra endif will be parsed separately, so we may get more than 1 item

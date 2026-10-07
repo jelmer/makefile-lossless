@@ -143,7 +143,9 @@ help:
 "#;
     // Use relaxed parsing for now
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse indented help text");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse indented help text")
+        .0;
 
     // Check that we can extract rules even with errors
     let rules = makefile.rules().collect::<Vec<_>>();
@@ -227,7 +229,9 @@ override_dh_build:
 
 	dh_python3
 "#;
-    let makefile = Makefile::read_relaxed(makefile_text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(makefile_text.as_bytes())
+        .unwrap()
+        .0;
 
     let rules: Vec<_> = makefile.rules().collect();
     assert_eq!(rules.len(), 2, "Expected 2 rules");

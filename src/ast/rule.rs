@@ -3729,7 +3729,7 @@ mod tests {
         // when the rule contains comments
         let content = b"override_dh_strip:\n\t# no longer necessary after buster\n\tdh_strip --dbgsym-migration='amule-dbg (<< 1:2.3.2-2~)'\n";
 
-        let makefile = Makefile::read_relaxed(&content[..]).unwrap();
+        let makefile = Makefile::from_reader_relaxed(&content[..]).unwrap().0;
 
         let mut rule = makefile.rules().next().unwrap();
 

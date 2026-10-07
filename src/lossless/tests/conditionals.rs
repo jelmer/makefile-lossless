@@ -7,48 +7,59 @@ fn test_conditionals() {
     // Basic conditionals - ifdef/ifndef
     let code = "ifdef DEBUG\n    DEBUG_FLAG := 1\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse basic ifdef");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse basic ifdef")
+        .0;
     assert!(makefile.code().contains("DEBUG_FLAG"));
 
     // Basic conditionals - ifeq/ifneq
     let code = "ifeq ($(OS),Windows_NT)\n    RESULT := windows\nelse\n    RESULT := unix\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse ifeq/ifneq");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse ifeq/ifneq")
+        .0;
     assert!(makefile.code().contains("RESULT"));
     assert!(makefile.code().contains("windows"));
 
     // Nested conditionals with else
     let code = "ifdef DEBUG\n    CFLAGS += -g\n    ifdef VERBOSE\n        CFLAGS += -v\n    endif\nelse\n    CFLAGS += -O2\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse nested conditionals with else");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse nested conditionals with else")
+        .0;
     assert!(makefile.code().contains("CFLAGS"));
     assert!(makefile.code().contains("VERBOSE"));
 
     // Empty conditionals
     let code = "ifdef DEBUG\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse empty conditionals");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse empty conditionals")
+        .0;
     assert!(makefile.code().contains("ifdef DEBUG"));
 
     // Conditionals with else ifeq
     let code = "ifeq ($(OS),Windows)\n    EXT := .exe\nelse ifeq ($(OS),Linux)\n    EXT := .bin\nelse\n    EXT := .out\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse conditionals with else ifeq");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse conditionals with else ifeq")
+        .0;
     assert!(makefile.code().contains("EXT"));
 
     // Invalid conditionals - this should generate parse errors but still produce a Makefile
     let code = "ifXYZ DEBUG\nDEBUG := 1\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse with recovery");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse with recovery")
+        .0;
     assert!(makefile.code().contains("DEBUG"));
 
     // Missing condition - this should also generate parse errors but still produce a Makefile
     let code = "ifdef \nDEBUG := 1\nendif\n";
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf)
-        .expect("Failed to parse with recovery - missing condition");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse with recovery - missing condition")
+        .0;
     assert!(makefile.code().contains("DEBUG"));
 }
 
@@ -546,7 +557,9 @@ all: $(OBJS)
 "#;
 
     let mut buf = code.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse conditional features");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse conditional features")
+        .0;
 
     // Instead of checking for variable definitions which might not get created
     // due to conditionals, let's verify that we can parse the content without errors
@@ -576,8 +589,9 @@ all: $(OBJS)
 "#;
 
     let mut buf = code_with_var.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse with explicit variable");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse with explicit variable")
+        .0;
 
     // Now we should definitely find at least the CC variable
     let vars = makefile.variable_definitions().collect::<Vec<_>>();
@@ -592,8 +606,9 @@ fn test_real_conditional_directives() {
     // Basic if/else conditional
     let conditional = "ifdef DEBUG\nCFLAGS = -g\nelse\nCFLAGS = -O2\nendif\n";
     let mut buf = conditional.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse basic if/else conditional");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse basic if/else conditional")
+        .0;
     let code = makefile.code();
     assert!(code.contains("ifdef DEBUG"));
     assert!(code.contains("else"));
@@ -602,7 +617,9 @@ fn test_real_conditional_directives() {
     // ifdef with nested ifdef
     let nested = "ifdef DEBUG\nCFLAGS = -g\nifdef VERBOSE\nCFLAGS += -v\nendif\nendif\n";
     let mut buf = nested.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse nested ifdef");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse nested ifdef")
+        .0;
     let code = makefile.code();
     assert!(code.contains("ifdef DEBUG"));
     assert!(code.contains("ifdef VERBOSE"));
@@ -610,7 +627,9 @@ fn test_real_conditional_directives() {
     // ifeq form
     let ifeq = "ifeq ($(OS),Windows_NT)\nTARGET = app.exe\nelse\nTARGET = app\nendif\n";
     let mut buf = ifeq.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse ifeq form");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse ifeq form")
+        .0;
     let code = makefile.code();
     assert!(code.contains("ifeq"));
     assert!(code.contains("Windows_NT"));
@@ -629,8 +648,9 @@ endif
 "#;
     // Use relaxed parsing for conditionals with indented lines
     let mut buf = content.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse indented lines in conditionals");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse indented lines in conditionals")
+        .0;
 
     // Check that we detected conditionals
     let code = makefile.code();
@@ -654,7 +674,9 @@ else
 endif
 "#;
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifeq directive");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse else ifeq directive")
+        .0;
     assert!(makefile.code().contains("else ifeq"));
     assert!(makefile.code().contains("TARGET"));
 
@@ -671,7 +693,9 @@ else
 endif
 "#;
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifdef directive");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse else ifdef directive")
+        .0;
     assert!(makefile.code().contains("else ifdef"));
 
     // Test else ifndef
@@ -685,7 +709,9 @@ else
 endif
 "#;
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifndef directive");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse else ifndef directive")
+        .0;
     assert!(makefile.code().contains("else ifndef"));
 
     // Test else ifneq
@@ -699,7 +725,9 @@ else
 endif
 "#;
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse else ifneq directive");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse else ifneq directive")
+        .0;
     assert!(makefile.code().contains("else ifneq"));
 }
 
@@ -723,8 +751,9 @@ all:
 	@echo $(RESULT)
 "#;
     let mut buf = content.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse complex else conditionals");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse complex else conditionals")
+        .0;
 
     // Verify the structure is preserved
     let code = makefile.code();
@@ -753,7 +782,7 @@ X := 3
 endif
 "#;
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut buf).unwrap().0;
 
     // Check that we can traverse the syntax tree
     let syntax = makefile.syntax();
@@ -817,7 +846,9 @@ endif
 "#;
     // Use relaxed parsing for nested conditionals test
     let mut buf = content.as_bytes();
-    let makefile = Makefile::read_relaxed(&mut buf).expect("Failed to parse nested conditionals");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse nested conditionals")
+        .0;
 
     // Check that we detected conditionals
     let code = makefile.code();
@@ -863,7 +894,9 @@ else
 EXT = .out
 endif
 "#;
-    let makefile = Makefile::read_relaxed(&mut text.as_bytes()).unwrap();
+    let makefile = Makefile::from_reader_relaxed(&mut text.as_bytes())
+        .unwrap()
+        .0;
 
     let conditionals: Vec<_> = makefile.conditionals().collect();
     assert_eq!(conditionals.len(), 1);

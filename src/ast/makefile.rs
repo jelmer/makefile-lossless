@@ -1030,19 +1030,39 @@ impl Makefile {
     }
 
     /// Read a makefile from a reader
-    pub fn read<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
+    ///
+    /// Returns an error if reading fails or the text has syntax errors.
+    pub fn from_reader<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
         buf.parse()
     }
 
+    /// Read a makefile from a reader
+    #[deprecated(since = "0.4.2", note = "use `from_reader` instead")]
+    pub fn read<R: std::io::Read>(r: R) -> Result<Makefile, Error> {
+        Self::from_reader(r)
+    }
+
     /// Read makefile from a reader, but allow syntax errors
-    pub fn read_relaxed<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
+    #[deprecated(
+        since = "0.4.2",
+        note = "use `from_reader_relaxed` instead, which also returns the errors"
+    )]
+    pub fn read_relaxed<R: std::io::Read>(r: R) -> Result<Makefile, Error> {
+        Ok(Self::from_reader_relaxed(r)?.0)
+    }
+
+    /// Read a makefile from a reader, allowing syntax errors.
+    ///
+    /// Returns the parsed makefile and a list of errors, as
+    /// [`Makefile::from_str_relaxed`] does.
+    pub fn from_reader_relaxed<R: std::io::Read>(
+        mut r: R,
+    ) -> Result<(Self, Vec<ErrorInfo>), std::io::Error> {
         let mut buf = String::new();
         r.read_to_string(&mut buf)?;
-
-        let parsed = parse(&buf, None);
-        Ok(parsed.root())
+        Ok(Self::from_str_relaxed(&buf))
     }
 
     /// Parse a makefile from a string, allowing syntax errors.
@@ -1053,6 +1073,13 @@ impl Makefile {
     pub fn from_str_relaxed(s: &str) -> (Self, Vec<ErrorInfo>) {
         let parsed = parse(s, None);
         (parsed.root(), parsed.errors)
+    }
+
+    /// Read a makefile from a file path
+    ///
+    /// Returns an error if the file can not be read or has syntax errors.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
+        std::fs::read_to_string(path)?.parse()
     }
 
     /// Read a makefile from a file path, allowing syntax errors.
@@ -1587,21 +1614,6 @@ impl Makefile {
         append_with_blank_line(self.syntax(), syntax, &eol);
 
         Ok(Conditional::cast(self.syntax().children().last().unwrap()).unwrap())
-    }
-
-    /// Read the makefile
-    pub fn from_reader<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
-        let mut buf = String::new();
-        r.read_to_string(&mut buf)?;
-
-        let parsed = parse(&buf, None);
-        if !parsed.errors.is_empty() {
-            Err(Error::Parse(ParseError {
-                errors: parsed.errors,
-            }))
-        } else {
-            Ok(parsed.root())
-        }
     }
 
     /// Replace rule at given index with a new rule
@@ -3912,7 +3924,7 @@ clean:
 	dh_clean
 "#;
 
-        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let mut makefile = Makefile::from_reader_relaxed(content.as_bytes()).unwrap().0;
         let initial_count = makefile.rules().count();
         assert_eq!(initial_count, 2);
 
@@ -3934,7 +3946,7 @@ clean:
 	dh_clean
 "#;
 
-        let mut makefile = Makefile::read_relaxed(content.as_bytes()).unwrap();
+        let mut makefile = Makefile::from_reader_relaxed(content.as_bytes()).unwrap().0;
         let mut rule = makefile.add_rule("build-indep");
         rule.add_prerequisite("build").unwrap();
 

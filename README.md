@@ -50,11 +50,12 @@ You can also read from any `std::io::Read`:
 use std::fs::File;
 use makefile_lossless::Makefile;
 
-let makefile = Makefile::read(File::open("Makefile").unwrap()).unwrap();
+let makefile = Makefile::from_reader(File::open("Makefile").unwrap()).unwrap();
 ```
 
-Use `Makefile::read_relaxed` to tolerate syntax errors and still get a tree
-back.
+Use `Makefile::from_reader_relaxed`, `Makefile::from_str_relaxed` or
+`Makefile::from_file_relaxed` to tolerate syntax errors and still get a tree
+back, along with the errors.
 
 Modifying
 ---------

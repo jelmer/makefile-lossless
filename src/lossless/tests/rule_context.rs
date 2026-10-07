@@ -139,8 +139,9 @@ build:
 "#;
     // Use relaxed parsing for now
     let mut buf = content.as_bytes();
-    let makefile =
-        Makefile::read_relaxed(&mut buf).expect("Failed to parse space-indented recipes");
+    let makefile = Makefile::from_reader_relaxed(&mut buf)
+        .expect("Failed to parse space-indented recipes")
+        .0;
 
     // Check that we can extract rules even with errors
     let rules = makefile.rules().collect::<Vec<_>>();
