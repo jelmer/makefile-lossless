@@ -637,8 +637,16 @@ pub enum TextPart {
         /// the closing brace. If the reference is not closed, the range
         /// extends to the end of the text.
         range: Range<usize>,
-        /// The result of [`ParsedReference::parse`] on the text in `range`.
-        /// Error offsets are relative to the start of `range`.
+        /// The result of [`ParsedReference::parse_prefix`] on the text from
+        /// the start of `range`. Error offsets are relative to the start of
+        /// `range`.
+        ///
+        /// This is usually the same as [`ParsedReference::parse`] on the
+        /// text in `range`, but not always for
+        /// [`MakefileVariant::BSDMake`]: make only treats a modifier as a
+        /// SysV substitution if a closing brace follows, and looks for it
+        /// past the end of the reference, so `${S:a=b{}}` is the reference
+        /// `${S:a=b{}` followed by `}`.
         parsed: Result<ParsedReference, ReferenceError>,
     },
 }
@@ -2342,6 +2350,27 @@ mod tests {
             vec![('R', "${A:S/\\#/x/}"), ('L', " \\#")]
         );
         assert_eq!(split("${A:S} ${B}", BSDMake), vec![('E', "${A:S} ${B}")]);
+    }
+
+    #[test]
+    fn test_split_references_bsd_sysv_closing_brace_after() {
+        // bmake expands `${S:a=b{}}` with S=a to `b{}`.
+        let parts = split_references("${S:a=b{}}", BSDMake);
+        assert_eq!(
+            parts,
+            vec![
+                TextPart::Reference {
+                    range: 0..9,
+                    parsed: Ok(reference("S", vec![sysv("a", "b{")])),
+                },
+                TextPart::Literal(9..10),
+            ]
+        );
+        assert_eq!(
+            ParsedReference::parse_prefix("${S:a=b{}}", BSDMake),
+            Ok((reference("S", vec![sysv("a", "b{")]), 9))
+        );
+        assert!(ParsedReference::parse("${S:a=b{}", BSDMake).is_err());
     }
 
     #[test]
