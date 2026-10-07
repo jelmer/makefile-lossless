@@ -1244,6 +1244,45 @@ impl Makefile {
             .filter_map(VariableReference::cast)
     }
 
+    /// The innermost variable reference whose text range contains `offset`.
+    ///
+    /// The range of a reference runs from its `$` up to and including its
+    /// closing delimiter. Like [`Self::variable_references`], this covers
+    /// references anywhere in the makefile, including recipes and `define`
+    /// bodies, and returns function calls such as `$(dir $(FILE))` and
+    /// references with computed names such as `$(A_$(B))` too; use
+    /// [`VariableReference::is_function_call`] and
+    /// [`VariableReference::name`] to tell them apart.
+    ///
+    /// Returns `None` if no reference contains `offset`, including when
+    /// `offset` is at or past the end of the makefile.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "X = $(dir $(FILE)) $(Y)\n".parse().unwrap();
+    /// let name_at = |offset: u32| {
+    ///     makefile
+    ///         .variable_reference_at(offset.into())
+    ///         .and_then(|r| r.name())
+    /// };
+    /// assert_eq!(name_at(2), None);
+    /// assert_eq!(name_at(4), Some("dir".to_string()));
+    /// assert_eq!(name_at(12), Some("FILE".to_string()));
+    /// assert_eq!(name_at(17), Some("dir".to_string()));
+    /// assert_eq!(name_at(21), Some("Y".to_string()));
+    /// ```
+    pub fn variable_reference_at(&self, offset: rowan::TextSize) -> Option<VariableReference> {
+        if !self.syntax().text_range().contains(offset) {
+            return None;
+        }
+        self.syntax()
+            .token_at_offset(offset)
+            .right_biased()?
+            .parent_ancestors()
+            .find_map(VariableReference::cast)
+    }
+
     /// Get all top-level items that overlap with the given text range.
     ///
     /// Since items are stored in document order, this skips items entirely
@@ -2906,6 +2945,137 @@ override_dh_auto_configure:
         let range = rowan::TextRange::new(17.into(), (input.len() as u32).into());
         let vars: Vec<_> = makefile.variable_definitions_in_range(range).collect();
         assert_eq!(vars.len(), 0);
+    }
+
+    /// The runs of offsets, up to a few past the end of `text`, for which
+    /// `variable_reference_at` returns the same reference, with its text.
+    fn reference_runs(text: &str) -> Vec<(u32, u32, Option<String>)> {
+        let makefile: Makefile = text.parse().unwrap();
+        let mut runs: Vec<(u32, u32, Option<String>)> = Vec::new();
+        for offset in 0..text.len() as u32 + 3 {
+            let found = makefile
+                .variable_reference_at(offset.into())
+                .map(|r| r.to_string());
+            match runs.last_mut() {
+                Some((_, end, last)) if *last == found => *end = offset + 1,
+                _ => runs.push((offset, offset + 1, found)),
+            }
+        }
+        runs
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn test_variable_reference_at_nested() {
+        assert_eq!(
+            reference_runs("X = $(dir $(FILE)) $(Y)\n"),
+            vec![
+                (0, 4, None),
+                (4, 10, some("$(dir $(FILE))")),
+                (10, 17, some("$(FILE)")),
+                (17, 18, some("$(dir $(FILE))")),
+                (18, 19, None),
+                (19, 23, some("$(Y)")),
+                (23, 27, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_computed_name() {
+        assert_eq!(
+            reference_runs("X = $(A_$(B))\n"),
+            vec![
+                (0, 4, None),
+                (4, 8, some("$(A_$(B))")),
+                (8, 12, some("$(B)")),
+                (12, 13, some("$(A_$(B))")),
+                (13, 17, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_recipe() {
+        assert_eq!(
+            reference_runs("all: $(DEP)\n\techo $(FOO) $@ $$(BAR)\n"),
+            vec![
+                (0, 5, None),
+                (5, 11, some("$(DEP)")),
+                (11, 18, None),
+                (18, 24, some("$(FOO)")),
+                (24, 25, None),
+                (25, 27, some("$@")),
+                (27, 39, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_define_body() {
+        assert_eq!(
+            reference_runs("define X\n$(A) ${B}\nendef\n"),
+            vec![
+                (0, 9, None),
+                (9, 13, some("$(A)")),
+                (13, 14, None),
+                (14, 18, some("${B}")),
+                (18, 28, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_continuation() {
+        assert_eq!(
+            reference_runs("X = $(subst a \\\n  b,c,$(Y))\n"),
+            vec![
+                (0, 4, None),
+                (4, 22, some("$(subst a \\\n  b,c,$(Y))")),
+                (22, 26, some("$(Y)")),
+                (26, 27, some("$(subst a \\\n  b,c,$(Y))")),
+                (27, 31, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_crlf() {
+        assert_eq!(
+            reference_runs("X = $(A)\r\nall:\r\n\techo $(B)\r\n"),
+            vec![
+                (0, 4, None),
+                (4, 8, some("$(A)")),
+                (8, 22, None),
+                (22, 26, some("$(B)")),
+                (26, 31, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_multibyte() {
+        // Offsets inside the two-byte characters must not panic.
+        assert_eq!(
+            reference_runs("X = \u{e9} $(\u{e9}A)\n"),
+            vec![(0, 7, None), (7, 13, some("$(\u{e9}A)")), (13, 17, None),]
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_at_end_of_text() {
+        // Without a trailing newline, the reference ends at the end of the
+        // makefile, and the offset of that end is not in it.
+        assert_eq!(
+            reference_runs("X = $(A)"),
+            vec![(0, 4, None), (4, 8, some("$(A)")), (8, 11, None)]
+        );
+        let makefile: Makefile = "".parse().unwrap();
+        assert!(makefile.variable_reference_at(0.into()).is_none());
+        assert!(makefile.variable_reference_at(u32::MAX.into()).is_none());
     }
 
     #[test]
