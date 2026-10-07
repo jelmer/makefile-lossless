@@ -1,3 +1,4 @@
+use crate::lossless::ASSIGNMENT_OPERATORS;
 use crate::{MakefileVariant, SyntaxKind};
 use std::iter::Peekable;
 use std::str::Chars;
@@ -47,6 +48,10 @@ pub struct Lexer<'a> {
     recipe_prefix: char,
     /// Text of the current logical line, if it is not a recipe line.
     line: Option<String>,
+    /// Text of the current logical line, including recipe lines.
+    raw_line: String,
+    /// The GNU make `define` whose body is being read, if any.
+    define: Option<Define>,
     /// For nmake, whether the first operator on the current logical line
     /// is `=`, making it a macro definition. `None` before any operator.
     nmake_definition: Option<bool>,
@@ -65,6 +70,16 @@ pub struct Lexer<'a> {
     after_directive_dot: bool,
     /// Whether `#` can start a comment.
     comments: bool,
+}
+
+/// A GNU make `define` block whose body is being read.
+struct Define {
+    /// The number of `define` lines not yet closed by an `endef`.
+    depth: usize,
+    /// The assignment operator, if this defines `.RECIPEPREFIX`.
+    recipe_prefix_op: Option<&'static str>,
+    /// The text of the body so far.
+    body: String,
 }
 
 /// Whether `text` ends in an odd number of backslashes, so that the last
@@ -99,6 +114,8 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             line: Some(String::new()),
+            raw_line: String::new(),
+            define: None,
             nmake_definition: None,
             nmake_quoted: false,
             nmake_inline_files: 0,
@@ -108,8 +125,88 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Track `define` blocks and `.RECIPEPREFIX` assignments at the end of
+    /// a logical line. `line` is the text of the line if it is not a recipe
+    /// line and `raw` its text in any case.
+    fn end_logical_line(&mut self, line: Option<String>, raw: String) {
+        let Some(define) = &mut self.define else {
+            if let Some(line) = line {
+                if let Some(recipe_prefix_op) = Self::define_header(&line) {
+                    self.define = Some(Define {
+                        depth: 1,
+                        recipe_prefix_op,
+                        body: String::new(),
+                    });
+                } else {
+                    self.update_recipe_prefix(&line);
+                }
+            }
+            return;
+        };
+        // Like make, only look for `define` and `endef` on lines that do
+        // not start with the recipe prefix.
+        if !raw.starts_with(self.recipe_prefix) {
+            let raw = raw.replace("\\\r\n", " ").replace("\\\n", " ");
+            let rest = raw.trim_start_matches(Self::is_whitespace);
+            let keyword = |keyword: &str| {
+                rest.strip_prefix(keyword)
+                    .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t', '\r', '\n']))
+            };
+            if keyword("endef") {
+                define.depth -= 1;
+            } else if keyword("define") {
+                define.depth += 1;
+            }
+        }
+        if define.depth > 0 {
+            define.body.push_str(&raw);
+            return;
+        }
+        let define = self.define.take().unwrap();
+        if let Some(op) = define.recipe_prefix_op {
+            let body = define.body.replace("\r\n", "\n");
+            // The newline before `endef` is not part of the value.
+            self.set_recipe_prefix(op, body.strip_suffix('\n').unwrap_or(&body));
+        }
+    }
+
+    /// If `line` starts a `define` block, return the assignment operator if
+    /// it defines `.RECIPEPREFIX`. This follows the parser's check, in which
+    /// `define = 1` assigns to a variable named "define".
+    fn define_header(line: &str) -> Option<Option<&'static str>> {
+        let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
+        let mut rest = line.trim_end_matches(['\r', '\n']).trim_start();
+        loop {
+            if let Some(r) = rest.strip_prefix("define") {
+                if r.is_empty() || r.starts_with([' ', '\t', '#']) {
+                    rest = r.trim_start();
+                    break;
+                }
+            }
+            let modifier = ["override", "export", "private"].into_iter().find(|m| {
+                rest.strip_prefix(m)
+                    .is_some_and(|r| r.starts_with(Self::is_whitespace))
+            })?;
+            rest = rest[modifier.len()..].trim_start();
+        }
+        if ASSIGNMENT_OPERATORS.iter().any(|op| rest.starts_with(op)) {
+            return None;
+        }
+        let Some(rest) = rest.strip_prefix(".RECIPEPREFIX") else {
+            return Some(None);
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('#') {
+            return Some(Some("="));
+        }
+        Some(
+            ["=", ":=", "::=", ":::=", "+=", "?="]
+                .into_iter()
+                .find(|op| rest.starts_with(op)),
+        )
+    }
+
     /// Update the recipe prefix if `line` assigns to `.RECIPEPREFIX`.
-    // TODO: Handle `define .RECIPEPREFIX`.
     fn update_recipe_prefix(&mut self, line: &str) {
         let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
         let mut rest = line.trim_start();
@@ -131,12 +228,18 @@ impl<'a> Lexer<'a> {
             return;
         };
         let value = value.trim_start();
+        let value = if value.starts_with('#') { "" } else { value };
+        self.set_recipe_prefix(op, value);
+    }
+
+    /// Set the recipe prefix from an assignment of `value` to
+    /// `.RECIPEPREFIX` with operator `op`.
+    fn set_recipe_prefix(&mut self, op: &str, value: &str) {
         let first = match value.chars().next() {
-            None | Some('#') => None,
             // An immediately expanded reference.
             // TODO: Expand variable references.
             Some('$') if op != "=" && !value.starts_with("$$") => return,
-            Some(c) => Some(c),
+            first => first,
         };
         match op {
             // `.RECIPEPREFIX` is always defined.
@@ -331,7 +434,11 @@ impl<'a> Lexer<'a> {
                     }
                     return Some((SyntaxKind::TEXT, text));
                 }
-                (c, None) if c == self.recipe_prefix && c != '\t' && !self.continuation => {
+                // A prefix set to a newline, by a `define` whose value starts
+                // with an empty line, allows no recipe lines.
+                (c, None)
+                    if c == self.recipe_prefix && c != '\t' && c != '\n' && !self.continuation =>
+                {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
                     return Some((SyntaxKind::INDENT, c.to_string()));
@@ -610,10 +717,11 @@ impl Iterator for Lexer<'_> {
             } else if let Some(line) = &mut self.line {
                 line.push_str(&token.1);
             }
+            self.raw_line.push_str(&token.1);
             if token.0 == SyntaxKind::NEWLINE && !self.continuation {
-                if let Some(line) = self.line.replace(String::new()) {
-                    self.update_recipe_prefix(&line);
-                }
+                let line = self.line.replace(String::new());
+                let raw = std::mem::take(&mut self.raw_line);
+                self.end_logical_line(line, raw);
             }
         }
         match token.0 {
@@ -1612,5 +1720,75 @@ override_dh_auto_clean:
         let mut lexer = Lexer::new(".RECIPEPREFIX = >\n", Some(MakefileVariant::BSDMake));
         lexer.by_ref().for_each(drop);
         assert_eq!(lexer.recipe_prefix, '\t');
+    }
+
+    #[test]
+    fn test_define_recipe_prefix() {
+        let prefix = |text: &str| {
+            let mut lexer = Lexer::new(text, None);
+            lexer.by_ref().for_each(drop);
+            lexer.recipe_prefix
+        };
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\nendef\n"), '>');
+        assert_eq!(prefix("define .RECIPEPREFIX :=\n>x\nfoo\nendef\n"), '>');
+        assert_eq!(prefix("define .RECIPEPREFIX=\n>\nendef\n"), '>');
+        assert_eq!(prefix("override define .RECIPEPREFIX # c\n>\nendef\n"), '>');
+        assert_eq!(prefix("define .RECIPEPREFIX \\\n=\n>\nendef\n"), '>');
+        assert_eq!(prefix("define .RECIPEPREFIX\r\n>\r\nendef\r\n"), '>');
+        assert_eq!(prefix("define .RECIPEPREFIX\n  >\nendef\n"), ' ');
+        assert_eq!(
+            prefix(".RECIPEPREFIX = >\ndefine .RECIPEPREFIX\nendef\n"),
+            '\t'
+        );
+        assert_eq!(
+            prefix(".RECIPEPREFIX = >\ndefine .RECIPEPREFIX\n\nendef\n"),
+            '\t'
+        );
+        assert_eq!(prefix("define .RECIPEPREFIX\n\nfoo\nendef\n"), '\n');
+        // No line starts with that prefix, not even an empty one.
+        assert_eq!(
+            lex("define .RECIPEPREFIX\n\nfoo\nendef\n\nx\n", None)[9..],
+            [
+                (NEWLINE, "\n".into()),
+                (IDENTIFIER, "x".into()),
+                (NEWLINE, "\n".into())
+            ]
+        );
+        assert_eq!(prefix("define .RECIPEPREFIX ?=\n>\nendef\n"), '\t');
+        assert_eq!(prefix("define .RECIPEPREFIX +=\n>\nendef\n"), '>');
+        assert_eq!(
+            prefix(".RECIPEPREFIX = >\ndefine .RECIPEPREFIX +=\n;\nendef\n"),
+            '>'
+        );
+        // The value is not set before the `endef`.
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\n"), '\t');
+        // A continued line or one starting with the recipe prefix does not
+        // end the definition, nor does `endef` followed by a comment.
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\\\nendef\n"), '\t');
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\n\tendef\n"), '\t');
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\nendef#c\n"), '\t');
+        assert_eq!(prefix("define .RECIPEPREFIX\n>\n  endef # c\n"), '>');
+        assert_eq!(
+            prefix(".RECIPEPREFIX = >\ndefine .RECIPEPREFIX\n>endef\n;\nendef\n"),
+            '>'
+        );
+        assert_eq!(
+            prefix(".RECIPEPREFIX = >\ndefine .RECIPEPREFIX\n\tendef\n;\nendef\n"),
+            '\t'
+        );
+        // Nested definitions.
+        assert_eq!(
+            prefix("define .RECIPEPREFIX\n  define X\nendef\n>\nendef\n"),
+            ' '
+        );
+        assert_eq!(
+            prefix("define X\ndefine .RECIPEPREFIX\n>\nendef\nendef\n"),
+            '\t'
+        );
+        // An assignment in the body of another variable does not count.
+        assert_eq!(prefix("define X\n.RECIPEPREFIX = >\nendef\n"), '\t');
+        assert_eq!(prefix("define .RECIPEPREFIXES\n>\nendef\n"), '\t');
+        // An assignment to a variable named "define".
+        assert_eq!(prefix("define = 1\n.RECIPEPREFIX = >\n"), '>');
     }
 }
