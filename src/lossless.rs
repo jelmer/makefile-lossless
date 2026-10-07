@@ -334,9 +334,6 @@ pub(crate) fn node_text(node: &SyntaxNode) -> String {
     lf_line_endings(&node.text().to_string())
 }
 
-///
-/// This removes trailing NEWLINE tokens from the end of a RULE node to avoid
-/// extra blank lines at the end of a file when the last rule is removed.
 /// Build detached tree elements for splicing into a mutable tree: the given
 /// tokens, followed by a RECIPE node holding `recipe` if given.
 pub(crate) fn detached_elements(
@@ -356,8 +353,11 @@ pub(crate) fn detached_elements(
     elements
 }
 
+/// Remove the blank lines at the end of a RULE node, keeping the line
+/// break that ends its last line.
 pub(crate) fn trim_trailing_newlines(node: &SyntaxNode) {
-    // Collect all trailing NEWLINE tokens at the end of the rule and within RECIPE nodes
+    // The trailing NEWLINE tokens of the rule and its last RECIPE node, last
+    // first.
     let mut newlines_to_remove = vec![];
     let mut current = node.last_child_or_token();
 
@@ -385,17 +385,10 @@ pub(crate) fn trim_trailing_newlines(node: &SyntaxNode) {
         }
     }
 
-    // Remove all but one trailing newline (keep at least one)
-    // Remove from highest index to lowest to avoid index shifts
-    if newlines_to_remove.len() > 1 {
-        // Sort by index descending
-        newlines_to_remove.sort_by_key(|t| std::cmp::Reverse(t.index()));
-
-        for token in newlines_to_remove.iter().take(newlines_to_remove.len() - 1) {
-            let parent = token.parent().unwrap();
-            let idx = token.index();
-            parent.splice_children(idx..idx + 1, vec![]);
-        }
+    // Keep the first one, which ends the last line.
+    newlines_to_remove.pop();
+    for token in newlines_to_remove {
+        token.detach();
     }
 }
 
