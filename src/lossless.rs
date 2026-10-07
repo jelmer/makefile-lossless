@@ -32,7 +32,7 @@ pub enum Lang {}
 impl rowan::Language for Lang {
     type Kind = SyntaxKind;
     fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-        unsafe { std::mem::transmute::<u16, SyntaxKind>(raw.0) }
+        SyntaxKind::try_from(raw.0).unwrap_or_else(|raw| panic!("invalid SyntaxKind {raw}"))
     }
     fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {
         kind.into()

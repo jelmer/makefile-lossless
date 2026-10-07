@@ -17,7 +17,7 @@ pub struct Parse<T> {
     positioned_errors: Vec<PositionedParseError>,
     /// The make variant the text was parsed for.
     variant: Option<MakefileVariant>,
-    _ty: PhantomData<T>,
+    _ty: PhantomData<fn() -> T>,
 }
 
 impl<T> Parse<T> {
@@ -100,10 +100,6 @@ impl<T> Parse<T> {
     }
 }
 
-// Implement Send + Sync since GreenNode is thread-safe
-unsafe impl<T> Send for Parse<T> {}
-unsafe impl<T> Sync for Parse<T> {}
-
 impl Parse<Makefile> {
     /// Parse makefile text, returning a Parse result
     pub fn parse_makefile(text: &str) -> Self {
@@ -150,5 +146,42 @@ impl Parse<Rule> {
                 }],
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::Lang;
+    use crate::SyntaxKind;
+
+    #[test]
+    #[should_panic(expected = "invalid SyntaxKind 60000")]
+    fn test_syntax_node_with_unknown_kind() {
+        let green = GreenNode::new(rowan::SyntaxKind(60000), []);
+        Parse::<Makefile>::new(green, vec![], vec![])
+            .syntax_node()
+            .kind();
+    }
+
+    #[test]
+    fn test_syntax_kind_round_trip() {
+        use rowan::Language;
+        for (i, &kind) in SyntaxKind::ALL.iter().enumerate() {
+            let raw = Lang::kind_to_raw(kind);
+            assert_eq!(usize::from(raw.0), i);
+            assert_eq!(Lang::kind_from_raw(raw), kind);
+        }
+        assert_eq!(
+            SyntaxKind::try_from(SyntaxKind::ALL.len() as u16),
+            Err(SyntaxKind::ALL.len() as u16)
+        );
+    }
+
+    #[test]
+    fn test_parse_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Parse<Makefile>>();
+        assert_send_sync::<Parse<Rule>>();
     }
 }

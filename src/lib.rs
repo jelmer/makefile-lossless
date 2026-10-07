@@ -85,13 +85,28 @@ pub enum MakefileVariant {
     POSIXMake,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(non_camel_case_types)]
-#[repr(u16)]
-#[allow(missing_docs)]
-#[non_exhaustive]
-pub enum SyntaxKind {
-    IDENTIFIER = 0,
+/// Define `SyntaxKind` along with `SyntaxKind::ALL`, which lists every
+/// variant in discriminant order.
+macro_rules! syntax_kinds {
+    ($($kind:ident,)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[allow(non_camel_case_types)]
+        #[repr(u16)]
+        #[allow(missing_docs)]
+        #[non_exhaustive]
+        pub enum SyntaxKind {
+            $($kind,)*
+        }
+
+        impl SyntaxKind {
+            /// Every kind, indexed by its raw value.
+            const ALL: &'static [SyntaxKind] = &[$(SyntaxKind::$kind,)*];
+        }
+    };
+}
+
+syntax_kinds! {
+    IDENTIFIER,
     INDENT,
     TEXT,
     WHITESPACE,
@@ -143,6 +158,15 @@ pub enum SyntaxKind {
     EXPRESSION_STATEMENT, // A line of only references, e.g. `$(eval ...)` or `$(info ...)`, optionally followed by `;` and text
     TARGET_PATTERN,       // The target pattern of a static pattern rule
     LOAD,                 // A GNU make `load` or `-load` directive
+}
+
+impl TryFrom<u16> for SyntaxKind {
+    type Error = u16;
+
+    /// Convert a raw kind back, returning it as the error if it is unknown.
+    fn try_from(raw: u16) -> Result<Self, u16> {
+        Self::ALL.get(usize::from(raw)).copied().ok_or(raw)
+    }
 }
 
 /// Convert our `SyntaxKind` into the rowan `SyntaxKind`.
