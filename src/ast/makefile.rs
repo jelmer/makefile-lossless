@@ -3965,6 +3965,26 @@ VAR3 = value3
     }
 
     #[test]
+    fn test_rule_remove_last_keeps_blank_lines_before_other_items() {
+        for (code, expected) in [
+            ("a:\n\techo\n\n\nX = 1\nb:\n", "a:\n\techo\n\n\nX = 1\n"),
+            ("a:\n\n\n# x\nb:\n", "a:\n"),
+            ("a:\n\techo\n\n\nb:\n", "a:\n\techo\n"),
+            ("a:\n\techo\n\n# doc\nb:\n", "a:\n\techo\n"),
+            (
+                "a:\n\techo $(X) y $(Z) w\n\n\nb:\n",
+                "a:\n\techo $(X) y $(Z) w\n",
+            ),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            let rule = makefile.find_rule_by_target("b").unwrap();
+            rule.remove().unwrap();
+            assert_eq!(makefile.code(), expected, "{code:?}");
+            assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
     fn test_insert_rule_before_doc_comment() {
         let cases = [
             ("a:\n# doc\nc:\n", 1, "a:\n\nb:\n\n# doc\nc:\n"),

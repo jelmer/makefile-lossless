@@ -1723,8 +1723,8 @@ impl Rule {
     /// they document it. If that leaves a blank line above where it was
     /// followed by another blank line or the end of the file, the blank line
     /// above is removed too.
-    /// When removing the last rule in a makefile, this will also trim any trailing blank lines
-    /// from the previous rule to avoid leaving extra whitespace at the end of the file.
+    /// If that leaves another rule at the end of the file, the blank lines at
+    /// its end are removed too.
     pub fn remove(self) -> Result<(), Error> {
         let parent = self.syntax().parent().ok_or_else(|| {
             Error::Parse(ParseError {
@@ -1737,25 +1737,20 @@ impl Rule {
             })
         })?;
 
-        // Check if this is the last rule by seeing if there's any next sibling that's a RULE
-        let is_last_rule = self
-            .syntax()
-            .siblings(rowan::Direction::Next)
-            .skip(1) // Skip self
-            .all(|sibling| sibling.kind() != RULE);
-
         remove_with_preceding_comments(self.syntax(), &parent);
 
-        // If we removed the last rule, trim trailing newlines from the last remaining RULE
-        if is_last_rule {
-            // Find the last RULE node in the parent
-            if let Some(last_rule_node) = parent
-                .children()
-                .filter(|child| child.kind() == RULE)
-                .last()
-            {
-                trim_trailing_newlines(&last_rule_node);
-            }
+        // Trim the blank lines at the end of the last remaining rule if
+        // nothing follows it any more.
+        let last_rule = parent
+            .children()
+            .filter(|child| child.kind() == RULE)
+            .last();
+        if let Some(last_rule) = last_rule.filter(|rule| {
+            rule.siblings_with_tokens(rowan::Direction::Next)
+                .skip(1)
+                .all(|it| matches!(it.kind(), NEWLINE | WHITESPACE))
+        }) {
+            trim_trailing_newlines(&last_rule);
         }
 
         Ok(())
