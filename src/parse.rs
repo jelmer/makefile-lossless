@@ -105,9 +105,13 @@ impl<T> Parse<T> {
             .expect("no node of the requested type in the parsed text")
     }
 
-    /// Get the syntax node
+    /// Get the root syntax node of the parsed text
+    ///
+    /// Like `tree()`, this returns a fresh mutable tree, so AST nodes
+    /// reached from it can be edited in place. Each call creates a new
+    /// tree; edits are not shared between calls or stored in the `Parse`.
     pub fn syntax_node(&self) -> SyntaxNode<crate::lossless::Lang> {
-        SyntaxNode::new_root(self.green.clone())
+        SyntaxNode::new_root_mut(self.green.clone())
     }
 }
 
@@ -203,6 +207,15 @@ mod tests {
         Parse::<Makefile>::new(green, vec![], vec![])
             .syntax_node()
             .kind();
+    }
+
+    #[test]
+    fn test_syntax_node_is_mutable() {
+        let parsed = Parse::<Makefile>::parse_makefile("all: foo\n\techo foo\n");
+        let makefile = Makefile::cast(parsed.syntax_node()).unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.push_command("echo bar");
+        assert_eq!(makefile.to_string(), "all: foo\n\techo foo\n\techo bar\n");
     }
 
     #[test]
