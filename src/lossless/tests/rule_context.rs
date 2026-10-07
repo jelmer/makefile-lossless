@@ -1292,6 +1292,40 @@ fn test_tab_indented_comment_ending_in_escaped_backslash() {
 }
 
 #[test]
+fn test_tab_indented_continued_assignment_outside_rule() {
+    // Every line of a continued assignment is read as an ordinary line,
+    // whether it is outside of rule context or only on some paths.
+    for prefix in ["", "ifdef A\nall:\nendif\n"] {
+        let code = format!("{prefix}\tX = a \\\n\tb: c \\\n\t$(Y)\nY = 1\n");
+        let parsed = parse(&code, None);
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        assert_eq!(parsed.root().to_string(), code);
+        let vars: Vec<_> = parsed
+            .root()
+            .variable_definitions()
+            .map(|v| (v.name().unwrap(), v.raw_value().unwrap()))
+            .collect();
+        assert_eq!(
+            vars,
+            vec![
+                ("X".to_string(), "a \\\n\tb: c \\\n\t$(Y)".to_string()),
+                ("Y".to_string(), "1".to_string()),
+            ],
+            "{code:?}"
+        );
+    }
+}
+
+#[test]
+fn test_tab_indented_continued_line_at_end_without_newline() {
+    let code = "\tX = a \\\n\tb";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    assert_eq!(parsed.root().to_string(), code);
+    assert_eq!(node_kinds(&parsed.syntax()), "VARIABLE\n  EXPR\n");
+}
+
+#[test]
 fn test_space_indented_line_after_rule_is_not_recipe() {
     let code = "t:\n\techo 1\n  X = 1\n";
     let parsed = parse(code, None);

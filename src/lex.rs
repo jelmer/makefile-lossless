@@ -770,22 +770,33 @@ pub(crate) fn recipe_prefix_after(input: &str) -> char {
 }
 
 /// Lex `input`, treating its first line as an ordinary makefile line even if
-/// it starts with a tab. Also returns whether the input ends in a line
-/// continuation.
+/// it starts with a tab.
 pub(crate) fn lex_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
-) -> (Vec<(SyntaxKind, String)>, bool) {
+) -> Vec<(SyntaxKind, String)> {
     let mut lexer = Lexer::new(input, variant);
     lexer.line_type = Some(LineType::Other);
-    let tokens: Vec<_> = lexer.by_ref().collect();
-    // A continued comment takes in the newline and the next line, so if
-    // the input ends in a newline that is part of a comment, the comment
-    // continues past it.
-    let comment_continues = tokens
-        .last()
-        .is_some_and(|(kind, text)| *kind == SyntaxKind::COMMENT && text.ends_with('\n'));
-    (tokens, lexer.continuation || comment_continues)
+    lexer.collect()
+}
+
+/// Lex the first logical line of `input`, including its line ending, as an
+/// ordinary makefile line even if it starts with a tab.
+pub(crate) fn lex_first_non_recipe_line(
+    input: &str,
+    variant: Option<MakefileVariant>,
+) -> Vec<(SyntaxKind, String)> {
+    let mut lexer = Lexer::new(input, variant);
+    lexer.line_type = Some(LineType::Other);
+    let mut tokens = vec![];
+    while let Some(token) = lexer.next() {
+        let line_end = token.0 == SyntaxKind::NEWLINE && !lexer.continuation;
+        tokens.push(token);
+        if line_end {
+            break;
+        }
+    }
+    tokens
 }
 
 /// Lex text inside a variable reference in a recipe line or `define`

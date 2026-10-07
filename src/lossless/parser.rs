@@ -1,5 +1,7 @@
 use super::*;
-use crate::lex::{ends_with_unescaped_backslash, lex, lex_non_recipe_line};
+use crate::lex::{
+    ends_with_unescaped_backslash, lex, lex_first_non_recipe_line, lex_non_recipe_line,
+};
 use crate::MakefileVariant;
 use rowan::GreenNode;
 
@@ -285,6 +287,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Number of times tokens were lexed again, which may change where
         /// a logical line ends.
         token_edits: usize,
+    }
+
+    /// A logical line lexed again, from [`Parser::lex_as_non_recipe_line`].
+    struct RelexedLine {
+        /// The new tokens, in reverse order.
+        tokens: Vec<(SyntaxKind, String)>,
+        /// The number of current tokens they replace.
+        replaces: usize,
     }
 
     /// The rest of a logical line, from [`Parser::bsd_logical_line`].
@@ -2358,7 +2368,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             if !tail.starts_with('$') {
                 return;
             }
-            let pieces = lex_non_recipe_line(tail, self.variant).0;
+            let pieces = lex_non_recipe_line(tail, self.variant);
             // Keep token_positions in step with the new tokens.
             let mut position = self.token_positions[consumed].0;
             let positions: Vec<_> = pieces
@@ -4374,8 +4384,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     );
                 }
                 self.parse_recipe_line();
-            } else if self.indented_line_is_statement() {
-                self.relex_as_non_recipe_line();
+            } else if let Some(line) = self.lex_indented_statement() {
+                self.replace_line(line);
             } else {
                 self.record_error(
                     ParseErrorKind::RecipeBeforeFirstTarget,
@@ -4396,17 +4406,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 // either way, while GNU make reads it as an ordinary line
                 // outside of rule context, so it has to be a recipe line if
                 // it isn't valid as one.
-                RuleContext::Varies
-                    if self.indented_lines_are_commands() && self.at_bsd_comment_line() =>
-                {
-                    self.parse_bsd_comment_line()
+                RuleContext::Varies if self.indented_lines_are_commands() => {
+                    if self.at_bsd_comment_line() {
+                        self.parse_bsd_comment_line()
+                    } else {
+                        self.parse_recipe_line()
+                    }
                 }
-                RuleContext::Varies
-                    if !self.indented_lines_are_commands() && self.indented_line_is_statement() =>
-                {
-                    self.relex_as_non_recipe_line()
-                }
-                RuleContext::Varies => self.parse_recipe_line(),
+                RuleContext::Varies => match self.lex_indented_statement() {
+                    Some(line) => self.replace_line(line),
+                    None => self.parse_recipe_line(),
+                },
             }
         }
 
@@ -4437,17 +4447,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 })
         }
 
-        /// Whether the tab-indented line at the current position, read as an
-        /// ordinary line, is valid outside of rule context in GNU make: a
-        /// comment, blank line, directive or assignment. Expressions and
-        /// rules are not.
-        fn indented_line_is_statement(&mut self) -> bool {
-            let (mut line, _) = self.lex_as_non_recipe_line();
-            line.reverse();
-            while matches!(line.last(), Some((WHITESPACE | INDENT, _))) {
-                line.pop();
+        /// The tab-indented line at the current position lexed as an ordinary
+        /// line, if it is valid as such outside of rule context in GNU make: a
+        /// comment, blank line, directive or assignment. Expressions and rules
+        /// are not.
+        fn lex_indented_statement(&mut self) -> Option<RelexedLine> {
+            let mut line = self.lex_as_non_recipe_line();
+            let tokens = std::mem::replace(&mut self.tokens, line.tokens);
+            let mut indent = vec![];
+            while let Some(token) = self
+                .tokens
+                .pop_if(|(kind, _)| matches!(kind, WHITESPACE | INDENT))
+            {
+                indent.push(token);
             }
-            let tokens = std::mem::replace(&mut self.tokens, line);
             let is_statement = match self.tokens.last() {
                 None | Some((NEWLINE | COMMENT, _)) => true,
                 _ => {
@@ -4461,8 +4474,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         || self.at_load_keyword()
                 }
             };
-            self.tokens = tokens;
-            is_statement
+            self.tokens.extend(indent.into_iter().rev());
+            line.tokens = std::mem::replace(&mut self.tokens, tokens);
+            is_statement.then_some(line)
         }
 
         /// Parse a tab-indented line with only a comment, or nothing at all,
@@ -4494,33 +4508,30 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         /// Lex the rest of the current logical line as an ordinary makefile
-        /// line. Returns the new tokens in forward order and the number of
-        /// current tokens they replace.
-        fn lex_as_non_recipe_line(&self) -> (Vec<(SyntaxKind, String)>, usize) {
-            let mut text = String::new();
-            let mut count = 0;
-            let mut current = self.tokens.iter().rev();
-            loop {
-                for (kind, token) in current.by_ref() {
-                    text.push_str(token);
-                    count += 1;
-                    if *kind == NEWLINE {
-                        break;
-                    }
+        /// line.
+        fn lex_as_non_recipe_line(&self) -> RelexedLine {
+            let start = usize::from(self.current_range().start());
+            let mut tokens = lex_first_non_recipe_line(&self.original_text[start..], self.variant);
+            let len: usize = tokens.iter().map(|(_, text)| text.len()).sum();
+            let mut replaced_len = 0;
+            let mut replaces = 0;
+            for (_, text) in self.tokens.iter().rev() {
+                if replaced_len >= len {
+                    break;
                 }
-                let (tokens, continued) = lex_non_recipe_line(&text, self.variant);
-                if !continued || count == self.tokens.len() {
-                    return (tokens, count);
-                }
+                replaced_len += text.len();
+                replaces += 1;
             }
+            assert_eq!(replaced_len, len, "relexed line ends inside a token");
+            tokens.reverse();
+            RelexedLine { tokens, replaces }
         }
 
-        /// Lex the rest of the current logical line again as an ordinary
-        /// makefile line.
-        fn relex_as_non_recipe_line(&mut self) {
+        /// Replace the tokens of the rest of the current logical line with
+        /// `line`.
+        fn replace_line(&mut self, line: RelexedLine) {
             let consumed = self.token_positions.len() - self.tokens.len();
-            let (tokens, count) = self.lex_as_non_recipe_line();
-            self.tokens.truncate(self.tokens.len() - count);
+            self.tokens.truncate(self.tokens.len() - line.replaces);
 
             // Keep token_positions in step with the new tokens.
             let rest = self.token_positions.split_off(consumed);
@@ -4528,7 +4539,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 .first()
                 .map(|(start, _)| *start)
                 .expect("relexed line has tokens");
-            for (_, token) in &tokens {
+            for (_, token) in line.tokens.iter().rev() {
                 let end = position + rowan::TextSize::of(token.as_str());
                 self.token_positions.push((position, end));
                 position = end;
@@ -4536,7 +4547,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.token_positions
                 .extend_from_slice(&rest[rest.len() - self.tokens.len()..]);
 
-            self.tokens.extend(tokens.into_iter().rev());
+            self.tokens.extend(line.tokens);
             self.token_edits += 1;
         }
 
