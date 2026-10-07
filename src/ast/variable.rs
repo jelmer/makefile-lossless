@@ -1,5 +1,5 @@
 use super::makefile::MakefileItem;
-use super::{is_continuation, line_ending, logical_text, LineSyntax};
+use super::{is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax};
 use crate::lossless::{
     detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
     scan_recipe_variable_refs, Error, ErrorInfo, ParseError, RecipeVariableReference,
@@ -225,14 +225,17 @@ impl VariableDefinition {
             // GNU make takes the rest of the line as the name, including any
             // whitespace and line continuations inside it. The parser only
             // emits an OPERATOR token after a `define` name if it is the
-            // assignment operator.
+            // assignment operator. At the end of the file the line is
+            // followed by the empty body of the block, its last EXPR node.
             let is_define = directive.text() == "define";
+            let body = self.define_body().map(rowan::NodeOrToken::Node);
             let mut elements: Vec<_> = self
                 .after_directive_keywords()
                 .take_while(|it| {
                     is_continuation(it)
                         || !(matches!(it.kind(), NEWLINE | COMMENT)
-                            || is_define && it.kind() == OPERATOR)
+                            || is_define && it.kind() == OPERATOR
+                            || Some(it) == body.as_ref())
                 })
                 .collect();
             while elements
@@ -1184,9 +1187,31 @@ impl VariableDefinition {
             })
         };
 
-        let Some(expr) = self.value_expr() else {
+        let Some(mut expr) = self.value_expr() else {
             return self.insert_value(&new_expr);
         };
+        if self.is_define() {
+            // A `define` line at the end of the file has no line break
+            // before the body, or one that continues it.
+            let eol = line_ending(self.syntax());
+            let continued = expr
+                .prev_sibling_or_token()
+                .is_some_and(|it| it.kind() == NEWLINE && is_continuation(&it));
+            let index = if continued {
+                let index = expr.index();
+                self.syntax()
+                    .splice_children(index..index, detached_elements(&[(NEWLINE, &eol)], None));
+                index + 1
+            } else {
+                terminate_line_before(self.syntax(), expr.index(), &eol)
+            };
+            expr = self
+                .syntax()
+                .children_with_tokens()
+                .nth(index)
+                .and_then(|it| it.into_node())
+                .expect("the body follows the define line");
+        }
         let after_operator = expr
             .prev_sibling_or_token()
             .is_some_and(|it| it.kind() == OPERATOR);
@@ -1240,7 +1265,6 @@ impl VariableDefinition {
             })
             .all(|it| matches!(it.kind(), WHITESPACE | COMMENT | NEWLINE) || is_continuation(&it))
         });
-        // TODO: add a body to a `define` line at the end of the file
         if is_undefine || self.is_define() || !rest_is_blank {
             return Err(value_error(
                 "set_value",
@@ -2644,8 +2668,40 @@ mod tests {
     }
 
     #[test]
+    fn test_set_value_define_at_end_of_file() {
+        // The `define` line is ended before the body.
+        for (text, expected) in [
+            ("define X", "define X\nnew\nendef\n"),
+            ("define X ", "define X \nnew\nendef\n"),
+            ("define X =", "define X =\nnew\nendef\n"),
+            ("define X # c", "define X # c\nnew\nendef\n"),
+            ("define $(A)B", "define $(A)B\nnew\nendef\n"),
+            ("define X\\\n", "define X\\\n\nnew\nendef\n"),
+            ("define X\n", "define X\nnew\nendef\n"),
+        ] {
+            let (makefile, _) = Makefile::from_str_relaxed(text);
+            let mut var = makefile.variable_definitions().next().unwrap();
+            var.set_value("new");
+            assert!(var.add_endef().unwrap());
+            crate::test_util::assert_matches_reparse(&makefile);
+            assert_eq!(makefile.code(), expected);
+            assert_eq!(var.raw_value().as_deref(), Some("new\n"));
+        }
+    }
+
+    #[test]
+    fn test_define_name_at_end_of_file() {
+        for text in ["define X", "define X ", "define X\\\n"] {
+            let (makefile, _) = Makefile::from_str_relaxed(text);
+            let var = makefile.variable_definitions().next().unwrap();
+            assert_eq!(var.name().as_deref(), Some("X"));
+            assert_eq!(var.raw_value().as_deref(), Some(""));
+        }
+    }
+
+    #[test]
     fn test_try_set_value_without_value() {
-        for text in ["undefine X\n", "export X Y\n", "define X"] {
+        for text in ["undefine X\n", "export X Y\n"] {
             let (makefile, _) = Makefile::from_str_relaxed(text);
             let mut var = makefile.variable_definitions().next().unwrap();
             let error = var.try_set_value("new").unwrap_err();

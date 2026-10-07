@@ -1369,3 +1369,30 @@ fn test_space_indented_line_outside_rule_not_recovered() {
         "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  ERROR\n"
     );
 }
+
+#[test]
+fn test_space_indented_comment_after_blank_line() {
+    // make ignores a comment line indented with spaces, also after a blank
+    // line, where it ends the rule like an unindented one.
+    let code = "a:\n\techo a\n\n  # x\nc:\n\techo c\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    assert_eq!(parsed.root().to_string(), code);
+    assert_eq!(
+        node_kinds(&parsed.syntax()),
+        "RULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\nRULE\n  TARGETS\n  PREREQUISITES\n  RECIPE\n"
+    );
+    let makefile = parsed.root();
+    let c = makefile.items().nth(1).unwrap();
+    assert_eq!(c.doc_comments().collect::<Vec<_>>(), vec!["x"]);
+}
+
+#[test]
+fn test_space_indented_comment_after_blank_line_in_recipe() {
+    // The recipe continues after the comment.
+    let code = "a:\n\techo a\n\n  # x\n\techo b\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    let rule = parsed.root().rules().next().unwrap();
+    assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a", "echo b"]);
+}

@@ -350,6 +350,23 @@ fn test_substitution_strings_are_literal() {
     };
     assert_eq!(references(&vars[0]), vec!["$(SRCS: = $(DIR)"]);
     assert_eq!(references(&vars[1]), vec!["$(SRCS:.c=.obj)"]);
+    let parsed: Vec<_> = makefile
+        .variable_references()
+        .map(|r| r.parse(MakefileVariant::NMake))
+        .collect();
+    let sysv = |name: &str, from: &str, to: &str| {
+        Ok(crate::ParsedReference {
+            name: name.to_string(),
+            modifiers: vec![crate::Modifier::SysVSubstitute {
+                from: crate::ModifierArg::literal(from),
+                to: crate::ModifierArg::literal(to),
+            }],
+        })
+    };
+    assert_eq!(
+        parsed,
+        vec![sysv("SRCS", " ", " $(DIR"), sysv("SRCS", ".c", ".obj")]
+    );
 
     // Functions may contain references.
     let makefile = parse_nmake("X = $(subst $(A),b,c)\n");
@@ -419,6 +436,43 @@ fn test_all_dependents_reference() {
         .map(|r| (r.to_string(), r.name()))
         .collect();
     assert_eq!(references, vec![r("$*", "*")]);
+}
+
+#[test]
+fn test_target_as_dependent() {
+    // On a dependency line, `$$@` is the current target and `$$(@B)` a part
+    // of it; the reference is the `$@` or `$(@B)` after the first `$`.
+    let code = "a.obj b.obj: $$(@B).c $$@.h $$x\n\tcl $$@\n";
+    let makefile = parse_nmake(code);
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.name(), r.text_range()))
+        .collect();
+    assert_eq!(
+        references,
+        vec![
+            (
+                "$(@B)".to_string(),
+                Some("@B".to_string()),
+                rowan::TextRange::new(14.into(), 19.into())
+            ),
+            (
+                "$@".to_string(),
+                Some("@".to_string()),
+                rowan::TextRange::new(23.into(), 25.into())
+            ),
+        ]
+    );
+    let rule = makefile.rules().next().unwrap();
+    assert_eq!(
+        rule.prerequisites_for(MakefileVariant::NMake)
+            .collect::<Vec<_>>(),
+        vec!["$$(@B).c", "$$@.h", "$$x"]
+    );
+
+    // Other variants read `$$` as an escaped dollar.
+    let makefile: Makefile = "a.obj: $$@.h\n".parse().unwrap();
+    assert_eq!(makefile.variable_references().count(), 0);
 }
 
 #[test]

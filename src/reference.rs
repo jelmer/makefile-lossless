@@ -526,7 +526,9 @@ impl ParsedReference {
     /// [`MakefileVariant::GNUMake`] a function call such as `$(wildcard *.c)`
     /// gives [`ReferenceError::FunctionCall`]. For [`MakefileVariant::NMake`]
     /// `$**`, all dependents of the target, refers to `**`; a filename part
-    /// such as `$(@D)` or `$(**F)` is part of the name, as in GNU make.
+    /// such as `$(@D)` or `$(**F)` is part of the name, as in GNU make. The
+    /// strings of an nmake substitution can't invoke macros, so it ends at
+    /// the first `)`, and `$` is literal in them.
     pub fn parse(text: &str, variant: MakefileVariant) -> Result<Self, ReferenceError> {
         let (parsed, end) = Self::parse_prefix(text, variant)?;
         if end != text.len() {
@@ -544,7 +546,9 @@ impl ParsedReference {
     ///
     /// This is useful for expanding a value: find the next `$`, parse the
     /// reference there and continue after it. Note that `$$` is not a
-    /// reference.
+    /// reference, not even in nmake's `$$@`, the current target on a
+    /// dependency line: the makefile parser reads that as a `$` followed by
+    /// the reference `$@`, and likewise for `$$(@F)`.
     ///
     /// For [`MakefileVariant::BSDMake`], `\#` stands for `#`, as make
     /// replaces it before parsing any line other than a recipe line.
@@ -1898,8 +1902,6 @@ impl<'a> Parser<'a> {
         let endc = match self.peek() {
             Some('(') => ')',
             Some('{') => '}',
-            // TODO: In an nmake dependency line, `$$@` is the target and
-            // `$$(@F)` a part of it, rather than an escaped dollar.
             Some('$') => {
                 return Err(syntax_error(
                     start,
@@ -1929,6 +1931,11 @@ impl<'a> Parser<'a> {
             }
         };
         let body_start = self.pos + 1;
+        if variant == MakefileVariant::NMake && endc == ')' {
+            if let Some(parsed) = self.parse_nmake_substitution(body_start)? {
+                return Ok(parsed);
+            }
+        }
         let body_end = self.text.len()
             - skip_balanced(&self.text[self.pos..])
                 .ok_or_else(|| {
@@ -1941,6 +1948,63 @@ impl<'a> Parser<'a> {
                 .len();
         self.pos = body_end;
         parse_simple_body(&self.text[body_start..body_end - 1], body_start, variant)
+    }
+
+    /// Parse nmake's `$(name:string1=string2)` with its body at
+    /// `body_start`, or return `None` if the reference is not one.
+    ///
+    /// The strings "can't invoke macros", so the reference ends at the first
+    /// `)` and `$` is literal in them.
+    fn parse_nmake_substitution(
+        &mut self,
+        body_start: usize,
+    ) -> Result<Option<ParsedReference>, ReferenceError> {
+        let rest = &self.text[body_start..];
+        let name_len = nmake_macro_name_len(rest);
+        if name_len == 0 || !rest[name_len..].starts_with(':') {
+            return Ok(None);
+        }
+        let Some(len) = rest.find(')') else {
+            return Err(syntax_error(
+                self.text.len(),
+                ReferenceSyntaxErrorKind::UnclosedExpression,
+                "unclosed reference, expecting ')'",
+            ));
+        };
+        let body = &rest[..len];
+        self.pos = body_start + len + 1;
+        let Some((from, to)) = body[name_len + 1..].split_once('=') else {
+            return Ok(Some(ParsedReference {
+                name: body.to_string(),
+                modifiers: vec![],
+            }));
+        };
+        Ok(Some(ParsedReference {
+            name: body[..name_len].to_string(),
+            modifiers: vec![Modifier::SysVSubstitute {
+                from: ModifierArg::literal(from),
+                to: ModifierArg::literal(to),
+            }],
+        }))
+    }
+}
+
+/// The length of the macro name at the start of `text` that the parser
+/// takes as the name of an nmake substitution: a run of identifier
+/// characters, `**`, or another single character that does not end a name.
+fn nmake_macro_name_len(text: &str) -> usize {
+    let identifier = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || "_/.-%".contains(c)))
+        .unwrap_or(text.len());
+    if identifier > 0 {
+        return identifier;
+    }
+    if text.starts_with("**") {
+        return 2;
+    }
+    match text.chars().next() {
+        Some(c) if !c.is_whitespace() && !"$(){}:=#\\^\"'".contains(c) => c.len_utf8(),
+        _ => 0,
     }
 }
 
@@ -2266,6 +2330,43 @@ mod tests {
                 ('L', " "),
                 ('R', "$(OBJS:.obj=.o)"),
             ]
+        );
+    }
+
+    #[test]
+    fn test_nmake_substitution_strings_are_literal() {
+        // nmake's substitution strings can't invoke macros, so the reference
+        // ends at the first `)`, as the parser reads it.
+        assert_eq!(
+            split("$(SRCS: = $(DIR)\\) $(OBJS:.c=$O)", NMake),
+            vec![
+                ('R', "$(SRCS: = $(DIR)"),
+                ('L', "\\) "),
+                ('R', "$(OBJS:.c=$O)"),
+            ]
+        );
+        assert_eq!(
+            ParsedReference::parse_prefix("$(SRCS: = $(DIR)\\)", NMake),
+            Ok((reference("SRCS", vec![sysv(" ", " $(DIR")]), 16))
+        );
+        assert_eq!(
+            ParsedReference::parse("$(OBJS:.c=$O)", NMake),
+            Ok(reference("OBJS", vec![sysv(".c", "$O")]))
+        );
+        // Other references and GNU make substitutions still nest.
+        assert_eq!(
+            ParsedReference::parse("$($(A):x=y)", NMake),
+            Ok(reference("$(A)", vec![sysv("x", "y")]))
+        );
+        assert_eq!(
+            ParsedReference::parse("$(SRCS: = $(DIR)\\)", GNUMake),
+            Ok(reference(
+                "SRCS",
+                vec![Modifier::SysVSubstitute {
+                    from: lit(" "),
+                    to: ModifierArg::new([text(" "), expr("$(DIR)"), text("\\")]),
+                }]
+            ))
         );
     }
 
