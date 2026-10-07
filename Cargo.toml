@@ -11,7 +11,22 @@ authors = [ "Jelmer Vernooij <jelmer@jelmer.uk>",]
 documentation = "https://docs.rs/makefile-lossless"
 homepage = "https://github.com/jelmer/makefile-lossless"
 keywords = ["makefile", "make", "parser", "lossless", "cst"]
-exclude = [".github/", "TODO"]
+exclude = [".github/", "TODO", "benches/"]
+
+[lib]
+# Keeps the libtest harness from rejecting divan options in `cargo bench`.
+bench = false
 
 [dependencies]
 rowan = "^0.16"
+
+[dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "edit"
+harness = false
