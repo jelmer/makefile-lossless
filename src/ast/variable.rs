@@ -1,6 +1,7 @@
 use super::makefile::MakefileItem;
 use super::{
-    edit_error, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
+    edit_error, is_continuation, line_ending, logical_text, replace_children,
+    terminate_line_before, GreenElement, LineSyntax,
 };
 use crate::lossless::{
     detached_elements, is_sunsh_operator, node_text, parse, remove_with_preceding_comments,
@@ -1350,7 +1351,7 @@ impl VariableDefinition {
             })
             .and_then(|it| it.into_token())
             .filter(|t| t.kind() == WHITESPACE);
-        let mut elements = value_elements(tokens, &new_expr, before_comment.as_slice());
+        let children = value_children(&new_expr, before_comment.as_slice());
         // A line continuation at the end of the file leaves the line break,
         // and any indentation after it, in the value. Keep the line break as
         // the end of the line.
@@ -1360,13 +1361,18 @@ impl VariableDefinition {
             .filter_map(|it| it.into_token())
             .filter(|t| t.kind() != INDENT)
             .last()
-            .filter(|t| ends_line && t.kind() == NEWLINE);
+            .filter(|t| ends_line && t.kind() == NEWLINE)
+            .map(|t| t.text().to_string());
+        replace_children(&expr, children);
+        let index = expr.index();
         if let Some(newline) = newline {
-            elements.extend(detached_elements(&[(NEWLINE, newline.text())], None));
+            self.syntax().splice_children(
+                index + 1..index + 1,
+                detached_elements(&[(NEWLINE, &newline)], None),
+            );
         }
-        let expr_idx = expr.index();
         self.syntax()
-            .splice_children(expr_idx..expr_idx + 1, elements);
+            .splice_children(index..index, detached_elements(tokens, None));
         Ok(())
     }
 
@@ -1433,6 +1439,15 @@ fn value_elements(
     expr: &SyntaxNode<crate::lossless::Lang>,
     trailing: &[crate::lossless::SyntaxToken],
 ) -> Vec<crate::lossless::SyntaxElement> {
+    let children = value_children(expr, trailing);
+    detached_elements(tokens, Some(rowan::GreenNode::new(EXPR.into(), children)))
+}
+
+/// The children of `expr`, an EXPR node, with copies of `trailing` added.
+fn value_children(
+    expr: &SyntaxNode<crate::lossless::Lang>,
+    trailing: &[crate::lossless::SyntaxToken],
+) -> Vec<GreenElement> {
     let mut children: Vec<_> = expr.green().children().map(|it| it.to_owned()).collect();
     for token in trailing {
         let mut text = token.text().to_string();
@@ -1447,7 +1462,7 @@ fn value_elements(
         }
         children.push(rowan::GreenToken::new(token.kind().into(), &text).into());
     }
-    detached_elements(tokens, Some(rowan::GreenNode::new(EXPR.into(), children)))
+    children
 }
 
 #[cfg(test)]
@@ -3447,5 +3462,48 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_set_value_keeps_unchanged_parts() {
+        let makefile: Makefile = "X  =  a  $(B)  c   # c\nY = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let expr = var.value_expr().unwrap();
+        let reference = expr.children().next().unwrap();
+        let space = expr.last_token().unwrap();
+        var.try_set_value("z  $(B)  c").unwrap();
+        assert_eq!(makefile.code(), "X  =  z  $(B)  c   # c\nY = 1\n");
+        assert_eq!(var.value_expr(), Some(expr.clone()));
+        assert_eq!(reference.parent(), Some(expr.clone()));
+        assert_eq!(space.parent(), Some(expr));
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_value_of_define_keeps_unchanged_lines() {
+        let makefile: Makefile = "define X\n  a\n\tb\nendef\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        let body = var.value_expr().unwrap();
+        let first = body.first_token().unwrap();
+        var.try_set_value("  a\nc\n").unwrap();
+        assert_eq!(makefile.code(), "define X\n  a\nc\nendef\n");
+        assert_eq!(var.value_expr(), Some(body.clone()));
+        assert!(first.parent_ancestors().any(|n| n == body));
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_value_in_makefile_with_errors() {
+        let parsed = Makefile::parse("X = a  # c\nifdef Y\nZ = 1\n");
+        assert!(!parsed.ok());
+        let makefile = parsed.tree();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.try_set_value("b").unwrap();
+        assert_eq!(makefile.code(), "X = b  # c\nifdef Y\nZ = 1\n");
+        let reparsed = Makefile::parse(&makefile.code()).tree();
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.syntax())
+        );
     }
 }
