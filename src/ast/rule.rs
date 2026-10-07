@@ -5,9 +5,8 @@ use super::{
     terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
-    build_command, node_text, recipe_green, remove_with_preceding_comments, trim_trailing_newlines,
-    Conditional, Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode,
-    SyntaxToken,
+    build_command, node_text, remove_with_preceding_comments, trim_trailing_newlines, Conditional,
+    Error, ErrorInfo, Makefile, ParseError, Recipe, Rule, SyntaxElement, SyntaxNode, SyntaxToken,
 };
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -239,8 +238,9 @@ impl Rule {
     ///
     /// # Panics
     ///
-    /// Panics if there are no targets, or if a target or prerequisite can
-    /// not be written so that it reads back the same.
+    /// Panics if there are no targets, if a target or prerequisite can not
+    /// be written so that it reads back the same, or if a recipe line can not
+    /// be written as a single recipe line, as for [`Rule::push_command`].
     ///
     /// # Example
     /// ```
@@ -268,8 +268,9 @@ impl Rule {
         children.push(prerequisites.green().into_owned().into());
         children.push(GreenToken::new(NEWLINE.into(), "\n").into());
         for recipe in recipes {
-            let recipe = recipe_green(&[(INDENT, "\t"), (TEXT, recipe), (NEWLINE, "\n")]);
-            children.push(recipe.into());
+            let recipe = build_command('\t', recipe, "\n", "Rule::new")
+                .unwrap_or_else(|e| panic!("invalid recipe: {e}"));
+            children.push(recipe.green().into_owned().into());
         }
         let syntax = SyntaxNode::new_root_mut(GreenNode::new(RULE.into(), children));
         Rule::cast(syntax).unwrap()
@@ -3550,11 +3551,13 @@ mod tests {
 
     #[test]
     fn test_new_rule_matches_parse() {
-        let cases: [(&[&str], &[&str], &[&str]); 4] = [
+        let cases: [(&[&str], &[&str], &[&str]); 6] = [
             (&["a"], &[], &[]),
             (&["a", "b"], &["c"], &[]),
             (&["a"], &[], &["echo"]),
             (&["a"], &["b", "c"], &["echo", "true"]),
+            (&["a"], &[], &["echo a \\\n\tb", "echo $(X \\\nY)"]),
+            (&["a"], &[], &["# a \\\n\tb", "@echo $(X)"]),
         ];
         for (targets, prerequisites, recipes) in cases {
             let rule = Rule::new(targets, prerequisites, recipes);
@@ -3568,6 +3571,12 @@ mod tests {
             makefile.insert_rule(0, rule).unwrap();
             assert_matches_reparse(&makefile);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid recipe")]
+    fn test_new_rule_line_break_in_recipe() {
+        Rule::new(&["a"], &[], &["echo a\nb"]);
     }
 
     #[test]
