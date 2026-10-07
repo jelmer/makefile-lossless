@@ -119,7 +119,7 @@ impl Parser<'_> {
                 len -= 1;
                 continue;
             }
-            let token_len = self.tokens.last().expect("text comes from tokens").1.len();
+            let token_len = self.current_text().expect("text comes from tokens").len();
             if token_len > len {
                 self.bump_token_head(len);
                 return;
@@ -271,18 +271,14 @@ impl Parser<'_> {
                 }
             } else {
                 // Start by checking if this is a function like $(shell ...)
-                let mut is_function = false;
-
-                if self.current() == Some(IDENTIFIER) {
-                    let function_name = &self.tokens.last().unwrap().1;
-                    // Common makefile functions
-                    let known_functions = [
-                        "shell", "wildcard", "call", "eval", "file", "abspath", "dir",
-                    ];
-                    if known_functions.contains(&function_name.as_str()) {
-                        is_function = true;
-                    }
-                }
+                // Common makefile functions
+                let known_functions = [
+                    "shell", "wildcard", "call", "eval", "file", "abspath", "dir",
+                ];
+                let is_function = matches!(
+                    self.current_token(),
+                    Some((IDENTIFIER, name)) if known_functions.contains(&name)
+                );
 
                 if self.at_nmake_substitution() {
                     // nmake's substitution strings can't invoke macros,
@@ -319,9 +315,8 @@ impl Parser<'_> {
             && !self.is_line_continuation()
             && !(self.variant == Some(MakefileVariant::BSDMake)
                 && self
-                    .tokens
-                    .last()
-                    .is_some_and(|(_, text)| text.starts_with(':')))
+                    .current_text()
+                    .is_some_and(|text| text.starts_with(':')))
         {
             // Single character variable like $X or $$. A `)` or `}` is
             // left alone: make finds the end of an enclosing reference
@@ -330,7 +325,9 @@ impl Parser<'_> {
             // the first character of a token such as `XY` or a run of
             // whitespace is the name, except for nmake's `$**`, which
             // the lexer reads as one token.
-            let text = &self.tokens.last().unwrap().1;
+            let text = self
+                .current_text()
+                .expect("not at the end of the reference");
             let first_len = if self.variant == Some(MakefileVariant::NMake) && text == "**" {
                 2
             } else {
@@ -356,9 +353,9 @@ impl Parser<'_> {
     /// the end of the line, or at the quote that ends a quoted `ifeq`
     /// argument.
     fn at_reference_end(&self) -> bool {
-        match self.tokens.last() {
+        match self.current_token() {
             None | Some((NEWLINE, _)) => true,
-            Some((QUOTE, text)) => self.argument_quote.as_ref() == Some(text),
+            Some((QUOTE, text)) => self.argument_quote.as_deref() == Some(text),
             _ => false,
         }
     }

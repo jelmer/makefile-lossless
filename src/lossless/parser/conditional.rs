@@ -103,7 +103,10 @@ impl Parser<'_> {
     /// argument, end the argument at a quote inside a variable reference
     /// too, leaving the reference unterminated.
     fn parse_quoted_argument(&mut self) -> bool {
-        let quote = self.tokens.last().unwrap().1.clone();
+        let quote = self
+            .current_text()
+            .expect("at the opening quote")
+            .to_string();
         self.bump();
         self.argument_quote = Some(quote.clone());
         let found = self.parse_quoted_argument_rest(&quote);
@@ -116,7 +119,7 @@ impl Parser<'_> {
             if self.consume_line_continuation() {
                 continue;
             }
-            match self.tokens.last() {
+            match self.current_token() {
                 Some((QUOTE, text)) if text == quote => {
                     self.bump();
                     return true;
@@ -129,15 +132,16 @@ impl Parser<'_> {
     }
 
     fn parse_conditional_keyword(&mut self) -> Option<String> {
-        if self.current() != Some(IDENTIFIER) {
-            self.error(
-                ParseErrorKind::InvalidConditional,
-                "expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".to_string(),
-            );
-            return None;
-        }
-
-        let token = self.tokens.last().unwrap().1.clone();
+        let token = match self.current_token() {
+            Some((IDENTIFIER, token)) => token.to_string(),
+            _ => {
+                self.error(
+                    ParseErrorKind::InvalidConditional,
+                    "expected conditional keyword (ifdef, ifndef, ifeq, or ifneq)".to_string(),
+                );
+                return None;
+            }
+        };
         if !Self::is_conditional_start(&token) {
             // Reached for an `else` or `endif` outside of a conditional.
             let kind = match token.as_str() {
@@ -274,8 +278,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn parse_conditional(&mut self) {
-        if self.current() == Some(IDENTIFIER)
-            && Self::is_conditional_start(&self.tokens.last().unwrap().1)
+        if matches!(self.current_token(), Some((IDENTIFIER, t)) if Self::is_conditional_start(t))
             && self.nesting_depth >= crate::reference::MAX_DEPTH
         {
             self.parse_too_deeply_nested_block();
@@ -338,7 +341,10 @@ impl Parser<'_> {
                         self.parse_normal_content();
                         continue;
                     }
-                    let token = self.tokens.last().unwrap().1.clone();
+                    let token = self
+                        .current_text()
+                        .expect("at a conditional keyword")
+                        .to_string();
                     match token.as_str() {
                         "else" => {
                             if seen_final_else {

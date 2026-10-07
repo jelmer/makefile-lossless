@@ -16,7 +16,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn at_dependency_operator(&self) -> bool {
-        match self.tokens.last() {
+        match self.current_token() {
             Some((OPERATOR, op)) => {
                 Self::is_colon_dependency_operator(op) || self.at_bang_dependency_operator()
             }
@@ -39,7 +39,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn at_bang(&self) -> bool {
-        matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!")
+        self.at(OPERATOR, "!")
     }
 
     /// Whether the current token is a `!` that is part of a name.
@@ -182,7 +182,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn at_assignment_operator(&self) -> bool {
-        matches!(self.tokens.last(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str()))
+        matches!(self.current_token(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op))
     }
 
     /// Whether the current token is one of `keywords`, followed by

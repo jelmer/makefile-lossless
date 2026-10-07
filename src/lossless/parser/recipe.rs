@@ -43,7 +43,7 @@ impl Parser<'_> {
             // TEXT token ends in a continuation backslash
             while self.current().is_some() && self.current() != Some(NEWLINE) {
                 if self.current() == Some(TEXT) || (comment && self.current() == Some(COMMENT)) {
-                    if let Some((_kind, text)) = self.tokens.last() {
+                    if let Some(text) = self.current_text() {
                         if self.variant == Some(MakefileVariant::NMake) {
                             inline_files += text.matches("<<").count();
                         }
@@ -87,7 +87,10 @@ impl Parser<'_> {
         while inline_files > 0 {
             match self.current() {
                 Some(TEXT) => {
-                    if self.tokens.last().unwrap().1.starts_with("<<") {
+                    if self
+                        .current_text()
+                        .is_some_and(|text| text.starts_with("<<"))
+                    {
                         inline_files -= 1;
                     }
                     self.bump();
@@ -172,7 +175,7 @@ impl Parser<'_> {
     /// rest. This is for places where `#` does not start a comment, such
     /// as a recipe on the rule line.
     fn split_continued_comment(&mut self) -> bool {
-        let Some((COMMENT, text)) = self.tokens.last() else {
+        let Some((COMMENT, text)) = self.current_token() else {
             return false;
         };
         let Some(lf) = text.find('\n') else {
@@ -249,9 +252,10 @@ impl Parser<'_> {
                     self.parse_comment();
                 }
                 Some(IDENTIFIER) => {
-                    let token = &self.tokens.last().unwrap().1;
                     // Check if this is a starting conditional directive
-                    if Self::is_conditional_start(token) && self.at_conditional_keyword() {
+                    if self.current_text().is_some_and(Self::is_conditional_start)
+                        && self.at_conditional_keyword()
+                    {
                         // Unless it continues the recipe, this is a top-level
                         // conditional, not part of the rule. Blank lines
                         // don't end a rule's recipe.
@@ -285,7 +289,7 @@ impl Parser<'_> {
     /// with "missing separator".
     fn at_space_indented_recipe(&mut self) -> bool {
         if self.in_rule != RuleContext::Inside
-            || !matches!(self.tokens.last(), Some((WHITESPACE, ws)) if !ws.contains('\t'))
+            || !matches!(self.current_token(), Some((WHITESPACE, ws)) if !ws.contains('\t'))
         {
             return false;
         }
@@ -297,9 +301,9 @@ impl Parser<'_> {
             && !self.is_variable_assignment_line()
             && !self.at_include_keyword()
             && !matches!(
-                self.tokens.last(),
+                self.current_token(),
                 Some((IDENTIFIER, word)) if Self::is_conditional_start(word)
-                    || matches!(word.as_str(), "else" | "endif" | "define" | "endef")
+                    || matches!(word, "else" | "endif" | "define" | "endef")
             );
         self.tokens.push(ws);
         self.token_positions.push(ws_position);
@@ -326,10 +330,7 @@ impl Parser<'_> {
         // were indented with a tab.
         loop {
             let mut text = String::new();
-            while let Some((kind, _)) = self.tokens.last() {
-                if *kind == NEWLINE {
-                    break;
-                }
+            while self.current().is_some_and(|kind| kind != NEWLINE) {
                 text.push_str(&self.pop_token().unwrap().1);
             }
             let continued = ends_with_unescaped_backslash(&text);
@@ -443,7 +444,7 @@ impl Parser<'_> {
         {
             indent.push((token, self.token_positions.pop().unwrap()));
         }
-        let is_statement = match self.tokens.last() {
+        let is_statement = match self.current_token() {
             None | Some((NEWLINE | COMMENT, _)) => true,
             _ => {
                 self.at_vpath_keyword()
@@ -474,8 +475,8 @@ impl Parser<'_> {
             self.bump_as(WHITESPACE);
         }
         let mut comment = String::new();
-        while let Some((kind, text)) = self.tokens.last() {
-            if *kind == NEWLINE
+        while let Some((kind, text)) = self.current_token() {
+            if kind == NEWLINE
                 && (!ends_with_unescaped_backslash(&comment) || self.tokens.len() == 1)
             {
                 break;

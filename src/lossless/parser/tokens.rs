@@ -54,7 +54,7 @@ impl Parser<'_> {
 
     /// Whether the current token's text is `text`.
     pub(super) fn at_text(&self, text: &str) -> bool {
-        self.tokens.last().is_some_and(|(_, t)| t == text)
+        self.current_text() == Some(text)
     }
 
     /// Returns true if the current token is an unescaped BACKSLASH
@@ -114,10 +114,9 @@ impl Parser<'_> {
         self.pending_backslash_escape = false;
         self.builder.token(kind.into(), &head);
 
-        let tail = &self.tokens.last().unwrap().1;
-        if !tail.starts_with('$') {
+        let Some(tail) = self.current_text().filter(|tail| tail.starts_with('$')) else {
             return;
-        }
+        };
         let pieces = lex_non_recipe_line(tail, self.variant);
         self.replace_current_token(pieces);
     }
@@ -190,6 +189,23 @@ impl Parser<'_> {
     /// Peek at the first unprocessed token
     pub(super) fn current(&self) -> Option<SyntaxKind> {
         self.tokens.last().map(|(kind, _)| *kind)
+    }
+
+    /// The kind and text of the first unprocessed token.
+    pub(super) fn current_token(&self) -> Option<(SyntaxKind, &str)> {
+        self.tokens
+            .last()
+            .map(|(kind, text)| (*kind, text.as_str()))
+    }
+
+    /// The text of the first unprocessed token.
+    pub(super) fn current_text(&self) -> Option<&str> {
+        self.tokens.last().map(|(_, text)| text.as_str())
+    }
+
+    /// Whether the current token is of kind `kind` with text `text`.
+    pub(super) fn at(&self, kind: SyntaxKind, text: &str) -> bool {
+        self.current_token() == Some((kind, text))
     }
 
     /// Kind of the first non-whitespace token after the current one.

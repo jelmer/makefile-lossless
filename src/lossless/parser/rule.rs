@@ -43,7 +43,7 @@ impl Parser<'_> {
     /// Whether the current token starts with a character that ends a
     /// target name unless escaped with a backslash.
     fn at_escapable_target_separator(&self) -> bool {
-        match self.tokens.last() {
+        match self.current_token() {
             Some((WHITESPACE, _)) => true,
             Some((OPERATOR, op)) => op.starts_with(':') || self.at_bang_dependency_operator(),
             _ => false,
@@ -54,8 +54,8 @@ impl Parser<'_> {
     /// is escaped by a preceding backslash, leaving the rest of the
     /// token as the current token.
     fn bump_escaped_char(&mut self) {
-        let text = &self.tokens.last().unwrap().1;
-        let len = text.chars().next().unwrap().len_utf8();
+        let text = self.current_text().expect("at an escaped character");
+        let len = text.chars().next().map_or(0, char::len_utf8);
         if len == text.len() {
             self.bump_as(TEXT);
         } else {
@@ -380,8 +380,8 @@ impl Parser<'_> {
         // followed by `:=`, and `!=` is `!` followed by `=`.
         if has_target && self.bsd_directives_enabled() {
             self.skip_ws();
-            if let Some((OPERATOR, op)) = self.tokens.last() {
-                if matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=") {
+            if let Some((OPERATOR, op)) = self.current_token() {
+                if matches!(op, ":=" | "::=" | ":::=" | "!=") {
                     let (_, op) = self.pop_token().unwrap();
                     let split = if op.starts_with("::") { 2 } else { 1 };
                     let (dependency_op, assignment_op) = op.split_at(split);
@@ -811,7 +811,7 @@ impl Parser<'_> {
             }
 
             // Check if we're at a colon
-            if self.current() == Some(OPERATOR) && self.tokens.last().unwrap().1 == ":" {
+            if self.at(OPERATOR, ":") {
                 break;
             }
 

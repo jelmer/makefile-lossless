@@ -113,9 +113,10 @@ impl Parser<'_> {
         let required = if let Some((_, count)) = directive {
             self.bump_n(count);
             true
-        } else if self.current() == Some(IDENTIFIER)
-            && ["include", "-include", "sinclude"].contains(&self.tokens.last().unwrap().1.as_str())
-        {
+        } else if matches!(
+            self.current_token(),
+            Some((IDENTIFIER, "include" | "-include" | "sinclude"))
+        ) {
             self.bump();
             !self.gnu_directives_enabled()
         } else {
@@ -142,9 +143,9 @@ impl Parser<'_> {
     /// `${X}` is not delimited, and the closing delimiter is looked for
     /// anywhere, even in a variable reference.
     fn check_include_delimiters(&mut self) {
-        let close = match self.tokens.last() {
-            Some((TEXT, open)) if open == "<" => '>',
-            Some((QUOTE, open)) if open == "\"" => '"',
+        let close = match self.current_token() {
+            Some((TEXT, "<")) => '>',
+            Some((QUOTE, "\"")) => '"',
             // A missing path is reported by `parse_file_list`.
             None | Some((NEWLINE | COMMENT, _)) => return,
             Some(_) => {
@@ -408,7 +409,7 @@ impl Parser<'_> {
     /// tokens making up the keyword. Like nmake, this only recognizes a
     /// `!` in the first column, and ignores the case of the keyword.
     fn nmake_directive(&self) -> Option<(&'static str, usize)> {
-        if !matches!(self.tokens.last(), Some((OPERATOR, op)) if op == "!") {
+        if !self.at(OPERATOR, "!") {
             return None;
         }
         let start = usize::from(self.current_range().start());
@@ -658,7 +659,7 @@ impl Parser<'_> {
                 "expected variable name after .for".to_string(),
             );
         }
-        if self.current() == Some(IDENTIFIER) && self.tokens.last().unwrap().1 == "in" {
+        if self.at(IDENTIFIER, "in") {
             self.bump();
         } else if valid {
             self.record_error(

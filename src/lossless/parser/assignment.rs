@@ -42,13 +42,14 @@ impl Parser<'_> {
     /// `private` modifier. A keyword directly followed by an operator is the
     /// variable name itself, as in `override := 1`.
     fn at_assignment_prefix_keyword(&self) -> bool {
-        self.current() == Some(IDENTIFIER)
-            && match self.tokens.last().unwrap().1.as_str() {
-                "export" => self.gnu_directives_enabled() || self.is_bsd_make(),
-                "unexport" | "override" | "private" => self.gnu_directives_enabled(),
-                _ => false,
+        let enabled = match self.current_token() {
+            Some((IDENTIFIER, "export")) => self.gnu_directives_enabled() || self.is_bsd_make(),
+            Some((IDENTIFIER, "unexport" | "override" | "private")) => {
+                self.gnu_directives_enabled()
             }
-            && self.peek_past_ws() != Some(OPERATOR)
+            _ => false,
+        };
+        enabled && self.peek_past_ws() != Some(OPERATOR)
     }
 
     pub(super) fn parse_assignment(&mut self) {
@@ -66,15 +67,9 @@ impl Parser<'_> {
         // Without an assignment only `export` and `unexport` can start
         // the line; GNU make rejects `override export X`.
         let bare_needs_export = self.at_assignment_prefix_keyword()
-            && !matches!(
-                self.tokens.last().unwrap().1.as_str(),
-                "export" | "unexport"
-            );
+            && !matches!(self.current_text(), Some("export" | "unexport"));
         while self.at_assignment_prefix_keyword() {
-            is_export_directive |= matches!(
-                self.tokens.last().unwrap().1.as_str(),
-                "export" | "unexport"
-            );
+            is_export_directive |= matches!(self.current_text(), Some("export" | "unexport"));
             self.bump();
             self.skip_ws_and_continuations();
             if bsd_gmake_export {
@@ -85,8 +80,7 @@ impl Parser<'_> {
         // `undefine NAME`, unless followed by an operator as in
         // `undefine = 1`, which assigns to a variable named "undefine".
         let is_undefine = self.gnu_directives_enabled()
-            && self.current() == Some(IDENTIFIER)
-            && self.tokens.last().unwrap().1 == "undefine"
+            && self.at(IDENTIFIER, "undefine")
             && self.peek_past_ws() != Some(OPERATOR);
         if is_undefine {
             self.bump();
@@ -170,21 +164,17 @@ impl Parser<'_> {
                 self.skip_ws_and_continuations();
             }
         }
-        match self.current() {
-            Some(OPERATOR) => {
-                let op = &self.tokens.last().unwrap().1;
-                if ASSIGNMENT_OPERATORS.contains(&op.as_str()) {
-                    self.bump();
-                    self.skip_ws();
-                    self.parse_assignment_value();
-                } else {
-                    self.error(
-                        ParseErrorKind::ExpectedAssignmentOperator,
-                        format!("invalid assignment operator: {}", op),
-                    );
-                }
+        match self.current_token() {
+            Some((OPERATOR, _)) if self.at_assignment_operator() => {
+                self.bump();
+                self.skip_ws();
+                self.parse_assignment_value();
             }
-            Some(NEWLINE | COMMENT) | None if bare_needs_export => {
+            Some((OPERATOR, op)) => {
+                let msg = format!("invalid assignment operator: {}", op);
+                self.error(ParseErrorKind::ExpectedAssignmentOperator, msg);
+            }
+            Some((NEWLINE | COMMENT, _)) | None if bare_needs_export => {
                 self.record_error(
                     ParseErrorKind::ExpectedAssignmentOperator,
                     "expected assignment operator".to_string(),
@@ -192,10 +182,10 @@ impl Parser<'_> {
                 self.expect_eol();
             }
             // Bare "export VARNAME" without assignment operator is valid GNU Make
-            Some(NEWLINE) => {
+            Some((NEWLINE, _)) => {
                 self.bump();
             }
-            Some(COMMENT) if is_export_directive => self.expect_eol(),
+            Some((COMMENT, _)) if is_export_directive => self.expect_eol(),
             None => {
                 // EOF after export VARNAME is fine
             }
@@ -219,10 +209,10 @@ impl Parser<'_> {
         if self.is_bsd_make() || (self.bsd_directives_enabled() && self.is_bsd_assignment_line()) {
             return self.parse_bsd_variable_name();
         }
-        let at_name = |this: &Self| match this.tokens.last() {
+        let at_name = |this: &Self| match this.current_token() {
             // A backslash is part of the name unless it continues the line.
             Some((BACKSLASH, _)) => !this.is_line_continuation(),
-            Some((kind, text)) => Self::is_gnu_name_token(*kind, text),
+            Some((kind, text)) => Self::is_gnu_name_token(kind, text),
             None => false,
         };
         if !at_name(self) {
@@ -261,9 +251,9 @@ impl Parser<'_> {
                 Some(OPERATOR)
                     if level == 0
                         && self.is_bsd_make()
-                        && is_colons_before_subst(&self.tokens.last().unwrap().1) =>
+                        && self.current_text().is_some_and(is_colons_before_subst) =>
                 {
-                    let len = self.tokens.last().unwrap().1.len();
+                    let len = self.current_text().expect("checked in the guard").len();
                     self.bump_token_head(len - ":=".len());
                     return true;
                 }
@@ -423,9 +413,7 @@ impl Parser<'_> {
 
         // Consume any `override`/`export`/`unexport`/`private` modifiers and the
         // `define` keyword itself.
-        while self.current() == Some(IDENTIFIER)
-            && Self::is_define_modifier(&self.tokens.last().unwrap().1)
-        {
+        while matches!(self.current_token(), Some((IDENTIFIER, t)) if Self::is_define_modifier(t)) {
             self.bump();
             self.skip_ws_and_continuations();
         }
