@@ -855,6 +855,18 @@ mod tests {
     }
 
     #[test]
+    fn test_try_set_assignment_operator_colons_after_name() {
+        // BSD make reads the first colon of `::=` as part of the name.
+        let makefile = parse_bsd("a:b=c\n");
+        let mut var = makefile.variable_definitions().next().unwrap();
+        assert!(var.try_set_assignment_operator("::=").is_err());
+        assert_eq!(makefile.code(), "a:b=c\n");
+        var.try_set_assignment_operator(":sh=").unwrap();
+        assert_eq!(makefile.code(), "a:b:sh=c\n");
+        assert_eq!(var.assignment_operator(), Some(":sh=".to_string()));
+    }
+
+    #[test]
     fn test_include_without_space() {
         let makefile = parse_ok(".include<bsd.own.mk>\n.-include\"x.mk\"\n");
         assert_eq!(

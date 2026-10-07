@@ -915,7 +915,15 @@ impl VariableDefinition {
     /// (export prefix, variable name, value, whitespace, etc.)
     ///
     /// # Arguments
-    /// * `op` - The new operator: "=", ":=", "::=", ":::=", "+=", "?=", or "!="
+    /// * `op` - The new operator: "=", ":=", "::=", ":::=", "+=", "?=", "!=",
+    ///   or ":sh=" for BSD make
+    ///
+    /// # Panics
+    ///
+    /// Panics if `op` is not an assignment operator or the definition has
+    /// no operator to change, as described for
+    /// [`Self::try_set_assignment_operator`], which returns an error
+    /// instead.
     ///
     /// # Example
     /// ```
@@ -927,13 +935,49 @@ impl VariableDefinition {
     /// assert!(makefile.code().contains("VAR ?= value"));
     /// ```
     pub fn set_assignment_operator(&mut self, op: &str) {
+        self.try_set_assignment_operator(op)
+            .unwrap_or_else(|e| panic!("invalid assignment operator: {e}"))
+    }
+
+    /// Change the assignment operator of this variable definition, like
+    /// [`Self::set_assignment_operator`]
+    ///
+    /// Returns an error, leaving the definition unchanged, if `op` is not
+    /// an assignment operator, if the definition has no operator, as in
+    /// `export X` or a `define` block without one, or if make would not
+    /// read the definition with `op` as its operator.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let mut makefile: Makefile = "VAR := value\n".parse().unwrap();
+    /// let mut var = makefile.variable_definitions().next().unwrap();
+    /// assert!(var.try_set_assignment_operator("bogus").is_err());
+    /// var.try_set_assignment_operator("+=").unwrap();
+    /// assert_eq!(makefile.code(), "VAR += value\n");
+    /// ```
+    pub fn try_set_assignment_operator(&mut self, op: &str) -> Result<(), Error> {
+        // TODO: nmake only has `=`, but the tree does not record which
+        // variant it was parsed as, so other operators are not rejected
+        // there.
+        let error = |message: String| value_error("set_assignment_operator", message);
+        if !is_assignment_operator(op) {
+            return Err(error(format!("{op:?} is not an assignment operator")));
+        }
         // The name may contain operator tokens too, as in BSD make's `a:b=c`.
         let op_index = self
             .syntax()
             .children_with_tokens()
             .filter_map(|it| it.into_token())
             .find(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
-            .map(|t| t.index());
+            .map(|t| t.index())
+            .filter(|_| !self.is_undefine())
+            .ok_or_else(|| {
+                error(format!(
+                    "{:?} has no assignment operator",
+                    self.syntax().to_string()
+                ))
+            })?;
 
         // Build a new VARIABLE node, copying all children but replacing the OPERATOR token
         let mut builder = GreenNodeBuilder::new();
@@ -941,7 +985,7 @@ impl VariableDefinition {
 
         for child in self.syntax().children_with_tokens() {
             match child {
-                rowan::NodeOrToken::Token(token) if Some(token.index()) == op_index => {
+                rowan::NodeOrToken::Token(token) if token.index() == op_index => {
                     builder.token(OPERATOR.into(), op);
                 }
                 rowan::NodeOrToken::Token(token) => {
@@ -955,6 +999,24 @@ impl VariableDefinition {
 
         builder.finish_node();
         let new_variable = SyntaxNode::new_root_mut(builder.finish());
+
+        // The name may end in characters that join the operator, so check
+        // that GNU or BSD make reads the definition back.
+        let text = new_variable.to_string();
+        let reads_back = |variant| {
+            let parsed = parse(&text, variant);
+            let mut children = parsed.root().syntax().children_with_tokens();
+            let node = children.next().and_then(|it| it.into_node());
+            parsed.errors.is_empty()
+                && children.next().is_none()
+                && node.is_some_and(|n| n.green() == new_variable.green())
+        };
+        let reads_back = reads_back(None) || reads_back(Some(MakefileVariant::BSDMake));
+        if !reads_back {
+            return Err(error(format!(
+                "Cannot write {text:?} with {op:?} as its operator"
+            )));
+        }
 
         // Replace the old VARIABLE node with the new one
         let index = self.syntax().index();
@@ -970,7 +1032,10 @@ impl VariableDefinition {
                     .unwrap(),
             )
             .unwrap();
+        } else {
+            *self = VariableDefinition::cast(new_variable).expect("built a VARIABLE node");
         }
+        Ok(())
     }
 
     /// Rename the variable, preserving the operator, value and any
@@ -1497,6 +1562,51 @@ mod tests {
         var.set_assignment_operator("::=");
         assert_eq!(var.assignment_operator(), Some("::=".to_string()));
         assert_eq!(makefile.code(), "VAR ::= value\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid assignment operator")]
+    fn test_set_assignment_operator_unknown() {
+        let makefile: Makefile = "X = 1\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("bogus");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid assignment operator")]
+    fn test_set_assignment_operator_without_operator() {
+        let makefile: Makefile = "export X\n".parse().unwrap();
+        let mut var = makefile.variable_definitions().next().unwrap();
+        var.set_assignment_operator("=");
+    }
+
+    #[test]
+    fn test_try_set_assignment_operator() {
+        for (code, op, expected) in [
+            ("X = 1\n", "?=", Some("X ?= 1\n")),
+            ("X=1", ":::=", Some("X:::=1")),
+            (
+                "define X =\na\nendef\n",
+                "+=",
+                Some("define X +=\na\nendef\n"),
+            ),
+            ("X = 1\n", "bogus", None),
+            ("X = 1\n", "", None),
+            ("X = 1\n", "= =", None),
+            ("export X\n", "=", None),
+            ("define X\na\nendef\n", "=", None),
+            ("undefine X\n", "=", None),
+        ] {
+            let makefile: Makefile = code.parse().unwrap();
+            let mut var = makefile.variable_definitions().next().unwrap();
+            let result = var.try_set_assignment_operator(op);
+            assert_eq!(result.is_ok(), expected.is_some(), "{code:?} {op:?}");
+            assert_eq!(makefile.code(), expected.unwrap_or(code), "{code:?} {op:?}");
+            if expected.is_some() {
+                assert_eq!(var.assignment_operator().as_deref(), Some(op));
+            }
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
     }
 
     #[test]
