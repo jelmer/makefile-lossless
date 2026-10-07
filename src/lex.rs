@@ -1,5 +1,6 @@
 use crate::lossless::ASSIGNMENT_OPERATORS;
 use crate::{MakefileVariant, SyntaxKind};
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -45,9 +46,15 @@ pub struct Lexer<'a> {
     /// The character that starts a recipe line, set with GNU make's
     /// `.RECIPEPREFIX`.
     recipe_prefix: char,
-    /// Text of the current logical line, unless it is a recipe line or
-    /// its first word shows that it can't start a `define` block or assign
-    /// to `.RECIPEPREFIX`.
+    /// Whether `.RECIPEPREFIX` is a recursively expanded variable, so that
+    /// `+=` appends to it without expanding.
+    recipe_prefix_recursive: bool,
+    /// The variables known to be set when GNU make reads the current line,
+    /// for expanding the value of `.RECIPEPREFIX`, if the input sets it.
+    variables: Option<Variables>,
+    /// Text of the current logical line without comments, unless it is a
+    /// recipe line or, if no variables are tracked, its first word shows
+    /// that it can't start a `define` block or assign to `.RECIPEPREFIX`.
     line: Option<String>,
     /// Whether the first word of the current logical line has been seen.
     line_checked: bool,
@@ -76,12 +83,180 @@ pub struct Lexer<'a> {
     comments: bool,
 }
 
+/// The assignment operator at the start of `text`, if any.
+fn assignment_operator_at(text: &str) -> Option<&'static str> {
+    ASSIGNMENT_OPERATORS
+        .iter()
+        .filter(|op| text.starts_with(**op))
+        .max_by_key(|op| op.len())
+        .copied()
+}
+
+/// A GNU make variable set in the makefile.
+struct Variable {
+    value: String,
+    recursive: bool,
+}
+
+/// The GNU make variables whose values are known from the assignments
+/// read so far. A variable that is not set by an unconditional assignment
+/// in the makefile might come from the environment, the command line or an
+/// included makefile, so its value is unknown.
+#[derive(Default)]
+struct Variables {
+    known: HashMap<String, Variable>,
+    /// The number of conditionals open at the current line.
+    conditional_depth: usize,
+}
+
+/// The longest chain of recursively expanded variables to follow, so that
+/// one that refers to itself is not expanded forever.
+const MAX_EXPANSION_DEPTH: usize = 32;
+
+impl Variables {
+    /// Expand the variable references in `text`, or return `None` if that
+    /// needs a variable whose value is unknown, or anything other than a
+    /// plain variable reference, such as a function call.
+    fn expand(&self, text: &str, depth: usize) -> Option<String> {
+        if depth > MAX_EXPANSION_DEPTH {
+            return None;
+        }
+        let mut result = String::new();
+        let mut rest = text;
+        while let Some(i) = rest.find('$') {
+            result.push_str(&rest[..i]);
+            let after = &rest[i + 1..];
+            let open = after.chars().next()?;
+            let (name, len) = match open {
+                '$' => {
+                    result.push('$');
+                    rest = &after[1..];
+                    continue;
+                }
+                '(' | '{' => {
+                    let close = if open == '(' { ')' } else { '}' };
+                    let end = after.find(close)?;
+                    (&after[1..end], end + 1)
+                }
+                c => (&after[..c.len_utf8()], c.len_utf8()),
+            };
+            let variable = self.known.get(Self::plain_name(name)?)?;
+            if variable.recursive {
+                result.push_str(&self.expand(&variable.value, depth + 1)?);
+            } else {
+                result.push_str(&variable.value);
+            }
+            rest = &after[len..];
+        }
+        result.push_str(rest);
+        Some(result)
+    }
+
+    /// `name` if it is a plain variable name, rather than a function call,
+    /// substitution reference or one with references in it.
+    fn plain_name(name: &str) -> Option<&str> {
+        let special = [' ', '\t', '$', ':', ',', '(', ')', '{', '}', '#', '=', '\\'];
+        (!name.is_empty() && !name.contains(special)).then_some(name)
+    }
+
+    /// Set `name` with assignment operator `op` to `value`, or forget it if
+    /// the result is unknown.
+    fn assign(&mut self, name: &str, op: &str, value: &str) {
+        let Some(name) = Self::plain_name(name) else {
+            // A name with references in it might be that of any variable.
+            if name.contains('$') {
+                self.known.clear();
+            }
+            return;
+        };
+        let variable = match op {
+            _ if self.conditional_depth > 0 => None,
+            "=" => Some(Variable {
+                value: value.to_string(),
+                recursive: true,
+            }),
+            ":=" | "::=" => self.expand(value, 0).map(|value| Variable {
+                value,
+                recursive: false,
+            }),
+            ":::=" => self.expand(value, 0).map(|value| Variable {
+                value: value.replace('$', "$$"),
+                recursive: true,
+            }),
+            "+=" => self.known.get(name).and_then(|old| {
+                let value = if old.recursive {
+                    value.to_string()
+                } else {
+                    self.expand(value, 0)?
+                };
+                let value = match (old.value.is_empty(), value.is_empty()) {
+                    (true, _) => value,
+                    (false, true) => old.value.clone(),
+                    (false, false) => format!("{} {value}", old.value),
+                };
+                Some(Variable {
+                    value,
+                    recursive: old.recursive,
+                })
+            }),
+            // A variable from the environment is not changed by `?=`.
+            "?=" if self.known.contains_key(name) => return,
+            _ => None,
+        };
+        match variable {
+            Some(variable) => self.known.insert(name.to_string(), variable),
+            None => self.known.remove(name),
+        };
+    }
+
+    /// Follow an assignment, `undefine`, conditional or other line that
+    /// may change variables, given the text of a logical line without its
+    /// modifiers such as `override`. `define` blocks are handled separately.
+    fn update(&mut self, line: &str) {
+        let first_word = line.split([' ', '\t']).next().unwrap_or_default();
+        match first_word {
+            "ifeq" | "ifneq" | "ifdef" | "ifndef" => self.conditional_depth += 1,
+            "endif" => self.conditional_depth = self.conditional_depth.saturating_sub(1),
+            "undefine" => self.assign(line[first_word.len()..].trim(), "undefine", ""),
+            // These can set any variable.
+            "include" | "-include" | "sinclude" | "load" | "-load" => self.known.clear(),
+            _ if line.contains("eval") => self.known.clear(),
+            _ => {
+                if let Some((name, op, value)) = Self::split_assignment(line) {
+                    self.assign(name.trim_end(), op, value.trim_start());
+                }
+            }
+        }
+    }
+
+    /// Split an assignment into its name, operator and value, at the first
+    /// assignment operator outside a variable reference.
+    fn split_assignment(line: &str) -> Option<(&str, &'static str, &str)> {
+        let mut depth = 0usize;
+        let mut after_dollar = false;
+        for (i, c) in line.char_indices() {
+            match c {
+                '(' | '{' if depth > 0 || after_dollar => depth += 1,
+                ')' | '}' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => {
+                    if let Some(op) = assignment_operator_at(&line[i..]) {
+                        return Some((&line[..i], op, &line[i + op.len()..]));
+                    }
+                }
+                _ => {}
+            }
+            after_dollar = c == '$' && !after_dollar;
+        }
+        None
+    }
+}
+
 /// A GNU make `define` block whose body is being read.
 struct Define {
     /// The number of `define` lines not yet closed by an `endef`.
     depth: usize,
-    /// The assignment operator, if this defines `.RECIPEPREFIX`.
-    recipe_prefix_op: Option<&'static str>,
+    /// The name of the variable and the assignment operator.
+    variable: Option<(String, &'static str)>,
     /// The text of the body so far.
     body: String,
 }
@@ -117,6 +292,8 @@ impl<'a> Lexer<'a> {
             reference_depth: 0,
             dollars: 0,
             recipe_prefix: '\t',
+            recipe_prefix_recursive: false,
+            variables: input.contains(".RECIPEPREFIX").then(Variables::default),
             line: Some(String::new()),
             line_checked: false,
             raw_line: String::new(),
@@ -136,14 +313,19 @@ impl<'a> Lexer<'a> {
     fn end_logical_line(&mut self, line: Option<String>, raw: String) {
         let Some(define) = &mut self.define else {
             if let Some(line) = line {
-                if let Some(recipe_prefix_op) = Self::define_header(&line) {
+                if let Some(variable) = Self::define_header(&line) {
                     self.define = Some(Define {
                         depth: 1,
-                        recipe_prefix_op,
+                        variable,
                         body: String::new(),
                     });
                 } else {
-                    self.update_recipe_prefix(&line);
+                    let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
+                    let line = Self::strip_modifiers(line.trim_end_matches(['\r', '\n']));
+                    self.update_recipe_prefix(line);
+                    if let Some(variables) = &mut self.variables {
+                        variables.update(line);
+                    }
                 }
             }
             return;
@@ -168,55 +350,74 @@ impl<'a> Lexer<'a> {
             return;
         }
         let define = self.define.take().unwrap();
-        if let Some(op) = define.recipe_prefix_op {
-            let body = define.body.replace("\r\n", "\n");
-            // The newline before `endef` is not part of the value.
-            self.set_recipe_prefix(op, body.strip_suffix('\n').unwrap_or(&body));
+        let Some((name, op)) = define.variable else {
+            if let Some(variables) = &mut self.variables {
+                variables.known.clear();
+            }
+            return;
+        };
+        let body = define.body.replace("\r\n", "\n");
+        // The newline before `endef` is not part of the value.
+        let value = body.strip_suffix('\n').unwrap_or(&body);
+        if name == ".RECIPEPREFIX" {
+            self.set_recipe_prefix(op, value);
+        }
+        if let Some(variables) = &mut self.variables {
+            variables.assign(&name, op, value);
         }
     }
 
-    /// If `line` starts a `define` block, return the assignment operator if
-    /// it defines `.RECIPEPREFIX`. This follows the parser's check, in which
-    /// `define = 1` assigns to a variable named "define".
-    fn define_header(line: &str) -> Option<Option<&'static str>> {
+    /// If `line` starts a `define` block, return the name of the variable
+    /// it defines and the assignment operator, if they are known. This
+    /// follows the parser's check, in which `define = 1` assigns to a
+    /// variable named "define".
+    fn define_header(line: &str) -> Option<Option<(String, &'static str)>> {
         let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
-        let mut rest = line.trim_end_matches(['\r', '\n']).trim_start();
-        loop {
-            if let Some(r) = rest.strip_prefix("define") {
-                if r.is_empty() || r.starts_with([' ', '\t', '#']) {
-                    rest = r.trim_start();
-                    break;
-                }
-            }
-            let modifier = ["override", "export", "unexport", "private"]
-                .into_iter()
-                .find(|m| {
-                    rest.strip_prefix(m)
-                        .is_some_and(|r| r.starts_with(Self::is_whitespace))
-                })?;
-            rest = rest[modifier.len()..].trim_start();
-        }
-        if ASSIGNMENT_OPERATORS.iter().any(|op| rest.starts_with(op)) {
+        let rest = Self::strip_modifiers(line.trim_end_matches(['\r', '\n']))
+            .strip_prefix("define")
+            .filter(|r| r.is_empty() || r.starts_with([' ', '\t', '#']))?
+            .trim_start();
+        if assignment_operator_at(rest).is_some() {
             return None;
         }
-        let Some(rest) = rest.strip_prefix(".RECIPEPREFIX") else {
-            return Some(None);
-        };
+        let end = rest
+            .char_indices()
+            .find(|(i, c)| {
+                matches!(c, ' ' | '\t' | '#') || assignment_operator_at(&rest[*i..]).is_some()
+            })
+            .map_or(rest.len(), |(i, _)| i);
+        let (name, rest) = rest.split_at(end);
         let rest = rest.trim_start();
-        if rest.is_empty() || rest.starts_with('#') {
-            return Some(Some("="));
+        let op = if rest.is_empty() || rest.starts_with('#') {
+            Some("=")
+        } else {
+            assignment_operator_at(rest)
+        };
+        Some(op.map(|op| (name.to_string(), op)))
+    }
+
+    /// `line` without leading whitespace and the modifiers such as
+    /// `override` before it, which GNU make takes in any order, and
+    /// repeated.
+    fn strip_modifiers(line: &str) -> &str {
+        let mut rest = line.trim_start();
+        while let Some(r) = ["override", "export", "unexport", "private"]
+            .into_iter()
+            .find_map(|m| {
+                rest.strip_prefix(m)
+                    .filter(|r| r.starts_with(Self::is_whitespace))
+            })
+        {
+            rest = r.trim_start();
         }
-        Some(
-            ["=", ":=", "::=", ":::=", "+=", "?="]
-                .into_iter()
-                .find(|op| rest.starts_with(op)),
-        )
+        rest
     }
 
     /// Stop collecting the text of the current line if `token` is the
     /// first word on it, and the line can't start a `define` block or assign
     /// to `.RECIPEPREFIX`: it doesn't start with `define`, `.RECIPEPREFIX`
-    /// or a modifier such as `override`.
+    /// or a modifier such as `override`. Lines that might be assignments
+    /// to other variables are kept while variables are tracked.
     fn check_line_start(&mut self, token: &(SyntaxKind, String)) {
         if self.line_checked
             || matches!(
@@ -230,26 +431,15 @@ impl<'a> Lexer<'a> {
             return;
         }
         self.line_checked = true;
-        if !token.1.starts_with(['d', '.', 'o', 'e', 'u', 'p']) {
+        if self.variables.is_none() && !token.1.starts_with(['d', '.', 'o', 'e', 'u', 'p']) {
             self.line = None;
         }
     }
 
-    /// Update the recipe prefix if `line` assigns to `.RECIPEPREFIX`.
+    /// Update the recipe prefix if `line`, a logical line without its line
+    /// ending and modifiers, assigns to `.RECIPEPREFIX`.
     fn update_recipe_prefix(&mut self, line: &str) {
-        let line = line.replace("\\\r\n", " ").replace("\\\n", " ");
-        let mut rest = line.trim_start();
-        // GNU make takes these modifiers in any order, and repeated.
-        while let Some(r) = ["override", "export", "unexport", "private"]
-            .into_iter()
-            .find_map(|m| {
-                rest.strip_prefix(m)
-                    .filter(|r| r.starts_with(Self::is_whitespace))
-            })
-        {
-            rest = r.trim_start();
-        }
-        let Some(rest) = rest.strip_prefix(".RECIPEPREFIX") else {
+        let Some(rest) = line.strip_prefix(".RECIPEPREFIX") else {
             return;
         };
         let rest = rest.trim_start();
@@ -259,26 +449,38 @@ impl<'a> Lexer<'a> {
         else {
             return;
         };
-        let value = value.trim_start();
-        let value = if value.starts_with('#') { "" } else { value };
-        self.set_recipe_prefix(op, value);
+        self.set_recipe_prefix(op, value.trim_start());
     }
 
     /// Set the recipe prefix from an assignment of `value` to
-    /// `.RECIPEPREFIX` with operator `op`.
+    /// `.RECIPEPREFIX` with operator `op`. Like GNU make, take the first
+    /// character of the value, which is expanded unless the variable is
+    /// recursively expanded.
     fn set_recipe_prefix(&mut self, op: &str, value: &str) {
-        let first = match value.chars().next() {
-            // An immediately expanded reference.
-            // TODO: Expand variable references.
-            Some('$') if op != "=" && !value.starts_with("$$") => return,
-            first => first,
+        let (expand, recursive) = match op {
+            "=" => (false, true),
+            ":=" | "::=" => (true, false),
+            ":::=" => (true, true),
+            "+=" if self.recipe_prefix != '\t' => return,
+            "+=" => (!self.recipe_prefix_recursive, self.recipe_prefix_recursive),
+            // `.RECIPEPREFIX` is always defined, so `?=` does not change
+            // it, and the output of a `!=` command is not known.
+            _ => return,
         };
-        match op {
-            // `.RECIPEPREFIX` is always defined.
-            "?=" => {}
-            "+=" if self.recipe_prefix != '\t' => {}
-            _ => self.recipe_prefix = first.unwrap_or('\t'),
-        }
+        let value = if expand {
+            let empty = Variables::default();
+            // TODO: Expand function calls, and variables that are not set by
+            // an unconditional assignment earlier in the makefile, such as
+            // ones from the environment.
+            let Some(value) = self.variables.as_ref().unwrap_or(&empty).expand(value, 0) else {
+                return;
+            };
+            value
+        } else {
+            value.to_string()
+        };
+        self.recipe_prefix = value.chars().next().unwrap_or('\t');
+        self.recipe_prefix_recursive = recursive;
     }
 
     fn is_whitespace(c: char) -> bool {
@@ -749,7 +951,11 @@ impl Iterator for Lexer<'_> {
             } else if self.line.is_some() {
                 self.check_line_start(&token);
             }
-            if let Some(line) = &mut self.line {
+            if let Some(line) = self
+                .line
+                .as_mut()
+                .filter(|_| token.0 != SyntaxKind::COMMENT)
+            {
                 line.push_str(&token.1);
             }
             if self.define.is_some() {
@@ -1782,6 +1988,76 @@ override_dh_auto_clean:
         let mut lexer = Lexer::new(".RECIPEPREFIX = >\n", Some(MakefileVariant::BSDMake));
         lexer.by_ref().for_each(drop);
         assert_eq!(lexer.recipe_prefix, '\t');
+    }
+
+    #[test]
+    fn test_recipe_prefix_expanded() {
+        // As checked against GNU make 4.4.
+        let cases = [
+            ("X := >\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X = >\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X = >\n.RECIPEPREFIX = $(X)\n", '$'),
+            ("Y = >\nX = $(Y)\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X = a>\n.RECIPEPREFIX := $(X)\n", 'a'),
+            ("X := >\n.RECIPEPREFIX := ${X}x\n", '>'),
+            ("X := >\n.RECIPEPREFIX ::= $X\n", '>'),
+            ("X := >\n.RECIPEPREFIX :::= $(X)\n", '>'),
+            ("X := >\n.RECIPEPREFIX := $(X)\nX := <\n", '>'),
+            ("X :=\n.RECIPEPREFIX := $(X)\n", '\t'),
+            ("X := $$\n.RECIPEPREFIX := $(X)\n", '$'),
+            ("X := >\nX += y\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("override X := >\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X = >\nexport X\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("define X\n>\nendef\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X := > # c\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X := >\n.RECIPEPREFIX := $(X) # c\n", '>'),
+            ("X :=\n.RECIPEPREFIX := $(X) # c\n", ' '),
+            ("E :=\n.RECIPEPREFIX := $(E) $(E)\n", ' '),
+            ("X := >\n.RECIPEPREFIX += $(X)\n", '>'),
+            ("X := >\n.RECIPEPREFIX =\n.RECIPEPREFIX += $(X)\n", '$'),
+            ("X := >\ndefine .RECIPEPREFIX :=\n$(X)\nendef\n", '>'),
+            ("ifdef A\nendif\nX := >\n.RECIPEPREFIX := $(X)\n", '>'),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(recipe_prefix_after(text), expected, "{text:?}");
+        }
+        let makefile = "X := >\n.RECIPEPREFIX := $(X)\nall:\n>echo a\n";
+        assert_eq!(
+            lex(makefile, None)[18..],
+            [
+                (INDENT, ">".into()),
+                (TEXT, "echo a".into()),
+                (NEWLINE, "\n".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recipe_prefix_not_expanded() {
+        // These are not known without evaluating more than plain variable
+        // references, or depend on the environment or other makefiles, so
+        // the recipe prefix is left as it was.
+        let cases = [
+            "X := >\n.RECIPEPREFIX := $(X:>=<)\n",
+            "X := >\n.RECIPEPREFIX := $(strip $(X))\n",
+            "X := >\n.RECIPEPREFIX := $\n",
+            ".RECIPEPREFIX := $(UNDEFINED)\n",
+            "t: X := >\n.RECIPEPREFIX := $(X)\n",
+            "X != echo '>'\n.RECIPEPREFIX := $(X)\n",
+            "X ?= >\n.RECIPEPREFIX := $(X)\n",
+            "X = $(X)\n.RECIPEPREFIX := $(X)\n",
+            "ifdef A\nX := >\nendif\n.RECIPEPREFIX := $(X)\n",
+            "X := >\ninclude x.mk\n.RECIPEPREFIX := $(X)\n",
+            "X := >\n$(eval X := <)\n.RECIPEPREFIX := $(X)\n",
+            "Y := X\nX := >\n$(Y) := <\n.RECIPEPREFIX := $(X)\n",
+            "X := >\nundefine X\n.RECIPEPREFIX := $(X)\n",
+            "X := >\ndefine $(Y)\n<\nendef\n.RECIPEPREFIX := $(X)\n",
+        ];
+        for text in cases {
+            assert_eq!(recipe_prefix_after(text), '\t', "{text:?}");
+            let text = format!(".RECIPEPREFIX = >\n{text}");
+            assert_eq!(recipe_prefix_after(&text), '>', "{text:?}");
+        }
     }
 
     #[test]
