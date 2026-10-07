@@ -544,7 +544,9 @@ impl ParsedReference {
     ///
     /// This is useful for expanding a value: find the next `$`, parse the
     /// reference there and continue after it. Note that `$$` is not a
-    /// reference.
+    /// reference, not even in nmake's `$$@`, the current target on a
+    /// dependency line: the makefile parser reads that as a `$` followed by
+    /// the reference `$@`, and likewise for `$$(@F)`.
     ///
     /// For [`MakefileVariant::BSDMake`], `\#` stands for `#`, as make
     /// replaces it before parsing any line other than a recipe line.
@@ -1898,8 +1900,6 @@ impl<'a> Parser<'a> {
         let endc = match self.peek() {
             Some('(') => ')',
             Some('{') => '}',
-            // TODO: In an nmake dependency line, `$$@` is the target and
-            // `$$(@F)` a part of it, rather than an escaped dollar.
             Some('$') => {
                 return Err(syntax_error(
                     start,

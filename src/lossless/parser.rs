@@ -682,6 +682,29 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 && self.tokens[self.tokens.len() - 2].0 == DOLLAR
         }
 
+        /// Whether the parser is at nmake's `$$@` or `$$(@D)`, `$$(@B)`,
+        /// `$$(@F)` or `$$(@R)`, which on a dependency line stand for the
+        /// current target or a part of it.
+        fn at_nmake_target_as_dependent(&self) -> bool {
+            if self.variant != Some(MakefileVariant::NMake) || !self.at_dollar_escape() {
+                return false;
+            }
+            let n = self.tokens.len();
+            let token = |i: usize| {
+                n.checked_sub(i)
+                    .map(|j| (self.tokens[j].0, self.tokens[j].1.as_str()))
+            };
+            match token(3) {
+                Some((TEXT, "@")) => true,
+                Some((LPAREN, _)) => {
+                    token(4) == Some((TEXT, "@"))
+                        && matches!(token(5), Some((IDENTIFIER, "D" | "B" | "F" | "R")))
+                        && matches!(token(6), Some((RPAREN, _)))
+                }
+                _ => false,
+            }
+        }
+
         /// Parse the parenthesized member list of an archive member
         /// reference such as `libfoo.a(bar.o baz.o)`, starting at the `(`.
         /// The archive name before it is left to the caller, as it may
@@ -814,8 +837,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     {
                         break
                     }
-                    // TODO: nmake's `$$@`, the target as a dependent, is
-                    // parsed as a `$$` followed by `@`.
+                    // nmake's `$$@`, the target as a dependent: the first
+                    // `$` is followed by the reference `$@`.
+                    DOLLAR if self.at_nmake_target_as_dependent() => {
+                        self.bump();
+                        self.parse_variable_reference();
+                    }
                     DOLLAR => {
                         let escape = self.at_dollar_escape();
                         self.parse_variable_reference();
