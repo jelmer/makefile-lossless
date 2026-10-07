@@ -3,9 +3,18 @@
 //! These functions work on raw source text (not the syntax tree) and are useful
 //! for editor integrations that need to understand what is at a given cursor position.
 
-/// Extract a variable name from `$(VAR)` or `${VAR}` surrounding the given byte offset.
+use crate::reference::{split_references, ReferenceError, ReferenceSyntaxErrorKind, TextPart};
+use crate::MakefileVariant;
+
+/// Extract the name of the innermost `$(VAR)` or `${VAR}` reference
+/// surrounding the given byte offset, from just after its opening brace up
+/// to and including its closing brace.
 ///
-/// Returns `None` if the offset is not inside a variable reference.
+/// References are found as GNU make finds them, on the line containing the
+/// offset. Returns `None` if the offset is not inside a reference, if the
+/// innermost reference is a function call such as `$(wildcard *.c)`, is not
+/// closed or has a computed name such as `$(A_$(B))`, or if the offset is
+/// past the end of `text` or not on a character boundary.
 ///
 /// # Example
 /// ```
@@ -13,29 +22,46 @@
 /// assert_eq!(variable_at_offset("$(FOO)", 2), Some("FOO"));
 /// assert_eq!(variable_at_offset("${BAR}", 3), Some("BAR"));
 /// assert_eq!(variable_at_offset("plain text", 3), None);
+/// assert_eq!(variable_at_offset("$(subst a,b,$(X))", 3), None);
+/// assert_eq!(variable_at_offset("$(subst a,b,$(X))", 14), Some("X"));
 /// ```
 pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start = None;
-    let mut i = offset;
-    while i >= 2 {
-        i -= 1;
-        if i > 0 && (bytes[i] == b'(' || bytes[i] == b'{') && bytes[i - 1] == b'$' {
-            start = Some(i + 1);
-            break;
-        }
-        if bytes[i] == b')' || bytes[i] == b'}' || bytes[i] == b'\n' {
-            return None;
-        }
+    if !text.is_char_boundary(offset) {
+        return None;
     }
-    let start = start?;
-    let rest = &text[start..];
-    let end = rest.find([')', '}'])?;
-    let var_name = &rest[..end];
-    if offset >= start && offset <= start + end {
-        Some(var_name)
-    } else {
-        None
+    let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+    let mut region = line_start..line_end;
+    let mut name = None;
+    loop {
+        let Some((range, parsed)) =
+            split_references(&text[region.clone()], MakefileVariant::GNUMake)
+                .into_iter()
+                .find_map(|part| match part {
+                    TextPart::Reference { range, parsed } => {
+                        let range = region.start + range.start..region.start + range.end;
+                        let body_start = range.start + 2;
+                        (body_start <= offset && offset < range.end).then_some((range, parsed))
+                    }
+                    _ => None,
+                })
+        else {
+            return name;
+        };
+        let body_start = range.start + 2;
+        let unclosed = parsed.as_ref().err().and_then(ReferenceError::syntax_kind)
+            == Some(ReferenceSyntaxErrorKind::UnclosedExpression);
+        name = match parsed {
+            Ok(reference) if !reference.name.contains('$') => {
+                Some(&text[body_start..body_start + reference.name.len()])
+            }
+            _ => None,
+        };
+        region = if unclosed {
+            body_start..range.end
+        } else {
+            body_start..range.end - 1
+        };
     }
 }
 
@@ -123,6 +149,61 @@ mod tests {
     fn test_variable_at_offset_nested_context() {
         let text = "\t$(CC) main.c";
         assert_eq!(variable_at_offset(text, 3), Some("CC"));
+    }
+
+    #[test]
+    fn test_variable_at_offset_function_call() {
+        let text = "$(subst a,b,$(X))";
+        assert_eq!(variable_at_offset(text, 3), None);
+        assert_eq!(variable_at_offset(text, 12), None);
+        assert_eq!(variable_at_offset(text, 14), Some("X"));
+        assert_eq!(variable_at_offset(text, 15), Some("X"));
+        assert_eq!(variable_at_offset(text, 16), None);
+    }
+
+    #[test]
+    fn test_variable_at_offset_nested() {
+        let text = "$(A:.c=$(B))";
+        assert_eq!(variable_at_offset(text, 2), Some("A"));
+        assert_eq!(variable_at_offset(text, 5), Some("A"));
+        assert_eq!(variable_at_offset(text, 9), Some("B"));
+        assert_eq!(variable_at_offset(text, 11), Some("A"));
+        // A computed variable name has no name to return.
+        assert_eq!(variable_at_offset("$(A_$(B))", 3), None);
+        assert_eq!(variable_at_offset("$(A_$(B))", 6), Some("B"));
+    }
+
+    #[test]
+    fn test_variable_at_offset_mismatched_closer() {
+        // As in make, only the kind of brace that opens a reference closes it.
+        assert_eq!(variable_at_offset("$(A} x)", 2), Some("A} x"));
+        assert_eq!(variable_at_offset("${A) x}", 2), Some("A) x"));
+    }
+
+    #[test]
+    fn test_variable_at_offset_outside() {
+        let text = "x $(FOO) y";
+        assert_eq!(variable_at_offset(text, 0), None);
+        assert_eq!(variable_at_offset(text, 2), None);
+        assert_eq!(variable_at_offset(text, 3), None);
+        assert_eq!(variable_at_offset(text, 4), Some("FOO"));
+        assert_eq!(variable_at_offset(text, 7), Some("FOO"));
+        assert_eq!(variable_at_offset(text, 8), None);
+        assert_eq!(variable_at_offset("$X $@", 1), None);
+    }
+
+    #[test]
+    fn test_variable_at_offset_unclosed() {
+        assert_eq!(variable_at_offset("$(FOO", 3), None);
+        assert_eq!(variable_at_offset("$(FOO\nBAR)", 3), None);
+        assert_eq!(variable_at_offset("$(FOO $(BAR)", 9), Some("BAR"));
+    }
+
+    #[test]
+    fn test_variable_at_offset_multiline() {
+        let text = "A = $(B)\nC = $(D)\n";
+        assert_eq!(variable_at_offset(text, 6), Some("B"));
+        assert_eq!(variable_at_offset(text, 15), Some("D"));
     }
 
     #[test]
