@@ -1,5 +1,5 @@
 use super::*;
-use crate::lex::{lex, lex_non_recipe_line};
+use crate::lex::{ends_with_unescaped_backslash, lex, lex_non_recipe_line};
 use crate::MakefileVariant;
 use rowan::GreenNode;
 
@@ -245,7 +245,7 @@ fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::Text
 }
 
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
-    struct Parser {
+    struct Parser<'a> {
         /// input tokens, including whitespace,
         /// in *reverse* order.
         tokens: Vec<(SyntaxKind, String)>,
@@ -259,7 +259,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Token positions (start, end) in forward order, indexed by forward token index
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
         /// The original text
-        original_text: String,
+        original_text: &'a str,
         /// The makefile variant
         variant: Option<MakefileVariant>,
         /// Number of enclosing BSD `.for` loops.
@@ -270,9 +270,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// odd number have been seen, meaning the next backslash is escaped
         /// (`\\`) and a following newline is a literal backslash, not a line
         /// continuation. Reset to false by any other token. Mirrors the lexer's
-        /// `prev_was_backslash`, which makes the same decision for tokenizing
+        /// `pending_backslash_escape`, which makes the same decision for tokenizing
         /// the continued line's indent.
         pending_backslash_escape: bool,
+        /// The quote that ends the quoted `ifeq` argument being parsed, if
+        /// any. It ends any variable reference in the argument too.
+        argument_quote: Option<String>,
         /// Whether we are in rule context, i.e. a tab-indented line is a
         /// recipe line. Set by a rule line and cleared by any other line
         /// except comments, blank lines and conditional directives.
@@ -297,7 +300,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         token_edits: usize,
     }
 
-    impl Parser {
+    impl Parser<'_> {
         fn error(&mut self, kind: ParseErrorKind, msg: String) {
             self.builder.start_node(ERROR.into());
             self.record_error(kind, msg);
@@ -379,7 +382,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let index = self.token_positions.len() - self.tokens.len();
             match self.token_positions.get(index) {
                 Some(&(start, end)) => rowan::TextRange::new(start, end),
-                None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text.as_str())),
+                None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text)),
             }
         }
 
@@ -435,18 +438,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let comment =
                 self.current() == Some(COMMENT) && self.variant != Some(MakefileVariant::NMake);
             loop {
-                let mut last_text_content: Option<String> = None;
+                // Like the lexer, only an odd number of backslashes continues
+                // the line; `\\\\` is an escaped backslash.
+                let mut is_continuation = false;
 
-                // Consume all tokens until newline, tracking the last TEXT token's content
+                // Consume all tokens until newline, noting whether the last
+                // TEXT token ends in a continuation backslash
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
-                    // Save the text content if this is a TEXT token
                     if self.current() == Some(TEXT) || (comment && self.current() == Some(COMMENT))
                     {
                         if let Some((_kind, text)) = self.tokens.last() {
                             if self.variant == Some(MakefileVariant::NMake) {
                                 inline_files += text.matches("<<").count();
                             }
-                            last_text_content = Some(text.clone());
+                            is_continuation = ends_with_unescaped_backslash(text);
                         }
                     }
                     if comment && self.current() == Some(TEXT) {
@@ -460,13 +465,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.current() == Some(NEWLINE) {
                     self.bump();
                 }
-
-                // Check if the last TEXT token ended with a backslash (continuation)
-                // Like the lexer, only an odd number of backslashes continues
-                // the line; `\\\\` is an escaped backslash.
-                let is_continuation = last_text_content.as_ref().is_some_and(|text| {
-                    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
-                });
 
                 if is_continuation {
                     // This is a continuation line - consume the indent of the next line, if
@@ -538,8 +536,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.pending_backslash_escape = false;
                 // An odd number of trailing backslashes continues the line,
                 // even after a `#`.
-                let continued = self.current() == Some(NEWLINE)
-                    && text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+                let continued =
+                    self.current() == Some(NEWLINE) && ends_with_unescaped_backslash(&text);
                 if !text.is_empty() {
                     // Mirror how a tab-indented `# ...` line is tokenized,
                     // with any continuation lines in the comment except
@@ -869,6 +867,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             {
                                 self.bump();
                             }
+                            // After a blank line, it ends the rule like an
+                            // unindented comment.
+                            Some(COMMENT) => break,
                             Some(NEWLINE) | None => self.bump(),
                             _ if self.at_space_indented_recipe() => {
                                 newline_count = 0;
@@ -892,7 +893,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_comment();
                     }
                     Some(IDENTIFIER) => {
-                        let token = &self.tokens.last().unwrap().1.clone();
+                        let token = &self.tokens.last().unwrap().1;
                         // Check if this is a starting conditional directive
                         if Self::is_conditional_start(token) && self.at_conditional_keyword() {
                             // If we're not inside a conditional (depth == 0) and it doesn't
@@ -919,17 +920,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             }
                             newline_count = 0;
                             self.parse_include();
-                        } else if token == "else" || token == "endif" {
-                            // These should only appear if we're inside a conditional
-                            // If we see them at depth 0, something is wrong, so break
-                            break;
                         } else {
-                            // Any other identifier at depth 0 means the rule is over
-                            if conditional_depth == 0 {
-                                break;
-                            }
-                            // Otherwise, it's content inside a conditional (variable assignment, etc.)
-                            // Let it be handled by parse_normal_content
+                            // Any other identifier, including a stray `else` or
+                            // `endif`, ends the rule.
                             break;
                         }
                     }
@@ -2425,14 +2418,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 self.bump();
                             }
                             // Like `$(...)`, a reference can't span lines.
-                            Some(NEWLINE) | None => {
+                            _ if self.at_reference_end() => {
                                 self.record_error(
                                     ParseErrorKind::UnclosedReference,
                                     "unclosed variable reference".to_string(),
                                 );
                                 break;
                             }
-                            Some(_) => self.bump(),
+                            _ => self.bump(),
                         }
                     }
                 } else {
@@ -2480,7 +2473,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_parenthesized_expr_internal(true);
                     }
                 }
-            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
+            } else if !self.at_reference_end()
+                && !matches!(self.current(), Some(RPAREN | RBRACE))
                 && !self.is_line_continuation()
                 && !(self.variant == Some(MakefileVariant::BSDMake)
                     && self
@@ -2515,6 +2509,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
+        }
+
+        /// Whether a variable reference ends before the current token: at
+        /// the end of the line, or at the quote that ends a quoted `ifeq`
+        /// argument.
+        fn at_reference_end(&self) -> bool {
+            match self.tokens.last() {
+                None | Some((NEWLINE, _)) => true,
+                Some((QUOTE, text)) => self.argument_quote.as_ref() == Some(text),
+                _ => false,
+            }
         }
 
         /// Whether the tokens after `$(` are an nmake macro substitution,
@@ -2610,7 +2615,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     // Leave the newline for the caller, like GNU make,
                     // which does not let the reference span lines.
-                    Some(NEWLINE) | None => {
+                    _ if self.at_reference_end() => {
                         if is_variable_ref {
                             self.record_error(
                                 ParseErrorKind::UnclosedReference,
@@ -2624,7 +2629,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                         break;
                     }
-                    Some(_) => self.bump(),
+                    _ => self.bump(),
                 }
             }
 
@@ -2677,17 +2682,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Parse a quoted argument of `ifeq`, starting at its opening quote.
         /// Returns whether the closing quote was found on the logical line.
-        // TODO: GNU make ends the argument at a quote inside a variable
-        // reference too, leaving the reference unterminated.
+        /// Like GNU make, which finds the closing quote before expanding the
+        /// argument, end the argument at a quote inside a variable reference
+        /// too, leaving the reference unterminated.
         fn parse_quoted_argument(&mut self) -> bool {
             let quote = self.tokens.last().unwrap().1.clone();
             self.bump();
+            self.argument_quote = Some(quote.clone());
+            let found = self.parse_quoted_argument_rest(&quote);
+            self.argument_quote = None;
+            found
+        }
+
+        fn parse_quoted_argument_rest(&mut self, quote: &str) -> bool {
             loop {
                 if self.consume_line_continuation() {
                     continue;
                 }
                 match self.tokens.last() {
-                    Some((QUOTE, text)) if *text == quote => {
+                    Some((QUOTE, text)) if text == quote => {
                         self.bump();
                         return true;
                     }
@@ -4810,14 +4823,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Handle nested variable references
                         self.parse_variable_reference();
                     }
-                    Some(NEWLINE) | None => {
+                    _ if self.at_reference_end() => {
                         self.record_error(
                             ParseErrorKind::UnclosedReference,
                             "unclosed variable reference".to_string(),
                         );
                         break;
                     }
-                    Some(_) => self.bump(),
+                    _ => self.bump(),
                 }
             }
 
@@ -4844,11 +4857,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec::new(),
         positioned_errors: Vec::new(),
         token_positions,
-        original_text: text.to_string(),
+        original_text: text,
         variant,
         for_depth: 0,
         block_conditional_depth: 0,
         pending_backslash_escape: false,
+        argument_quote: None,
         in_rule: RuleContext::Outside,
         bsd_line: None,
         token_edits: 0,

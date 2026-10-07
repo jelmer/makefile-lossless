@@ -350,6 +350,23 @@ fn test_substitution_strings_are_literal() {
     };
     assert_eq!(references(&vars[0]), vec!["$(SRCS: = $(DIR)"]);
     assert_eq!(references(&vars[1]), vec!["$(SRCS:.c=.obj)"]);
+    let parsed: Vec<_> = makefile
+        .variable_references()
+        .map(|r| r.parse(MakefileVariant::NMake))
+        .collect();
+    let sysv = |name: &str, from: &str, to: &str| {
+        Ok(crate::ParsedReference {
+            name: name.to_string(),
+            modifiers: vec![crate::Modifier::SysVSubstitute {
+                from: crate::ModifierArg::literal(from),
+                to: crate::ModifierArg::literal(to),
+            }],
+        })
+    };
+    assert_eq!(
+        parsed,
+        vec![sysv("SRCS", " ", " $(DIR"), sysv("SRCS", ".c", ".obj")]
+    );
 
     // Functions may contain references.
     let makefile = parse_nmake("X = $(subst $(A),b,c)\n");
