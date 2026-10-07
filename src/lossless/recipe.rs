@@ -980,6 +980,44 @@ mod tests {
     }
 
     #[test]
+    fn test_comment_after_continuation() {
+        // A line starting with `#` that continues a command is part of the
+        // command, which GNU make passes to the shell with the `#` line in it
+        // and BSD make joins into one line.
+        use crate::MakefileVariant::*;
+        let text = "all:\n\techo a \\\n\t# b $(X) \\\n\techo c\n\techo d\n";
+        for variant in [None, Some(GNUMake), Some(BSDMake), Some(POSIXMake)] {
+            let makefile = parse_variant(text, variant);
+            let recipes: Vec<_> = makefile.rules().flat_map(|r| r.recipe_nodes()).collect();
+            let accessors: Vec<_> = recipes
+                .iter()
+                .map(|r| (r.text(), r.comment(), r.shell_text()))
+                .collect();
+            assert_eq!(
+                accessors,
+                vec![
+                    (
+                        "echo a \\\n# b $(X) \\\necho c".to_string(),
+                        None,
+                        "echo a \\\n# b $(X) \\\necho c".to_string()
+                    ),
+                    ("echo d".to_string(), None, "echo d".to_string()),
+                ],
+                "{variant:?}"
+            );
+            let rule = makefile.rules().next().unwrap();
+            assert_eq!(
+                rule.recipes().collect::<Vec<_>>(),
+                vec!["echo a \\\n# b $(X) \\\necho c", "echo d"],
+                "{variant:?}"
+            );
+            assert_eq!(makefile.comment_ranges().count(), 0, "{variant:?}");
+            let references: Vec<_> = recipes[0].references().map(|r| r.to_string()).collect();
+            assert_eq!(references, vec!["$(X)"], "{variant:?}");
+        }
+    }
+
+    #[test]
     fn test_inline_comment_continuation() {
         use crate::MakefileVariant::*;
         for variant in [None, Some(GNUMake), Some(BSDMake)] {
