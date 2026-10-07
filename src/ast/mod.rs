@@ -208,9 +208,7 @@ pub(crate) fn replace_children(node: &SyntaxNode, new: Vec<GreenElement>) {
         .zip(new[prefix..].iter().rev())
         .take_while(|(old, new)| same_green(old, new))
         .count();
-    for element in &old[prefix..old.len() - suffix] {
-        element.detach();
-    }
+    detach_elements(old[prefix..old.len() - suffix].iter().cloned());
     let middle = new[prefix..new.len() - suffix].to_vec();
     let root = SyntaxNode::new_root_mut(rowan::GreenNode::new(
         crate::SyntaxKind::ROOT.into(),
@@ -218,6 +216,16 @@ pub(crate) fn replace_children(node: &SyntaxNode, new: Vec<GreenElement>) {
     ));
     let elements: Vec<_> = root.children_with_tokens().collect();
     node.splice_children(prefix..prefix, elements);
+}
+
+/// Detach `elements` from the tree one by one.
+///
+/// Use this rather than `splice_children` over a range of several elements,
+/// which in rowan 0.16 only detaches the first element of the range.
+pub(crate) fn detach_elements(elements: impl IntoIterator<Item = SyntaxElement>) {
+    for element in elements {
+        element.detach();
+    }
 }
 
 /// Detach `tokens` from the tree, along with any BLANK_LINE node left empty.
@@ -553,7 +561,7 @@ pub(crate) fn hoist_doc_comment(node: &SyntaxNode) {
         }
         let index = element.index();
         let tail: Vec<_> = container.children_with_tokens().skip(index).collect();
-        container.splice_children(index..index + tail.len(), vec![]);
+        detach_elements(tail.iter().cloned());
         let after = container.index() + 1;
         container
             .parent()
@@ -788,4 +796,31 @@ pub(crate) fn collapse_continuations(node: &SyntaxNode, syntax: LineSyntax) -> S
         .descendants_with_tokens()
         .filter_map(|it| it.into_token());
     logical_text(node, tokens, syntax, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lossless::Makefile;
+    use crate::SyntaxKind::{EXPR, OPERATOR};
+    use rowan::ast::AstNode;
+
+    #[test]
+    fn test_detach_elements_mixed() {
+        let makefile: Makefile = "X := a b # c\nall:\n".parse().unwrap();
+        let variable = makefile.variable_definitions().next().unwrap();
+        let elements: Vec<_> = variable
+            .syntax()
+            .children_with_tokens()
+            .skip(1)
+            .take_while(|e| e.kind() != COMMENT)
+            .collect();
+        assert_eq!(
+            elements.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+            vec![WHITESPACE, OPERATOR, WHITESPACE, EXPR]
+        );
+        detach_elements(elements);
+        assert_eq!(makefile.to_string(), "X# c\nall:\n");
+        assert_eq!(variable.syntax().to_string(), "X# c\n");
+    }
 }
