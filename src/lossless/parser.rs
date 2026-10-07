@@ -273,6 +273,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// `pending_backslash_escape`, which makes the same decision for tokenizing
         /// the continued line's indent.
         pending_backslash_escape: bool,
+        /// The quote that ends the quoted `ifeq` argument being parsed, if
+        /// any. It ends any variable reference in the argument too.
+        argument_quote: Option<String>,
         /// Whether we are in rule context, i.e. a tab-indented line is a
         /// recipe line. Set by a rule line and cleared by any other line
         /// except comments, blank lines and conditional directives.
@@ -2412,14 +2415,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 self.bump();
                             }
                             // Like `$(...)`, a reference can't span lines.
-                            Some(NEWLINE) | None => {
+                            _ if self.at_reference_end() => {
                                 self.record_error(
                                     ParseErrorKind::UnclosedReference,
                                     "unclosed variable reference".to_string(),
                                 );
                                 break;
                             }
-                            Some(_) => self.bump(),
+                            _ => self.bump(),
                         }
                     }
                 } else {
@@ -2467,7 +2470,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_parenthesized_expr_internal(true);
                     }
                 }
-            } else if !matches!(self.current(), None | Some(NEWLINE | RPAREN | RBRACE))
+            } else if !self.at_reference_end()
+                && !matches!(self.current(), Some(RPAREN | RBRACE))
                 && !self.is_line_continuation()
                 && !(self.variant == Some(MakefileVariant::BSDMake)
                     && self
@@ -2502,6 +2506,17 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // expanding them, so this includes a `$` before a backslash-newline.
 
             self.builder.finish_node();
+        }
+
+        /// Whether a variable reference ends before the current token: at
+        /// the end of the line, or at the quote that ends a quoted `ifeq`
+        /// argument.
+        fn at_reference_end(&self) -> bool {
+            match self.tokens.last() {
+                None | Some((NEWLINE, _)) => true,
+                Some((QUOTE, text)) => self.argument_quote.as_ref() == Some(text),
+                _ => false,
+            }
         }
 
         /// Whether the tokens after `$(` are an nmake macro substitution,
@@ -2597,7 +2612,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     // Leave the newline for the caller, like GNU make,
                     // which does not let the reference span lines.
-                    Some(NEWLINE) | None => {
+                    _ if self.at_reference_end() => {
                         if is_variable_ref {
                             self.record_error(
                                 ParseErrorKind::UnclosedReference,
@@ -2611,7 +2626,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         }
                         break;
                     }
-                    Some(_) => self.bump(),
+                    _ => self.bump(),
                 }
             }
 
@@ -2664,17 +2679,25 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
         /// Parse a quoted argument of `ifeq`, starting at its opening quote.
         /// Returns whether the closing quote was found on the logical line.
-        // TODO: GNU make ends the argument at a quote inside a variable
-        // reference too, leaving the reference unterminated.
+        /// Like GNU make, which finds the closing quote before expanding the
+        /// argument, end the argument at a quote inside a variable reference
+        /// too, leaving the reference unterminated.
         fn parse_quoted_argument(&mut self) -> bool {
             let quote = self.tokens.last().unwrap().1.clone();
             self.bump();
+            self.argument_quote = Some(quote.clone());
+            let found = self.parse_quoted_argument_rest(&quote);
+            self.argument_quote = None;
+            found
+        }
+
+        fn parse_quoted_argument_rest(&mut self, quote: &str) -> bool {
             loop {
                 if self.consume_line_continuation() {
                     continue;
                 }
                 match self.tokens.last() {
-                    Some((QUOTE, text)) if *text == quote => {
+                    Some((QUOTE, text)) if text == quote => {
                         self.bump();
                         return true;
                     }
@@ -4797,14 +4820,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // Handle nested variable references
                         self.parse_variable_reference();
                     }
-                    Some(NEWLINE) | None => {
+                    _ if self.at_reference_end() => {
                         self.record_error(
                             ParseErrorKind::UnclosedReference,
                             "unclosed variable reference".to_string(),
                         );
                         break;
                     }
-                    Some(_) => self.bump(),
+                    _ => self.bump(),
                 }
             }
 
@@ -4836,6 +4859,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         for_depth: 0,
         block_conditional_depth: 0,
         pending_backslash_escape: false,
+        argument_quote: None,
         in_rule: RuleContext::Outside,
         bsd_line: None,
         token_edits: 0,
