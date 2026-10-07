@@ -1,4 +1,5 @@
 use super::*;
+use crate::bsd_condition::BsdConditionErrorKind;
 use crate::lex::{
     ends_with_unescaped_backslash, lex, lex_first_non_recipe_line, lex_non_recipe_line,
 };
@@ -3797,6 +3798,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// an optional comment and the newline. If `required` names the
         /// directive, an empty argument is reported as an error.
         fn parse_directive_argument(&mut self, required: Option<&str>) {
+            self.skip_ws_and_continuations();
+            let condition = (required.is_some() && self.variant != Some(MakefileVariant::NMake))
+                .then(|| self.bsd_logical_line());
             let found = self.parse_directive_expr();
             if let (Some(name), false) = (required, found) {
                 self.record_error(
@@ -3804,7 +3808,47 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     format!("expected condition after {}", self.directive_display(name)),
                 );
             }
+            if let Some(condition) = condition {
+                self.check_bsd_condition(&condition);
+            }
             self.finish_directive_line();
+        }
+
+        /// Report text after a complete BSD make condition, such as `junk`
+        /// in `.if 1 junk`, which make rejects as a malformed conditional.
+        ///
+        /// TODO: Report other syntax errors in the condition. BSD make only
+        /// finds them in the branches it evaluates, and some real makefiles
+        /// contain them, such as an unclosed `exists(` in an `.elif`.
+        fn check_bsd_condition(&mut self, line: &BsdLine) {
+            let Err(error) = crate::bsd_condition::parse_bsd_condition(&line.text) else {
+                return;
+            };
+            if !matches!(
+                error.kind(),
+                BsdConditionErrorKind::UnexpectedText
+                    | BsdConditionErrorKind::UnbalancedParenthesis
+            ) {
+                return;
+            }
+            let position = |text_offset: usize| {
+                let i = line
+                    .starts
+                    .partition_point(|(_, offset)| *offset <= text_offset)
+                    - 1;
+                let (start, offset) = line.starts[i];
+                start + rowan::TextSize::try_from(text_offset - offset).unwrap()
+            };
+            let condition = line.text.trim_end();
+            let start = position(error.offset);
+            let range = rowan::TextRange::new(start, position(condition.len()));
+            let line_number = self.line_at(start);
+            self.push_error(
+                ParseErrorKind::InvalidConditional,
+                format!("Malformed conditional ({condition})"),
+                range,
+                line_number,
+            );
         }
 
         /// Parse the rest of a directive line up to any comment into an EXPR

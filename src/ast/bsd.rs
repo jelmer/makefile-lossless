@@ -220,7 +220,7 @@ impl Directive {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Makefile, MakefileItem, MakefileVariant, Rule};
+    use crate::{Makefile, MakefileItem, MakefileVariant, ParseErrorKind, Rule, TextRange};
 
     fn parse_ok(text: &str) -> Makefile {
         let parsed = Makefile::parse(text);
@@ -709,8 +709,18 @@ mod tests {
 
     #[test]
     fn test_directive_followed_by_operator() {
-        // With whitespace after the name, this is still a directive.
-        let makefile = parse_ok(".info = x\n.if == \"\"\n.endif\n");
+        // With whitespace after the name, this is still a directive,
+        // although make rejects the condition.
+        let parsed = Makefile::parse(".info = x\n.if == \"\"\n.endif\n");
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Malformed conditional (== \"\")"]
+        );
+        let makefile = parsed.tree();
         let Some(MakefileItem::Directive(d)) = makefile.items().next() else {
             panic!("expected directive");
         };
@@ -761,6 +771,97 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "expected condition after .ifdef")]
         );
+    }
+
+    #[test]
+    fn test_malformed_condition() {
+        // BSD make rejects text after a complete condition.
+        let cases = [
+            (".if 1 junk\n.endif\n", "Malformed conditional (1 junk)"),
+            (".if (1) junk\n.endif\n", "Malformed conditional ((1) junk)"),
+            (
+                ".if 1 && 2 junk\n.endif\n",
+                "Malformed conditional (1 && 2 junk)",
+            ),
+            (".if 1)\n.endif\n", "Malformed conditional (1))"),
+            (
+                ".if ${X} \\\n  junk # c\n.endif\n",
+                "Malformed conditional (${X}  junk)",
+            ),
+            (".ifdef X Y\n.endif\n", "Malformed conditional (X Y)"),
+            (".ifndef X Y Z\n.endif\n", "Malformed conditional (X Y Z)"),
+            (".ifmake X Y\n.endif\n", "Malformed conditional (X Y)"),
+            (".ifnmake X Y\n.endif\n", "Malformed conditional (X Y)"),
+            (".ifdef X)\n.endif\n", "Malformed conditional (X))"),
+            (
+                ".if 0\n.elif 1 junk\n.endif\n",
+                "Malformed conditional (1 junk)",
+            ),
+            (
+                ".if 0\n.elifdef X Y\n.endif\n",
+                "Malformed conditional (X Y)",
+            ),
+            (
+                ".if 0\n.elifndef X Y\n.endif\n",
+                "Malformed conditional (X Y)",
+            ),
+            (
+                ".if 0\n.elifmake X Y\n.endif\n",
+                "Malformed conditional (X Y)",
+            ),
+            (
+                ".if 0\n.elifnmake X Y\n.endif\n",
+                "Malformed conditional (X Y)",
+            ),
+        ];
+        for (text, message) in cases {
+            let line = if text.contains(".elif") || text.contains("\\\n") {
+                2
+            } else {
+                1
+            };
+            // GNU make rejects these lines too.
+            for parsed in [
+                Makefile::parse_with_variant(text, MakefileVariant::BSDMake),
+                Makefile::parse(text),
+            ] {
+                assert_eq!(parsed.tree().to_string(), text);
+                assert_eq!(
+                    parsed
+                        .errors()
+                        .iter()
+                        .map(|e| (e.line, e.kind(), e.message.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec![(line, ParseErrorKind::InvalidConditional, message)],
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_malformed_condition_range() {
+        let parsed = Makefile::parse_with_variant(
+            ".if ${X} \\\n  junk # c\n.endif\n",
+            MakefileVariant::BSDMake,
+        );
+        let ranges: Vec<_> = parsed.positioned_errors().iter().map(|e| e.range).collect();
+        assert_eq!(ranges, vec![TextRange::new(13.into(), 17.into())]);
+    }
+
+    #[test]
+    fn test_well_formed_conditions() {
+        for text in [
+            ".if 1 # comment\n.endif\n",
+            ".ifdef X || Y\n.endif\n",
+            ".ifdef X&&Y\n.endif\n",
+            ".ifdef !X\n.endif\n",
+            ".ifdef (X)\n.endif\n",
+            ".if 1 \\\n  && 2\n.endif\n",
+            ".if ${X:U1} == 1\n.endif\n",
+        ] {
+            parse_bsd(text);
+        }
     }
 
     fn parse_bsd(text: &str) -> Makefile {
