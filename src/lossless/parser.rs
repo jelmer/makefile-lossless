@@ -1,5 +1,5 @@
 use super::*;
-use crate::lex::{lex, lex_non_recipe_line};
+use crate::lex::{ends_with_unescaped_backslash, lex, lex_non_recipe_line};
 use crate::MakefileVariant;
 use rowan::GreenNode;
 
@@ -245,7 +245,7 @@ fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::Text
 }
 
 pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
-    struct Parser {
+    struct Parser<'a> {
         /// input tokens, including whitespace,
         /// in *reverse* order.
         tokens: Vec<(SyntaxKind, String)>,
@@ -259,7 +259,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Token positions (start, end) in forward order, indexed by forward token index
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
         /// The original text
-        original_text: String,
+        original_text: &'a str,
         /// The makefile variant
         variant: Option<MakefileVariant>,
         /// Number of enclosing BSD `.for` loops.
@@ -270,7 +270,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// odd number have been seen, meaning the next backslash is escaped
         /// (`\\`) and a following newline is a literal backslash, not a line
         /// continuation. Reset to false by any other token. Mirrors the lexer's
-        /// `prev_was_backslash`, which makes the same decision for tokenizing
+        /// `pending_backslash_escape`, which makes the same decision for tokenizing
         /// the continued line's indent.
         pending_backslash_escape: bool,
         /// Whether we are in rule context, i.e. a tab-indented line is a
@@ -297,7 +297,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         token_edits: usize,
     }
 
-    impl Parser {
+    impl Parser<'_> {
         fn error(&mut self, kind: ParseErrorKind, msg: String) {
             self.builder.start_node(ERROR.into());
             self.record_error(kind, msg);
@@ -379,7 +379,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let index = self.token_positions.len() - self.tokens.len();
             match self.token_positions.get(index) {
                 Some(&(start, end)) => rowan::TextRange::new(start, end),
-                None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text.as_str())),
+                None => rowan::TextRange::empty(rowan::TextSize::of(self.original_text)),
             }
         }
 
@@ -435,18 +435,20 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let comment =
                 self.current() == Some(COMMENT) && self.variant != Some(MakefileVariant::NMake);
             loop {
-                let mut last_text_content: Option<String> = None;
+                // Like the lexer, only an odd number of backslashes continues
+                // the line; `\\\\` is an escaped backslash.
+                let mut is_continuation = false;
 
-                // Consume all tokens until newline, tracking the last TEXT token's content
+                // Consume all tokens until newline, noting whether the last
+                // TEXT token ends in a continuation backslash
                 while self.current().is_some() && self.current() != Some(NEWLINE) {
-                    // Save the text content if this is a TEXT token
                     if self.current() == Some(TEXT) || (comment && self.current() == Some(COMMENT))
                     {
                         if let Some((_kind, text)) = self.tokens.last() {
                             if self.variant == Some(MakefileVariant::NMake) {
                                 inline_files += text.matches("<<").count();
                             }
-                            last_text_content = Some(text.clone());
+                            is_continuation = ends_with_unescaped_backslash(text);
                         }
                     }
                     if comment && self.current() == Some(TEXT) {
@@ -460,13 +462,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 if self.current() == Some(NEWLINE) {
                     self.bump();
                 }
-
-                // Check if the last TEXT token ended with a backslash (continuation)
-                // Like the lexer, only an odd number of backslashes continues
-                // the line; `\\\\` is an escaped backslash.
-                let is_continuation = last_text_content.as_ref().is_some_and(|text| {
-                    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
-                });
 
                 if is_continuation {
                     // This is a continuation line - consume the indent of the next line, if
@@ -538,8 +533,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 self.pending_backslash_escape = false;
                 // An odd number of trailing backslashes continues the line,
                 // even after a `#`.
-                let continued = self.current() == Some(NEWLINE)
-                    && text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
+                let continued =
+                    self.current() == Some(NEWLINE) && ends_with_unescaped_backslash(&text);
                 if !text.is_empty() {
                     // Mirror how a tab-indented `# ...` line is tokenized,
                     // with any continuation lines in the comment except
@@ -892,7 +887,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         self.parse_comment();
                     }
                     Some(IDENTIFIER) => {
-                        let token = &self.tokens.last().unwrap().1.clone();
+                        let token = &self.tokens.last().unwrap().1;
                         // Check if this is a starting conditional directive
                         if Self::is_conditional_start(token) && self.at_conditional_keyword() {
                             // If we're not inside a conditional (depth == 0) and it doesn't
@@ -919,17 +914,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                             }
                             newline_count = 0;
                             self.parse_include();
-                        } else if token == "else" || token == "endif" {
-                            // These should only appear if we're inside a conditional
-                            // If we see them at depth 0, something is wrong, so break
-                            break;
                         } else {
-                            // Any other identifier at depth 0 means the rule is over
-                            if conditional_depth == 0 {
-                                break;
-                            }
-                            // Otherwise, it's content inside a conditional (variable assignment, etc.)
-                            // Let it be handled by parse_normal_content
+                            // Any other identifier, including a stray `else` or
+                            // `endif`, ends the rule.
                             break;
                         }
                     }
@@ -4844,7 +4831,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         errors: Vec::new(),
         positioned_errors: Vec::new(),
         token_positions,
-        original_text: text.to_string(),
+        original_text: text,
         variant,
         for_depth: 0,
         block_conditional_depth: 0,

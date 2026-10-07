@@ -138,24 +138,21 @@ impl Parse<Makefile> {
         let mut new_errors = Vec::new();
         let mut new_positioned_errors = Vec::new();
 
-        // Errors before the affected region (unchanged).
-        for err in self.errors() {
-            // ErrorInfo uses line numbers, not byte offsets. We need to figure out
-            // which errors are before the reparse region by line number.
-            // Since we can't easily map line numbers to byte offsets without the text,
-            // we use a simpler approach: count newlines up to reparse_start.
-            let lines_before = old_text[..u32::from(reparse_start) as usize]
-                .matches('\n')
-                .count();
-            if err.line <= lines_before {
-                new_errors.push(err.clone());
-            }
-        }
-
-        // Errors from the reparsed region (adjusted line numbers).
+        // ErrorInfo uses line numbers, not byte offsets, so count the lines
+        // before the reparse region.
         let line_offset = old_text[..u32::from(reparse_start) as usize]
             .matches('\n')
             .count();
+
+        // Errors before the affected region (unchanged).
+        new_errors.extend(
+            self.errors()
+                .iter()
+                .filter(|err| err.line <= line_offset)
+                .cloned(),
+        );
+
+        // Errors from the reparsed region (adjusted line numbers).
         for err in &reparsed.errors {
             new_errors.push(ErrorInfo {
                 line: err.line + line_offset,
