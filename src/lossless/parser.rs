@@ -6,7 +6,6 @@ use crate::MakefileVariant;
 use rowan::GreenNode;
 
 /// The parse results are stored as a "green tree".
-/// We'll discuss working with the results later
 #[derive(Debug)]
 pub(crate) struct Parse {
     pub(crate) green_node: GreenNode,
@@ -926,18 +925,14 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_rule_recipes(&mut self) {
-            // Track how many levels deep we are in conditionals that started in this rule
-            let mut conditional_depth = 0;
-            // Also track consecutive newlines to detect blank lines
+            // Track consecutive newlines to detect blank lines
             let mut newline_count = 0;
 
             loop {
                 if let Some((name, count)) = self.directive() {
                     // Blank lines don't end a rule's recipe, so this
                     // belongs to the rule if it has recipe lines.
-                    if !self.bsd_directive_in_rule(name)
-                        || (conditional_depth == 0 && !self.recipe_continues())
-                    {
+                    if !self.bsd_directive_in_rule(name) || !self.recipe_continues() {
                         break;
                     }
                     newline_count = 0;
@@ -953,11 +948,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         // A space-indented comment or blank line doesn't end the rule
                         let next = self.tokens.iter().rev().nth(1).map(|(kind, _)| *kind);
                         match next {
-                            Some(COMMENT)
-                                if conditional_depth > 0
-                                    || newline_count == 0
-                                    || self.recipe_continues() =>
-                            {
+                            Some(COMMENT) if newline_count == 0 || self.recipe_continues() => {
                                 self.bump();
                             }
                             // After a blank line, it ends the rule like an
@@ -978,8 +969,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     Some(COMMENT) => {
                         // Comments after blank lines should not be part of the
                         // rule, unless the recipe continues after them
-                        if conditional_depth == 0 && newline_count >= 1 && !self.recipe_continues()
-                        {
+                        if newline_count >= 1 && !self.recipe_continues() {
                             break;
                         }
                         newline_count = 0;
@@ -989,25 +979,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                         let token = &self.tokens.last().unwrap().1;
                         // Check if this is a starting conditional directive
                         if Self::is_conditional_start(token) && self.at_conditional_keyword() {
-                            // If we're not inside a conditional (depth == 0) and it doesn't
-                            // continue the recipe, this is a top-level conditional, not part
-                            // of the rule. Blank lines don't end a rule's recipe.
-                            if conditional_depth == 0 && !self.recipe_continues() {
+                            // Unless it continues the recipe, this is a top-level
+                            // conditional, not part of the rule. Blank lines
+                            // don't end a rule's recipe.
+                            if !self.recipe_continues() {
                                 break;
                             }
                             newline_count = 0;
-                            conditional_depth += 1;
                             self.parse_conditional();
-                            // parse_conditional() handles the entire conditional including endif,
-                            // so we need to decrement after it returns
-                            conditional_depth -= 1;
                         } else if self.at_include_keyword() {
                             // Only BSD make keeps rule context across an
                             // include line; GNU make ends the rule there.
                             if !self.is_bsd_make()
-                                || (conditional_depth == 0
-                                    && newline_count >= 1
-                                    && !self.recipe_continues())
+                                || (newline_count >= 1 && !self.recipe_continues())
                             {
                                 break;
                             }
@@ -1077,7 +1061,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     text.push_str(&self.pop_token().unwrap().1);
                 }
-                let continued = (text.len() - text.trim_end_matches('\\').len()) % 2 == 1;
+                let continued = ends_with_unescaped_backslash(&text);
                 if !text.is_empty() {
                     self.builder.token(TEXT.into(), &text);
                 }
@@ -2997,77 +2981,44 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             self.keyword_at(next, &["ifdef", "ifndef", "ifeq", "ifneq"])
         }
 
-        // Helper method to handle conditional token
-        fn handle_conditional_token(&mut self, token: &str, depth: &mut usize) -> bool {
+        /// Parse a nested conditional, or the `else` or `endif` of the one
+        /// being parsed. Returns false if `token` is none of those.
+        fn handle_conditional_token(&mut self, token: &str) -> bool {
             match token {
                 "ifdef" | "ifndef" | "ifeq" | "ifneq"
                     if matches!(self.variant, None | Some(MakefileVariant::GNUMake)) =>
                 {
-                    // Don't increment depth here - parse_conditional manages its own depth internally
-                    // Incrementing here causes the outer conditional to never exit its loop
                     self.parse_conditional();
                     true
                 }
                 "else" => {
-                    // Not valid outside of a conditional
-                    if *depth == 0 {
-                        self.error(
-                            ParseErrorKind::ElseWithoutIf,
-                            "else without matching if".to_string(),
-                        );
-                        // Always consume a token to guarantee progress
+                    self.builder.start_node(CONDITIONAL_ELSE.into());
+                    self.bump();
+                    self.skip_ws();
+
+                    // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
+                    // Like CONDITIONAL_IF, the node includes the newline.
+                    if self.at_keyword(&["ifdef", "ifndef"]) {
                         self.bump();
-                        false
+                        self.skip_ws_and_continuations();
+                        self.parse_simple_condition();
+                    } else if self.at_keyword(&["ifeq", "ifneq"]) {
+                        self.bump();
+                        self.skip_ws_and_continuations();
+                        self.parse_parenthesized_expr();
                     } else {
-                        // Start CONDITIONAL_ELSE node
-                        self.builder.start_node(CONDITIONAL_ELSE.into());
-
-                        // Consume the 'else' token
-                        self.bump();
-                        self.skip_ws();
-
-                        // Check if this is "else <conditional>" (else ifdef, else ifeq, etc.)
-                        // Like CONDITIONAL_IF, the node includes the newline.
-                        if self.at_keyword(&["ifdef", "ifndef"]) {
-                            self.bump();
-                            self.skip_ws_and_continuations();
-                            self.parse_simple_condition();
-                        } else if self.at_keyword(&["ifeq", "ifneq"]) {
-                            self.bump();
-                            self.skip_ws_and_continuations();
-                            self.parse_parenthesized_expr();
-                        } else {
-                            self.parse_directive_line_end("else", false);
-                        }
-
-                        self.builder.finish_node(); // finish CONDITIONAL_ELSE
-                        true
+                        self.parse_directive_line_end("else", false);
                     }
+
+                    self.builder.finish_node(); // finish CONDITIONAL_ELSE
+                    true
                 }
                 "endif" => {
-                    // Not valid outside of a conditional
-                    if *depth == 0 {
-                        self.error(
-                            ParseErrorKind::ExtraneousEndif,
-                            "endif without matching if".to_string(),
-                        );
-                        // Always consume a token to guarantee progress
-                        self.bump();
-                        false
-                    } else {
-                        *depth -= 1;
-
-                        // Start CONDITIONAL_ENDIF node
-                        self.builder.start_node(CONDITIONAL_ENDIF.into());
-
-                        // Consume the endif
-                        self.bump();
-
-                        self.parse_directive_line_end("endif", false);
-
-                        self.builder.finish_node(); // finish CONDITIONAL_ENDIF
-                        true
-                    }
+                    self.builder.start_node(CONDITIONAL_ENDIF.into());
+                    self.bump();
+                    self.parse_directive_line_end("endif", false);
+                    self.builder.finish_node(); // finish CONDITIONAL_ENDIF
+                    true
                 }
                 _ => false,
             }
@@ -3114,29 +3065,12 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
 
-            // Parse the conditional body
-            let mut depth = 1;
-
             let mut rule_context = ConditionalRuleContext::new(self.in_rule);
             let mut seen_final_else = false;
+            let mut seen_endif = false;
 
-            // More reliable loop detection
-            let mut position_count = std::collections::HashMap::<usize, usize>::new();
-            let max_repetitions = 15; // Permissive but safe limit
-
-            while depth > 0 && !self.is_at_eof() {
-                // Track position to detect infinite loops
-                let current_pos = self.tokens.len();
-                *position_count.entry(current_pos).or_insert(0) += 1;
-
-                // If we've seen the same position too many times, break
-                // This prevents infinite loops while allowing complex parsing
-                if position_count.get(&current_pos).unwrap() > &max_repetitions {
-                    // Instead of adding an error, just break out silently
-                    // to avoid breaking tests that expect no errors
-                    break;
-                }
-
+            while !seen_endif && !self.is_at_eof() {
+                let start = (self.current_range().start(), self.token_edits);
                 match self.current() {
                     Some(IDENTIFIER) => {
                         if let Some((name, count)) = self.directive() {
@@ -3160,10 +3094,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                                 seen_final_else |= is_final;
                                 self.in_rule = rule_context.next_branch(self.in_rule, is_final);
                             }
-                            "endif" => self.in_rule = rule_context.end(self.in_rule),
+                            "endif" => {
+                                self.in_rule = rule_context.end(self.in_rule);
+                                seen_endif = true;
+                            }
                             _ => {}
                         }
-                        if !self.handle_conditional_token(&token, &mut depth) {
+                        if !self.handle_conditional_token(&token) {
                             self.parse_normal_content();
                         }
                     }
@@ -3181,9 +3118,18 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                     }
                     None => unreachable!("loop condition excludes EOF"),
                 }
+                if self.current().is_some()
+                    && (self.current_range().start(), self.token_edits) == start
+                {
+                    debug_assert!(false, "no progress in conditional body");
+                    self.error(
+                        ParseErrorKind::Other,
+                        "unexpected token in conditional".to_string(),
+                    );
+                }
             }
 
-            if depth > 0 && self.is_at_eof() {
+            if !seen_endif {
                 self.record_unterminated_error(
                     ParseErrorKind::MissingEndif,
                     "unterminated conditional (missing endif)".to_string(),
@@ -4406,20 +4352,6 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
-        fn parse_identifier_token(&mut self) -> bool {
-            let token = &self.tokens.last().unwrap().1;
-
-            if Self::is_conditional_start(token) && self.at_conditional_keyword() {
-                self.parse_conditional();
-                return true;
-            }
-
-            // Handle normal content (define, assignment, include, vpath or
-            // rule)
-            self.parse_normal_content();
-            true
-        }
-
         fn parse_token(&mut self) -> bool {
             if let Some((name, count)) = self.directive() {
                 self.parse_directive(name, count);
@@ -4430,10 +4362,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 Some(IDENTIFIER) => {
                     if self.at_conditional_keyword() {
                         self.parse_conditional();
-                        true
                     } else {
-                        self.parse_identifier_token()
+                        self.parse_normal_content();
                     }
+                    true
                 }
                 Some(DOLLAR) => {
                     self.parse_normal_content();
@@ -4642,11 +4574,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
             let mut comment = String::new();
             while let Some((kind, text)) = self.tokens.last() {
-                if *kind == NEWLINE {
-                    let backslashes = comment.chars().rev().take_while(|c| *c == '\\').count();
-                    if backslashes % 2 == 0 || self.tokens.len() == 1 {
-                        break;
-                    }
+                if *kind == NEWLINE
+                    && (!ends_with_unescaped_backslash(&comment) || self.tokens.len() == 1)
+                {
+                    break;
                 }
                 comment.push_str(text);
                 self.pop_token();
