@@ -1,5 +1,6 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
+use super::word_list::{self, GreenElement, WordList};
 use super::{
     edit_error, escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
     terminate_line_before, LineSyntax,
@@ -110,6 +111,18 @@ pub(crate) fn build_targets_node(targets: &[String], context: &str) -> Result<Sy
         .and_then(|rule| rule.syntax().children().find(|n| n.kind() == TARGETS))
         .map(|node| SyntaxNode::new_root_mut(node.green().into_owned()))
         .ok_or_else(|| edit_error(context, format!("Cannot write {targets:?} as targets")))
+}
+
+/// The elements of a single prerequisite, as in a PREREQUISITES node.
+fn prerequisite_word(name: &str, before_comment: bool) -> Result<Vec<GreenElement>, Error> {
+    let node = build_prerequisites_node(&[name.to_string()], None, before_comment)?;
+    Ok(node.green().children().map(|c| c.to_owned()).collect())
+}
+
+/// The elements of a single target, as in a TARGETS node.
+fn target_word(name: &str, _before_comment: bool) -> Result<Vec<GreenElement>, Error> {
+    let node = build_targets_node(&[name.to_string()], "set_targets")?;
+    Ok(node.green().children().map(|c| c.to_owned()).collect())
 }
 
 /// Represents different types of items that can appear in a Rule's body
@@ -1310,6 +1323,10 @@ impl Rule {
     /// Only normal prerequisites are considered; order-only prerequisites are
     /// left alone.
     ///
+    /// The prerequisite is removed along with the whitespace after it, or
+    /// before it if it is the last one or the whitespace after it holds a
+    /// line continuation; the rest of the line is kept as written.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -1319,24 +1336,31 @@ impl Rule {
     /// assert!(!rule.remove_prerequisite("nonexistent").unwrap());
     /// ```
     pub fn remove_prerequisite(&mut self, target: &str) -> Result<bool, Error> {
-        let current_prereqs: Vec<String> = self.prerequisites().collect();
-        if !current_prereqs.iter().any(|p| p == target) {
+        let old: Vec<String> = self.prerequisites().collect();
+        let indices: Vec<usize> = (0..old.len()).filter(|&i| old[i] == target).collect();
+        if indices.is_empty() {
             return Ok(false);
         }
-        self.set_prerequisites(
-            current_prereqs
-                .iter()
-                .map(|p| p.as_str())
-                .filter(|p| *p != target)
-                .collect(),
-        )?;
+        let node = self
+            .prerequisites_node()
+            .expect("a rule with prerequisites has a PREREQUISITES node");
+        let mut list = WordList::new(&node);
+        if indices.len() == old.len() || list.len() != old.len() {
+            let new = old.iter().map(|p| p.as_str()).filter(|p| *p != target);
+            self.set_prerequisites(new.collect())?;
+            return Ok(true);
+        }
+        list.remove_all(&indices, &old, prerequisite_word)?;
+        let new: Vec<String> = old.into_iter().filter(|p| p != target).collect();
+        self.apply_list(&node, list, &new, "remove_prerequisite")?;
         Ok(true)
     }
 
     /// Add a prerequisite to this rule
     ///
-    /// The prerequisite is added to the end of the normal prerequisites,
-    /// before any order-only prerequisites.
+    /// The prerequisite is added after a space at the end of the normal
+    /// prerequisites, on the same line as the last one and before any
+    /// order-only prerequisites.
     ///
     /// # Example
     /// ```
@@ -1362,6 +1386,10 @@ impl Rule {
     /// written so that it reads back the same, such as one containing
     /// whitespace or a `|`.
     ///
+    /// The prerequisites at the start and end that do not change are kept
+    /// as written, along with the whitespace, line continuations and
+    /// comment around them; the others are written afresh.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -1371,8 +1399,61 @@ impl Rule {
     /// assert_eq!(rule.order_only_prerequisites().collect::<Vec<_>>(), vec!["dir"]);
     /// ```
     pub fn set_prerequisites(&mut self, prereqs: Vec<&str>) -> Result<(), Error> {
-        let prereqs = prereqs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let new: Vec<String> = prereqs.iter().map(|s| s.to_string()).collect();
+        let old: Vec<String> = self.prerequisites().collect();
+        let node = match self.prerequisites_node() {
+            Some(node) if !old.is_empty() && !new.is_empty() => node,
+            _ => return self.rewrite_prerequisites(new),
+        };
+        let mut list = WordList::new(&node);
+        if list.len() != old.len() {
+            return Err(edit_error(
+                "set_prerequisites",
+                "Cannot edit the prerequisites in place".to_string(),
+            ));
+        }
+        build_prerequisites_node(&new, None, list.ends_before_comment())?;
+        list.edit(&old, &new, prerequisite_word)?;
+        self.apply_list(&node, list, &new, "set_prerequisites")
+    }
 
+    /// Edit `node`, the TARGETS or PREREQUISITES node of the rule, to hold
+    /// the edited `list`, provided that it reads back as `expected`.
+    fn apply_list(
+        &self,
+        node: &SyntaxNode,
+        list: WordList,
+        expected: &[String],
+        context: &str,
+    ) -> Result<(), Error> {
+        let pieces = list.into_pieces();
+        let copy = Rule::cast(SyntaxNode::new_root_mut(self.syntax().green().into_owned()))
+            .expect("a copy of a rule is a rule");
+        let copy_node = copy
+            .syntax()
+            .children_with_tokens()
+            .nth(node.index())
+            .and_then(|e| e.into_node())
+            .expect("the copy has the same children");
+        word_list::apply(&pieces, &copy_node);
+        let read: Vec<String> = if node.kind() == TARGETS {
+            copy.targets().collect()
+        } else {
+            copy.prerequisites().collect()
+        };
+        if read != expected {
+            return Err(edit_error(
+                context,
+                format!("Cannot write {expected:?} in place"),
+            ));
+        }
+        word_list::apply(&pieces, node);
+        Ok(())
+    }
+
+    /// Replace the normal prerequisites when there are none before or
+    /// after the change, keeping whatever follows them in the line.
+    fn rewrite_prerequisites(&mut self, prereqs: Vec<String>) -> Result<(), Error> {
         if let Some(node) = self.prerequisites_node() {
             let has_external_whitespace = node
                 .prev_sibling_or_token()
@@ -1407,25 +1488,17 @@ impl Rule {
                 None
             };
             let fresh = build_prerequisites_node(&prereqs, separator, next_kind == Some(COMMENT))?;
-            let old_green = node.green();
-            let rest = old_green.children().skip(keep).map(|c| c.to_owned());
-            let green = rowan::GreenNode::new(
-                PREREQUISITES.into(),
-                fresh
-                    .green()
-                    .children()
-                    .map(|c| c.to_owned())
-                    .chain(rest)
-                    .collect::<Vec<_>>(),
-            );
-            let index = node.index();
-            let mut elements = if !has_external_whitespace && !prereqs.is_empty() {
-                crate::lossless::detached_elements(&[(WHITESPACE, " ")], None)
-            } else {
-                vec![]
-            };
-            elements.push(SyntaxNode::new_root_mut(green).into());
-            self.syntax().splice_children(index..index + 1, elements);
+            for child in &children[..keep] {
+                child.detach();
+            }
+            node.splice_children(0..0, fresh.children_with_tokens().collect::<Vec<_>>());
+            if !has_external_whitespace && !prereqs.is_empty() {
+                let index = node.index();
+                self.syntax().splice_children(
+                    index..index,
+                    crate::lossless::detached_elements(&[(WHITESPACE, " ")], None),
+                );
+            }
             return Ok(());
         }
 
@@ -1476,29 +1549,39 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target"]);
     /// ```
     pub fn rename_target(&mut self, old_name: &str, new_name: &str) -> Result<bool, Error> {
-        // Collect current targets
-        let current_targets: Vec<String> = self.targets().collect();
-
-        // Check if the target to rename exists
-        if !current_targets.iter().any(|t| t == old_name) {
+        let old: Vec<String> = self.targets().collect();
+        if !old.iter().any(|t| t == old_name) {
             return Ok(false);
         }
-
-        // Create new target list with the renamed target
-        let new_targets: Vec<String> = current_targets
-            .into_iter()
-            .map(|t| {
-                if t == old_name {
-                    new_name.to_string()
-                } else {
-                    t
-                }
-            })
+        let new: Vec<String> = old
+            .iter()
+            .map(|t| if t == old_name { new_name } else { t }.to_string())
             .collect();
-
-        self.replace_targets_node(&new_targets, "rename_target")?;
-
+        self.edit_targets(&old, new, "rename_target")?;
         Ok(true)
+    }
+
+    /// Change the targets from `old` to `new`, keeping the formatting of
+    /// the targets common to the start and end of both lists.
+    fn edit_targets(
+        &mut self,
+        old: &[String],
+        new: Vec<String>,
+        context: &str,
+    ) -> Result<(), Error> {
+        let node = self
+            .targets_node()
+            .ok_or_else(|| edit_error(context, "No TARGETS node found in rule".to_string()))?;
+        build_targets_node(&new, context)?;
+        let mut list = WordList::new(&node);
+        if list.len() != old.len() {
+            return Err(edit_error(
+                context,
+                "Cannot edit the targets in place".to_string(),
+            ));
+        }
+        list.edit(old, &new, target_word)?;
+        self.apply_list(&node, list, &new, context)
     }
 
     /// Add a target to this rule
@@ -1524,6 +1607,9 @@ impl Rule {
     /// escaped. Returns an error if a target can not be written so that it
     /// reads back the same, such as one containing whitespace or a `:`.
     ///
+    /// As for [`Rule::set_prerequisites`], the targets at the start and end
+    /// that do not change are kept as written.
+    ///
     /// # Example
     /// ```
     /// use makefile_lossless::Rule;
@@ -1532,35 +1618,15 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["new_target1", "new_target2"]);
     /// ```
     pub fn set_targets(&mut self, targets: Vec<&str>) -> Result<(), Error> {
-        // Ensure targets list is not empty
         if targets.is_empty() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot set empty targets list for a rule".to_string(),
-                    line: 1,
-                    context: "set_targets".to_string(),
-                }],
-            }));
+            return Err(edit_error(
+                "set_targets",
+                "Cannot set empty targets list for a rule".to_string(),
+            ));
         }
-
-        let targets: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
-        self.replace_targets_node(&targets, "set_targets")?;
-
-        Ok(())
-    }
-
-    /// Replace the TARGETS node of the rule with one holding `targets`.
-    fn replace_targets_node(&self, targets: &[String], context: &str) -> Result<(), Error> {
-        let index = self
-            .syntax()
-            .children_with_tokens()
-            .position(|child| child.kind() == TARGETS)
-            .ok_or_else(|| edit_error(context, "No TARGETS node found in rule".to_string()))?;
-        let node = build_targets_node(targets, context)?;
-        self.syntax()
-            .splice_children(index..index + 1, vec![node.into()]);
-        Ok(())
+        let old: Vec<String> = self.targets().collect();
+        let new = targets.iter().map(|s| s.to_string()).collect();
+        self.edit_targets(&old, new, "set_targets")
     }
 
     /// Check if this rule has a specific target
@@ -1590,34 +1656,30 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["target2"]);
     /// ```
     pub fn remove_target(&mut self, target_name: &str) -> Result<bool, Error> {
-        // Collect current targets
-        let current_targets: Vec<String> = self.targets().collect();
-
-        // Check if the target exists
-        if !current_targets.iter().any(|t| t == target_name) {
+        let old: Vec<String> = self.targets().collect();
+        let indices: Vec<usize> = (0..old.len()).filter(|&i| old[i] == target_name).collect();
+        if indices.is_empty() {
             return Ok(false);
         }
-
-        // Filter out the target to remove
-        let new_targets: Vec<String> = current_targets
-            .into_iter()
-            .filter(|t| t != target_name)
-            .collect();
-
-        // If no targets remain, return an error
-        if new_targets.is_empty() {
-            return Err(Error::Parse(ParseError {
-                errors: vec![ErrorInfo {
-                    kind: crate::ParseErrorKind::Other,
-                    message: "Cannot remove all targets from a rule".to_string(),
-                    line: 1,
-                    context: "remove_target".to_string(),
-                }],
-            }));
+        if indices.len() == old.len() {
+            return Err(edit_error(
+                "remove_target",
+                "Cannot remove all targets from a rule".to_string(),
+            ));
         }
-
-        self.replace_targets_node(&new_targets, "remove_target")?;
-
+        let node = self.targets_node().ok_or_else(|| {
+            edit_error("remove_target", "No TARGETS node found in rule".to_string())
+        })?;
+        let mut list = WordList::new(&node);
+        if list.len() != old.len() {
+            return Err(edit_error(
+                "remove_target",
+                "Cannot edit the targets in place".to_string(),
+            ));
+        }
+        list.remove_all(&indices, &old, target_word)?;
+        let new: Vec<String> = old.into_iter().filter(|t| t != target_name).collect();
+        self.apply_list(&node, list, &new, "remove_target")?;
         Ok(true)
     }
 
@@ -2851,7 +2913,7 @@ mod tests {
         let cases = [
             ("a:\n", "a: x y\n"),
             ("a::\n", "a:: x y\n"),
-            ("a:b\n", "a: x y\n"),
+            ("a:b\n", "a:x y\n"),
             ("a: \n", "a: x y\n"),
             ("a:# c\n", "a: x y # c\n"),
             ("a:|c\n", "a: x y |c\n"),
@@ -4063,5 +4125,222 @@ endif
             }
             _ => panic!("Expected conditional"),
         }
+    }
+
+    /// Apply `edit` to the first rule of `src`, and check the resulting
+    /// text and that it parses back to the same tree.
+    fn check_edit(src: &str, edit: impl FnOnce(&mut Rule), expected: &str) {
+        let makefile: Makefile = src.parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        edit(&mut rule);
+        assert_eq!(makefile.code(), expected);
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_add_prerequisite_after_continuation() {
+        check_edit(
+            "a: b \\\n  c\n",
+            |r| r.add_prerequisite("d").unwrap(),
+            "a: b \\\n  c d\n",
+        );
+    }
+
+    #[test]
+    fn test_add_prerequisite_keeps_spacing() {
+        check_edit(
+            "a:  b   c # x\n",
+            |r| r.add_prerequisite("d").unwrap(),
+            "a:  b   c d # x\n",
+        );
+        check_edit(
+            "a: b  | e\n",
+            |r| r.add_prerequisite("d").unwrap(),
+            "a: b d  | e\n",
+        );
+        check_edit(
+            "a: b# x\n",
+            |r| r.add_prerequisite("d#").unwrap(),
+            "a: b d\\## x\n",
+        );
+    }
+
+    #[test]
+    fn test_add_prerequisite_trailing_backslash_before_comment() {
+        // `b\\\\` directly before a comment is read as `b\\`; once it is no
+        // longer last, it needs writing differently.
+        let makefile: Makefile = "a: b\\\\\\\\# x\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b\\\\"]);
+        rule.add_prerequisite("d").unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b\\\\", "d"]);
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_remove_prerequisite_keeps_formatting() {
+        let remove = |name| move |r: &mut Rule| assert!(r.remove_prerequisite(name).unwrap());
+        check_edit("a: b  c   d\n", remove("c"), "a: b  d\n");
+        check_edit("a: b c\n", remove("b"), "a: c\n");
+        check_edit("a: b c # x\n", remove("c"), "a: b # x\n");
+        check_edit("a: b c | e\n", remove("c"), "a: b | e\n");
+        check_edit("a: $(B) c $(B)\n", remove("$(B)"), "a: c\n");
+    }
+
+    #[test]
+    fn test_remove_prerequisite_around_continuation() {
+        let remove = |name| move |r: &mut Rule| assert!(r.remove_prerequisite(name).unwrap());
+        check_edit("a: b c \\\n  d\n", remove("c"), "a: b \\\n  d\n");
+        check_edit("a: b \\\n  c \\\n  d\n", remove("c"), "a: b \\\n  d\n");
+        check_edit("a: b \\\n  c d\n", remove("c"), "a: b \\\n  d\n");
+        check_edit("a: b \\\n  c\n", remove("c"), "a: b\n");
+        check_edit("a: b \\\n  c\n", remove("b"), "a: c\n");
+    }
+
+    #[test]
+    fn test_set_prerequisites_keeps_common_prefix_and_suffix() {
+        check_edit(
+            "a: $(X)  b \\\n  c\n",
+            |r| r.set_prerequisites(vec!["$(X)", "d", "c"]).unwrap(),
+            "a: $(X)  d \\\n  c\n",
+        );
+        check_edit(
+            "a: b  c\n",
+            |r| r.set_prerequisites(vec!["b", "x", "c"]).unwrap(),
+            "a: b x  c\n",
+        );
+        check_edit(
+            "a: b  c\n",
+            |r| r.set_prerequisites(vec!["x", "b", "c"]).unwrap(),
+            "a: x b  c\n",
+        );
+    }
+
+    #[test]
+    fn test_rename_target_keeps_formatting() {
+        check_edit(
+            "$(A)  b : c\n",
+            |r| assert!(r.rename_target("b", "d").unwrap()),
+            "$(A)  d : c\n",
+        );
+    }
+
+    #[test]
+    fn test_add_target_after_continuation() {
+        check_edit(
+            "a \\\n  b: c\n",
+            |r| r.add_target("d").unwrap(),
+            "a \\\n  b d: c\n",
+        );
+    }
+
+    #[test]
+    fn test_remove_target_keeps_formatting() {
+        check_edit(
+            "a  b c: d\n",
+            |r| assert!(r.remove_target("b").unwrap()),
+            "a  c: d\n",
+        );
+        check_edit(
+            "a b \\\n  c: d\n",
+            |r| assert!(r.remove_target("c").unwrap()),
+            "a b: d\n",
+        );
+    }
+
+    #[test]
+    fn test_set_targets_keeps_common_prefix_and_suffix() {
+        check_edit(
+            "$(A)  b \\\n  c: d\n",
+            |r| r.set_targets(vec!["$(A)", "x", "c"]).unwrap(),
+            "$(A)  x \\\n  c: d\n",
+        );
+    }
+
+    #[test]
+    fn test_remove_prerequisite_trailing_backslash_before_comment() {
+        // `b\\` is read as `b\\` when not last, but as `b\` directly
+        // before a comment, so it needs writing differently.
+        let makefile: Makefile = "a: b\\\\ c# x\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        assert!(rule.remove_prerequisite("c").unwrap());
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["b\\\\"]);
+        assert_eq!(makefile.code(), "a: b\\\\\\\\# x\n");
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_edit_rule_in_makefile_with_errors() {
+        let text = "a: b \\\n  c\nifdef X\nY = 1\n";
+        let parsed = Makefile::parse(text);
+        assert!(!parsed.ok());
+        let makefile = parsed.tree();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.add_prerequisite("d").unwrap();
+        rule.rename_target("a", "e").unwrap();
+        rule.add_target("f").unwrap();
+        assert!(rule.remove_prerequisite("b").unwrap());
+        assert_eq!(makefile.code(), "e f: c d\nifdef X\nY = 1\n");
+        let reparsed = Makefile::parse(&makefile.code()).tree();
+        assert_eq!(
+            format!("{:#?}", makefile.syntax()),
+            format!("{:#?}", reparsed.syntax())
+        );
+    }
+
+    #[test]
+    fn test_prerequisite_edits_keep_nodes() {
+        let makefile: Makefile = "a: b \\\n  c | d # x\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        let node = rule.prerequisites_node().unwrap();
+        let (normal, order_only) = rule.prerequisite_nodes();
+        rule.add_prerequisite("e").unwrap();
+        assert!(rule.remove_prerequisite("b").unwrap());
+        assert_eq!(makefile.code(), "a: c e | d # x\n");
+        assert_eq!(rule.prerequisites_node(), Some(node.clone()));
+        assert_eq!(normal[1].parent(), Some(node.clone()));
+        assert_eq!(order_only[0].parent(), Some(node));
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_set_prerequisites_empty_keeps_nodes() {
+        let makefile: Makefile = "a: b  c  | d # x\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        let node = rule.prerequisites_node().unwrap();
+        let (_, order_only) = rule.prerequisite_nodes();
+        rule.set_prerequisites(vec![]).unwrap();
+        assert_eq!(makefile.code(), "a: | d # x\n");
+        assert_matches_reparse(&makefile);
+        rule.set_prerequisites(vec!["f"]).unwrap();
+        assert_eq!(makefile.code(), "a: f | d # x\n");
+        assert_eq!(rule.prerequisites_node(), Some(node.clone()));
+        assert_eq!(order_only[0].parent(), Some(node));
+        assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_target_edits_keep_nodes() {
+        let makefile: Makefile = "a  b \\\n  c: d\n".parse().unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        let node = rule.targets_node().unwrap();
+        let tokens: Vec<_> = node
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .collect();
+        rule.rename_target("b", "x").unwrap();
+        rule.add_target("y").unwrap();
+        assert!(rule.remove_target("a").unwrap());
+        assert_eq!(makefile.code(), "x \\\n  c y: d\n");
+        assert_eq!(rule.targets_node(), Some(node.clone()));
+        let kept: Vec<_> = tokens.iter().filter(|t| t.parent().is_some()).collect();
+        assert_eq!(
+            kept.iter()
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>(),
+            vec![" ", "\\", "\n", "  ", "c"]
+        );
+        assert!(kept.iter().all(|t| t.parent() == Some(node.clone())));
+        assert_matches_reparse(&makefile);
     }
 }
