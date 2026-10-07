@@ -173,7 +173,25 @@ macro_rules! ast_node {
                 write!(f, "{}", self.0.text())
             }
         }
+
+        impl core::fmt::Debug for $ast {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                debug_node(f, stringify!($ast), &self.0)
+            }
+        }
     };
+}
+
+/// Format `node` for `Debug` as `name { range: 0..5, text: "a: b\n" }`.
+pub(crate) fn debug_node(
+    f: &mut core::fmt::Formatter<'_>,
+    name: &str,
+    node: &SyntaxNode,
+) -> core::fmt::Result {
+    f.debug_struct(name)
+        .field("range", &node.text_range())
+        .field("text", &node.text().to_string())
+        .finish()
 }
 
 ast_node!(Makefile, ROOT);

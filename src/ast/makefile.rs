@@ -234,7 +234,7 @@ fn build_conditional(
 }
 
 /// Represents different types of items that can appear in a Makefile
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MakefileItem {
     /// A rule definition (e.g., "target: prerequisites")

@@ -1,5 +1,6 @@
 #![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
 #![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 //! A lossless parser for Makefiles
 //!

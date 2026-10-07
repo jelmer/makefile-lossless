@@ -96,7 +96,7 @@ fn quoted_pair(s: &str) -> Option<Vec<String>> {
 ///
 /// Conditionals that are part of a rule's recipe can contain recipe lines in
 /// addition to ordinary makefile items.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ConditionalItem {
     /// A makefile item, such as a variable, rule or nested conditional

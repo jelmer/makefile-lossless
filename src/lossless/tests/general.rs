@@ -291,3 +291,26 @@ fn test_large_makefile_performance() {
 
     assert_eq!(makefile.rules().count(), 100); // Count unchanged
 }
+
+#[test]
+fn test_debug() {
+    let makefile: Makefile = "X = $(Y)\nall: a\n\techo hi\n".parse().unwrap();
+    let rule = makefile.rules().next().unwrap();
+    assert_eq!(
+        format!("{rule:?}"),
+        "Rule { range: 9..25, text: \"all: a\\n\\techo hi\\n\" }"
+    );
+    assert_eq!(
+        format!("{:?}", makefile.items().next().unwrap()),
+        "Variable(VariableDefinition { range: 0..9, text: \"X = $(Y)\\n\" })"
+    );
+    assert_eq!(
+        format!("{:?}", rule.items().next().unwrap()),
+        "Recipe(\"echo hi\")"
+    );
+    let reference = makefile.variable_references().next().unwrap();
+    assert_eq!(
+        format!("{reference:?}"),
+        "VariableReference { range: 4..8, text: \"$(Y)\" }"
+    );
+}

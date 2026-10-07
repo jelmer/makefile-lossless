@@ -126,25 +126,13 @@ fn target_word(name: &str, _before_comment: bool) -> Result<Vec<GreenElement>, E
 }
 
 /// Represents different types of items that can appear in a Rule's body
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RuleItem {
     /// A recipe line (command to execute)
     Recipe(String),
     /// A conditional block within the rule
     Conditional(Conditional),
-}
-
-impl std::fmt::Debug for RuleItem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RuleItem::Recipe(text) => f.debug_tuple("Recipe").field(text).finish(),
-            RuleItem::Conditional(_) => f
-                .debug_tuple("Conditional")
-                .field(&"<Conditional>")
-                .finish(),
-        }
-    }
 }
 
 impl RuleItem {
