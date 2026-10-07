@@ -935,6 +935,16 @@ impl Recipe {
     /// assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo world"]);
     /// ```
     pub fn remove(&self) {
+        let rule = self.syntax().ancestors().find(|n| n.kind() == RULE);
+        self.remove_node();
+        if let Some(rule) = rule {
+            move_out_trailing_lines(&rule);
+        }
+    }
+
+    /// Remove this recipe line, as [`Recipe::remove`], leaving the rest of
+    /// the rule as it is.
+    fn remove_node(&self) {
         let node = self.syntax();
         let parent = node.parent().expect("Recipe node must have a parent");
 
@@ -1965,6 +1975,115 @@ mod tests {
             .map(|(t, _)| t.text().to_string())
             .collect();
         assert_eq!(kept, vec!["echo ", "$", "(", "X", ")", "  # c", "\n"]);
+        crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_remove_last_recipe_moves_trailing_lines() {
+        // The parser only puts comments after a blank line, and conditionals,
+        // in a rule if more recipe lines follow them.
+        let cases = [
+            ("a:\n\techo\n\n# c\n\tcmd\n", 1, "a:\n\techo\n\n# c\n"),
+            (
+                "a:\n\techo\n\n  # c\n\n  \n# d\n\tcmd\nX = 1\n",
+                1,
+                "a:\n\techo\n\n  # c\n\n  \n# d\nX = 1\n",
+            ),
+            (
+                "a:\n\techo\n# c\n# d\n\n# e\n\n\tcmd\n",
+                1,
+                "a:\n\techo\n# c\n# d\n\n# e\n\n",
+            ),
+            (
+                "a:\n\techo\n\n# c\nifdef X\n\tcmd\nendif\n\n# d\n",
+                1,
+                "a:\n\techo\n\n# c\nifdef X\nendif\n\n# d\n",
+            ),
+            (
+                "a:\n\techo\nifdef X\n\tcmd\nendif\n",
+                1,
+                "a:\n\techo\nifdef X\nendif\n",
+            ),
+            ("a: ; echo\n\n# c\n\tcmd\n", 1, "a: ; echo\n\n# c\n"),
+            ("a:\n\n# c\n\tcmd\n", 0, "a:\n\n# c\n"),
+            ("a: ; cmd\n\n# c\n\tcmd\n", 0, "a:\n\n# c\n\tcmd\n"),
+            // Comments directly after the last recipe line stay in the rule.
+            ("a:\n\techo\n\tcmd\n# c\n", 1, "a:\n\techo\n# c\n"),
+            // Recipe lines after the comment keep it in the rule.
+            (
+                "a:\n\techo\n\n# c\n\tcmd\n\tlast\n",
+                1,
+                "a:\n\techo\n\n# c\n\tlast\n",
+            ),
+        ];
+        for (text, index, expected) in cases {
+            let makefile: Makefile = text.parse().unwrap();
+            let rule = makefile.rules().next().unwrap();
+            let comment = rule
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .find(|t| t.kind() == COMMENT);
+            rule.recipe_nodes().nth(index).unwrap().remove();
+            assert_eq!(makefile.code(), expected, "{text:?}");
+            crate::test_util::assert_matches_reparse(&makefile);
+            // The comment is moved, not rebuilt.
+            if let Some(comment) = comment {
+                assert_eq!(
+                    comment.parent_ancestors().last().as_ref(),
+                    Some(makefile.syntax()),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_last_recipe_moves_trailing_lines_bsd() {
+        let cases = [
+            (
+                "a:\n\techo\n\n# c\n.if 1\n\tcmd\n.endif\n",
+                "a:\n\techo\n\n# c\n.if 1\n.endif\n",
+            ),
+            (
+                "a:\n\techo\n.include \"x.mk\"\n\n# c\n\tcmd\n",
+                "a:\n\techo\n.include \"x.mk\"\n\n# c\n",
+            ),
+            (
+                "a:\n\techo\ninclude x.mk\n\n# c\n\tcmd\n",
+                "a:\n\techo\ninclude x.mk\n\n# c\n",
+            ),
+            (
+                "a:\n\techo\n\n.include \"x.mk\"\n\tcmd\n",
+                "a:\n\techo\n\n.include \"x.mk\"\n",
+            ),
+        ];
+        for (text, expected) in cases {
+            let parse = |text: &str| {
+                let parsed = Makefile::parse_with_variant(text, crate::MakefileVariant::BSDMake);
+                assert_eq!(parsed.errors(), &[], "{text:?}");
+                parsed.tree()
+            };
+            let makefile = parse(text);
+            let rule = makefile.rules().next().unwrap();
+            rule.recipe_nodes().last().unwrap().remove();
+            assert_eq!(makefile.code(), expected, "{text:?}");
+            assert_eq!(
+                format!("{:#?}", makefile.syntax()),
+                format!("{:#?}", parse(expected).syntax()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clear_commands_moves_trailing_lines() {
+        let makefile: Makefile = "a:\n\techo\n\n# c\nifdef X\n\tcmd\nendif\n\tz\n"
+            .parse()
+            .unwrap();
+        let mut rule = makefile.rules().next().unwrap();
+        rule.clear_commands();
+        assert_eq!(makefile.code(), "a:\n\n# c\nifdef X\nendif\n");
         crate::test_util::assert_matches_reparse(&makefile);
     }
 

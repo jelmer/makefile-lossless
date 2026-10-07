@@ -2561,7 +2561,11 @@ mod tests {
 
         let mut rule: Rule = text.parse().unwrap();
         assert!(rule.remove_command(1));
-        assert_eq!(rule.to_string(), "all:\n\ta\nifdef X\nendif\n");
+        // Without commands in it, the conditional is no longer part of the
+        // rule.
+        let root = rule.syntax().parent().unwrap();
+        assert_eq!(root.to_string(), "all:\n\ta\nifdef X\nendif\n");
+        assert_eq!(rule.to_string(), "all:\n\ta\n");
         assert!(!rule.remove_command(1));
 
         let mut rule: Rule = text.parse().unwrap();
@@ -2580,7 +2584,9 @@ mod tests {
 
         let mut rule: Rule = text.parse().unwrap();
         rule.clear_commands();
-        assert_eq!(rule.to_string(), "all:\nifdef X\nendif\n");
+        let root = rule.syntax().parent().unwrap();
+        assert_eq!(root.to_string(), "all:\nifdef X\nendif\n");
+        assert_eq!(rule.to_string(), "all:\n");
         assert_eq!(rule.recipe_count(), 0);
     }
 

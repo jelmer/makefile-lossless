@@ -391,6 +391,92 @@ pub(crate) fn trim_trailing_newlines(node: &SyntaxNode) {
     }
 }
 
+/// Move the lines at the end of `rule` that the parser would not put in it
+/// to after it, as needed once a recipe line has been removed. The parser
+/// only takes comments after a blank line, conditionals and other
+/// directives into a rule if more recipe lines follow them.
+pub(crate) fn move_out_trailing_lines(rule: &SyntaxNode) {
+    let Some(parent) = rule.parent() else {
+        return;
+    };
+    let children: Vec<SyntaxElement> = rule.children_with_tokens().collect();
+    let has_recipe = |e: &SyntaxElement| {
+        e.as_node()
+            .is_some_and(|n| n.descendants().any(|d| d.kind() == RECIPE))
+    };
+    // The rule line ends at its first line break, which may be in a recipe
+    // after `;` or a target-specific assignment.
+    let Some(header_end) = children
+        .iter()
+        .position(|e| matches!(e.kind(), NEWLINE | RECIPE | VARIABLE))
+    else {
+        return;
+    };
+    let start = children
+        .iter()
+        .rposition(has_recipe)
+        .map_or(header_end, |i| i.max(header_end))
+        + 1;
+    let tail = &children[start..];
+    // Follow the parser: blank lines stay in the rule, and so do comments
+    // with no blank line before them, which take their line break along.
+    let mut blank_lines = 0;
+    let mut i = 0;
+    let end = loop {
+        let Some(element) = tail.get(i) else {
+            return;
+        };
+        let next = tail.get(i + 1).map(|e| e.kind());
+        match element.kind() {
+            NEWLINE => blank_lines += 1,
+            WHITESPACE if matches!(next, None | Some(NEWLINE)) => {}
+            WHITESPACE if next == Some(COMMENT) && blank_lines == 0 => {}
+            COMMENT if blank_lines == 0 => {
+                i += tail[i + 1..]
+                    .iter()
+                    .take_while(|e| e.kind() == WHITESPACE)
+                    .count();
+                if tail.get(i + 1).is_some_and(|e| e.kind() == NEWLINE) {
+                    i += 1;
+                }
+            }
+            // Only BSD make puts an include line other than a `.include`
+            // directive in a rule, which it keeps there unless a blank line
+            // comes first.
+            INCLUDE
+                if blank_lines == 0
+                    && element
+                        .as_node()
+                        .and_then(|n| n.first_token())
+                        .is_some_and(|t| !t.text().starts_with('.')) => {}
+            _ => break i,
+        }
+        i += 1;
+    };
+    let moved = &tail[end..];
+    crate::ast::detach_elements(moved.iter().cloned());
+    // Outside a rule, the line break of a blank line is in a BLANK_LINE node.
+    let mut blank = true;
+    let mut elements = Vec::new();
+    for element in moved {
+        let kind = element.kind();
+        if kind == NEWLINE && blank {
+            let node = SyntaxNode::new_root_mut(rowan::GreenNode::new(BLANK_LINE.into(), []));
+            node.splice_children(0..0, vec![element.clone()]);
+            elements.push(node.into());
+        } else {
+            elements.push(element.clone());
+        }
+        blank = match kind {
+            WHITESPACE => blank,
+            NEWLINE => true,
+            _ => element.as_node().is_some(),
+        };
+    }
+    let index = rule.index() + 1;
+    parent.splice_children(index..index, elements);
+}
+
 /// Remove `node` from `parent` along with the comment lines directly above
 /// it, as found by [`crate::ast::lines_above`].
 ///
