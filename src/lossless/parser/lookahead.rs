@@ -92,11 +92,9 @@ impl Parser<'_> {
         // current token always does, and its end in the token stack.
         let n = self.tokens.len();
         let mut tokens = self
-            .tokens
-            .iter()
-            .rev()
+            .upcoming()
             .enumerate()
-            .map(|(i, token)| (token, i == 0 || self.tokens[n - i].0 == NEWLINE, n - i))
+            .map(|(i, token)| (token, i == 0 || self.tokens[n - i].kind == NEWLINE, n - i))
             .filter(|((kind, _), _, _)| *kind != WHITESPACE)
             .peekable();
         while let Some(&((kind, text), at_start, end)) = tokens.peek() {
@@ -105,11 +103,11 @@ impl Parser<'_> {
                     .clone()
                     .nth(n)
                     .filter(|((kind, _), _, _)| *kind == IDENTIFIER)
-                    .map(|((_, name), _, _)| name.as_str())
+                    .map(|((_, name), _, _)| name)
             };
             // The name of a BSD directive such as `.if` or `.  if`, or the
             // equivalent BSD name of an nmake directive such as `!IF`
-            let bsd_name = match (*kind, text.as_str()) {
+            let bsd_name = match (kind, text) {
                 (IDENTIFIER, ".") if bsd => word(1),
                 (IDENTIFIER, t) if bsd => t.strip_prefix('.'),
                 (OPERATOR, "!") if nmake && at_start => {
@@ -120,7 +118,7 @@ impl Parser<'_> {
             if comments_end.is_none() && !matches!(kind, NEWLINE | COMMENT) {
                 *comments_end = Some(end);
             }
-            match (*kind, text.as_str()) {
+            match (kind, text) {
                 (NEWLINE | COMMENT, _) => {}
                 (INDENT, _) if in_rule == RuleContext::Inside => return true,
                 _ if bsd_name.is_some_and(is_bsd_if) => {
@@ -168,10 +166,10 @@ impl Parser<'_> {
             // Skip to the start of the next line, following continuations
             let mut prev = None;
             for ((kind, _), _, _) in tokens.by_ref() {
-                if *kind == NEWLINE && prev != Some(BACKSLASH) {
+                if kind == NEWLINE && prev != Some(BACKSLASH) {
                     break;
                 }
-                prev = Some(*kind);
+                prev = Some(kind);
             }
         }
         comments_end.get_or_insert(0);
@@ -191,10 +189,10 @@ impl Parser<'_> {
 
     /// Like `at_keyword`, for the token at `end - 1` in the token stack.
     pub(super) fn keyword_at(&self, end: usize, keywords: &[&str]) -> bool {
-        let mut tokens = self.tokens[..end].iter().rev();
+        let mut tokens = self.upcoming_from(end);
         if !tokens
             .next()
-            .is_some_and(|(kind, text)| *kind == IDENTIFIER && keywords.contains(&text.as_str()))
+            .is_some_and(|(kind, text)| kind == IDENTIFIER && keywords.contains(&text))
         {
             return false;
         }
@@ -216,7 +214,7 @@ impl Parser<'_> {
         if self.keyword_at(end, GNU_CONDITIONAL_KEYWORDS) {
             return true;
         }
-        let mut tokens = self.tokens[..end].iter().rev();
+        let mut tokens = self.upcoming_from(end);
         matches!(tokens.next(), Some((IDENTIFIER, t)) if t == "ifeq" || t == "ifneq")
             && matches!(tokens.next(), Some((LPAREN | QUOTE, _)))
     }
@@ -267,12 +265,12 @@ impl Parser<'_> {
         if !self.keyword_at(end, keywords) {
             return false;
         }
-        let mut tokens = self.tokens[..end].iter().rev().skip(1).peekable();
+        let mut tokens = self.upcoming_from(end).skip(1).peekable();
         if self.variant != Some(MakefileVariant::BSDMake) {
             return true;
         }
         while let Some((kind, text)) = tokens.next() {
-            match (*kind, text.as_str()) {
+            match (kind, text) {
                 (NEWLINE, _) => break,
                 (OPERATOR, ":" | "::")
                     if matches!(tokens.peek(), None | Some((WHITESPACE | NEWLINE, _)))
@@ -297,20 +295,20 @@ impl Parser<'_> {
     /// `matches`, after removing any escaped first character.
     fn line_has_operator(&self, matches: impl Fn(&str) -> bool) -> bool {
         let mut escaped = self.pending_backslash_escape;
-        for (kind, text) in self.tokens.iter().rev() {
+        for (kind, text) in self.upcoming() {
             match kind {
                 // An unescaped backslash before the newline continues the
                 // line.
                 NEWLINE if !escaped => break,
                 OPERATOR => {
-                    let op = if escaped { &text[1..] } else { text.as_str() };
+                    let op = if escaped { &text[1..] } else { text };
                     if matches(op) {
                         return true;
                     }
                 }
                 _ => {}
             }
-            escaped = *kind == BACKSLASH && !escaped;
+            escaped = kind == BACKSLASH && !escaped;
         }
         false
     }
@@ -332,7 +330,7 @@ impl Parser<'_> {
         tokens: &mut std::iter::Peekable<I>,
     ) -> bool
     where
-        I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        I: Iterator<Item = (SyntaxKind, &'a str)> + Clone,
     {
         let mut skipped = false;
         loop {
@@ -355,10 +353,10 @@ impl Parser<'_> {
     /// Make expands such lines for their side effects; anything else on
     /// the line (e.g. a colon) makes it a rule or assignment instead.
     pub(super) fn is_expression_statement_line(&self) -> bool {
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         let mut seen_reference = false;
         loop {
-            match tokens.next().map(|(kind, text)| (*kind, text.as_str())) {
+            match tokens.next() {
                 None | Some((NEWLINE | COMMENT, _)) => return seen_reference,
                 // Only GNU make ignores the rest of such a line after a
                 // `;`; bmake rejects it.
@@ -401,7 +399,7 @@ impl Parser<'_> {
                         }
                         _ => return false,
                     };
-                    let mut tokens = tokens.by_ref().map(|(kind, _)| *kind);
+                    let mut tokens = tokens.by_ref().map(|(kind, _)| kind);
                     let mut depth = 1;
                     let mut prev = open;
                     while depth > 0 {
@@ -441,7 +439,7 @@ impl Parser<'_> {
         let mut level = 0i32;
         let mut seen_name = false;
         let mut seen_space = false;
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         while let Some((kind, text)) = tokens.next() {
             match kind {
                 NEWLINE | COMMENT => return false,
@@ -451,7 +449,7 @@ impl Parser<'_> {
                         && text == ":"
                         && tokens
                             .peek()
-                            .is_some_and(|(k, t)| *k == IDENTIFIER && t == "sh") =>
+                            .is_some_and(|&(k, t)| k == IDENTIFIER && t == "sh") =>
                 {
                     tokens.next();
                 }
@@ -475,7 +473,7 @@ impl Parser<'_> {
                 OPERATOR if self.is_bsd_make() && is_colons_before_subst(text) => {
                     return !seen_space
                 }
-                OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => return true,
+                OPERATOR if ASSIGNMENT_OPERATORS.contains(&text) => return true,
                 _ if seen_space => return false,
                 _ => seen_name = true,
             }
@@ -486,26 +484,22 @@ impl Parser<'_> {
     /// Whether the line is a GNU make style `export VAR=value`, which BSD
     /// make accepts if the line has no `:` in it.
     pub(super) fn at_gmake_export(&self) -> bool {
-        let mut tokens = self.tokens.iter().rev();
+        let mut tokens = self.upcoming();
         tokens
             .next()
-            .is_some_and(|(kind, text)| *kind == IDENTIFIER && text == "export")
-            && tokens.next().is_some_and(|(kind, _)| *kind == WHITESPACE)
+            .is_some_and(|(kind, text)| kind == IDENTIFIER && text == "export")
+            && tokens.next().is_some_and(|(kind, _)| kind == WHITESPACE)
             && self.has_assignment_operator_on_line()
             && !self
-                .tokens
-                .iter()
-                .rev()
+                .upcoming()
                 .take_while(|(kind, _)| *kind != NEWLINE)
                 .any(|(_, text)| text.contains(':'))
     }
 
     pub(super) fn has_assignment_operator_on_line(&self) -> bool {
-        self.tokens
-            .iter()
-            .rev()
+        self.upcoming()
             .take_while(|(kind, _)| *kind != NEWLINE)
-            .any(|(kind, text)| *kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text.as_str()))
+            .any(|(kind, text)| kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text))
     }
 
     /// Whether the line starting at `end - 1` in the token stack is an
@@ -516,9 +510,8 @@ impl Parser<'_> {
         if !self.gnu_directives_enabled() {
             return false;
         }
-        let mut words = self.tokens[..end]
-            .iter()
-            .rev()
+        let mut words = self
+            .upcoming_from(end)
             .filter(|(kind, _)| *kind != WHITESPACE)
             .skip_while(|(kind, text)| *kind == IDENTIFIER && is_assignment_modifier(text));
         matches!(words.next(), Some((IDENTIFIER, text)) if text == "undefine")
@@ -550,7 +543,7 @@ impl Parser<'_> {
         }
         let gnu = self.gnu_directives_enabled();
         let is_directive = |text: &str| gnu && is_assignment_modifier(text);
-        let mut tokens = self.tokens[..end].iter().rev().peekable();
+        let mut tokens = self.upcoming_from(end).peekable();
         let mut seen_name = false;
         // Whitespace after the name: anything but an operator now means
         // this is not an assignment.
@@ -574,11 +567,11 @@ impl Parser<'_> {
             match kind {
                 NEWLINE => break,
                 IDENTIFIER if is_directive(text) => seen_directive = true,
-                OPERATOR if ASSIGNMENT_OPERATORS.contains(&text.as_str()) => {
+                OPERATOR if ASSIGNMENT_OPERATORS.contains(&text) => {
                     return seen_name || seen_directive
                 }
                 // It's a rule if we see a colon first
-                OPERATOR if matches!(text.as_str(), ":" | "::" | "&:" | "&::") => return false,
+                OPERATOR if matches!(text, ":" | "::" | "&:" | "&::") => return false,
                 WHITESPACE => name_done = seen_name,
                 // A line continuation counts as whitespace.
                 BACKSLASH if matches!(tokens.peek(), Some((NEWLINE, _))) => {

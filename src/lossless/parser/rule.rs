@@ -67,7 +67,7 @@ impl Parser<'_> {
     fn at_dollar_escape(&self) -> bool {
         self.current() == Some(DOLLAR)
             && self.tokens.len() >= 2
-            && self.tokens[self.tokens.len() - 2].0 == DOLLAR
+            && self.tokens[self.tokens.len() - 2].kind == DOLLAR
     }
 
     /// Whether the parser is at nmake's `$$@` or `$$(@D)`, `$$(@B)`,
@@ -80,7 +80,7 @@ impl Parser<'_> {
         let n = self.tokens.len();
         let token = |i: usize| {
             n.checked_sub(i)
-                .map(|j| (self.tokens[j].0, self.tokens[j].1.as_str()))
+                .map(|j| (self.tokens[j].kind, self.tokens[j].text))
         };
         match token(3) {
             Some((TEXT, "@")) => true,
@@ -101,7 +101,7 @@ impl Parser<'_> {
             return true;
         }
         // Look for the `)` as `parse_archive_member_list` would.
-        let mut tokens = self.tokens.iter().rev().skip(1).peekable();
+        let mut tokens = self.upcoming().skip(1).peekable();
         while let Some((kind, _)) = tokens.next() {
             match kind {
                 RPAREN => return true,
@@ -381,7 +381,7 @@ impl Parser<'_> {
             self.skip_ws();
             if let Some((OPERATOR, op)) = self.current_token() {
                 if matches!(op, ":=" | "::=" | ":::=" | "!=") {
-                    let (_, op) = self.pop_token().unwrap();
+                    self.pop_token();
                     let split = if op.starts_with("::") { 2 } else { 1 };
                     let (dependency_op, assignment_op) = op.split_at(split);
                     self.builder.token(OPERATOR.into(), dependency_op);
@@ -462,9 +462,9 @@ impl Parser<'_> {
             return false;
         }
         let mut escaped = self.pending_backslash_escape;
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         while let Some((kind, text)) = tokens.next() {
-            match (*kind, text.as_str()) {
+            match (kind, text) {
                 (OPERATOR, ":") if !escaped => return true,
                 (BACKSLASH, _) if !escaped && matches!(tokens.peek(), Some((NEWLINE, _))) => {
                     tokens.next();
@@ -475,7 +475,7 @@ impl Parser<'_> {
                 (DOLLAR, _) if !Self::skip_variable_reference(&mut tokens) => return false,
                 _ => {}
             }
-            escaped = *kind == BACKSLASH && !escaped;
+            escaped = kind == BACKSLASH && !escaped;
         }
         false
     }
@@ -495,11 +495,9 @@ impl Parser<'_> {
                 Some(OPERATOR) if self.at_text(":") && !self.pending_backslash_escape => break,
                 Some(WHITESPACE)
                     if self
-                        .tokens
-                        .iter()
-                        .rev()
+                        .upcoming()
                         .find(|(kind, _)| *kind != WHITESPACE)
-                        .is_some_and(|(kind, text)| *kind == OPERATOR && text == ":") =>
+                        .is_some_and(|(kind, text)| kind == OPERATOR && text == ":") =>
                 {
                     break
                 }
@@ -519,11 +517,11 @@ impl Parser<'_> {
     /// variable name, as in `all: export CFLAGS = -O2`.
     fn at_assignment_modifier<'a, I>(mut tokens: std::iter::Peekable<I>) -> bool
     where
-        I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        I: Iterator<Item = (SyntaxKind, &'a str)> + Clone,
     {
         tokens
             .next()
-            .is_some_and(|(kind, text)| *kind == IDENTIFIER && is_assignment_modifier(text))
+            .is_some_and(|(kind, text)| kind == IDENTIFIER && is_assignment_modifier(text))
             && Self::skip_ws_and_continuation_tokens(&mut tokens)
             && matches!(tokens.peek(), Some((IDENTIFIER | DOLLAR | BACKSLASH, _)))
     }
@@ -541,7 +539,7 @@ impl Parser<'_> {
             return false;
         }
         // tokens is reversed (last = current), so iterate from the end.
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         Self::skip_ws_and_continuation_tokens(&mut tokens);
         while Self::at_assignment_modifier(tokens.clone()) {
             tokens.next();
@@ -552,9 +550,9 @@ impl Parser<'_> {
             return false;
         }
         Self::skip_ws_and_continuation_tokens(&mut tokens);
-        tokens.next().is_some_and(|(kind, text)| {
-            *kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text.as_str())
-        })
+        tokens
+            .next()
+            .is_some_and(|(kind, text)| kind == OPERATOR && ASSIGNMENT_OPERATORS.contains(&text))
     }
 
     /// Advance `tokens` past a variable name, as accepted by
@@ -566,7 +564,7 @@ impl Parser<'_> {
         semicolon_ends: bool,
     ) -> Option<bool>
     where
-        I: Iterator<Item = &'a (SyntaxKind, String)> + Clone,
+        I: Iterator<Item = (SyntaxKind, &'a str)> + Clone,
     {
         let mut seen_name = false;
         // Whether the previous token is an unescaped backslash.
@@ -597,8 +595,8 @@ impl Parser<'_> {
                 {
                     return Some(seen_name)
                 }
-                Some((kind, text)) if Self::is_gnu_name_token(*kind, text) => {
-                    escaped = *kind == BACKSLASH && !escaped;
+                Some((kind, text)) if Self::is_gnu_name_token(kind, text) => {
+                    escaped = kind == BACKSLASH && !escaped;
                 }
                 _ => return Some(seen_name),
             }
@@ -624,7 +622,7 @@ impl Parser<'_> {
     /// the reference to start a nested one.
     fn skip_variable_reference<'a, I>(tokens: &mut std::iter::Peekable<I>) -> bool
     where
-        I: Iterator<Item = &'a (SyntaxKind, String)>,
+        I: Iterator<Item = (SyntaxKind, &'a str)>,
     {
         let close = match tokens.peek() {
             Some((LPAREN, _)) => RPAREN,
@@ -642,13 +640,13 @@ impl Parser<'_> {
         let mut depth = 1;
         let mut backslashes = 0;
         while let Some((kind, _)) = tokens.next() {
-            if *kind == BACKSLASH {
+            if kind == BACKSLASH {
                 backslashes += 1;
                 continue;
             }
             let continued = backslashes % 2 == 1;
             backslashes = 0;
-            match *kind {
+            match kind {
                 // A line continuation inside a reference doesn't end it.
                 NEWLINE if continued => {}
                 NEWLINE => return false,
@@ -671,7 +669,7 @@ impl Parser<'_> {
     fn parse_target_specific_assignment(&mut self) {
         self.builder.start_node(VARIABLE.into());
         self.skip_ws_and_continuations();
-        while Self::at_assignment_modifier(self.tokens.iter().rev().peekable()) {
+        while Self::at_assignment_modifier(self.upcoming().peekable()) {
             self.bump();
             self.skip_ws_and_continuations();
         }
@@ -761,11 +759,9 @@ impl Parser<'_> {
     /// `.SHELL: name=sh`.
     fn at_bsd_special_sources_target(&self) -> bool {
         let target: String = self
-            .tokens
-            .iter()
-            .rev()
+            .upcoming()
             .take_while(|(kind, _)| !matches!(kind, WHITESPACE | NEWLINE | OPERATOR))
-            .map(|(_, text)| text.as_str())
+            .map(|(_, text)| text)
             .collect();
         target.starts_with(".PATH")
             || matches!(

@@ -96,10 +96,7 @@ impl Parser<'_> {
             .tokens
             .iter()
             .rev()
-            .zip(self.token_positions.iter().rev())
-            .map(|((kind, token), &(start, end))| {
-                (*kind, token.as_str(), rowan::TextRange::new(start, end))
-            });
+            .map(|token| (token.kind, token.text, token.range()));
         let (text, starts, end) = bsd_logical_line(tokens, self.pending_backslash_escape);
         BsdLine {
             exprs: crate::reference::BsdExprLine::new(crate::reference::UnescapedHash::new(&text)),
@@ -366,9 +363,9 @@ impl Parser<'_> {
         let n = self.tokens.len();
         self.variant == Some(MakefileVariant::NMake)
             && n >= 2
-            && matches!(self.tokens[n - 1].0, IDENTIFIER | TEXT)
-            && self.tokens[n - 2].0 == OPERATOR
-            && self.tokens[n - 2].1.starts_with(':')
+            && matches!(self.tokens[n - 1].kind, IDENTIFIER | TEXT)
+            && self.tokens[n - 2].kind == OPERATOR
+            && self.tokens[n - 2].text.starts_with(':')
     }
 
     // Helper method to parse a conditional comparison (ifeq/ifneq)

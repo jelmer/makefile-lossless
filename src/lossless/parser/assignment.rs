@@ -8,8 +8,8 @@ impl Parser<'_> {
         let n = self.tokens.len();
         if self.variant != Some(MakefileVariant::NMake)
             || n < 2
-            || self.tokens[n - 1] != (TEXT, "^".to_string())
-            || self.tokens[n - 2].0 != NEWLINE
+            || self.current_token() != Some((TEXT, "^"))
+            || self.tokens[n - 2].kind != NEWLINE
         {
             return false;
         }
@@ -324,13 +324,13 @@ impl Parser<'_> {
         if !self.bsd_directives_enabled() {
             return None;
         }
-        let mut tokens = self.tokens.iter().rev().enumerate();
+        let mut tokens = self.upcoming().enumerate();
         let mut seen = false;
         let mut shell = false;
         let mut level = 0usize;
         loop {
             let (i, (kind, text)) = tokens.next()?;
-            match (*kind, text.as_str()) {
+            match (kind, text) {
                 (NEWLINE, _) => return None,
                 (LPAREN | LBRACE, _) if seen => {
                     level += 1;
@@ -339,7 +339,7 @@ impl Parser<'_> {
                 (RPAREN | RBRACE, _) if level > 0 => level -= 1,
                 _ if level > 0 => {}
                 (OPERATOR, ":") => match tokens.next()? {
-                    (_, (IDENTIFIER, name)) if name == "sh" => {
+                    (_, (IDENTIFIER, "sh")) => {
                         seen = true;
                         shell = true;
                     }
@@ -527,10 +527,10 @@ impl Parser<'_> {
                         RPAREN | RBRACE => *depth = depth.saturating_sub(1),
                         _ => {}
                     }
-                    let (_, text) = self.pop_token().unwrap();
+                    let token = self.pop_token().unwrap();
                     self.pending_backslash_escape =
                         escapes_next(kind == BACKSLASH, self.pending_backslash_escape);
-                    word.push_str(&text);
+                    word.push_str(token.text);
                 }
             }
             parsed = true;
@@ -552,10 +552,8 @@ impl Parser<'_> {
     /// line or, after a single word, an operator follows it.
     fn define_name_part_ends_after_ws(&self, multiword: bool) -> bool {
         let mut rest = self
-            .tokens
-            .iter()
-            .rev()
-            .map(|(kind, _)| *kind)
+            .upcoming()
+            .map(|(kind, _)| kind)
             .skip_while(|kind| *kind == WHITESPACE);
         match rest.next() {
             None | Some(NEWLINE | COMMENT) => true,
@@ -569,20 +567,21 @@ impl Parser<'_> {
     /// everything up to the operator, as a single IDENTIFIER token.
     /// Returns false if the name is empty.
     fn bump_gmake_export_name(&mut self) -> bool {
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         let mut len = 0;
         let mut escaped = false;
-        while let Some((kind, _)) = tokens.peek() {
-            let at_continuation = *kind == BACKSLASH
+        while let Some(&(kind, _)) = tokens.peek() {
+            let at_continuation = kind == BACKSLASH
                 && !escaped
                 && matches!(tokens.clone().nth(1), Some((NEWLINE, _)));
-            if at_continuation || matches!(*kind, OPERATOR | NEWLINE | COMMENT) {
+            if at_continuation || matches!(kind, OPERATOR | NEWLINE | COMMENT) {
                 break;
             }
-            escaped = *kind == BACKSLASH && !escaped;
+            escaped = kind == BACKSLASH && !escaped;
             tokens.next();
             len += 1;
         }
+        drop(tokens);
         self.bump_as_identifier(len)
     }
 
@@ -601,12 +600,12 @@ impl Parser<'_> {
         if !self.gnu_directives_enabled() {
             return false;
         }
-        let mut tokens = self.tokens.iter().rev().peekable();
+        let mut tokens = self.upcoming().peekable();
         loop {
             Self::skip_ws_and_continuation_tokens(&mut tokens);
             match tokens.next() {
                 // As for other directives, `define:` is a rule.
-                Some((IDENTIFIER, text)) if text == "define" => {
+                Some((IDENTIFIER, "define")) => {
                     let mut after = tokens.clone();
                     match after.next() {
                         None | Some((WHITESPACE | NEWLINE | COMMENT, _)) => {}
@@ -616,7 +615,7 @@ impl Parser<'_> {
                     Self::skip_ws_and_continuation_tokens(&mut tokens);
                     return !matches!(
                         tokens.next(),
-                        Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op.as_str())
+                        Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op)
                     );
                 }
                 Some((IDENTIFIER, text)) if is_assignment_modifier(text) => {}
@@ -632,17 +631,15 @@ impl Parser<'_> {
     /// comments first, so `endef#c` is not `endef`.
     fn first_token_on_line(&self) -> Option<&str> {
         let mut tokens = self
-            .tokens
-            .iter()
-            .rev()
+            .upcoming()
             .skip_while(|(kind, _)| matches!(*kind, WHITESPACE | INDENT));
         let (kind, text) = tokens.next()?;
-        if *kind != IDENTIFIER {
+        if kind != IDENTIFIER {
             return None;
         }
-        match tokens.next().map(|(kind, _)| *kind) {
-            None | Some(WHITESPACE | NEWLINE) => Some(text.as_str()),
-            Some(BACKSLASH) if matches!(tokens.next(), Some((NEWLINE, _))) => Some(text.as_str()),
+        match tokens.next().map(|(kind, _)| kind) {
+            None | Some(WHITESPACE | NEWLINE) => Some(text),
+            Some(BACKSLASH) if matches!(tokens.next(), Some((NEWLINE, _))) => Some(text),
             _ => None,
         }
     }
