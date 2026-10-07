@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 /// A piece of a [`ModifierArg`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModifierArgPart {
     /// Literal text, with escapes removed.
     Literal(String),
@@ -21,7 +21,7 @@ pub enum ModifierArgPart {
 
 /// An argument of a modifier, made up of literal text and nested
 /// expressions.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct ModifierArg(Vec<ModifierArgPart>);
 
 impl ModifierArg {
@@ -96,7 +96,7 @@ impl ModifierArg {
 }
 
 /// Flags of the `:S` and `:C` modifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct SubstituteFlags {
     /// `g`: replace all occurrences in each word, not just the first.
     pub global: bool,
@@ -107,7 +107,7 @@ pub struct SubstituteFlags {
 }
 
 /// The order requested by the `:O` modifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SortOrder {
     /// `:O`: sort words lexicographically.
@@ -123,7 +123,7 @@ pub enum SortOrder {
 }
 
 /// The words selected by the `:[...]` modifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WordSelector {
     /// `:[#]`: the number of words.
     Count,
@@ -146,7 +146,7 @@ pub enum WordSelector {
 }
 
 /// The operator of an assignment modifier such as `::=`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssignOp {
     /// `::=`: assign the value.
     Set,
@@ -161,7 +161,7 @@ pub enum AssignOp {
 /// A modifier in a variable reference, such as `:M*.c` in `${SRCS:M*.c}`.
 ///
 /// See the "Variable modifiers" section of NetBSD make(1) for their meaning.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Modifier {
     /// `:E`: the suffix of each word.
@@ -364,7 +364,7 @@ pub enum Modifier {
 ///     vec![Modifier::Match("*.c".to_string()), Modifier::Quote]
 /// );
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParsedReference {
     /// The unexpanded name of the variable. It may contain nested
     /// expressions, as in `${VAR_${X}}`, and is empty in `${:Uvalue}`.
@@ -417,7 +417,7 @@ pub enum ReferenceSyntaxErrorKind {
 }
 
 /// An error parsing a variable reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReferenceError {
     /// The reference is malformed.
@@ -625,7 +625,7 @@ impl ParsedReference {
 }
 
 /// A part of make text, as returned by [`split_references`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TextPart {
     /// Text without any `$`, as written.
