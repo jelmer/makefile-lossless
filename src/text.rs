@@ -2,6 +2,7 @@
 //!
 //! These functions work on raw source text (not the syntax tree) and are useful
 //! for editor integrations that need to understand what is at a given cursor position.
+//! They are deprecated in favour of the source ranges the syntax tree provides.
 
 use crate::reference::{split_references, ReferenceError, ReferenceSyntaxErrorKind, TextPart};
 use crate::MakefileVariant;
@@ -16,8 +17,16 @@ use crate::MakefileVariant;
 /// closed or has a computed name such as `$(A_$(B))`, or if the offset is
 /// past the end of `text` or not on a character boundary.
 ///
+/// Deprecated in favour of [`Makefile::variable_reference_at`], which
+/// differs in that it returns function calls, references with computed
+/// names and single-character references such as `$@` too, counts the
+/// `$(` as part of the reference and follows line continuations.
+///
+/// [`Makefile::variable_reference_at`]: crate::Makefile::variable_reference_at
+///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// use makefile_lossless::variable_at_offset;
 /// assert_eq!(variable_at_offset("$(FOO)", 2), Some("FOO"));
 /// assert_eq!(variable_at_offset("${BAR}", 3), Some("BAR"));
@@ -25,6 +34,10 @@ use crate::MakefileVariant;
 /// assert_eq!(variable_at_offset("$(subst a,b,$(X))", 3), None);
 /// assert_eq!(variable_at_offset("$(subst a,b,$(X))", 14), Some("X"));
 /// ```
+#[deprecated(
+    since = "0.4.2",
+    note = "use Makefile::variable_reference_at and VariableReference::name instead"
+)]
 pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
     if !text.is_char_boundary(offset) {
         return None;
@@ -71,13 +84,48 @@ pub fn variable_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// Returns `None` if the offset is not on a word character, is past the end
 /// of `text` or is not on a character boundary.
 ///
+/// Deprecated in favour of the source ranges of the syntax tree, which say
+/// what the word is: [`Rule::target_ranges`] for targets,
+/// [`Rule::prerequisite_ranges`] and
+/// [`Rule::order_only_prerequisite_ranges`] for prerequisites,
+/// [`VariableDefinition::name_range`] for variable names and the
+/// `keyword_range` methods, such as [`Include::keyword_range`], for
+/// directives. The ranges are in the same order as [`Rule::targets`] and
+/// [`Rule::prerequisites`], so the prerequisite at `offset` is
+/// ```
+/// # use makefile_lossless::Makefile;
+/// # let makefile: Makefile = "all: build test\n".parse().unwrap();
+/// # let offset = 6.into();
+/// let prerequisite = makefile.rules().find_map(|rule| {
+///     rule.prerequisites()
+///         .zip(rule.prerequisite_ranges())
+///         .find(|(_, range)| range.contains_inclusive(offset))
+///         .map(|(prerequisite, _)| prerequisite)
+/// });
+/// assert_eq!(prerequisite, Some("build".to_string()));
+/// ```
+///
+/// [`Rule::target_ranges`]: crate::Rule::target_ranges
+/// [`Rule::prerequisite_ranges`]: crate::Rule::prerequisite_ranges
+/// [`Rule::order_only_prerequisite_ranges`]: crate::Rule::order_only_prerequisite_ranges
+/// [`Rule::targets`]: crate::Rule::targets
+/// [`Rule::prerequisites`]: crate::Rule::prerequisites
+/// [`VariableDefinition::name_range`]: crate::VariableDefinition::name_range
+/// [`Include::keyword_range`]: crate::Include::keyword_range
+///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// use makefile_lossless::word_at_offset;
 /// assert_eq!(word_at_offset("hello world", 0), Some("hello"));
 /// assert_eq!(word_at_offset("hello world", 5), None); // space
 /// assert_eq!(word_at_offset("hello world", 6), Some("world"));
 /// ```
+#[deprecated(
+    since = "0.4.2",
+    note = "use the ranges of the syntax tree, such as Rule::target_ranges, \
+            Rule::prerequisite_ranges or VariableDefinition::name_range, instead"
+)]
 pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
     if !text.is_char_boundary(offset) {
         return None;
@@ -109,14 +157,38 @@ pub fn word_at_offset(text: &str, offset: usize) -> Option<&str> {
 /// Returns false if the offset is past the end of `text` or is not on a
 /// character boundary.
 ///
+/// Deprecated in favour of [`Rule::prerequisite_list_range`]: `offset` is
+/// in the prerequisites if
+/// ```
+/// # use makefile_lossless::Makefile;
+/// # let makefile: Makefile = "all: build test\n".parse().unwrap();
+/// # let offset = 5.into();
+/// let in_prerequisites = makefile.rules().any(|rule| {
+///     rule.prerequisite_list_range()
+///         .is_some_and(|range| range.contains_inclusive(offset))
+/// });
+/// assert!(in_prerequisites);
+/// ```
+/// Unlike this function, that also covers prerequisites on continuation
+/// lines, and it does not count variable values such as `x` in
+/// `FOO := x`, target-specific variable assignments, recipes after a `;`
+/// or comments as prerequisites.
+///
+/// [`Rule::prerequisite_list_range`]: crate::Rule::prerequisite_list_range
+///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// use makefile_lossless::is_in_prerequisites;
 /// let text = "all: build test\n\techo ok\n";
 /// assert!(!is_in_prerequisites(text, 0));  // 'a' in target
 /// assert!(is_in_prerequisites(text, 5));   // 'b' in prerequisites
 /// assert!(!is_in_prerequisites(text, 17)); // 'e' in recipe
 /// ```
+#[deprecated(
+    since = "0.4.2",
+    note = "use Makefile::rules and Rule::prerequisite_list_range instead"
+)]
 pub fn is_in_prerequisites(text: &str, offset: usize) -> bool {
     if !text.is_char_boundary(offset) {
         return false;
@@ -133,6 +205,7 @@ pub fn is_in_prerequisites(text: &str, offset: usize) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
