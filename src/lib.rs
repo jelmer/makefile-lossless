@@ -6,7 +6,6 @@
 //! Example:
 //!
 //! ```rust
-//! use std::io::Read;
 //! let contents = r#"PYTHON = python3
 //!
 //! .PHONY: all
@@ -45,6 +44,10 @@ mod reference;
 #[cfg(test)]
 mod test_util;
 mod text;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 pub use ast::conditional::{ConditionalBranch, ConditionalItem};
 pub use ast::makefile::MakefileItem;

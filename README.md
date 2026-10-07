@@ -6,8 +6,19 @@ syntax tree (CST) that preserves all whitespace, comments and formatting.
 Because nothing is discarded, a parsed Makefile can be modified and written
 back out with only the intended changes applied.
 
-Both GNU make and BSD make (NetBSD make, bmake) syntax are supported. Use
-`Makefile::parse_with_variant` to restrict parsing to one of them.
+GNU make, BSD make (NetBSD make, bmake), Microsoft nmake and POSIX make
+syntax are supported. By default the parser accepts any of them; use
+`Makefile::parse_with_variant` to restrict parsing to one:
+
+```rust
+use makefile_lossless::{Makefile, MakefileVariant};
+
+let parsed = Makefile::parse_with_variant("!IF 1\nX = 1\n!ENDIF\n", MakefileVariant::NMake);
+assert!(parsed.ok());
+
+let parsed = Makefile::parse_with_variant("ifdef X\nY = 1\nendif\n", MakefileVariant::POSIXMake);
+assert!(!parsed.ok());
+```
 
 Parsing
 -------
