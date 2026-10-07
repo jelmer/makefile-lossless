@@ -245,18 +245,21 @@ impl Recipe {
     /// the one set with GNU make's `.RECIPEPREFIX` before it.
     fn recipe_prefix(&self) -> char {
         let node = self.syntax();
-        match node.first_token().filter(|t| t.kind() == INDENT) {
-            // TODO: Handle a `.RECIPEPREFIX` set to a space, which make
-            // strips from continuation lines too.
-            Some(indent) => indent
-                .text()
-                .chars()
-                .next()
-                .filter(|c| *c != ' ')
-                .unwrap_or('\t'),
-            None => node
-                .parent()
-                .map_or('\t', |parent| recipe_prefix_before(&parent, node.index())),
+        let prefix_before = || {
+            node.parent()
+                .map_or('\t', |parent| recipe_prefix_before(&parent, node.index()))
+        };
+        match node
+            .first_token()
+            .filter(|t| t.kind() == INDENT)
+            .and_then(|t| t.text().chars().next())
+        {
+            // A line indented with spaces is a recipe line in some makes, so
+            // the space is only the prefix if `.RECIPEPREFIX` says so.
+            Some(' ') if prefix_before() == ' ' => ' ',
+            Some(' ') => '\t',
+            Some(c) => c,
+            None => prefix_before(),
         }
     }
 
@@ -1211,6 +1214,22 @@ mod tests {
             (
                 ".RECIPEPREFIX = >\nall:\n>echo \"$(subst x,y,a\\\n>x)\"\n",
                 "echo \"$(subst x,y,a\\\n>x)\"",
+            ),
+            (
+                "define .RECIPEPREFIX\n \nendef\nall:\n echo a \\\n  b\n",
+                "echo a \\\n b",
+            ),
+            (
+                "define .RECIPEPREFIX\n \nendef\nall:\n echo \"c \\\n d\"\n",
+                "echo \"c \\\nd\"",
+            ),
+            (
+                "define .RECIPEPREFIX\n \nendef\nall: ; echo a \\\n b \\\n\tc\n",
+                "echo a \\\nb \\\n\tc",
+            ),
+            (
+                "define .RECIPEPREFIX\n \nendef\nall:\n echo \"$(subst x,y,a\\\n x)\"\n",
+                "echo \"$(subst x,y,a\\\n x)\"",
             ),
         ];
         for (text, expected) in cases {
