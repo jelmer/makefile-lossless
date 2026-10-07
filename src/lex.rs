@@ -198,14 +198,15 @@ impl<'a> Lexer<'a> {
     /// Read up to the end of the line.
     fn read_line(&mut self) -> String {
         let mut result = String::new();
+        let mut after_backslash = false;
         loop {
-            let after_backslash = result.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
             if self.at_newline() && !self.at_escaped_cr(after_backslash) {
                 break;
             }
             let Some(c) = self.input.next() else {
                 break;
             };
+            after_backslash = c == '\\' && !after_backslash;
             result.push(c);
         }
         result
