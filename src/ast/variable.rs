@@ -1354,11 +1354,19 @@ fn value_elements(
     trailing: &[crate::lossless::SyntaxToken],
 ) -> Vec<crate::lossless::SyntaxElement> {
     let mut children: Vec<_> = expr.green().children().map(|it| it.to_owned()).collect();
-    children.extend(
-        trailing
-            .iter()
-            .map(|t| rowan::GreenToken::new(t.kind().into(), t.text()).into()),
-    );
+    for token in trailing {
+        let mut text = token.text().to_string();
+        // The lexer reads a run of whitespace as one token.
+        if let Some(last) = children
+            .last()
+            .and_then(|it| it.as_token())
+            .filter(|last| token.kind() == WHITESPACE && last.kind() == WHITESPACE.into())
+        {
+            text.insert_str(0, last.text());
+            children.pop();
+        }
+        children.push(rowan::GreenToken::new(token.kind().into(), &text).into());
+    }
     detached_elements(tokens, Some(rowan::GreenNode::new(EXPR.into(), children)))
 }
 
@@ -1916,6 +1924,9 @@ mod tests {
             ("X =# c\n", "new", "X = new# c\n"),
             ("a: X = # c\n", "new", "a: X = new # c\n"),
             ("export X := a # c\r\n", "new", "export X := new # c\r\n"),
+            ("X = old # c\n", "a ", "X = a  # c\n"),
+            ("X = old # c\n", "a\t", "X = a\t # c\n"),
+            ("export X  # c\n", "a ", "export X = a   # c\n"),
         ] {
             let makefile: Makefile = text.parse().unwrap();
             let mut var = makefile.variable_definitions().next().unwrap();
