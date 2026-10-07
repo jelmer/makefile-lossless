@@ -435,7 +435,7 @@ impl FromStr for Rule {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Rule::parse(s).to_rule_result()
+        Rule::parse(s).to_result()
     }
 }
 
