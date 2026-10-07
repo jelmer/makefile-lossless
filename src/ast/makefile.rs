@@ -1849,15 +1849,11 @@ impl Makefile {
             None => return Ok(false),
         };
 
-        // Count prerequisites before removal
-        let prereq_count = phony_rule.prerequisites().count();
-
-        // Remove the prerequisite
         phony_rule.remove_prerequisite(target)?;
 
-        // Check if .PHONY has no more prerequisites, if so remove the rule
-        if prereq_count == 1 {
-            // We just removed the last prerequisite, so remove the entire rule
+        // Remove the rule if that was its last prerequisite, which may have
+        // been listed more than once.
+        if phony_rule.prerequisites().next().is_none() {
             phony_rule.remove()?;
         }
 
@@ -4177,6 +4173,14 @@ VAR3 = value3
         assert!(!makefile.is_phony("clean"));
         assert!(makefile.is_phony("test"));
         assert!(!makefile.remove_phony_target("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target_duplicate() {
+        let mut makefile: Makefile = "a:\n.PHONY: a a\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("a").unwrap());
+        assert_eq!(makefile.code(), "a:\n");
+        assert_matches_reparse(&makefile);
     }
 
     #[test]
