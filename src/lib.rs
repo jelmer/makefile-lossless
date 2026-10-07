@@ -27,6 +27,12 @@
 //! use `"\n"`. Rules and other items inserted into a file are converted to
 //! its line ending, except for line breaks after a backslash, since whether
 //! a backslash before a CRLF continues the line depends on the make variant.
+//!
+//! New recipe lines start with the recipe prefix in effect where they are
+//! added: a tab, or the character set with GNU make's `.RECIPEPREFIX` in
+//! the lines before them. Recipe lines of inserted rules and other items
+//! are converted the same way, including the prefix at the start of their
+//! continuation lines, which make strips.
 
 mod ast;
 mod bsd_condition;

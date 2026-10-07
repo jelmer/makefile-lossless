@@ -40,7 +40,6 @@ pub struct Lexer<'a> {
     dollars: usize,
     /// The character that starts a recipe line, set with GNU make's
     /// `.RECIPEPREFIX`.
-    // TODO: The editing APIs still start new recipe lines with a tab.
     recipe_prefix: char,
     /// Text of the current logical line, if it is not a recipe line.
     line: Option<String>,
@@ -632,6 +631,17 @@ impl Iterator for Lexer<'_> {
 
 pub(crate) fn lex(input: &str, variant: Option<MakefileVariant>) -> Vec<(SyntaxKind, String)> {
     Lexer::new(input, variant).collect()
+}
+
+/// The character that starts a recipe line after `input`, as set by the
+/// `.RECIPEPREFIX` assignments in it that the parser follows.
+pub(crate) fn recipe_prefix_after(input: &str) -> char {
+    if !input.contains(".RECIPEPREFIX") {
+        return '\t';
+    }
+    let mut lexer = Lexer::new(input, None);
+    while lexer.next().is_some() {}
+    lexer.recipe_prefix
 }
 
 /// Lex `input`, treating its first line as an ordinary makefile line even if
@@ -1574,11 +1584,7 @@ override_dh_auto_clean:
 
     #[test]
     fn test_recipe_prefix() {
-        let prefix = |text: &str| {
-            let mut lexer = Lexer::new(text, None);
-            lexer.by_ref().for_each(drop);
-            lexer.recipe_prefix
-        };
+        let prefix = recipe_prefix_after;
         assert_eq!(prefix(".RECIPEPREFIX = >\n"), '>');
         assert_eq!(prefix(".RECIPEPREFIX := ab # comment\n"), 'a');
         assert_eq!(prefix("override .RECIPEPREFIX ::= >\n"), '>');

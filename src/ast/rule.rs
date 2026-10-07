@@ -1,7 +1,8 @@
 use super::conditional::ConditionalItem;
 use super::makefile::MakefileItem;
 use super::{
-    escape_hashes, is_continuation, line_ending, logical_text, terminate_line_before, LineSyntax,
+    escape_hashes, is_continuation, line_ending, logical_text, recipe_prefix_before,
+    terminate_line_before, LineSyntax,
 };
 use crate::lossless::{
     build_command, node_text, recipe_green, remove_with_preceding_comments, trim_trailing_newlines,
@@ -1171,7 +1172,8 @@ impl Rule {
             .parent()
             .expect("Recipe node must have a parent");
 
-        let syntax = build_command(line, &line_ending(self.syntax()), "replace_command")?;
+        let prefix = recipe_prefix_before(&parent, target_index);
+        let syntax = build_command(prefix, line, &line_ending(self.syntax()), "replace_command")?;
         parent.splice_children(target_index..target_index + 1, vec![syntax.into()]);
 
         Ok(true)
@@ -1212,8 +1214,9 @@ impl Rule {
     /// ```
     pub fn try_push_command(&mut self, line: &str) -> Result<(), Error> {
         let eol = line_ending(self.syntax());
-        let syntax = build_command(line, &eol, "push_command")?;
         let index = self.recipe_end_index();
+        let prefix = recipe_prefix_before(self.syntax(), index);
+        let syntax = build_command(prefix, line, &eol, "push_command")?;
         let index = terminate_line_before(self.syntax(), index, &eol);
         self.syntax()
             .splice_children(index..index, vec![syntax.into()]);

@@ -324,3 +324,148 @@ fn test_comments_reject_line_breaks() {
     assert_eq!(makefile.code(), "# c\n# d \\\\\nX = 1\n");
     assert_matches_reparse(&makefile);
 }
+
+#[test]
+fn test_recipe_prefix_push_command() {
+    let mut makefile: Makefile = ".RECIPEPREFIX = >\nall:\n>echo a\n".parse().unwrap();
+    let mut rule = makefile.rules().next().unwrap();
+    rule.push_command("echo b");
+    rule.insert_command(0, "echo c");
+    rule.replace_command(1, "echo d");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall:\n>echo c\n>echo d\n>echo b\n"
+    );
+    assert_eq!(
+        rule.recipes().collect::<Vec<_>>(),
+        vec!["echo c", "echo d", "echo b"]
+    );
+    assert_matches_reparse(&makefile);
+
+    // An empty rule, as add_rule creates.
+    let mut rule = makefile.add_rule("b");
+    rule.push_command("echo e");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall:\n>echo c\n>echo d\n>echo b\n\nb:\n>echo e\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_recipe_prefix_continuation() {
+    // make strips the recipe prefix from the start of continuation lines.
+    let makefile: Makefile = ".RECIPEPREFIX = >\nall:\n>echo a\n".parse().unwrap();
+    let mut rule = makefile.rules().next().unwrap();
+    rule.push_command("echo x \\\n\ty");
+    rule.push_command("echo y \\\n\t\tz");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall:\n>echo a\n>echo x \\\n>y\n>echo y \\\n>\tz\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_recipe_prefix_recipe_editing() {
+    let makefile: Makefile = ".RECIPEPREFIX = >\nall: ; echo a\n".parse().unwrap();
+    let rule = makefile.rules().next().unwrap();
+    let recipe = rule.recipe_nodes().next().unwrap();
+    recipe.insert_after("echo b");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall: ; echo a\n>echo b\n"
+    );
+    assert_matches_reparse(&makefile);
+    recipe.insert_before("echo c");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall:\n>echo c\n>echo a\n>echo b\n"
+    );
+    assert_matches_reparse(&makefile);
+    let mut recipe = rule.recipe_nodes().nth(2).unwrap();
+    recipe.replace_text("echo x \\\n\ty");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\nall:\n>echo c\n>echo a\n>echo x \\\n>y\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_recipe_prefix_changes_mid_file() {
+    let makefile: Makefile = ".RECIPEPREFIX = >\na:\n>echo a\n.RECIPEPREFIX =\nb:\n\techo c\n"
+        .parse()
+        .unwrap();
+    let mut rules: Vec<_> = makefile.rules().collect();
+    rules[0].push_command("echo b");
+    rules[1].push_command("echo d");
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\na:\n>echo a\n>echo b\n.RECIPEPREFIX =\nb:\n\techo c\n\techo d\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_recipe_prefix_inserted_rule() {
+    let mut makefile: Makefile = ".RECIPEPREFIX = >\na:\n>echo a\n".parse().unwrap();
+    makefile
+        .insert_rule(1, Rule::new(&["b"], &[], &["echo b"]))
+        .unwrap();
+    let rule: Rule = "c:\n\techo x \\\n\ty\n\techo z\n".parse().unwrap();
+    makefile.insert_rule(2, rule).unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\na:\n>echo a\n\nb:\n>echo b\n\nc:\n>echo x \\\n>y\n>echo z\n"
+    );
+    assert_matches_reparse(&makefile);
+
+    // Recipes from a makefile with a different prefix are converted.
+    let mut other: Makefile = "b:\n\techo b\n".parse().unwrap();
+    let rule = makefile.rules().next().unwrap();
+    other.insert_rule(0, rule).unwrap();
+    assert_eq!(other.to_string(), "a:\n\techo a\n\nb:\n\techo b\n");
+    assert_matches_reparse(&other);
+}
+
+#[test]
+fn test_recipe_prefix_add_conditional() {
+    let mut makefile: Makefile = ".RECIPEPREFIX = >\na:\n>echo a\n".parse().unwrap();
+    makefile
+        .add_conditional("ifdef", "X", "b:\n\techo b\n", Some("c:\n\techo c\n"))
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\na:\n>echo a\n\nifdef X\nb:\n>echo b\nelse\nc:\n>echo c\nendif\n"
+    );
+    assert_matches_reparse(&makefile);
+
+    let mut cond = makefile.conditionals().next().unwrap();
+    cond.add_if_item(MakefileItem::Rule(Rule::new(&["d"], &[], &["echo d"])));
+    // Directly after the assignment that sets the prefix.
+    let mut item = makefile.items().next().unwrap();
+    item.insert_after(MakefileItem::Rule(Rule::new(&["e"], &[], &["echo e"])))
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        ".RECIPEPREFIX = >\ne:\n>echo e\na:\n>echo a\n\nifdef X\nd:\n>echo d\nb:\n>echo b\nelse\nc:\n>echo c\nendif\n"
+    );
+    assert_matches_reparse(&makefile);
+}
+
+#[test]
+fn test_recipe_prefix_add_conditional_with_items() {
+    // Items from a makefile with a different prefix.
+    let other: Makefile = ".RECIPEPREFIX = >\nb:\n>echo b\n".parse().unwrap();
+    let rule = other.rules().next().unwrap();
+    let mut makefile: Makefile = "a:\n\techo a\n".parse().unwrap();
+    makefile
+        .add_conditional_with_items("ifdef", "X", [MakefileItem::Rule(rule)], None::<Vec<_>>)
+        .unwrap();
+    assert_eq!(
+        makefile.to_string(),
+        "a:\n\techo a\n\nifdef X\nb:\n\techo b\nendif\n"
+    );
+    assert_matches_reparse(&makefile);
+}
