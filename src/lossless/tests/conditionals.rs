@@ -923,3 +923,134 @@ fn test_conditional_headers_include_newline() {
         );
     }
 }
+
+/// Openers and closers of each kind of nested block, with the variant to
+/// parse them with.
+const NESTED_BLOCKS: &[(&str, &str, Option<MakefileVariant>)] = &[
+    ("ifdef X\n", "endif\n", None),
+    ("ifeq (a,b)\n", "endif\n", Some(MakefileVariant::GNUMake)),
+    (".if 1\n", ".endif\n", Some(MakefileVariant::BSDMake)),
+    (".ifdef X\n", ".endif\n", None),
+    (".for i in 1\n", ".endfor\n", Some(MakefileVariant::BSDMake)),
+    ("!IF 1\n", "!ENDIF\n", Some(MakefileVariant::NMake)),
+    ("define X\n", "endef\n", None),
+];
+
+#[test]
+fn test_deeply_nested_blocks() {
+    // Like make, these have no nesting limit, but this crate stops
+    // building nested nodes at a depth of MAX_DEPTH, so neither the parser
+    // nor dropping the tree overflows the stack.
+    let mixed = (
+        "ifdef X\n.if 1\n.for i in 1\n",
+        ".endfor\n.endif\nendif\n",
+        None,
+    );
+    let cases = NESTED_BLOCKS.iter().map(|&block| (block, 25_000));
+    for ((open, close, variant), depth) in cases.chain([(mixed, 200_000)]) {
+        let text = format!(
+            "{}x = {}{}\n{}",
+            open.repeat(depth),
+            "$(".repeat(depth),
+            ")".repeat(depth),
+            close.repeat(depth)
+        );
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let parsed = parse(&text, variant);
+                assert_eq!(parsed.syntax().to_string(), text);
+                let errors: Vec<_> = parsed.errors.iter().map(ErrorInfo::kind).collect();
+                // The reference is in the block that is too deep, or in
+                // a define body, so it is not parsed.
+                let expected = if open.starts_with("define") {
+                    vec![]
+                } else {
+                    vec![ParseErrorKind::TooDeeplyNested]
+                };
+                assert_eq!(errors, expected);
+            })
+            .unwrap()
+            .join()
+            .unwrap_or_else(|_| panic!("{open:?} nested {depth} deep"));
+    }
+}
+
+#[test]
+fn test_nesting_depth_limit() {
+    use crate::reference::MAX_DEPTH;
+    let depth_of_error = |text: &str, variant| {
+        let parsed = parse(text, variant);
+        assert_eq!(parsed.syntax().to_string(), text);
+        let errors: Vec<_> = parsed.errors.iter().map(|e| (e.kind(), e.line)).collect();
+        let error = parsed.syntax().descendants().find(|n| n.kind() == ERROR);
+        let depth = error.as_ref().map(|e| {
+            e.ancestors()
+                .filter(|n| matches!(n.kind(), CONDITIONAL | FOR_LOOP))
+                .count()
+        });
+        (errors, depth, error.map(|e| e.to_string()))
+    };
+    for &(open, close, variant) in NESTED_BLOCKS {
+        if open.starts_with("define") {
+            continue;
+        }
+        let text = format!("{}{}", open.repeat(MAX_DEPTH), close.repeat(MAX_DEPTH));
+        assert_eq!(
+            depth_of_error(&text, variant),
+            (vec![], None, None),
+            "{open:?}"
+        );
+        // The block that is too deep is kept as text up to its end, and
+        // the enclosing ones are closed as usual.
+        let text = format!(
+            "{}{open}x = 1\n{close}{}",
+            open.repeat(MAX_DEPTH),
+            close.repeat(MAX_DEPTH)
+        );
+        assert_eq!(
+            depth_of_error(&text, variant),
+            (
+                vec![(ParseErrorKind::TooDeeplyNested, MAX_DEPTH + 1)],
+                Some(MAX_DEPTH),
+                Some(format!("{open}x = 1\n{close}"))
+            ),
+            "{open:?}"
+        );
+    }
+}
+
+#[test]
+fn test_too_deeply_nested_block_with_branches() {
+    use crate::reference::MAX_DEPTH;
+    let text = format!(
+        "{}ifdef A\nelse ifdef B\nelse\n  ifeq (a,b)\n  endif\nendif\n{}",
+        "ifdef X\n".repeat(MAX_DEPTH),
+        "endif\n".repeat(MAX_DEPTH)
+    );
+    let parsed = parse(&text, None);
+    assert_eq!(parsed.syntax().to_string(), text);
+    let errors: Vec<_> = parsed.errors.iter().map(ErrorInfo::kind).collect();
+    assert_eq!(errors, vec![ParseErrorKind::TooDeeplyNested]);
+    let error = parsed
+        .syntax()
+        .descendants()
+        .find(|n| n.kind() == ERROR)
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "ifdef A\nelse ifdef B\nelse\n  ifeq (a,b)\n  endif\nendif\n"
+    );
+}
+
+#[test]
+fn test_too_deeply_nested_block_unterminated() {
+    use crate::reference::MAX_DEPTH;
+    let text = format!("{}.if 1\nx = 1\n", ".if 1\n".repeat(MAX_DEPTH));
+    let parsed = parse(&text, Some(MakefileVariant::BSDMake));
+    assert_eq!(parsed.syntax().to_string(), text);
+    let errors: Vec<_> = parsed.errors.iter().map(ErrorInfo::kind).collect();
+    let mut expected = vec![ParseErrorKind::TooDeeplyNested];
+    expected.extend([ParseErrorKind::MissingEndif; MAX_DEPTH]);
+    assert_eq!(errors, expected);
+}
