@@ -215,6 +215,7 @@ impl Parse<Makefile> {
         // have shifted, so find the lines in the new tree.
         crate::lossless::locate_error_lines(
             &rowan::SyntaxNode::new_root(new_root.clone()),
+            &new_text,
             &mut new_positioned_errors,
         );
         let new_parse = Parse::new(new_root, new_errors, new_positioned_errors);

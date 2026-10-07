@@ -186,13 +186,17 @@ impl ConditionalRuleContext {
 }
 
 /// Set the line range and space indent range of each of `errors` in the
-/// tree `root`.
-pub(crate) fn locate_error_lines(root: &SyntaxNode, errors: &mut [PositionedParseError]) {
+/// tree `root`, whose text is `text`.
+pub(crate) fn locate_error_lines(
+    root: &SyntaxNode,
+    text: &str,
+    errors: &mut [PositionedParseError],
+) {
     for error in errors {
         error.line_range = logical_line_range(root, error.range.start());
         error.space_indent_range = None;
         if error.kind == ParseErrorKind::MissingSeparator {
-            let line = root.text().slice(error.line_range).to_string();
+            let line = &text[error.line_range];
             let spaces = line.len() - line.trim_start_matches(' ').len();
             if spaces > 0 {
                 error.space_indent_range = Some(rowan::TextRange::at(
@@ -217,23 +221,24 @@ fn logical_line_range(root: &SyntaxNode, offset: rowan::TextSize) -> rowan::Text
             && !crate::ast::is_continuation(&t.clone().into())
             && !t.prev_token().is_some_and(|p| ends_in_backslash(&p))
     };
+    // The token containing the byte at `offset`. Unlike
+    // `SyntaxNode::token_at_offset`, this finds children by binary search.
+    let token_at = |offset: rowan::TextSize| {
+        root.covering_element(rowan::TextRange::at(offset, 1.into()))
+            .into_token()
+            .expect("every byte is part of a token")
+    };
     let text_end = root.text_range().end();
-    let (before, token) = match root.token_at_offset(offset).right_biased() {
-        Some(token) if offset < text_end => {
-            let before = if is_line_end(&token) {
-                token.prev_token()
-            } else {
-                Some(token.clone())
-            };
-            (before, Some(token))
-        }
-        _ => {
-            let last = root
-                .descendants_with_tokens()
-                .filter_map(|it| it.into_token())
-                .last();
-            (last, None)
-        }
+    let (before, token) = if offset < text_end {
+        let token = token_at(offset);
+        let before = if is_line_end(&token) {
+            token.prev_token()
+        } else {
+            Some(token.clone())
+        };
+        (before, Some(token))
+    } else {
+        (text_end.checked_sub(1.into()).map(token_at), None)
     };
     let start = std::iter::successors(before, |t| t.prev_token())
         .find(is_line_end)
@@ -260,6 +265,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         token_positions: Vec<(rowan::TextSize, rowan::TextSize)>,
         /// The original text
         original_text: &'a str,
+        /// The offset of the start of each line in `original_text`.
+        line_starts: Vec<usize>,
         /// The makefile variant
         variant: Option<MakefileVariant>,
         /// Number of enclosing BSD `.for` loops.
@@ -336,16 +343,16 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// last one, even if the input does not end with a newline.
         fn record_unterminated_error(&mut self, kind: ParseErrorKind, msg: String) {
             let range = self.current_range();
-            let line = self.original_text.lines().count() + 1;
-            self.push_error(kind, msg, range, line);
+            // The number of lines, as counted by `str::lines`.
+            let lines = self.line_starts.len()
+                - usize::from(self.original_text.is_empty() || self.original_text.ends_with('\n'));
+            self.push_error(kind, msg, range, lines + 1);
         }
 
         /// The 1-based line number of `offset`.
         fn line_at(&self, offset: rowan::TextSize) -> usize {
-            self.original_text[..usize::from(offset)]
-                .matches('\n')
-                .count()
-                + 1
+            self.line_starts
+                .partition_point(|&start| start <= usize::from(offset))
         }
 
         fn push_error(
@@ -386,12 +393,19 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
         }
 
+        /// The text of the given 1-based line, without its line ending.
         fn get_context_for_line(&self, line_number: usize) -> String {
-            self.original_text
-                .lines()
-                .nth(line_number - 1)
-                .unwrap_or("")
-                .to_string()
+            let Some(&start) = self.line_starts.get(line_number - 1) else {
+                return String::new();
+            };
+            let line = match self.line_starts.get(line_number) {
+                Some(&next) => {
+                    let line = &self.original_text[start..next - 1];
+                    line.strip_suffix('\r').unwrap_or(line)
+                }
+                None => &self.original_text[start..],
+            };
+            line.to_string()
         }
 
         /// Run `f`, which adds the children of a `kind` node, and add that
@@ -4550,6 +4564,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             let green_node = self.builder.finish();
             locate_error_lines(
                 &SyntaxNode::new_root(green_node.clone()),
+                self.original_text,
                 &mut self.positioned_errors,
             );
 
@@ -4885,6 +4900,9 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         positioned_errors: Vec::new(),
         token_positions,
         original_text: text,
+        line_starts: std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .collect(),
         variant,
         for_depth: 0,
         block_conditional_depth: 0,

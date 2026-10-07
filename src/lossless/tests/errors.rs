@@ -1144,6 +1144,45 @@ fn test_error_location_last_line_without_newline() {
 }
 
 #[test]
+fn test_error_location_crlf() {
+    assert_eq!(
+        error_locations("X = 1\r\nfoo bar\r\nY = 2\r\n"),
+        vec![(
+            "expected ':'".to_string(),
+            2,
+            "foo bar".to_string(),
+            rowan::TextRange::new(14.into(), 16.into())
+        )]
+    );
+    // A carriage return without a newline does not end the line.
+    assert_eq!(
+        error_locations("X = 1\nfoo bar\r"),
+        vec![(
+            "expected ':'".to_string(),
+            2,
+            "foo bar\r".to_string(),
+            rowan::TextRange::new(14.into(), 14.into())
+        )]
+    );
+}
+
+#[test]
+fn test_error_location_after_last_line() {
+    for input in ["ifdef X\nbar = 1\n", "ifdef X\nbar = 1"] {
+        assert_eq!(
+            error_locations(input),
+            vec![(
+                "unterminated conditional (missing endif)".to_string(),
+                3,
+                String::new(),
+                rowan::TextRange::empty(rowan::TextSize::of(input))
+            )],
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
 fn test_error_location_in_conditional() {
     assert_eq!(
         error_locations("ifdef A\nfoo bar\nendif\n"),
