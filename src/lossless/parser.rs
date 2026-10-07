@@ -265,6 +265,8 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         for_depth: usize,
         /// Number of enclosing BSD `.if` or nmake `!IF` conditionals.
         block_conditional_depth: usize,
+        /// Number of enclosing conditionals and loops of any kind.
+        nesting_depth: usize,
         /// Number of variable references being parsed that enclose the
         /// current token.
         reference_depth: usize,
@@ -3006,6 +3008,13 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         }
 
         fn parse_conditional(&mut self) {
+            if self.current() == Some(IDENTIFIER)
+                && Self::is_conditional_start(&self.tokens.last().unwrap().1)
+                && self.nesting_depth >= crate::reference::MAX_DEPTH
+            {
+                self.parse_too_deeply_nested_block();
+                return;
+            }
             self.builder.start_node(CONDITIONAL.into());
 
             // Start the initial conditional (ifdef/ifndef/ifeq/ifneq)
@@ -3046,6 +3055,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             self.builder.finish_node(); // finish CONDITIONAL_IF
 
+            self.nesting_depth += 1;
             let mut rule_context = ConditionalRuleContext::new(self.in_rule);
             let mut seen_final_else = false;
             let mut seen_endif = false;
@@ -3117,6 +3127,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 );
             }
 
+            self.nesting_depth -= 1;
             self.builder.finish_node();
         }
 
@@ -3837,6 +3848,10 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         /// Uses the same node kinds as GNU conditionals: `.elif*` and `.else`
         /// become CONDITIONAL_ELSE nodes and `.endif` a CONDITIONAL_ENDIF.
         fn parse_block_conditional(&mut self, name: &str, count: usize) {
+            if self.nesting_depth >= crate::reference::MAX_DEPTH {
+                self.parse_too_deeply_nested_block();
+                return;
+            }
             self.builder.start_node(CONDITIONAL.into());
             self.builder.start_node(CONDITIONAL_IF.into());
             self.bump_n(count);
@@ -3845,6 +3860,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
 
             let mut rule_context = ConditionalRuleContext::new(self.in_rule);
             self.block_conditional_depth += 1;
+            self.nesting_depth += 1;
 
             loop {
                 if self.is_at_eof() {
@@ -3900,11 +3916,70 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             }
 
             self.block_conditional_depth -= 1;
+            self.nesting_depth -= 1;
             self.builder.finish_node();
+        }
+
+        /// Add the conditional or loop starting at the current line, up to
+        /// the line that closes it, as an ERROR node without looking at
+        /// what it contains, as it is nested too deeply to parse
+        /// recursively.
+        ///
+        /// TODO: Lines in a `define` body are not told apart from
+        /// directives here.
+        fn parse_too_deeply_nested_block(&mut self) {
+            self.record_error(
+                ParseErrorKind::TooDeeplyNested,
+                "conditionals and loops nested too deeply".to_string(),
+            );
+            self.builder.start_node(ERROR.into());
+            let mut depth = 0;
+            loop {
+                match self.block_delimiter() {
+                    Some(true) => depth += 1,
+                    Some(false) => depth -= 1,
+                    None => {}
+                }
+                self.skip_logical_line();
+                if depth == 0 || self.is_at_eof() {
+                    break;
+                }
+            }
+            self.builder.finish_node();
+        }
+
+        /// Whether the current line opens (true) or closes (false) a
+        /// conditional or loop, if it does either.
+        fn block_delimiter(&self) -> Option<bool> {
+            if let Some((name, _)) = self.directive() {
+                return match name {
+                    _ if is_bsd_if(name) || name == "for" => Some(true),
+                    "endif" | "endfor" => Some(false),
+                    _ => None,
+                };
+            }
+            let end = self.tokens.len()
+                - self
+                    .tokens
+                    .iter()
+                    .rev()
+                    .take_while(|(kind, _)| *kind == WHITESPACE)
+                    .count();
+            if !self.conditional_line_at(end) {
+                return None;
+            }
+            match self.tokens[end - 1].1.as_str() {
+                "endif" => Some(false),
+                token => Self::is_conditional_start(token).then_some(true),
+            }
         }
 
         /// Parse a BSD `.for VAR... in LIST` ... `.endfor` loop.
         fn parse_bsd_for(&mut self, count: usize) {
+            if self.nesting_depth >= crate::reference::MAX_DEPTH {
+                self.parse_too_deeply_nested_block();
+                return;
+            }
             self.builder.start_node(FOR_LOOP.into());
             self.builder.start_node(FOR_HEADER.into());
             self.bump_n(count);
@@ -3969,6 +4044,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
             // the end of its body, which is right unless the loop runs zero
             // times.
             self.for_depth += 1;
+            self.nesting_depth += 1;
             loop {
                 if self.is_at_eof() {
                     self.record_unterminated_error(
@@ -3989,6 +4065,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
                 }
             }
             self.for_depth -= 1;
+            self.nesting_depth -= 1;
 
             self.builder.finish_node();
         }
@@ -4950,6 +5027,7 @@ pub(crate) fn parse(text: &str, variant: Option<MakefileVariant>) -> Parse {
         variant,
         for_depth: 0,
         block_conditional_depth: 0,
+        nesting_depth: 0,
         reference_depth: 0,
         pending_backslash_escape: false,
         argument_quote: None,
