@@ -154,7 +154,7 @@ pub(crate) fn lines_above(node: &SyntaxNode) -> Vec<LineAbove> {
     if !starts_line(prev.as_ref()) {
         return lines;
     }
-    while let Some(newline) = prev.filter(&in_parent) {
+    while let Some(newline) = prev.filter(in_parent) {
         let mut tokens = vec![newline.clone()];
         let mut comment = None;
         let mut before = prev_token(&newline);
