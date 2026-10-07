@@ -19,7 +19,8 @@ use crate::MakefileVariant;
 use crate::SyntaxKind::{
     self, BACKSLASH, BLANK_LINE, COMMENT, CONDITIONAL, CONDITIONAL_ENDIF, CONDITIONAL_IF,
     DIRECTIVE, DOLLAR, EXPRESSION_STATEMENT, FOR_END, FOR_HEADER, FOR_LOOP, INCLUDE, INDENT,
-    LBRACE, LOAD, LPAREN, NEWLINE, PREREQUISITE, RECIPE, RULE, TEXT, VARIABLE, VPATH, WHITESPACE,
+    LBRACE, LOAD, LPAREN, NEWLINE, OPERATOR, PREREQUISITE, RECIPE, RULE, TEXT, VARIABLE, VPATH,
+    WHITESPACE,
 };
 use std::ops::Range;
 
@@ -318,32 +319,57 @@ pub(crate) fn recipe_prefix_before(parent: &SyntaxNode, index: usize) -> char {
 
 /// `node`, or a copy of it in which the recipe lines start with the recipe
 /// prefix in effect where they would be after `before`, the text in front
-/// of `node`. Recipes on a rule line, after `;`, are left alone.
-// TODO: Rewrite the continuation lines of recipes on a rule line too, as
-// recipe_line_content does.
+/// of `node`.
+///
+/// The old prefix of a recipe on a rule line, after `;`, is the one in
+/// effect where it is in the tree of `node`, so `node` should not be a copy
+/// taken out of that tree.
 pub(crate) fn with_recipe_prefix(node: &SyntaxNode, before: &str) -> SyntaxNode {
     let text = format!("{before}{node}");
-    let changes = |node: &SyntaxNode| -> Vec<(SyntaxNode, char, char)> {
-        let start = node.text_range().start();
-        node.descendants()
-            .filter(|n| n.kind() == RECIPE)
-            .filter_map(|recipe| {
-                let first = recipe.first_token().filter(|t| t.kind() == INDENT)?;
-                let old = first.text().chars().next().filter(|c| *c != ' ')?;
-                let offset = before.len() + usize::from(recipe.text_range().start() - start);
-                let new = crate::lex::recipe_prefix_after(&text[..offset]);
-                (old != new).then_some((recipe, old, new))
-            })
-            .collect()
-    };
-    if changes(node).is_empty() {
+    let start = node.text_range().start();
+    let changes: Vec<(usize, char, char)> = node
+        .descendants()
+        .filter(|n| n.kind() == RECIPE)
+        .enumerate()
+        .filter_map(|(i, recipe)| {
+            let old = old_recipe_prefix(&recipe)?;
+            let offset = before.len() + usize::from(recipe.text_range().start() - start);
+            let new = crate::lex::recipe_prefix_after(&text[..offset]);
+            (old != new).then_some((i, old, new))
+        })
+        .collect();
+    if changes.is_empty() {
         return node.clone();
     }
     let copy = SyntaxNode::new_root_mut(node.green().into_owned());
-    for (recipe, old, new) in changes(&copy) {
-        crate::lossless::change_recipe_prefix(&recipe, old, new);
+    let recipes: Vec<_> = copy.descendants().filter(|n| n.kind() == RECIPE).collect();
+    for (i, old, new) in changes {
+        crate::lossless::change_recipe_prefix(&recipes[i], old, new);
     }
     copy
+}
+
+/// The recipe prefix that starts the lines of `recipe`, if it has lines
+/// that start with one.
+fn old_recipe_prefix(recipe: &SyntaxNode) -> Option<char> {
+    let first = recipe.first_token()?;
+    match first.kind() {
+        INDENT => first.text().chars().next().filter(|c| *c != ' '),
+        OPERATOR if continues(recipe) => {
+            let parent = recipe.parent()?;
+            Some(recipe_prefix_before(&parent, recipe.index()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `recipe` has a line break before its last token, and so goes on
+/// past its first line.
+fn continues(recipe: &SyntaxNode) -> bool {
+    recipe
+        .children_with_tokens()
+        .filter(|it| it.kind() == NEWLINE)
+        .any(|it| it.as_token() != recipe.last_token().as_ref())
 }
 
 /// Whether nodes of this kind hold the line break that ends them, rather

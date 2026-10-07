@@ -56,13 +56,14 @@ fn parse_recipe_line(
     Ok((recipe.clone(), !parsed.errors.is_empty()))
 }
 
-/// The text of `recipe`, a recipe on a line of its own whose lines start
-/// with the recipe prefix `old`, without the prefix of its first line and
-/// its final line ending, written for the recipe prefix `new` so that make
-/// reads the same command: the prefix of each continuation line becomes
-/// `new`, and one that starts with `new` without the prefix gets another
-/// `new`, for make to strip. Line breaks inside references are left alone,
-/// since make keeps the recipe prefix there and takes a tab as whitespace.
+/// The text of `recipe`, whose continuation lines start with the recipe
+/// prefix `old`, without the prefix of its first line or the `;` before a
+/// recipe on a rule line, and without its final line ending, written for
+/// the recipe prefix `new` so that make reads the same command: the prefix
+/// of each continuation line becomes `new`, and one that starts with `new`
+/// without the prefix gets another `new`, for make to strip. Line breaks
+/// inside references are left alone, since make keeps the recipe prefix
+/// there and takes a tab as whitespace.
 fn text_for_prefix(recipe: &SyntaxNode, old: char, new: char) -> String {
     let mut text = String::new();
     let mut line_start = false;
@@ -72,7 +73,8 @@ fn text_for_prefix(recipe: &SyntaxNode, old: char, new: char) -> String {
             INDENT if i == 0 => {
                 text.push_str(element_text.strip_prefix(old).unwrap_or(&element_text))
             }
-            INDENT if line_start && element_text.starts_with(old) => {
+            OPERATOR if i == 0 => {}
+            _ if line_start && element_text.starts_with(old) => {
                 text.push(new);
                 text.push_str(&element_text[old.len_utf8()..]);
             }
@@ -90,15 +92,15 @@ fn text_for_prefix(recipe: &SyntaxNode, old: char, new: char) -> String {
     text
 }
 
-/// Rewrite `recipe`, a recipe on a line of its own whose lines start with
-/// the recipe prefix `old`, for the recipe prefix `new`, as described for
-/// [`text_for_prefix`].
+/// Rewrite `recipe`, whose lines start with the recipe prefix `old`, for
+/// the recipe prefix `new`, as described for [`text_for_prefix`].
 pub(crate) fn change_recipe_prefix(recipe: &SyntaxNode, old: char, new: char) {
     if old == new {
         return;
     }
+    let inline = recipe.first_token().is_some_and(|t| t.kind() == OPERATOR);
     let text = text_for_prefix(recipe, old, new);
-    let (parsed, _) = parse_recipe_line(&text, new, false, "change_recipe_prefix")
+    let (parsed, _) = parse_recipe_line(&text, new, inline, "change_recipe_prefix")
         .expect("a recipe line reads the same with another recipe prefix");
     let mut children: Vec<GreenElement> = parsed.green().children().map(|c| c.to_owned()).collect();
     children.pop();
@@ -1365,6 +1367,56 @@ mod tests {
             item.insert_after(crate::MakefileItem::Rule(rule.clone()))
                 .unwrap();
             assert_eq!(makefile.code(), format!("{text}{code}"));
+            let inserted = makefile.rules().next().unwrap();
+            assert_eq!(
+                inserted.recipe_nodes().next().unwrap().shell_text(),
+                expected
+            );
+            crate::test_util::assert_matches_reparse(&makefile);
+        }
+    }
+
+    #[test]
+    fn test_insert_rule_custom_recipe_prefix_rule_line() {
+        // The prefix of continuation lines of a recipe after `;` is
+        // rewritten like that of a recipe on a line of its own.
+        let tab_source = "all: ; echo a \\\n\tb \\\n c \\\n\t>d \\\n>e\n";
+        let custom_source = ".RECIPEPREFIX = >\nall: ; echo a \\\n>b \\\n\tc \\\n >d\n";
+        for (source, text, code) in [
+            (
+                tab_source,
+                ".RECIPEPREFIX = >\nX = 1\n",
+                "all: ; echo a \\\n>b \\\n c \\\n>>d \\\n>>e\n",
+            ),
+            (
+                tab_source,
+                "define .RECIPEPREFIX\n \nendef\nX = 1\n",
+                "all: ; echo a \\\n b \\\n  c \\\n >d \\\n>e\n",
+            ),
+            (
+                custom_source,
+                "X = 1\n",
+                "all: ; echo a \\\n\tb \\\n\t\tc \\\n >d\n",
+            ),
+            (
+                custom_source.strip_suffix('\n').unwrap(),
+                "X = 1\n",
+                "all: ; echo a \\\n\tb \\\n\t\tc \\\n >d\n",
+            ),
+            (
+                ".RECIPEPREFIX = >\nall:\n>echo a \\\n>b \\\n\tc \\\n >d\n",
+                "X = 1\n",
+                "all:\n\techo a \\\n\tb \\\n\t\tc \\\n >d\n",
+            ),
+        ] {
+            let source_makefile: Makefile = source.parse().unwrap();
+            let rule = source_makefile.rules().next().unwrap();
+            let expected = rule.recipe_nodes().next().unwrap().shell_text();
+            let makefile: Makefile = text.parse().unwrap();
+            let mut item = makefile.items().last().unwrap();
+            item.insert_after(crate::MakefileItem::Rule(rule.clone()))
+                .unwrap();
+            assert_eq!(makefile.code(), format!("{text}{code}"), "{source:?}");
             let inserted = makefile.rules().next().unwrap();
             assert_eq!(
                 inserted.recipe_nodes().next().unwrap().shell_text(),

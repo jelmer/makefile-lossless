@@ -1119,8 +1119,6 @@ impl Conditional {
     /// assert!(makefile.to_string().contains("CFLAGS = -g"));
     /// ```
     pub fn add_if_item(&mut self, item: MakefileItem) {
-        let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
-
         // Find position after CONDITIONAL_IF
         let insert_pos = self
             .syntax()
@@ -1131,7 +1129,8 @@ impl Conditional {
 
         let insert_pos =
             terminate_line_before(self.syntax(), insert_pos, &line_ending(self.syntax()));
-        let item_node = with_recipe_prefix(&item_node, &text_before(self.syntax(), insert_pos));
+        let item_node = with_recipe_prefix(item.syntax(), &text_before(self.syntax(), insert_pos));
+        let item_node = with_trailing_newline(&item_node, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }
@@ -1157,13 +1156,13 @@ impl Conditional {
     /// ```
     pub fn add_else_item(&mut self, item: MakefileItem) {
         let else_node = self.plain_else().unwrap_or_else(|| self.add_else_clause());
-        let item_node = with_trailing_newline(item.syntax(), &line_ending(self.syntax()));
         let insert_pos = terminate_line_before(
             self.syntax(),
             else_node.index() + 1,
             &line_ending(self.syntax()),
         );
-        let item_node = with_recipe_prefix(&item_node, &text_before(self.syntax(), insert_pos));
+        let item_node = with_recipe_prefix(item.syntax(), &text_before(self.syntax(), insert_pos));
+        let item_node = with_trailing_newline(&item_node, &line_ending(self.syntax()));
         self.syntax()
             .splice_children(insert_pos..insert_pos, vec![item_node.into()]);
     }

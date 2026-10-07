@@ -473,8 +473,8 @@ impl MakefileItem {
             "replace",
         )?;
         let current_index = self.syntax().index();
-        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
-        let new_node = with_recipe_prefix(&new_node, &text_before(&parent, current_index));
+        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, current_index));
+        let new_node = with_trailing_newline(&new_node, &line_ending(&parent));
 
         // Replace the current node with the new item's syntax
         parent.splice_children(
@@ -687,8 +687,8 @@ impl MakefileItem {
         )?;
         hoist_doc_comment(self.syntax());
         let current_index = index_before_doc_comment(self.syntax());
-        let new_node = with_trailing_newline(new_item.syntax(), &line_ending(&parent));
-        let new_node = with_recipe_prefix(&new_node, &text_before(&parent, current_index));
+        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, current_index));
+        let new_node = with_trailing_newline(&new_node, &line_ending(&parent));
 
         parent.splice_children(current_index..current_index, vec![new_node.into()]);
 
@@ -725,10 +725,10 @@ impl MakefileItem {
             "insert_after",
         )?;
         let eol = line_ending(&parent);
-        let new_node = with_trailing_newline(new_item.syntax(), &eol);
         hoist_next_doc_comment(self.syntax());
         let index = terminate_line_before(&parent, self.syntax().index() + 1, &eol);
-        let new_node = with_recipe_prefix(&new_node, &text_before(&parent, index));
+        let new_node = with_recipe_prefix(new_item.syntax(), &text_before(&parent, index));
+        let new_node = with_trailing_newline(&new_node, &eol);
 
         // Insert the new item after the current item
         parent.splice_children(index..index, vec![new_node.into()]);
@@ -1571,7 +1571,7 @@ impl Makefile {
         let item_text = |item: MakefileItem| {
             // The body is parsed on its own, where recipe lines start with
             // a tab; they get the prefix of the makefile when it is added.
-            with_recipe_prefix(&with_trailing_newline(item.syntax(), "\n"), "").to_string()
+            with_trailing_newline(&with_recipe_prefix(item.syntax(), ""), "\n").to_string()
         };
         let if_text: String = if_items.into_iter().map(item_text).collect();
         let else_text: Option<String> =
@@ -1637,8 +1637,8 @@ impl Makefile {
         let target_index = target_node.index();
         let parent = target_node.parent().unwrap();
 
-        let new_node = with_trailing_newline(new_rule.syntax(), &line_ending(self.syntax()));
-        let new_node = with_recipe_prefix(&new_node, &text_before(&parent, target_index));
+        let new_node = with_recipe_prefix(new_rule.syntax(), &text_before(&parent, target_index));
+        let new_node = with_trailing_newline(&new_node, &line_ending(self.syntax()));
 
         parent.splice_children(target_index..target_index + 1, vec![new_node.into()]);
         Ok(())
@@ -1744,9 +1744,9 @@ impl Makefile {
         });
 
         let eol = line_ending(self.syntax());
-        let new_node = with_trailing_newline(new_rule.syntax(), &eol);
         let target_index = terminate_line_before(&parent, target_index, &eol);
-        let new_node = with_recipe_prefix(&new_node, &text_before(&parent, target_index));
+        let new_node = with_recipe_prefix(new_rule.syntax(), &text_before(&parent, target_index));
+        let new_node = with_trailing_newline(&new_node, &eol);
 
         let blank_line = || {
             let mut bl_builder = GreenNodeBuilder::new();
