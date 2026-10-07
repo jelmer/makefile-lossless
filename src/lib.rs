@@ -1,11 +1,41 @@
 #![allow(clippy::tabs_in_doc_comments)] // Makefile uses tabs
 #![deny(missing_docs)]
 
-//! A lossless parser for Makefiles
+//! A lossless parser and editor for makefiles.
 //!
-//! Example:
+//! Parsing produces a concrete syntax tree, built on [`rowan`], that keeps
+//! every byte of the input: whitespace, comments, line continuations and
+//! anything the parser did not understand. Converting the tree back to text
+//! gives the original input, so a makefile can be edited and written out
+//! with only the intended changes.
+//!
+//! [`Makefile`] is the root of the tree. Its [`items`](Makefile::items) are
+//! [`MakefileItem`]s: a [`Rule`] (targets, prerequisites and [`Recipe`]
+//! lines), a [`VariableDefinition`], an [`Include`], a [`Conditional`]
+//! (whose branches contain further items) and a few others. These types
+//! are views into the same tree; editing through one of them, e.g. with
+//! [`VariableDefinition::set_value`] or [`Rule::add_prerequisite`], changes
+//! the [`Makefile`] it belongs to.
+//!
+//! Parsing never fails. [`Makefile::parse`] returns a [`Parse`], which holds
+//! the tree together with any syntax errors found, recorded as
+//! [`ErrorInfo`]. Text that could not be parsed ends up in the tree as
+//! error nodes rather than being dropped. The [`FromStr`](std::str::FromStr)
+//! implementation of [`Makefile`] is stricter, and returns
+//! [`Error::Parse`] if there were any errors.
+//!
+//! GNU make, BSD make, nmake and POSIX make differ in syntax, so parsing
+//! and some accessors take a [`MakefileVariant`]. [`Makefile::parse`]
+//! accepts the syntax of any of them, while [`Makefile::parse_with_variant`]
+//! only accepts what that variant does. Methods that interpret text, such
+//! as [`Rule::targets`], read it the way GNU make does; their `_for`
+//! counterparts, such as [`Rule::targets_for`], take the variant to use.
+//!
+//! # Example
 //!
 //! ```rust
+//! use makefile_lossless::Makefile;
+//!
 //! let contents = r#"PYTHON = python3
 //!
 //! .PHONY: all
@@ -15,9 +45,41 @@
 //! build:
 //! 	$(PYTHON) setup.py build
 //! "#;
-//! let makefile: makefile_lossless::Makefile = contents.parse().unwrap();
+//! let parsed = Makefile::parse(contents);
+//! assert!(parsed.ok());
+//! let makefile = parsed.tree();
+//! assert_eq!(makefile.code(), contents);
 //!
-//! assert_eq!(makefile.rules().count(), 3);
+//! let mut var = makefile.find_variable("PYTHON").next().unwrap();
+//! var.set_value("python3.13");
+//!
+//! let mut rule = makefile.find_rule_by_target("all").unwrap();
+//! rule.add_prerequisite("test").unwrap();
+//!
+//! assert_eq!(
+//!     makefile.to_string(),
+//!     r#"PYTHON = python3.13
+//!
+//! .PHONY: all
+//!
+//! all: build test
+//!
+//! build:
+//! 	$(PYTHON) setup.py build
+//! "#
+//! );
+//! ```
+//!
+//! Errors are recorded rather than raised:
+//!
+//! ```rust
+//! use makefile_lossless::Makefile;
+//!
+//! let contents = "all: build\nthis is not valid\n";
+//! let parsed = Makefile::parse(contents);
+//! assert!(!parsed.ok());
+//! assert_eq!(parsed.tree().code(), contents);
+//! assert!(contents.parse::<Makefile>().is_err());
 //! ```
 //!
 //! Editing methods that add new lines end them the same way as the first
