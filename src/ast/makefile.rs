@@ -853,6 +853,15 @@ impl ExtractFromItem for Vpath {
     }
 }
 
+impl ExtractFromItem for Load {
+    fn extract(item: MakefileItem) -> Option<Self> {
+        match item {
+            MakefileItem::Load(l) => Some(l),
+            _ => None,
+        }
+    }
+}
+
 impl ExtractFromItem for ExpressionStatement {
     fn extract(item: MakefileItem) -> Option<Self> {
         match item {
@@ -1201,6 +1210,22 @@ impl Makefile {
     /// assert_eq!(patterns, vec![Some("%.c".to_string()), Some("%.h".to_string())]);
     /// ```
     pub fn vpaths(&self) -> impl Iterator<Item = Vpath> + '_ {
+        RecursiveItemsIter::new(self.items())
+    }
+
+    /// Get all `load` directives in the makefile, including those in
+    /// conditionals, in source order.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "load a.so\nifdef X\n-load b.so\nendif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let objects: Vec<_> = makefile.loads().map(|l| l.objects()).collect();
+    /// assert_eq!(objects, vec![vec!["a.so".to_string()], vec!["b.so".to_string()]]);
+    /// ```
+    pub fn loads(&self) -> impl Iterator<Item = Load> + '_ {
         RecursiveItemsIter::new(self.items())
     }
 
@@ -3818,6 +3843,25 @@ override_dh_auto_configure:
                 .map(|r| r.text())
                 .collect::<Vec<_>>(),
             vec!["echo ${f}", "echo x", "echo y"]
+        );
+    }
+
+    #[test]
+    fn test_loads() {
+        let makefile: Makefile =
+            "load a.so\nifdef X\n-load b.so c.so\nelse\nifdef Y\nload d.so\nendif\nendif\nall:\n\techo\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            makefile
+                .loads()
+                .map(|l| (l.objects(), l.is_optional()))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec!["a.so".to_string()], false),
+                (vec!["b.so".to_string(), "c.so".to_string()], true),
+                (vec!["d.so".to_string()], false),
+            ]
         );
     }
 
