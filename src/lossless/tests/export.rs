@@ -559,7 +559,8 @@ fn test_bare_export_later_keywords_are_names() {
 #[test]
 fn test_bare_modifier_not_export_is_error() {
     // GNU make: "missing separator", since only `export` and `unexport`
-    // can appear without an assignment.
+    // can appear without an assignment. It reads the line as a rule, as
+    // does BSD make ("Need an operator").
     for code in [
         "override export X\n",
         "private export X\n",
@@ -567,14 +568,46 @@ fn test_bare_modifier_not_export_is_error() {
         "override export\n",
         "override X\n",
         "private X # c\n",
+        "override a b\n",
+        "override a(b c) = 2\n",
+        "private a(b c) = 2\n",
+        "private a(b c) += 2\n",
+        "override private a b = 2\n",
+        "override\n",
+        "private # c\n",
     ] {
-        let parsed = parse(code, Some(MakefileVariant::GNUMake));
-        assert_eq!(
-            vec![ParseErrorKind::ExpectedAssignmentOperator],
-            parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>(),
-            "{code:?}"
-        );
-        assert_eq!(code, parsed.root().to_string());
+        for variant in [Some(MakefileVariant::GNUMake), None] {
+            let parsed = parse(code, variant);
+            assert_eq!(
+                vec![ParseErrorKind::MissingSeparator],
+                parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>(),
+                "{code:?} {variant:?}"
+            );
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            assert_eq!(
+                0,
+                root.variable_definitions().count(),
+                "{code:?} {variant:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_modifier_assignment_name_without_whitespace() {
+    for (code, name) in [
+        ("override a(b) = 2\n", "a(b)"),
+        ("private a$(x y) = 2\n", "a$(x y)"),
+        ("override export a = 2\n", "a"),
+    ] {
+        for variant in [Some(MakefileVariant::GNUMake), None] {
+            let parsed = parse(code, variant);
+            assert_eq!(parsed.errors, vec![], "{code:?}");
+            let var = parsed.root().variable_definitions().next().unwrap();
+            assert_eq!(Some(name.to_string()), var.name(), "{code:?}");
+            assert_eq!(Some("2".to_string()), var.raw_value(), "{code:?}");
+        }
     }
 }
 

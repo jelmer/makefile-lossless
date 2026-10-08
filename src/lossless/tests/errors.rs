@@ -1098,7 +1098,7 @@ fn test_bsd_commands_after_invalid_dependency_line() {
 fn test_error_kind_variables_and_directives() {
     assert_eq!(
         error_kinds("override FOO bar\n", None),
-        vec![ParseErrorKind::ExpectedAssignmentOperator]
+        vec![ParseErrorKind::MissingSeparator]
     );
     assert_eq!(
         error_kinds("define\nendef\n", None),
