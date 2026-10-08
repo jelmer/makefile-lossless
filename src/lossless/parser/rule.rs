@@ -379,6 +379,21 @@ impl Parser<'_> {
         let has_target = self.at_dependency_operator() || self.parse_rule_targets();
         self.builder.finish_node();
 
+        // GNU make likewise reads `one two := three` as the dependency
+        // operator `:` followed by a target-specific assignment with an
+        // empty variable name, which is an error.
+        if has_target && self.variant == Some(MakefileVariant::GNUMake) {
+            self.skip_ws();
+            if let Some((OPERATOR, op @ (":=" | "::=" | ":::="))) = self.current_token() {
+                let split = if op.starts_with("::") { 2 } else { 1 };
+                let (dependency_op, assignment_op) = op.split_at(split);
+                self.replace_current_token(vec![
+                    (OPERATOR, dependency_op),
+                    (OPERATOR, assignment_op),
+                ]);
+            }
+        }
+
         // BSD make reads `one two:=three` as the dependency operator `:`
         // followed by a target-local assignment `=three` with an empty
         // variable name, which it ignores. Likewise `:::=` is `::`
@@ -551,9 +566,12 @@ impl Parser<'_> {
             tokens.next();
             Self::skip_ws_and_continuation_tokens(&mut tokens);
         }
-        // GNU make starts the recipe at a `;` before the operator.
-        if Self::skip_variable_name(&mut tokens, true) != Some(true) {
-            return false;
+        // GNU make starts the recipe at a `;` before the operator. It reads
+        // an empty name too, and then reports an error.
+        match Self::skip_variable_name(&mut tokens, true) {
+            Some(true) => {}
+            Some(false) if self.variant == Some(MakefileVariant::GNUMake) => {}
+            _ => return false,
         }
         Self::skip_ws_and_continuation_tokens(&mut tokens);
         tokens
@@ -679,8 +697,14 @@ impl Parser<'_> {
             self.bump();
             self.skip_ws_and_continuations();
         }
-        self.parse_variable_name();
+        let has_name = self.parse_variable_name();
         self.skip_ws_and_continuations();
+        if !has_name {
+            self.record_error(
+                ParseErrorKind::ExpectedVariableName,
+                "empty variable name".to_string(),
+            );
+        }
         // Assignment operator.
         if self.current() == Some(OPERATOR) {
             self.bump();
