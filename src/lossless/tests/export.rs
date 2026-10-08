@@ -269,14 +269,9 @@ fn test_export_names_with_computed_name() {
 fn test_export_multiple_words_with_assignment() {
     // GNU make exports the words "A", "B", "=" and "x"
     let parsed = parse("export A B = x\n", None);
-    assert_eq!(
-        parsed
-            .errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>(),
-        vec!["expected assignment operator"]
-    );
+    assert_eq!(parsed.errors, vec![]);
+    let var = parsed.root().variable_definitions().next().unwrap();
+    assert_eq!(var.names().collect::<Vec<_>>(), vec!["A", "B", "=", "x"]);
 }
 
 #[test]
@@ -681,4 +676,126 @@ fn test_name_ranges_match_name_range() {
             "{code:?}"
         );
     }
+}
+
+#[test]
+fn test_bare_export_name_list_with_any_characters() {
+    // When the rest of the line is not a variable assignment as GNU make
+    // reads it, which allows no whitespace in the name, an `export` or
+    // `unexport` directive lists the whitespace-separated words as names,
+    // whatever characters they contain.
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(usize, usize)]);
+    let cases: &[Case] = &[
+        ("export a(b c)\n", &["a(b", "c)"], &[(7, 10), (11, 13)]),
+        (
+            "export a b = 2\n",
+            &["a", "b", "=", "2"],
+            &[(7, 8), (9, 10), (11, 12), (13, 14)],
+        ),
+        (
+            "unexport a(b c) = 2\n",
+            &["a(b", "c)", "=", "2"],
+            &[(9, 12), (13, 15), (16, 17), (18, 19)],
+        ),
+        (
+            "export a b := 2 # c\n",
+            &["a", "b", ":=", "2"],
+            &[(7, 8), (9, 10), (11, 13), (14, 15)],
+        ),
+        (
+            "export a b: c\n",
+            &["a", "b:", "c"],
+            &[(7, 8), (9, 11), (12, 13)],
+        ),
+        (
+            "export a (b) = 2\n",
+            &["a", "(b)", "=", "2"],
+            &[(7, 8), (9, 12), (13, 14), (15, 16)],
+        ),
+        (
+            "export a b = $(x y)\n",
+            &["a", "b", "=", "$(x y)"],
+            &[(7, 8), (9, 10), (11, 12), (13, 19)],
+        ),
+        (
+            "export a\\\n b = 2\n",
+            &["a", "b", "=", "2"],
+            &[(7, 8), (11, 12), (13, 14), (15, 16)],
+        ),
+    ];
+    for &(code, names, ranges) in cases {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let vars: Vec<_> = root.variable_definitions().collect();
+        assert_eq!(1, vars.len(), "{code:?}");
+        let var = &vars[0];
+        assert_eq!(names, var.names().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(ranges, name_ranges(var), "{code:?}");
+        assert_eq!(Some(names[0].to_string()), var.name(), "{code:?}");
+        assert_eq!(None, var.assignment_operator(), "{code:?}");
+        assert_eq!(None, var.raw_value(), "{code:?}");
+    }
+}
+
+#[test]
+fn test_bare_export_name_list_auto() {
+    // Without a variant, a line that BSD make reads as an assignment stays
+    // one, but other lines are read as GNU make does.
+    let cases: &[(&str, &[&str], Option<&str>)] = &[
+        ("export a(b c)\n", &["a(b", "c)"], None),
+        ("export a b = 2\n", &["a", "b", "=", "2"], None),
+        ("export a(b c) = 2\n", &["a(b c)"], Some("2")),
+    ];
+    for &(code, names, value) in cases {
+        let parsed = parse(code, None);
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let var = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(names, var.names().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(value.map(str::to_string), var.raw_value(), "{code:?}");
+    }
+}
+
+#[test]
+fn test_export_assignment_name_without_whitespace() {
+    // GNU make only reads whitespace inside a variable reference as part
+    // of the name, so these are assignments.
+    for (code, name) in [
+        ("export a(b) = 2\n", "a(b)"),
+        ("export a$(x y) = 2\n", "a$(x y)"),
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let var = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(vec![name], var.names().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(Some("2".to_string()), var.raw_value(), "{code:?}");
+    }
+}
+
+#[test]
+fn test_bare_export_with_colon() {
+    // GNU make reads a line starting with `export` or `unexport` that is
+    // not an assignment as a directive, even with a colon in it.
+    for (code, names) in [
+        ("export a: b\n", vec!["a:", "b"]),
+        ("unexport a:: b\n", vec!["a::", "b"]),
+        ("export : foo\n", vec![":", "foo"]),
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        assert_eq!(0, root.rules().count(), "{code:?}");
+        let var = root.variable_definitions().next().unwrap();
+        assert_eq!(names, var.names().collect::<Vec<_>>(), "{code:?}");
+    }
+    // A keyword followed by an assignment operator is the variable name.
+    let parsed = parse("export := 1\n", Some(MakefileVariant::GNUMake));
+    assert_eq!(parsed.errors, vec![]);
+    let var = parsed.root().variable_definitions().next().unwrap();
+    assert_eq!(Some("export".to_string()), var.name());
+    // BSD make reads these as rules, so without a variant they stay rules.
+    let parsed = parse("export a: b\n", None);
+    assert_eq!(1, parsed.root().rules().count());
 }

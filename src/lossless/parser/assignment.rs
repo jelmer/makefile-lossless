@@ -23,7 +23,8 @@ impl Parser<'_> {
 
     /// Whether the current token is an `export`/`unexport`/`override`/
     /// `private` modifier. A keyword directly followed by an operator is the
-    /// variable name itself, as in `override := 1`.
+    /// variable name itself, as in `override := 1`, except that GNU make
+    /// reads `export : x` as an `export` directive.
     fn at_assignment_prefix_keyword(&self) -> bool {
         let enabled = match self.current_token() {
             Some((IDENTIFIER, "export")) if self.is_bsd_make() => true,
@@ -32,7 +33,9 @@ impl Parser<'_> {
             }
             _ => false,
         };
-        enabled && self.peek_past_ws() != Some(OPERATOR)
+        enabled
+            && (self.peek_past_ws() != Some(OPERATOR)
+                || self.gnu_export_keyword_at(self.tokens.len()))
     }
 
     pub(super) fn parse_assignment(&mut self) {
@@ -80,6 +83,20 @@ impl Parser<'_> {
                 "empty variable name".to_string(),
             );
             self.expect_eol();
+            self.builder.finish_node();
+            return;
+        }
+        // GNU make reads the rest of an `export` or `unexport` line that
+        // is not an assignment as a list of names, whatever characters
+        // they contain: `export a b = 2` exports "a", "b", "=" and "2".
+        if is_export_directive
+            && !bare_needs_export
+            && !is_undefine
+            && self.gnu_directives_enabled()
+            && !self.at_gnu_assignment()
+            && !(self.bsd_directives_enabled() && self.is_bsd_assignment_line())
+        {
+            self.parse_export_name_list();
             self.builder.finish_node();
             return;
         }
@@ -132,10 +149,8 @@ impl Parser<'_> {
         // Skip whitespace and parse operator
         self.skip_ws_and_continuations();
 
-        // A bare "export"/"unexport" directive may list several variables.
-        // With an operator, as in `export A B = x`, GNU make exports each
-        // word, including "=" and "x"; that is almost certainly a mistake,
-        // so leave it to the operator check below to report.
+        // A bare "export"/"unexport" directive in BSD make may list several
+        // variables.
         if is_export_directive && !self.has_assignment_operator_on_line() {
             loop {
                 match self.current() {
@@ -182,6 +197,23 @@ impl Parser<'_> {
         }
 
         self.builder.finish_node();
+    }
+
+    /// Parse the names of a bare `export` or `unexport` directive through
+    /// the end of the line. Operators in a name are read as part of it,
+    /// so that the line has no assignment operator.
+    fn parse_export_name_list(&mut self) {
+        loop {
+            match self.current() {
+                None | Some(NEWLINE | COMMENT) => break,
+                Some(DOLLAR) => self.parse_variable_reference(),
+                Some(OPERATOR) => self.bump_as(IDENTIFIER),
+                Some(WHITESPACE) => self.skip_ws(),
+                _ if self.consume_line_continuation() => {}
+                _ => self.bump(),
+            }
+        }
+        self.expect_eol();
     }
 
     /// Parse a variable name, which may be built from several parts such

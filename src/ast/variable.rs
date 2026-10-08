@@ -383,6 +383,16 @@ impl VariableDefinition {
                 it.as_token()
                     .is_some_and(|t| t.kind() == OPERATOR && is_assignment_operator(t.text()))
             });
+        // The names of a bare `export` or `unexport` directive are just
+        // separated by whitespace, as in `export a(b c)`.
+        if operator.is_none() && self.is_bare_export_directive() {
+            return self
+                .after_directive_keywords()
+                .take_while(|it| {
+                    !matches!(it.kind(), WHITESPACE | NEWLINE | COMMENT) && !is_continuation(it)
+                })
+                .collect();
+        }
         // BSD make names may contain almost any character, as in `EXP.[A-]`
         // or `a:b`, including whitespace inside parentheses and braces.
         let mut elements: Vec<_> = self
@@ -419,6 +429,19 @@ impl VariableDefinition {
         elements
     }
 
+    /// Internal: whether this is an `export` or `unexport` directive
+    /// without an assignment, which lists names.
+    fn is_bare_export_directive(&self) -> bool {
+        let keywords = self.directive_keywords();
+        keywords
+            .first()
+            .is_some_and(|t| matches!(t.text(), "export" | "unexport"))
+            && !keywords
+                .iter()
+                .any(|t| matches!(t.text(), "define" | "undefine"))
+            && self.assignment_operator_kind().is_none()
+    }
+
     /// Internal: the children following the directive keywords and any
     /// whitespace around them.
     fn after_directive_keywords(&self) -> impl Iterator<Item = crate::lossless::SyntaxElement> {
@@ -433,6 +456,9 @@ impl VariableDefinition {
     /// Internal: the EXPR node holding the value, which follows the name
     /// (or, for BSD make's empty variable name, the assignment operator).
     pub(crate) fn value_expr(&self) -> Option<crate::lossless::SyntaxNode> {
+        if self.is_bare_export_directive() {
+            return None;
+        }
         let name_end = match self.name_elements().last() {
             Some(element) => element.index(),
             None => self
@@ -480,7 +506,9 @@ impl VariableDefinition {
     /// Usually this is just [`Self::name`], but a bare `export` or
     /// `unexport` directive can list several variables. As in GNU make,
     /// only its first word is a keyword, so `unexport export X` lists
-    /// "export" and "X". An `undefine` or `define` directive always has a
+    /// "export" and "X". The names are separated by whitespace and may
+    /// contain any other characters, so `export a(b c) = 2` lists "a(b",
+    /// "c)", "=" and "2". An `undefine` or `define` directive always has a
     /// single name, as in `undefine A B`, which yields just "A B".
     ///
     /// # Example
@@ -527,8 +555,14 @@ impl VariableDefinition {
         }
         let mut names = Vec::new();
         let mut current: Option<(String, rowan::TextRange)> = None;
+        let bare_export = self.is_bare_export_directive();
         for it in self.after_directive_keywords().take_while(|it| {
-            matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE) || is_continuation(it)
+            if bare_export {
+                !matches!(it.kind(), NEWLINE | COMMENT) || is_continuation(it)
+            } else {
+                matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE)
+                    || is_continuation(it)
+            }
         }) {
             if it.kind() == WHITESPACE || is_continuation(&it) {
                 names.extend(current.take());
