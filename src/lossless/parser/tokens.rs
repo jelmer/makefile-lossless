@@ -56,7 +56,14 @@ impl<'a> Parser<'a> {
     /// Replace the current token with `tokens`, which make up its text,
     /// given in forward order.
     pub(super) fn replace_current_token(&mut self, tokens: Vec<(SyntaxKind, &'a str)>) {
-        let start = self.pop_token().unwrap().start;
+        self.replace_next_tokens(1, tokens);
+    }
+
+    /// Replace the next `count` tokens with `tokens`, which make up their
+    /// text, given in forward order.
+    pub(super) fn replace_next_tokens(&mut self, count: usize, tokens: Vec<(SyntaxKind, &'a str)>) {
+        let start = self.current_range().start();
+        self.pop_tokens(count);
         self.tokens.extend(token_stack(start, tokens));
     }
 

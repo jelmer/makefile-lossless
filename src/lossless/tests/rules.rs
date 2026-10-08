@@ -260,6 +260,115 @@ fn test_parse_grouped_targets() {
 }
 
 #[test]
+fn test_grouped_targets_before_assignment_operator() {
+    // GNU make takes the `&:` in `a b &:= 2` as the grouped targets
+    // operator, so the line means the same as `a b &: = 2`.
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        for (code, spaced, targets, operator) in [
+            (
+                "a b &:= 2\n",
+                "a b &: = 2\n",
+                vec!["a", "b"],
+                crate::RuleOperator::GroupedColon,
+            ),
+            (
+                "a b&:=2\n",
+                "a b&: =2\n",
+                vec!["a", "b"],
+                crate::RuleOperator::GroupedColon,
+            ),
+            (
+                "a &:= 2\n",
+                "a &: = 2\n",
+                vec!["a"],
+                crate::RuleOperator::GroupedColon,
+            ),
+            (
+                "a b &::= 2\n",
+                "a b &:: = 2\n",
+                vec!["a", "b"],
+                crate::RuleOperator::GroupedDoubleColon,
+            ),
+            (
+                "a b &:::= 2\n",
+                "a b &:: := 2\n",
+                vec!["a", "b"],
+                crate::RuleOperator::GroupedDoubleColon,
+            ),
+        ] {
+            let parsed = parse(code, variant);
+            let root = parsed.root();
+            assert_eq!(code, root.to_string());
+            let rules: Vec<_> = root.rules().collect();
+            assert_eq!(1, rules.len(), "{variant:?} {code:?}");
+            assert_eq!(
+                targets,
+                rules[0].targets().collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
+            assert_eq!(Some(operator), rules[0].operator(), "{variant:?} {code:?}");
+
+            let spaced_parsed = parse(spaced, variant);
+            let spaced_rule = spaced_parsed.root().rules().next().unwrap();
+            assert_eq!(
+                spaced_parsed
+                    .errors
+                    .iter()
+                    .map(|e| e.kind)
+                    .collect::<Vec<_>>(),
+                parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
+            assert_eq!(
+                spaced_rule.prerequisites().collect::<Vec<_>>(),
+                rules[0].prerequisites().collect::<Vec<_>>(),
+                "{variant:?} {code:?}"
+            );
+            let assignment = |rule: &Rule| {
+                rule.scoped_assignment()
+                    .map(|var| (var.name(), var.assignment_operator(), var.raw_value()))
+            };
+            assert_eq!(
+                assignment(&spaced_rule),
+                assignment(&rules[0]),
+                "{variant:?} {code:?}"
+            );
+        }
+    }
+
+    // Without a known variant, `= 2` is read as in `a b &: = 2`.
+    let parsed = parse("a b &:= 2\n", None);
+    assert_eq!(parsed.errors, vec![]);
+    let rule = parsed.root().rules().next().unwrap();
+    assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["=", "2"]);
+    assert_eq!(rule.scoped_assignment(), None);
+
+    // In an assignment, the `&` is part of the variable name.
+    for variant in [None, Some(MakefileVariant::GNUMake)] {
+        let parsed = parse("X&:=y\n", variant);
+        assert_eq!(parsed.errors, vec![], "{variant:?}");
+        let var = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(var.name(), Some("X&".to_string()), "{variant:?}");
+        assert_eq!(var.assignment_operator(), Some(":=".to_string()));
+    }
+}
+
+#[test]
+fn test_ampersand_before_assignment_operator_in_bsd_make() {
+    // BSD make has no grouped targets, so `&` is a target.
+    let parsed = parse("a b &:= 2\n", Some(MakefileVariant::BSDMake));
+    assert_eq!(parsed.errors, vec![]);
+    let rule = parsed.root().rules().next().unwrap();
+    assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a", "b", "&"]);
+    assert_eq!(rule.operator(), Some(crate::RuleOperator::Colon));
+    assert_eq!(rule.prerequisites().count(), 0);
+    let var = rule.scoped_assignment().unwrap();
+    assert_eq!(var.name(), None);
+    assert_eq!(var.assignment_operator(), Some("=".to_string()));
+    assert_eq!(var.raw_value(), Some("2".to_string()));
+}
+
+#[test]
 fn test_directive_names_as_targets() {
     // Make only takes a word as a directive if whitespace, a comment or
     // the end of the line follows it.

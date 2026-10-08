@@ -790,6 +790,28 @@ impl Parser<'_> {
             )
     }
 
+    /// GNU make reads the `&:` in `a b &:= 2` as the grouped targets
+    /// operator, followed by `=`. The lexer instead takes the `&` as text,
+    /// as it is part of the name in an assignment such as `X&:=y`. If the
+    /// current token is such an `&`, split the tokens as GNU make does.
+    fn split_grouped_targets_operator(&mut self) -> bool {
+        if !matches!(self.variant, None | Some(MakefileVariant::GNUMake)) || !self.at(TEXT, "&") {
+            return false;
+        }
+        let Some((OPERATOR, op @ (":=" | "::=" | ":::="))) = self.upcoming().nth(1) else {
+            return false;
+        };
+        // `&:::=` is `&::` followed by `:=`.
+        let colons = (op.len() - 1).min(2);
+        let text = self.next_tokens_text(2);
+        let (dependency_op, assignment_op) = text.split_at(1 + colons);
+        self.replace_next_tokens(
+            2,
+            vec![(OPERATOR, dependency_op), (OPERATOR, assignment_op)],
+        );
+        true
+    }
+
     fn parse_rule_targets(&mut self) -> bool {
         // As in parse_prerequisite_word, whether a `(` here starts the
         // member list of an archive member target.
@@ -808,8 +830,8 @@ impl Parser<'_> {
                 seen_archive = false;
             }
 
-            // Check if we're at a colon
-            if self.at(OPERATOR, ":") {
+            // Stop at a colon, or at the `&:` of `&:=`.
+            if self.at(OPERATOR, ":") || self.split_grouped_targets_operator() {
                 break;
             }
 
