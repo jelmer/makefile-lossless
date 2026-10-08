@@ -162,7 +162,7 @@ fn starts_line(prev: Option<&SyntaxToken>) -> bool {
 
 /// The indentation before `node`, if it starts a line.
 pub(crate) fn line_indent(node: &SyntaxNode) -> Option<SyntaxToken> {
-    let indent = prev_token(&node.first_token()?)?;
+    let indent = prev_token(&first_token(node)?)?;
     (indent.kind() == WHITESPACE && starts_line(prev_token(&indent).as_ref())).then_some(indent)
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn lines_above(node: &SyntaxNode) -> Vec<LineAbove> {
         return lines;
     };
     let in_parent = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == parent);
-    let Some(first) = node.first_token() else {
+    let Some(first) = first_token(node) else {
         return lines;
     };
     let mut prev = match line_indent(node) {
@@ -506,6 +506,15 @@ fn holds_line_break(kind: SyntaxKind) -> bool {
             | LOAD
             | BLANK_LINE
     )
+}
+
+/// The first token in `node`.
+///
+/// Like [`last_token`], this skips empty nodes, such as the targets of
+/// `: x`, where rowan's `SyntaxNode::first_token` returns None.
+fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    node.descendants_with_tokens()
+        .find_map(|it| it.into_token())
 }
 
 /// The last token in `node`.
@@ -973,5 +982,33 @@ mod tests {
         );
         assert_eq!(makefile.to_string(), "X= # c\nall:\n");
         assert_eq!(last.parent().as_ref(), Some(variable.syntax()));
+    }
+
+    // A rule without targets, as in `: x`, starts with an empty TARGETS node.
+    #[test]
+    fn test_doc_comments_rule_without_targets() {
+        let makefile: Makefile = "a:\n# doc\n: x\n".parse().unwrap();
+        let item = makefile.items().nth(1).unwrap();
+        assert_eq!(item.doc_comments().collect::<Vec<_>>(), vec!["doc"]);
+        assert_eq!(item.preceding_comments().collect::<Vec<_>>(), vec!["doc"]);
+    }
+
+    #[test]
+    fn test_remove_rule_without_targets() {
+        let makefile: Makefile = "a:\n\n# doc\n  : x\n".parse().unwrap();
+        let rule = makefile.rules().nth(1).unwrap();
+        rule.remove().unwrap();
+        assert_eq!(makefile.to_string(), "a:\n");
+    }
+
+    #[test]
+    fn test_insert_before_rule_without_targets() {
+        let makefile: Makefile = "a:\n\techo\n# doc\n: x\n".parse().unwrap();
+        let new: Makefile = "B = 1\n".parse().unwrap();
+        let new = new.variable_definitions().next().unwrap();
+        let mut item = makefile.items().nth(1).unwrap();
+        item.insert_before(crate::MakefileItem::Variable(new))
+            .unwrap();
+        assert_eq!(makefile.to_string(), "a:\n\techo\nB = 1\n# doc\n: x\n");
     }
 }
