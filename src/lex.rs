@@ -831,6 +831,8 @@ impl<'a> Lexer<'a> {
                     '&' if self.gnu => {
                         // `&:` and `&::` separate grouped targets from their
                         // prerequisites; any other `&` is just a character.
+                        // In `&:=`, the `&` may end a variable name, so the
+                        // parser forms the `&:` in rules instead.
                         let mut probe = self.input.clone();
                         probe.next();
                         let mut colons = 0;
