@@ -518,6 +518,39 @@ impl Parser<'_> {
             && !matches!(words.next(), Some((OPERATOR, _)))
     }
 
+    /// Whether the line starting at `end - 1` in the token stack starts
+    /// with an `override` or `private` modifier but is not an assignment as
+    /// GNU make reads it: the modifiers must be followed by a name without
+    /// whitespace and an assignment operator. Like a line without an
+    /// operator, GNU make reads such a line as a rule, so `override X` and
+    /// `private a(b c) = 2` are missing a separator.
+    fn override_or_private_not_assignment_at(&self, end: usize) -> bool {
+        if !self.keyword_at(end, &["override", "private"]) {
+            return false;
+        }
+        let mut tokens = self.upcoming_from(end).peekable();
+        loop {
+            let is_modifier = matches!(
+                tokens.peek(),
+                Some((IDENTIFIER, text)) if is_assignment_modifier(text)
+            );
+            let mut after = tokens.clone();
+            after.next();
+            if !is_modifier
+                || !Self::skip_ws_and_continuation_tokens(&mut after)
+                || matches!(after.peek(), Some((OPERATOR, _)))
+            {
+                break;
+            }
+            tokens = after;
+        }
+        if Self::skip_variable_name(&mut tokens, false).is_none() {
+            return true;
+        }
+        Self::skip_ws_and_continuation_tokens(&mut tokens);
+        !matches!(tokens.next(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op))
+    }
+
     /// Whether the line is a variable assignment for the variant being
     /// parsed. BSD make only follows its own rule, so that `x{ = 1` is
     /// an assignment for GNU make but not for BSD make.
@@ -542,6 +575,9 @@ impl Parser<'_> {
             return true;
         }
         let gnu = self.gnu_directives_enabled();
+        if gnu && self.override_or_private_not_assignment_at(end) {
+            return false;
+        }
         let is_directive = |text: &str| gnu && is_assignment_modifier(text);
         let mut tokens = self.upcoming_from(end).peekable();
         let mut seen_name = false;
