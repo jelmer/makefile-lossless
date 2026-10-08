@@ -616,6 +616,73 @@ fn test_line_continuations_escaped_backslash() {
     assert_eq!(continuations("A = a \\", MakefileVariant::GNUMake), vec![]);
 }
 
+/// The text before the trailing backslash of `text`, if it has one.
+fn trailing_backslash(text: &str, variant: MakefileVariant) -> Option<&str> {
+    let makefile = Makefile::parse_with_variant(text, variant).tree();
+    let range = makefile.trailing_backslash_range()?;
+    assert_eq!(makefile.line_continuations().count(), 0, "{text:?}");
+    assert_eq!(&text[range], "\\", "{text:?}");
+    assert_eq!(usize::from(range.end()), text.len(), "{text:?}");
+    Some(&text[..usize::from(range.start())])
+}
+
+#[test]
+fn test_trailing_backslash_range() {
+    for (text, expected) in [
+        ("X = a \\", Some("X = a ")),
+        ("X = a\\", Some("X = a")),
+        ("X = a \\\\", None),
+        ("X = a \\\\\\", Some("X = a \\\\")),
+        ("X = \\", Some("X = ")),
+        ("\\", Some("")),
+        ("X = a \\\n", None),
+        ("X = a \\\r\n", None),
+        ("X = a \\ ", None),
+        ("X = a", None),
+        ("", None),
+        ("all: a \\", Some("all: a ")),
+        ("all: a\\", Some("all: a")),
+        ("all:\n\techo a \\", Some("all:\n\techo a ")),
+        ("all:\n\techo a \\\\", None),
+        ("all:\n\techo a \\\\\\", Some("all:\n\techo a \\\\")),
+        ("# c \\", Some("# c ")),
+        ("# c \\\\", None),
+        ("define X\na \\", Some("define X\na ")),
+        ("include a.mk \\", Some("include a.mk ")),
+        ("\r\n\\", Some("\r\n")),
+    ] {
+        assert_eq!(
+            trailing_backslash(text, MakefileVariant::GNUMake),
+            expected,
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn test_trailing_backslash_range_after_continuation() {
+    let makefile: Makefile = "X = a \\\n  b \\".parse().unwrap();
+    assert_eq!(
+        makefile.line_continuations().collect::<Vec<_>>(),
+        vec![rowan::TextRange::new(6.into(), 8.into())]
+    );
+    assert_eq!(
+        makefile.trailing_backslash_range(),
+        Some(rowan::TextRange::new(12.into(), 13.into()))
+    );
+}
+
+#[test]
+fn test_trailing_backslash_range_nmake() {
+    for (text, expected) in [("X = a \\", Some("X = a ")), ("X = a ^\\", None)] {
+        assert_eq!(
+            trailing_backslash(text, MakefileVariant::NMake),
+            expected,
+            "{text:?}"
+        );
+    }
+}
+
 #[test]
 fn test_line_continuations_crlf() {
     let text = "A = a \\\r\n  b\r\n# c \\\r\n d\r\nall:\r\n\techo \\\r\n\t  e\r\n";

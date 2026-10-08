@@ -244,6 +244,53 @@ impl Makefile {
             .filter_map(|it| it.into_token())
             .flat_map(|token| token_continuations(&token))
     }
+
+    /// The source range of a backslash that ends the input without a line
+    /// ending after it, unless it is escaped by another backslash.
+    ///
+    /// Such a backslash does not continue the line, so
+    /// [`Self::line_continuations`] does not report it. GNU make keeps it
+    /// as a literal backslash: `X = a \` at the end of a file without a
+    /// final newline sets `X` to `a \`, while with a newline after it, the
+    /// backslash continues the line and `X` is `a `. BSD make drops it in
+    /// both cases. Code that adds a final newline, such as a formatter,
+    /// can use this to avoid changing the meaning of the makefile.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    ///
+    /// let makefile: Makefile = "X = a \\".parse().unwrap();
+    /// assert_eq!(
+    ///     makefile.trailing_backslash_range(),
+    ///     Some(TextRange::new(6.into(), 7.into()))
+    /// );
+    /// let makefile: Makefile = "X = a \\\n".parse().unwrap();
+    /// assert_eq!(makefile.trailing_backslash_range(), None);
+    /// ```
+    pub fn trailing_backslash_range(&self) -> Option<rowan::TextRange> {
+        // Not last_token(), as the tree may end in an empty error node.
+        let last = self
+            .0
+            .token_at_offset(self.0.text_range().end())
+            .left_biased()?;
+        let mut count = 0;
+        for token in std::iter::successors(Some(last.clone()), |t| t.prev_token()) {
+            // An nmake `^\` escapes the backslash.
+            if token.text() == "^\\" {
+                break;
+            }
+            let text = token.text();
+            let backslashes = text.len() - text.trim_end_matches('\\').len();
+            count += backslashes;
+            if backslashes < text.len() {
+                break;
+            }
+        }
+        let end = last.text_range().end();
+        crate::syntax_rules::last_backslash_unescaped(count)
+            .then(|| rowan::TextRange::new(end - rowan::TextSize::from(1), end))
+    }
 }
 
 /// The line continuations within or starting in `token`.
