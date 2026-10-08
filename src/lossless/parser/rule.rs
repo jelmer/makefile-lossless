@@ -129,17 +129,8 @@ impl Parser<'_> {
                 continue;
             }
             match self.current() {
-                Some(IDENTIFIER) | Some(TEXT) => {
-                    self.builder.start_node(ARCHIVE_MEMBER.into());
-                    self.bump();
-                    self.builder.finish_node();
-                }
                 Some(WHITESPACE) => self.bump(),
-                Some(DOLLAR) => {
-                    self.builder.start_node(ARCHIVE_MEMBER.into());
-                    self.parse_variable_reference();
-                    self.builder.finish_node();
-                }
+                Some(IDENTIFIER | TEXT | DOLLAR) => self.parse_archive_member(),
                 _ => break,
             }
         }
@@ -155,6 +146,21 @@ impl Parser<'_> {
                 "expected ')' to close archive member".to_string(),
             );
         }
+    }
+
+    /// Parse one member of an archive member list. Members are split at
+    /// whitespace only, so a variable reference is part of the word
+    /// around it, as in `a$(X).o`.
+    fn parse_archive_member(&mut self) {
+        self.builder.start_node(ARCHIVE_MEMBER.into());
+        loop {
+            match self.current() {
+                Some(IDENTIFIER | TEXT) => self.bump(),
+                Some(DOLLAR) => self.parse_variable_reference(),
+                _ => break,
+            }
+        }
+        self.builder.finish_node();
     }
 
     /// Parse a rule's prerequisites. If `target_locals` is set, stop at
