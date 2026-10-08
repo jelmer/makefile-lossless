@@ -1337,3 +1337,60 @@ fn test_variable_name_starting_with_bracket() {
         }
     }
 }
+
+#[test]
+fn test_target_specific_empty_name_gnu() {
+    // GNU make reads these as rules with a target-specific assignment to a
+    // variable with an empty name, which is an error ("empty variable
+    // name"). A `:=` after targets is the dependency operator `:` followed
+    // by `=`, and `:::=` is `::` followed by `:=`.
+    for (code, targets, op, error_range) in [
+        ("a(b c) := 2\n", vec!["a(b c)"], "=", (8, 9)),
+        ("a b := 2\n", vec!["a", "b"], "=", (5, 6)),
+        ("a b:= 2\n", vec!["a", "b"], "=", (4, 5)),
+        ("a(b c) ::= 2\n", vec!["a(b c)"], "=", (9, 10)),
+        ("a b :::= 2\n", vec!["a", "b"], ":=", (6, 8)),
+        ("a b :=\n", vec!["a", "b"], "=", (5, 6)),
+        ("a: = 2\n", vec!["a"], "=", (3, 4)),
+        ("a: += 2\n", vec!["a"], "+=", (3, 5)),
+        ("a: != 2\n", vec!["a"], "!=", (3, 5)),
+        ("a:: := 2\n", vec!["a"], ":=", (4, 6)),
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(
+            vec![(
+                ParseErrorKind::ExpectedVariableName,
+                rowan::TextRange::new((error_range.0 as u32).into(), (error_range.1 as u32).into())
+            )],
+            parsed
+                .positioned_errors
+                .iter()
+                .map(|e| (e.kind(), e.range))
+                .collect::<Vec<_>>(),
+            "{code:?}"
+        );
+        let root = parsed.root();
+        assert_eq!(code, root.to_string());
+        let rules: Vec<_> = root.rules().collect();
+        assert_eq!(1, rules.len(), "{code:?}");
+        assert_eq!(targets, rules[0].targets().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(0, rules[0].prerequisites().count(), "{code:?}");
+        let var = rules[0].scoped_assignment().unwrap();
+        assert_eq!(None, var.name(), "{code:?}");
+        assert_eq!(Some(op.to_string()), var.assignment_operator(), "{code:?}");
+    }
+}
+
+#[test]
+fn test_target_specific_empty_name_other_variants() {
+    // BSD make ignores a target-local assignment with an empty name.
+    for code in ["a b := 2\n", "a: = 2\n"] {
+        assert_eq!(parse(code, None).errors, vec![], "{code:?}");
+    }
+    // Without a colon in the operator, GNU make finds no separator.
+    let parsed = parse("a b != 2\n", Some(MakefileVariant::GNUMake));
+    assert_eq!(
+        vec![ParseErrorKind::MissingSeparator],
+        parsed.errors.iter().map(|e| e.kind).collect::<Vec<_>>()
+    );
+}
