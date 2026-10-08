@@ -294,4 +294,55 @@ mod tests {
         let rules: Vec<_> = parsed.root().rules().collect();
         assert_eq!(rules[0].targets().collect::<Vec<_>>(), vec!["lib(a.o b.o)"]);
     }
+
+    #[test]
+    fn test_archive_member_with_reference_inside_word() {
+        // GNU make and BSD make split the member list at whitespace only,
+        // so a reference is part of the word around it.
+        let input = "lib.a(a$(X).o b.o ${Y}c $(A)$(B) $$d): x\nall: lib.a(p$(Z) \\\n q$(W)r)\n";
+        for variant in [
+            None,
+            Some(MakefileVariant::GNUMake),
+            Some(MakefileVariant::BSDMake),
+            Some(MakefileVariant::POSIXMake),
+        ] {
+            let parsed = parse(input, variant);
+            assert_eq!(parsed.errors, vec![], "{variant:?}");
+            assert_eq!(parsed.root().syntax().to_string(), input);
+            let members: Vec<Vec<(String, String)>> = parsed
+                .root()
+                .syntax()
+                .descendants()
+                .filter_map(ArchiveMembers::cast)
+                .map(|m| {
+                    m.members()
+                        .map(|m| (m.text(), format!("{:?}", m.syntax().text_range())))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                members,
+                vec![
+                    vec![
+                        ("a$(X).o".to_string(), "6..13".to_string()),
+                        ("b.o".to_string(), "14..17".to_string()),
+                        ("${Y}c".to_string(), "18..23".to_string()),
+                        ("$(A)$(B)".to_string(), "24..32".to_string()),
+                        ("$$d".to_string(), "33..36".to_string()),
+                    ],
+                    vec![
+                        ("p$(Z)".to_string(), "52..57".to_string()),
+                        ("q$(W)r".to_string(), "61..67".to_string()),
+                    ],
+                ],
+                "{variant:?}"
+            );
+            let rules: Vec<_> = parsed.root().rules().collect();
+            assert_eq!(
+                rules[0].targets().collect::<Vec<_>>(),
+                vec!["lib.a(a$(X).o b.o ${Y}c $(A)$(B) $$d)"],
+                "{variant:?}"
+            );
+        }
+    }
 }
