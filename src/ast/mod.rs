@@ -512,7 +512,7 @@ fn holds_line_break(kind: SyntaxKind) -> bool {
 ///
 /// Like [`last_token`], this skips empty nodes, such as the targets of
 /// `: x`, where rowan's `SyntaxNode::first_token` returns None.
-fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     node.descendants_with_tokens()
         .find_map(|it| it.into_token())
 }
@@ -524,7 +524,7 @@ fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 /// prerequisites of `a:` or the value of `X =`).
 // TODO: rowan 0.18 walks past empty children, so this can probably be dropped
 // after upgrading to it.
-fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     node.descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .last()
