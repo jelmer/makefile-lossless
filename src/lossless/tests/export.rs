@@ -577,3 +577,75 @@ fn test_bare_modifier_not_export_is_error() {
         assert_eq!(code, parsed.root().to_string());
     }
 }
+
+fn name_ranges(var: &VariableDefinition) -> Vec<(usize, usize)> {
+    var.name_ranges()
+        .map(|r| (usize::from(r.start()), usize::from(r.end())))
+        .collect()
+}
+
+fn assert_name_ranges(code: &str, names: &[&str], ranges: &[(usize, usize)]) {
+    let parsed = parse(code, Some(MakefileVariant::GNUMake));
+    assert_eq!(parsed.errors, vec![], "{code:?}");
+    let var = parsed.root().variable_definitions().next().unwrap();
+    assert_eq!(names, var.names().collect::<Vec<_>>(), "{code:?}");
+    assert_eq!(ranges, name_ranges(&var), "{code:?}");
+}
+
+#[test]
+fn test_name_ranges() {
+    assert_name_ranges("export A B\n", &["A", "B"], &[(7, 8), (9, 10)]);
+    assert_name_ranges("unexport A  B\n", &["A", "B"], &[(9, 10), (12, 13)]);
+    assert_name_ranges("export\tA B # c\n", &["A", "B"], &[(7, 8), (9, 10)]);
+    assert_name_ranges("export A B", &["A", "B"], &[(7, 8), (9, 10)]);
+    assert_name_ranges(
+        "unexport export X\n",
+        &["export", "X"],
+        &[(9, 15), (16, 17)],
+    );
+    assert_name_ranges(
+        "unexport \\\n export \\\n X\n",
+        &["export", "X"],
+        &[(12, 18), (22, 23)],
+    );
+    assert_name_ranges("export A \\\n  B\n", &["A", "B"], &[(7, 8), (13, 14)]);
+    assert_name_ranges("export A\\\n B\n", &["A", "B"], &[(7, 8), (11, 12)]);
+    assert_name_ranges("export a\\ b\n", &["a\\", "b"], &[(7, 9), (10, 11)]);
+    assert_name_ranges(
+        "export A$(B C)D $(E)\n",
+        &["A$(B C)D", "$(E)"],
+        &[(7, 15), (16, 20)],
+    );
+    assert_name_ranges(
+        "export CFLAGS.${PROG} $(C)-x\n",
+        &["CFLAGS.${PROG}", "$(C)-x"],
+        &[(7, 21), (22, 28)],
+    );
+    assert_name_ranges("export\n", &[], &[]);
+    assert_name_ranges("export FOO := bar\n", &["FOO"], &[(7, 10)]);
+    assert_name_ranges("X = 1\n", &["X"], &[(0, 1)]);
+    assert_name_ranges("undefine A B\n", &["A B"], &[(9, 12)]);
+    assert_name_ranges("define A B\nx\nendef\n", &["A B"], &[(7, 10)]);
+}
+
+#[test]
+fn test_name_ranges_match_name_range() {
+    // An assignment has a single name, even if it contains characters that
+    // cannot appear in a bare export list.
+    for (code, name) in [
+        ("x{ = 1\n", "x{"),
+        ("export x{ := 1\n", "x{"),
+        ("A$(B C)D = 1\n", "A$(B C)D"),
+        ("a\\b = 1\n", "a\\b"),
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let var = parsed.root().variable_definitions().next().unwrap();
+        assert_eq!(vec![name], var.names().collect::<Vec<_>>(), "{code:?}");
+        assert_eq!(
+            vec![var.name_range().unwrap()],
+            var.name_ranges().collect::<Vec<_>>(),
+            "{code:?}"
+        );
+    }
+}

@@ -180,6 +180,12 @@ fn test_export_continuation() {
     assert_eq!(makefile.rules().count(), 0);
     let var = makefile.variable_definitions().next().unwrap();
     assert_eq!(var.names().collect::<Vec<_>>(), vec!["X", "Y"]);
+    assert_eq!(
+        var.name_ranges()
+            .map(|r| (usize::from(r.start()), usize::from(r.end())))
+            .collect::<Vec<_>>(),
+        vec![(7, 8), (14, 15)]
+    );
 }
 
 #[test]
