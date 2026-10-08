@@ -653,7 +653,8 @@ impl ConditionalBranch {
     }
 
     /// The range of the directive line starting this branch, such as
-    /// `ifdef A` or `else ifeq ($(B),1)`, without its line ending. A
+    /// `ifdef A` or `else ifeq ($(B),1)`, without its line ending; see
+    /// [`Self::directive_line_range`] for the range including it. A
     /// trailing comment on the line is included.
     ///
     /// # Example
@@ -675,6 +676,27 @@ impl ConditionalBranch {
             }
             _ => range,
         }
+    }
+
+    /// The range of the directive line starting this branch, as
+    /// [`Self::directive_range`] but including its line ending, if any.
+    ///
+    /// This ends where the body of the branch starts, at the start of the
+    /// next line.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nX = 1\nelse\r\nX = 2\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let ranges: Vec<_> = cond.branches().map(|b| b.directive_line_range()).collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![TextRange::new(0.into(), 8.into()), TextRange::new(14.into(), 20.into())]
+    /// );
+    /// ```
+    pub fn directive_line_range(&self) -> rowan::TextRange {
+        self.header.text_range()
     }
 
     /// Whether this branch and `other` are different branches of the same
@@ -3231,6 +3253,136 @@ endif
             })
             .collect();
         assert_eq!(ranges, vec![(0, 13), (13, 28)]);
+    }
+
+    /// The text of each branch's directive line, without and with its line
+    /// ending, and the text after it.
+    fn directive_lines(text: &str, variant: MakefileVariant) -> Vec<(&str, &str, &str)> {
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        makefile
+            .syntax()
+            .descendants()
+            .filter_map(crate::lossless::Conditional::cast)
+            .flat_map(|cond| cond.branches().collect::<Vec<_>>())
+            .map(|b| {
+                let line = b.directive_line_range();
+                assert_eq!(line.start(), b.directive_range().start(), "{text:?}");
+                (
+                    &text[b.directive_range()],
+                    &text[line],
+                    &text[usize::from(line.end())..],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_directive_line_range() {
+        assert_eq!(
+            directive_lines(
+                "ifdef A # c\nX = 1\nelse # d\nX = 2\nelse ifeq ($(B),1)\nendif\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![
+                (
+                    "ifdef A # c",
+                    "ifdef A # c\n",
+                    "X = 1\nelse # d\nX = 2\nelse ifeq ($(B),1)\nendif\n"
+                ),
+                (
+                    "else # d",
+                    "else # d\n",
+                    "X = 2\nelse ifeq ($(B),1)\nendif\n"
+                ),
+                ("else ifeq ($(B),1)", "else ifeq ($(B),1)\n", "endif\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directive_line_range_crlf_and_continuation() {
+        assert_eq!(
+            directive_lines(
+                "ifdef \\\r\n A\r\nelse \\\r\n ifdef B\r\nendif\r\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![
+                (
+                    "ifdef \\\r\n A",
+                    "ifdef \\\r\n A\r\n",
+                    "else \\\r\n ifdef B\r\nendif\r\n"
+                ),
+                (
+                    "else \\\r\n ifdef B",
+                    "else \\\r\n ifdef B\r\n",
+                    "endif\r\n"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directive_line_range_at_end_of_file() {
+        assert_eq!(
+            directive_lines("ifdef A", MakefileVariant::GNUMake),
+            vec![("ifdef A", "ifdef A", "")]
+        );
+        assert_eq!(
+            directive_lines("ifdef A\nelse", MakefileVariant::GNUMake),
+            vec![("ifdef A", "ifdef A\n", "else"), ("else", "else", "")]
+        );
+    }
+
+    #[test]
+    fn test_directive_line_range_in_rule() {
+        assert_eq!(
+            directive_lines(
+                "all:\nifdef A\n\techo a\nelse\n\techo b\nendif\n",
+                MakefileVariant::GNUMake
+            ),
+            vec![
+                ("ifdef A", "ifdef A\n", "\techo a\nelse\n\techo b\nendif\n"),
+                ("else", "else\n", "\techo b\nendif\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directive_line_range_bsd() {
+        assert_eq!(
+            directive_lines(
+                ".if ${A}\nX=1\n.elif ${B} # c\n.else\n.endif\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![
+                (
+                    ".if ${A}",
+                    ".if ${A}\n",
+                    "X=1\n.elif ${B} # c\n.else\n.endif\n"
+                ),
+                (".elif ${B} # c", ".elif ${B} # c\n", ".else\n.endif\n"),
+                (".else", ".else\n", ".endif\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directive_line_range_nmake() {
+        assert_eq!(
+            directive_lines(
+                "!IF 1\r\nX=1\r\n!ELSEIF 2\r\n!ELSE\r\n!ENDIF\r\n",
+                MakefileVariant::NMake
+            ),
+            vec![
+                (
+                    "!IF 1",
+                    "!IF 1\r\n",
+                    "X=1\r\n!ELSEIF 2\r\n!ELSE\r\n!ENDIF\r\n"
+                ),
+                ("!ELSEIF 2", "!ELSEIF 2\r\n", "!ELSE\r\n!ENDIF\r\n"),
+                ("!ELSE", "!ELSE\r\n", "!ENDIF\r\n"),
+            ]
+        );
     }
 
     #[test]
