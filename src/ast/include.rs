@@ -271,7 +271,8 @@ impl Include {
     /// path at whitespace outside variable references, as GNU make does
     /// after expanding it. Each name is read as for [`Self::path`]: `\#` is
     /// unescaped and a backslash-escaped space is kept as written, without
-    /// splitting the name. A BSD make `.include` or nmake `!INCLUDE` names a
+    /// splitting the name; see [`Self::split_file_names`] for the file
+    /// names make opens. A BSD make `.include` or nmake `!INCLUDE` names a
     /// single file, so it gives at most one name.
     ///
     /// # Example
@@ -284,6 +285,63 @@ impl Include {
     /// ```
     pub fn paths(&self) -> impl Iterator<Item = String> + '_ {
         self.path_words().into_iter().map(|(_, path)| path)
+    }
+
+    /// Split the expanded file names of a GNU make `include` into the names
+    /// of the files make opens.
+    ///
+    /// [`Self::paths`] returns the names as written, before expansion, with
+    /// any backslash-escaped spaces kept. After expanding the variable
+    /// references in them, make splits the text at spaces and tabs, but not
+    /// at a blank escaped with a backslash. In a run of backslashes before
+    /// a blank, each pair stands for one backslash, and an odd one left
+    /// over escapes the blank. Other backslashes are kept as they are, so
+    /// `a\:b` and `a\\b` name the files `a\:b` and `a\\b`.
+    ///
+    /// Applied to a name from [`Self::paths`] without variable references,
+    /// this gives the file that make opens for it: `include a\ b.mk` opens
+    /// `a b.mk` and `include a\\\ b.mk` opens `a\ b.mk`. The exception is a
+    /// name ending in an even number of backslashes that is followed by a
+    /// blank, which make halves: `include a\\ b` opens `a\` and `b`.
+    /// Splitting [`Self::path`] instead handles that case between names,
+    /// but not before trailing whitespace or a comment, which it trims.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Include;
+    /// assert_eq!(
+    ///     Include::split_file_names("a\\ b.mk  c\\\\ d.mk\te.mk"),
+    ///     vec!["a b.mk", "c\\", "d.mk", "e.mk"]
+    /// );
+    /// ```
+    pub fn split_file_names(expanded: &str) -> Vec<String> {
+        let mut names = vec![];
+        let mut name = String::new();
+        let mut chars = expanded.chars().peekable();
+        while let Some(c) = chars.next() {
+            let mut backslashes = 0;
+            let mut c = Some(c);
+            while c == Some('\\') {
+                backslashes += 1;
+                c = chars.next();
+            }
+            let blank = c.filter(|c| matches!(c, ' ' | '\t'));
+            if blank.is_none() {
+                name.extend(std::iter::repeat_n('\\', backslashes));
+                name.extend(c);
+                continue;
+            }
+            name.extend(std::iter::repeat_n('\\', backslashes / 2));
+            if crate::syntax_rules::last_backslash_unescaped(backslashes) {
+                name.extend(blank);
+            } else if !name.is_empty() {
+                names.push(std::mem::take(&mut name));
+            }
+        }
+        if !name.is_empty() {
+            names.push(name);
+        }
+        names
     }
 
     /// The source ranges of the file names of the include directive, in the
@@ -1607,5 +1665,64 @@ mod tests {
         assert_eq!(inc.path_expr(), Some(expr.clone()));
         assert_eq!(reference.parent(), Some(expr));
         crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_split_file_names() {
+        // As GNU make 4.4.1 reads them, from its "No such file" errors.
+        for (expanded, names) in [
+            ("a.mk", vec!["a.mk"]),
+            ("a.mk  b.mk\tc.mk ", vec!["a.mk", "b.mk", "c.mk"]),
+            ("", vec![]),
+            ("  ", vec![]),
+            ("a\\ b.mk", vec!["a b.mk"]),
+            ("a\\\tb.mk", vec!["a\tb.mk"]),
+            ("a\\ b\\ c", vec!["a b c"]),
+            ("a\\ ", vec!["a "]),
+            ("\\ a", vec![" a"]),
+            ("a\\\\ b", vec!["a\\", "b"]),
+            ("a\\\\\\ b.mk", vec!["a\\ b.mk"]),
+            ("a\\\\\\\\ b", vec!["a\\\\", "b"]),
+            ("a\\\\\\\\\\ b.mk", vec!["a\\\\ b.mk"]),
+            ("a\\\\b.mk", vec!["a\\\\b.mk"]),
+            ("a\\\\\\\\b.mk", vec!["a\\\\\\\\b.mk"]),
+            ("a\\:b.mk", vec!["a\\:b.mk"]),
+            ("a\\#b.mk", vec!["a\\#b.mk"]),
+            ("a\\%b.mk", vec!["a\\%b.mk"]),
+            ("a\\xb.mk", vec!["a\\xb.mk"]),
+            ("a\\", vec!["a\\"]),
+            ("a\\\\", vec!["a\\\\"]),
+            ("x.mk\ny.mk", vec!["x.mk\ny.mk"]),
+            ("\u{e9}\\ \u{e9}", vec!["\u{e9} \u{e9}"]),
+        ] {
+            assert_eq!(Include::split_file_names(expanded), names, "{expanded:?}");
+        }
+    }
+
+    #[test]
+    fn test_split_file_names_of_paths() {
+        let makefile: Makefile = "include a\\ b.mk a\\#b.mk a\\\\\\#b.mk \\\n  c\\:d a\\\\\n"
+            .parse()
+            .unwrap();
+        let inc = makefile.includes().next().unwrap();
+        assert_eq!(
+            inc.paths()
+                .flat_map(|path| Include::split_file_names(&path))
+                .collect::<Vec<_>>(),
+            vec!["a b.mk", "a#b.mk", "a\\#b.mk", "c\\:d", "a\\\\"]
+        );
+    }
+
+    #[test]
+    fn test_split_file_names_backslashes_before_separator() {
+        // GNU make opens `a\` here, but paths() leaves out the space after
+        // `a\\`, so this needs the text with the separator.
+        let makefile: Makefile = "include a\\\\ b\n".parse().unwrap();
+        let inc = makefile.includes().next().unwrap();
+        assert_eq!(inc.paths().collect::<Vec<_>>(), vec!["a\\\\", "b"]);
+        assert_eq!(
+            Include::split_file_names(&inc.path().unwrap()),
+            vec!["a\\", "b"]
+        );
     }
 }
