@@ -1,7 +1,7 @@
 use super::*;
 use crate::ast::{
-    detach_elements, line_ending, recipe_prefix_before, replace_children, replace_range,
-    terminate_line_before,
+    detach_elements, first_token, last_token, line_ending, recipe_prefix_before, replace_children,
+    replace_range, terminate_line_before,
 };
 use rowan::{GreenNode, GreenToken};
 
@@ -1106,10 +1106,12 @@ impl Recipe {
             match element {
                 rowan::NodeOrToken::Token(token) if token.kind() == WHITESPACE => token.detach(),
                 rowan::NodeOrToken::Node(node) => {
-                    while let Some(token) = node.last_token().filter(|t| t.kind() == WHITESPACE) {
+                    // The node may end in an empty node, as does the
+                    // target-local assignment in BSD make's `x: X = ; cmd`.
+                    while let Some(token) = last_token(&node).filter(|t| t.kind() == WHITESPACE) {
                         token.detach();
                     }
-                    if node.first_token().is_some() {
+                    if first_token(&node).is_some() {
                         break;
                     }
                 }
@@ -2387,6 +2389,27 @@ mod tests {
         assert_eq!(makefile.to_string(), "all: b\r\nZ = 1\r\n");
         assert_eq!(newline.parent().as_ref(), Some(rule.syntax()));
         crate::test_util::assert_matches_reparse(&makefile);
+    }
+
+    #[test]
+    fn test_inline_recipe_after_empty_target_local_value() {
+        // The rule line ends with the empty value of the target-local
+        // assignment, after the whitespace to be removed.
+        let parse = || {
+            let text = "x: X = ; cmd\nZ = 1\n";
+            let makefile = Makefile::parse_with_variant(text, crate::MakefileVariant::BSDMake);
+            let makefile = makefile.tree();
+            let rule = makefile.rules().next().unwrap();
+            let recipe = rule.recipe_nodes().next().unwrap();
+            (makefile, recipe)
+        };
+        let (makefile, recipe) = parse();
+        recipe.remove();
+        assert_eq!(makefile.to_string(), "x: X =\nZ = 1\n");
+
+        let (makefile, recipe) = parse();
+        recipe.try_insert_before("echo y").unwrap();
+        assert_eq!(makefile.to_string(), "x: X =\n\techo y\n\tcmd\nZ = 1\n");
     }
 
     #[test]
