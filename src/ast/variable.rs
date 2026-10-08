@@ -494,26 +494,53 @@ impl VariableDefinition {
     /// );
     /// ```
     pub fn names(&self) -> impl Iterator<Item = String> {
-        if self.is_undefine() || self.is_define() {
-            return self.name().into_iter().collect::<Vec<_>>().into_iter();
+        self.names_with_ranges().into_iter().map(|(name, _)| name)
+    }
+
+    /// The source ranges of the names in [`Self::names`], one for each name
+    /// in the same order.
+    ///
+    /// For a definition with a single name this is just
+    /// [`Self::name_range`]. For a bare `export` or `unexport` directive
+    /// listing several variables, each range covers one word, including
+    /// any variable references inside it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "export A $(B)\n".parse().unwrap();
+    /// let var = makefile.variable_definitions().next().unwrap();
+    /// let ranges: Vec<_> = var
+    ///     .name_ranges()
+    ///     .map(|r| (usize::from(r.start()), usize::from(r.end())))
+    ///     .collect();
+    /// assert_eq!(ranges, vec![(7, 8), (9, 13)]);
+    /// ```
+    pub fn name_ranges(&self) -> impl Iterator<Item = rowan::TextRange> {
+        self.names_with_ranges().into_iter().map(|(_, range)| range)
+    }
+
+    /// Internal: the names in [`Self::names`] with their source ranges.
+    fn names_with_ranges(&self) -> Vec<(String, rowan::TextRange)> {
+        if self.is_undefine() || self.is_define() || self.assignment_operator().is_some() {
+            return self.name().zip(self.name_range()).into_iter().collect();
         }
         let mut names = Vec::new();
-        let mut current = String::new();
+        let mut current: Option<(String, rowan::TextRange)> = None;
         for it in self.after_directive_keywords().take_while(|it| {
             matches!(it.kind(), IDENTIFIER | BACKSLASH | EXPR | WHITESPACE) || is_continuation(it)
         }) {
             if it.kind() == WHITESPACE || is_continuation(&it) {
-                if !current.is_empty() {
-                    names.push(std::mem::take(&mut current));
-                }
+                names.extend(current.take());
+            } else if let Some((name, range)) = current.as_mut() {
+                name.push_str(&it.to_string());
+                *range = range.cover(it.text_range());
             } else {
-                current.push_str(&it.to_string());
+                current = Some((it.to_string(), it.text_range()));
             }
         }
-        if !current.is_empty() {
-            names.push(current);
-        }
-        names.into_iter()
+        names.extend(current);
+        names
     }
 
     /// The source range covering just the variable's name.
