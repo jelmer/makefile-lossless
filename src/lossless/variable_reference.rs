@@ -246,6 +246,40 @@ impl VariableReference {
         ReferenceLocation::Other
     }
 
+    /// The archive member list this reference is in, as `$(OBJS)` in
+    /// `lib.a($(OBJS))` or `$@` in `lib.a($@): x`.
+    ///
+    /// [`Self::location`] gives the [`ReferenceLocation::Target`] or
+    /// [`ReferenceLocation::Prerequisite`] the member list is part of. Like
+    /// [`Self::location`], this only looks at the innermost enclosing item:
+    /// a reference nested in another one, as `$(X)` in
+    /// `lib.a($(addsuffix .o,$(X)))`, returns `None`, and so does a
+    /// reference in the archive name, as in `$(LIB)(m.o)`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "$(LIB)($(OBJS)): x\n".parse().unwrap();
+    /// let members: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| r.archive_members().map(|m| m.member_names()))
+    ///     .collect();
+    /// assert_eq!(members, vec![None, Some(vec!["$(OBJS)".to_string()])]);
+    /// ```
+    pub fn archive_members(&self) -> Option<ArchiveMembers> {
+        self.0
+            .ancestors()
+            .skip(1)
+            .take_while(|it| {
+                VariableReference::cast(it.clone()).is_none()
+                    && matches!(
+                        it.kind(),
+                        EXPR | PREREQUISITE | ARCHIVE_MEMBERS | ARCHIVE_MEMBER
+                    )
+            })
+            .find_map(ArchiveMembers::cast)
+    }
+
     /// Internal: the location of `child`, a child node of this reference
     /// containing a nested reference.
     fn location_of_child(&self, child: &SyntaxNode) -> ReferenceLocation {
@@ -544,12 +578,14 @@ pub enum ReferenceLocation {
     /// as in `all: CFLAGS = $(OPT)`; see
     /// [`Rule::scoped_assignment`](crate::Rule::scoped_assignment).
     TargetSpecificValue(VariableDefinition),
-    /// In the targets of a rule.
+    /// In the targets of a rule, including an archive member list as in
+    /// `lib.a($(OBJS)): x`; see [`VariableReference::archive_members`].
     Target(Rule),
     /// In the target pattern of a static pattern rule, between the two
     /// colons.
     TargetPattern(Rule),
-    /// In the prerequisites of a rule, including order-only ones.
+    /// In the prerequisites of a rule, including order-only ones and
+    /// archive member lists; see [`VariableReference::archive_members`].
     Prerequisite(Rule),
     /// In a recipe line, including one after the `;` of a rule line and
     /// one outside any rule, as returned by

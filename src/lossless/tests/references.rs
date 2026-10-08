@@ -652,6 +652,79 @@ fn test_reference_location_rules() {
     );
 }
 
+fn archive_members_of_references(code: &str, variant: MakefileVariant) -> Vec<(String, String)> {
+    let parsed = parse(code, Some(variant));
+    assert_eq!(parsed.errors, vec![], "{code:?}");
+    parsed
+        .root()
+        .variable_references()
+        .map(|r| {
+            let members = match r.archive_members() {
+                Some(members) => format!(
+                    "{:?} {:?} {:?}",
+                    members.archive_name(),
+                    members.member_names(),
+                    members.text_range()
+                ),
+                None => "none".to_string(),
+            };
+            (r.to_string(), members)
+        })
+        .collect()
+}
+
+#[test]
+fn test_reference_archive_members() {
+    assert_eq!(
+        archive_members_of_references(
+            "lib.a($@): x\nall: lib.a(m.o $<) $(Y)\n$(LIB)($(OBJS)): z\n",
+            MakefileVariant::GNUMake
+        ),
+        pairs(&[
+            ("$@", "Some(\"lib.a\") [\"$@\"] 6..8"),
+            ("$<", "Some(\"lib.a\") [\"m.o\", \"$<\"] 24..30"),
+            ("$(Y)", "none"),
+            ("$(LIB)", "none"),
+            ("$(OBJS)", "Some(\"$(LIB)\") [\"$(OBJS)\"] 44..51"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_archive_members_nested() {
+    // Like location(), only the outermost reference is in the member list.
+    assert_eq!(
+        archive_members_of_references("lib.a($(addsuffix .o,$(X))): x\n", MakefileVariant::GNUMake),
+        pairs(&[
+            (
+                "$(addsuffix .o,$(X))",
+                "Some(\"lib.a\") [\"$(addsuffix .o,$(X))\"] 6..26"
+            ),
+            ("$(X)", "none"),
+        ])
+    );
+}
+
+#[test]
+fn test_reference_archive_members_continuation() {
+    assert_eq!(
+        archive_members_of_references("all: lib.a(m.o \\\r\n $(Y))\r\n", MakefileVariant::GNUMake),
+        pairs(&[("$(Y)", "Some(\"lib.a\") [\"m.o\", \"$(Y)\"] 11..23")])
+    );
+}
+
+#[test]
+fn test_reference_archive_members_bsd() {
+    assert_eq!(
+        archive_members_of_references("${L}(${M}): y\nX = lib.a(${Z})\n", MakefileVariant::BSDMake),
+        pairs(&[
+            ("${L}", "none"),
+            ("${M}", "Some(\"${L}\") [\"${M}\"] 5..9"),
+            ("${Z}", "none"),
+        ])
+    );
+}
+
 #[test]
 fn test_reference_location_variables() {
     let makefile: Makefile =
