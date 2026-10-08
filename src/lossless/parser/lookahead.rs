@@ -203,6 +203,19 @@ impl Parser<'_> {
         }
     }
 
+    /// Whether the token at `end - 1` in the token stack is an `export` or
+    /// `unexport` keyword starting a directive for GNU make. Anything but
+    /// an assignment operator may follow it, so `export : x` exports the
+    /// variables ":" and "x" and `export a: b` the variables "a:" and "b".
+    pub(super) fn gnu_export_keyword_at(&self, end: usize) -> bool {
+        self.variant == Some(MakefileVariant::GNUMake)
+            && self.keyword_at(end, &["export", "unexport"])
+            && !matches!(
+                self.upcoming_from(end).skip(1).find(|(kind, _)| *kind != WHITESPACE),
+                Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op)
+            )
+    }
+
     /// Whether the token at `end - 1` in the token stack is a GNU make
     /// conditional keyword such as `ifeq` or `endif`. As for other
     /// directives, `ifeq: a` is a rule. GNU make rejects `ifeq(a,b)`,
@@ -496,6 +509,18 @@ impl Parser<'_> {
                 .any(|(_, text)| text.contains(':'))
     }
 
+    /// Whether the rest of the line is an assignment as GNU make reads it:
+    /// a name with no whitespace outside variable references, followed by
+    /// an assignment operator.
+    pub(super) fn at_gnu_assignment(&self) -> bool {
+        let mut tokens = self.upcoming().peekable();
+        if Self::skip_variable_name(&mut tokens, false).is_none() {
+            return false;
+        }
+        Self::skip_ws_and_continuation_tokens(&mut tokens);
+        matches!(tokens.next(), Some((OPERATOR, op)) if ASSIGNMENT_OPERATORS.contains(&op))
+    }
+
     pub(super) fn has_assignment_operator_on_line(&self) -> bool {
         self.upcoming()
             .take_while(|(kind, _)| *kind != NEWLINE)
@@ -538,7 +563,7 @@ impl Parser<'_> {
     /// Like `is_assignment_line`, for the line starting at `end - 1` in
     /// the token stack.
     fn assignment_at(&self, end: usize) -> bool {
-        if self.undefine_at(end) {
+        if self.undefine_at(end) || self.gnu_export_keyword_at(end) {
             return true;
         }
         let gnu = self.gnu_directives_enabled();
