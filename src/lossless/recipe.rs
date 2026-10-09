@@ -266,72 +266,144 @@ impl Recipe {
         self.logical_text(true, None)
     }
 
+    /// The source range of each line of the command as GNU make hands it
+    /// to the shell, before variable expansion: the lines of
+    /// [`Recipe::shell_text`], one for each physical line.
+    ///
+    /// The ranges leave out the recipe prefix that make strips from the
+    /// start of the first line and of each continuation line, a tab unless
+    /// set with `.RECIPEPREFIX`, and the line endings. The backslash before
+    /// a line ending is part of its line. For a recipe after `;` on the
+    /// rule line, the first range starts after the `;` and the whitespace
+    /// after it. A line of the command that is empty gets an empty range
+    /// where its text would be.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    ///
+    /// let makefile: Makefile = "all:\n\techo a \\\n\t\tb\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipe = rule.recipe_nodes().next().unwrap();
+    /// assert_eq!(
+    ///     recipe.line_ranges().collect::<Vec<_>>(),
+    ///     vec![
+    ///         TextRange::new(6.into(), 14.into()),
+    ///         TextRange::new(16.into(), 18.into()),
+    ///     ]
+    /// );
+    /// ```
+    pub fn line_ranges(&self) -> impl Iterator<Item = rowan::TextRange> {
+        let mut lines = vec![];
+        let mut line: Option<rowan::TextRange> = None;
+        for (token, range) in self.logical_pieces(true, None) {
+            if token.kind() == NEWLINE {
+                lines.push(line.unwrap_or_else(|| rowan::TextRange::empty(range.start())));
+                line = None;
+            } else {
+                line = Some(line.map_or(range, |line| line.cover(range)));
+            }
+        }
+        let body_end = self
+            .syntax()
+            .last_token()
+            .filter(|t| t.kind() == NEWLINE)
+            .map_or(self.syntax().text_range().end(), |t| t.text_range().start());
+        lines.push(line.unwrap_or_else(|| rowan::TextRange::empty(body_end)));
+        lines.into_iter()
+    }
+
     /// The text of the line from `from`, or from its start, with line
     /// continuations as make passes them to the shell.
     fn logical_text(&self, include_comments: bool, from: Option<rowan::TextSize>) -> String {
-        let mut after_newline = false;
-        let mut prefix = None;
-        let comment = self.comment_start();
-        self.body_tokens()
-            .filter_map(|t| {
-                if !include_comments && comment.is_some_and(|c| t.text_range().start() >= c) {
-                    return None;
-                }
-                if from.is_some_and(|from| t.text_range().start() < from) {
-                    return None;
-                }
-                // Tokens in a reference are all text.
-                let nested = t.parent().as_ref() != Some(self.syntax());
-                match t.kind() {
-                    NEWLINE => {
-                        after_newline = true;
-                        Some(lf_line_endings(t.text()))
-                    }
-                    // make strips the recipe prefix from continuation lines.
-                    // In a reference it keeps it, but turns the line break
-                    // and the whitespace after it into a space, so a tab
-                    // goes either way.
-                    INDENT if after_newline => {
-                        after_newline = false;
-                        let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
-                        let text = t.text();
-                        let text = match text.strip_prefix(prefix) {
-                            Some(rest) if !nested || prefix == '\t' => rest,
-                            _ => text,
-                        };
-                        Some(text.to_string())
-                    }
-                    // In a recipe after `;` on the rule line, the parser
-                    // leaves a prefix other than a tab in the text.
-                    TEXT | COMMENT
-                        if after_newline
-                            && !nested
-                            && !self.starts_with_indent()
-                            && (t.kind() == TEXT || include_comments) =>
-                    {
-                        after_newline = false;
-                        let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
-                        let text = t.text();
-                        let text = match text.strip_prefix(prefix) {
-                            Some(rest) if prefix != '\t' => rest,
-                            _ => text,
-                        };
-                        Some(text.to_string())
-                    }
-                    COMMENT if include_comments => {
-                        after_newline = false;
-                        Some(t.text().to_string())
-                    }
-                    // Other tokens directly in the node are the `;` and the
-                    // whitespace before a recipe on the rule line.
-                    _ if t.kind() == TEXT || nested => {
-                        after_newline = false;
-                        Some(t.text().to_string())
-                    }
-                    _ => None,
+        self.logical_pieces(include_comments, from)
+            .map(|(token, range)| match token.kind() {
+                NEWLINE => lf_line_endings(token.text()),
+                _ => {
+                    let start = token.text_range().start();
+                    token.text()[range - start].to_string()
                 }
             })
             .collect()
+    }
+
+    /// The tokens making up the line from `from`, or from its start, as
+    /// make passes it to the shell, each with the range of it that is
+    /// kept. Line breaks are NEWLINE tokens, which make passes on as `\n`.
+    fn logical_pieces(
+        &self,
+        include_comments: bool,
+        from: Option<rowan::TextSize>,
+    ) -> impl Iterator<Item = (SyntaxToken, rowan::TextRange)> + '_ {
+        let mut after_newline = false;
+        let mut prefix = None;
+        let comment = self.comment_start();
+        // The range of `t` without the recipe prefix at its start.
+        let strip = |t: &SyntaxToken, prefix: char| {
+            let range = t.text_range();
+            if t.text().starts_with(prefix) {
+                rowan::TextRange::new(range.start() + rowan::TextSize::of(prefix), range.end())
+            } else {
+                range
+            }
+        };
+        self.body_tokens().filter_map(move |t| {
+            if !include_comments && comment.is_some_and(|c| t.text_range().start() >= c) {
+                return None;
+            }
+            if from.is_some_and(|from| t.text_range().start() < from) {
+                return None;
+            }
+            // Tokens in a reference are all text.
+            let nested = t.parent().as_ref() != Some(self.syntax());
+            let range = match t.kind() {
+                NEWLINE => {
+                    after_newline = true;
+                    t.text_range()
+                }
+                // make strips the recipe prefix from continuation lines.
+                // In a reference it keeps it, but turns the line break
+                // and the whitespace after it into a space, so a tab
+                // goes either way.
+                INDENT if after_newline => {
+                    after_newline = false;
+                    let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
+                    if !nested || prefix == '\t' {
+                        strip(&t, prefix)
+                    } else {
+                        t.text_range()
+                    }
+                }
+                // In a recipe after `;` on the rule line, the parser
+                // leaves a prefix other than a tab in the text.
+                TEXT | COMMENT
+                    if after_newline
+                        && !nested
+                        && !self.starts_with_indent()
+                        && (t.kind() == TEXT || include_comments) =>
+                {
+                    after_newline = false;
+                    let prefix = *prefix.get_or_insert_with(|| self.recipe_prefix());
+                    if prefix != '\t' {
+                        strip(&t, prefix)
+                    } else {
+                        t.text_range()
+                    }
+                }
+                COMMENT if include_comments => {
+                    after_newline = false;
+                    t.text_range()
+                }
+                // Other tokens directly in the node are the `;` and the
+                // whitespace before a recipe on the rule line.
+                _ if t.kind() == TEXT || nested => {
+                    after_newline = false;
+                    t.text_range()
+                }
+                _ => return None,
+            };
+            Some((t, range))
+        })
     }
 
     /// Whether this recipe starts with indentation, unlike one after `;` on
@@ -2478,6 +2550,124 @@ mod tests {
         assert_eq!(
             format!("{:#?}", makefile.syntax()),
             format!("{:#?}", reparsed.syntax())
+        );
+    }
+
+    /// The line ranges of each recipe in `text`, after checking that the
+    /// text in them is that of the lines of [`Recipe::shell_text`].
+    fn line_ranges(text: &str) -> Vec<Vec<rowan::TextRange>> {
+        let makefile: Makefile = text.parse().unwrap();
+        let rule = makefile.rules().next().unwrap();
+        rule.recipe_nodes()
+            .map(|recipe| {
+                let ranges: Vec<_> = recipe.line_ranges().collect();
+                let lines: Vec<&str> = ranges.iter().map(|r| &text[*r]).collect();
+                assert_eq!(lines.join("\n"), recipe.shell_text(), "{text:?}");
+                ranges
+            })
+            .collect()
+    }
+
+    fn range(start: u32, end: u32) -> rowan::TextRange {
+        rowan::TextRange::new(start.into(), end.into())
+    }
+
+    #[test]
+    fn test_line_ranges_simple() {
+        assert_eq!(
+            line_ranges("all:\n\techo hello\n\t@echo bye"),
+            vec![vec![range(6, 16)], vec![range(18, 27)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_continuation() {
+        assert_eq!(
+            line_ranges("all:\n\techo a \\\n\tb\n"),
+            vec![vec![range(6, 14), range(16, 17)]]
+        );
+        // make strips only one tab.
+        assert_eq!(
+            line_ranges("all:\n\techo a \\\n\t\tb\n"),
+            vec![vec![range(6, 14), range(16, 18)]]
+        );
+        assert_eq!(
+            line_ranges("all:\n\techo a \\\n  b\n"),
+            vec![vec![range(6, 14), range(15, 18)]]
+        );
+        assert_eq!(
+            line_ranges("all:\n\techo a \\\nb\n"),
+            vec![vec![range(6, 14), range(15, 16)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_indented() {
+        assert_eq!(line_ranges("all:\n\t  echo a\n"), vec![vec![range(6, 14)]]);
+    }
+
+    #[test]
+    fn test_line_ranges_empty_lines() {
+        assert_eq!(
+            line_ranges("all:\n\techo a \\\n\t\n"),
+            vec![vec![range(6, 14), range(16, 16)]]
+        );
+        assert_eq!(
+            line_ranges("all:\n\t\n\techo\n"),
+            vec![vec![range(6, 6)], vec![range(8, 12)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_comment() {
+        assert_eq!(
+            line_ranges("all:\n\t# c \\\n\tb\n\techo a # b\n"),
+            vec![vec![range(6, 11), range(13, 14)], vec![range(16, 26)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_reference() {
+        assert_eq!(
+            line_ranges("all:\n\techo $(subst x,y,\\\n\tb)z\n"),
+            vec![vec![range(6, 24), range(26, 29)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_recipe_prefix() {
+        // A tab is not the recipe prefix here, so make keeps it.
+        assert_eq!(
+            line_ranges(".RECIPEPREFIX = >\nall:\n>echo a \\\n>b \\\n\tc\n"),
+            vec![vec![range(24, 32), range(34, 37), range(38, 40)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_rule_line() {
+        assert_eq!(
+            line_ranges("all: ; echo a \\\n\tb\n"),
+            vec![vec![range(7, 15), range(17, 18)]]
+        );
+        assert_eq!(
+            line_ranges(".RECIPEPREFIX = >\nall: ; echo a \\\n>b\n"),
+            vec![vec![range(25, 33), range(35, 36)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_conditional() {
+        assert_eq!(
+            line_ranges("all:\nifdef X\n\techo a \\\n\tb\nendif\n"),
+            vec![vec![range(14, 22), range(24, 25)]]
+        );
+    }
+
+    #[test]
+    fn test_line_ranges_crlf() {
+        assert_eq!(
+            line_ranges("all:\r\n\techo a \\\r\n\tb\r\n"),
+            vec![vec![range(7, 15), range(18, 19)]]
         );
     }
 }
