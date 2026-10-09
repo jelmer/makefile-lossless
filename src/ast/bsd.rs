@@ -802,8 +802,9 @@ mod tests {
                 .iter()
                 .map(|e| e.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["expected 'in' in .for"]
+            vec!["expected 'in' in .for", ".endfor without matching .for"]
         );
+        assert_eq!(parsed.tree().items().count(), 0);
     }
 
     #[test]
@@ -1591,7 +1592,11 @@ mod tests {
         ] {
             let parsed = Makefile::parse_with_variant(code, MakefileVariant::BSDMake);
             let messages: Vec<_> = parsed.errors().iter().map(|e| e.message.as_str()).collect();
-            assert_eq!(messages, vec![message], "{code:?}");
+            assert_eq!(
+                messages,
+                vec![message, ".endfor without matching .for"],
+                "{code:?}"
+            );
             assert_eq!(parsed.tree().to_string(), code);
         }
     }
