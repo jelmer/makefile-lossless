@@ -157,6 +157,44 @@ impl ForLoop {
     }
 }
 
+keyword_enum! {
+    /// The keyword of a single-line directive, as returned by
+    /// [`Directive::directive_kind`].
+    pub enum DirectiveKind {
+        /// BSD make `.break`, which ends the innermost `.for` loop.
+        BsdBreak => ".break",
+        /// BSD make `.undef`.
+        BsdUndef => ".undef",
+        /// BSD make `.export`.
+        BsdExport => ".export",
+        /// BSD make `.export-all`.
+        BsdExportAll => ".export-all",
+        /// BSD make `.export-env`, which exports without marking the
+        /// variables as exported.
+        BsdExportEnv => ".export-env",
+        /// BSD make `.export-literal`, which exports the unexpanded value.
+        BsdExportLiteral => ".export-literal",
+        /// BSD make `.unexport`.
+        BsdUnexport => ".unexport",
+        /// BSD make `.unexport-env`.
+        BsdUnexportEnv => ".unexport-env",
+        /// BSD make `.error`.
+        BsdError => ".error",
+        /// BSD make `.warning`.
+        BsdWarning => ".warning",
+        /// BSD make `.info`.
+        BsdInfo => ".info",
+        /// nmake `!UNDEF`.
+        NmakeUndef => "!UNDEF",
+        /// nmake `!ERROR`.
+        NmakeError => "!ERROR",
+        /// nmake `!MESSAGE`.
+        NmakeMessage => "!MESSAGE",
+        /// nmake `!CMDSWITCHES`.
+        NmakeCmdswitches => "!CMDSWITCHES",
+    }
+}
+
 impl Directive {
     /// The directive keyword including the leading dot, e.g. `.undef`.
     ///
@@ -179,6 +217,22 @@ impl Directive {
     /// ```
     pub fn keyword(&self) -> Option<String> {
         directive_keyword(self.syntax())
+    }
+
+    /// The directive keyword; see [`Self::keyword`].
+    ///
+    /// Returns `None` if the keyword is missing.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{DirectiveKind, Makefile, MakefileItem, MakefileVariant};
+    /// let makefile =
+    ///     Makefile::parse_with_variant(".export-env PATH\n", MakefileVariant::BSDMake).tree();
+    /// let MakefileItem::Directive(d) = makefile.items().next().unwrap() else { panic!() };
+    /// assert_eq!(d.directive_kind(), Some(DirectiveKind::BsdExportEnv));
+    /// ```
+    pub fn directive_kind(&self) -> Option<DirectiveKind> {
+        self.keyword()?.parse().ok()
     }
 
     /// The source range of the directive keyword, including the leading dot
@@ -220,8 +274,60 @@ impl Directive {
 
 #[cfg(test)]
 mod tests {
+    use super::DirectiveKind;
     use crate::{Makefile, MakefileItem, MakefileVariant, ParseErrorKind, Rule, TextRange};
     use rowan::ast::AstNode;
+
+    #[test]
+    fn test_directive_kind() {
+        let bsd = MakefileVariant::BSDMake;
+        let nmake = MakefileVariant::NMake;
+        let cases = [
+            (
+                bsd,
+                ".for x in a\n.break\n.endfor\n",
+                DirectiveKind::BsdBreak,
+            ),
+            (bsd, ".undef X\n", DirectiveKind::BsdUndef),
+            (bsd, ".export X\n", DirectiveKind::BsdExport),
+            (bsd, ".export-all\n", DirectiveKind::BsdExportAll),
+            (bsd, ".  export-env X\n", DirectiveKind::BsdExportEnv),
+            (bsd, ".export-literal X\n", DirectiveKind::BsdExportLiteral),
+            (bsd, ".unexport X\n", DirectiveKind::BsdUnexport),
+            (bsd, ".unexport-env\n", DirectiveKind::BsdUnexportEnv),
+            (bsd, ".error message\n", DirectiveKind::BsdError),
+            (bsd, ".warning message\n", DirectiveKind::BsdWarning),
+            (bsd, ".info message\n", DirectiveKind::BsdInfo),
+            (nmake, "!undef X\n", DirectiveKind::NmakeUndef),
+            (nmake, "!ERROR message\n", DirectiveKind::NmakeError),
+            (nmake, "! Message hello\n", DirectiveKind::NmakeMessage),
+            (nmake, "!CMDSWITCHES +D\n", DirectiveKind::NmakeCmdswitches),
+        ];
+        assert_eq!(cases.len(), DirectiveKind::ALL.len());
+        for (variant, text, kind) in cases {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert_eq!(parsed.errors(), &[], "{text:?}");
+            let directive = parsed
+                .tree()
+                .syntax()
+                .descendants()
+                .find_map(crate::Directive::cast)
+                .unwrap();
+            assert_eq!(directive.directive_kind(), Some(kind), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_directive_kind_round_trip() {
+        for &kind in DirectiveKind::ALL {
+            assert_eq!(kind.as_str().parse::<DirectiveKind>(), Ok(kind));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(
+            "!message".parse::<DirectiveKind>().unwrap_err().keyword(),
+            "!message"
+        );
+    }
 
     fn parse_ok(text: &str) -> Makefile {
         let parsed = Makefile::parse(text);
