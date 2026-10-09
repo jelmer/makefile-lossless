@@ -769,3 +769,69 @@ fn test_line_continuations_nmake() {
         vec![("A = x ^\\\nB = y ", "\\\n")]
     );
 }
+
+#[test]
+fn test_argument_index_at_offset_arity() {
+    // Commas after the last argument a function takes are part of it, as in
+    // `arguments()`.
+    let makefile: Makefile = "X = $(subst a,b,c,d)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    // "X = $(subst a,b,c,d)"
+    //  01234567890123456789
+    assert_eq!(refs[0].argument_index_at_offset(16), Some(2));
+    assert_eq!(refs[0].argument_index_at_offset(17), Some(2));
+    assert_eq!(refs[0].argument_index_at_offset(18), Some(2));
+    assert_eq!(refs[0].argument_index_at_offset(20), Some(2));
+
+    let makefile: Makefile = "X = $(if a,b,c,d)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(refs[0].argument_index_at_offset(15), Some(2));
+
+    let makefile: Makefile = "X = $(foreach v,a b,$(v),x)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    // "X = $(foreach v,a b,$(v),x)"
+    //  0123456789012345678901234567
+    assert_eq!(refs[0].argument_index_at_offset(14), Some(0));
+    assert_eq!(refs[0].argument_index_at_offset(17), Some(1));
+    assert_eq!(refs[0].argument_index_at_offset(21), Some(2));
+    assert_eq!(refs[0].argument_index_at_offset(26), Some(2));
+}
+
+#[test]
+fn test_argument_index_at_offset_variadic() {
+    let makefile: Makefile = "X = $(call f,a,b,c)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    // "X = $(call f,a,b,c)"
+    //  0123456789012345678
+    assert_eq!(refs[0].argument_index_at_offset(11), Some(0));
+    assert_eq!(refs[0].argument_index_at_offset(18), Some(3));
+
+    let makefile: Makefile = "X = $(and a,b,c,d)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(refs[0].argument_index_at_offset(16), Some(3));
+
+    let makefile: Makefile = "X = $(or a,b,c,d)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(refs[0].argument_index_at_offset(15), Some(3));
+}
+
+#[test]
+fn test_argument_index_at_offset_nesting() {
+    // Only the delimiters of the call itself nest, as in `arguments()`.
+    let makefile: Makefile = "X = $(if ${x,y},T,F)\n".parse().unwrap();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    // "X = $(if ${x,y},T,F)"
+    //  01234567890123456789
+    assert_eq!(refs[0].arguments().unwrap().unwrap().len(), 3);
+    assert_eq!(refs[0].argument_index_at_offset(13), Some(1));
+    assert_eq!(refs[0].argument_index_at_offset(16), Some(2));
+}
+
+#[test]
+fn test_argument_index_at_offset_unclosed() {
+    let makefile = Makefile::parse("X = $(subst a,b,c,d\n").tree();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(refs[0].to_string(), "$(subst a,b,c,d");
+    assert_eq!(refs[0].argument_index_at_offset(14), Some(1));
+    assert_eq!(refs[0].argument_index_at_offset(19), Some(2));
+}

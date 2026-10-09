@@ -391,7 +391,11 @@ impl VariableReference {
     /// Determine which argument (0-based) the given byte offset falls into.
     ///
     /// Returns `None` if the offset is not inside this reference or if this
-    /// is not a function call.
+    /// is not a function call. For a call of a built-in function, the
+    /// arguments are split as by [`Self::arguments`], so commas after the
+    /// last argument that the function takes are part of that argument;
+    /// this also applies if the call is not closed yet. An offset on a
+    /// comma belongs to the argument before it.
     ///
     /// # Example
     /// ```
@@ -414,6 +418,19 @@ impl VariableReference {
             return None;
         }
 
+        let text = self.0.text().to_string();
+        if let Ok(Some((call, _))) = crate::FunctionCall::parse_partial_prefix(&text) {
+            let offset = offset - ref_start;
+            let arguments = call.arguments;
+            return Some(
+                arguments
+                    .iter()
+                    .position(|r| offset <= r.end)
+                    .unwrap_or(arguments.len() - 1),
+            );
+        }
+
+        // Not a built-in function, so every comma separates arguments.
         let mut arg_index = 0;
         let mut depth = 0;
         let mut past_name = false;
