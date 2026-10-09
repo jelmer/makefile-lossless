@@ -3,7 +3,7 @@
 mod variant;
 
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::Makefile;
+use makefile_lossless::{Makefile, MakefileVariant};
 
 fuzz_target!(|data: &[u8]| {
     let Some((variant, text)) = variant::optional_variant_and_text(data) else {
@@ -12,7 +12,14 @@ fuzz_target!(|data: &[u8]| {
 
     // Full-file parse: must never panic, even on garbage input.
     let parse = variant::parse(text, variant);
-    assert_eq!(parse.variant(), variant);
+    match variant {
+        Some(variant) => assert_eq!(parse.variant(), Some(variant)),
+        // The default parser only records a variant when it detects nmake.
+        None => assert!(matches!(
+            parse.variant(),
+            None | Some(MakefileVariant::NMake)
+        )),
+    }
     assert_eq!(parse.tree().to_string(), text);
     let _ = parse.errors();
     for error in parse.positioned_errors() {
