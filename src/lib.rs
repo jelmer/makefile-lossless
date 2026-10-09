@@ -114,6 +114,7 @@ mod text;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+pub use ast::bsd::DirectiveKind;
 pub use ast::conditional::{BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind};
 pub use ast::include::IncludeKind;
 pub use ast::makefile::MakefileItem;
