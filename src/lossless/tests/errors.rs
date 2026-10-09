@@ -1422,29 +1422,94 @@ fn test_invalid_line_reports_one_error() {
     assert_eq!(parsed.root().variable_definitions().count(), 1);
 }
 
+fn errors_with_lines(parsed: &Parse) -> Vec<(ParseErrorKind, &str, usize)> {
+    parsed
+        .errors
+        .iter()
+        .map(|e| (e.kind(), e.message.as_str(), e.line))
+        .collect()
+}
+
+fn top_level_kinds(parsed: &Parse) -> Vec<SyntaxKind> {
+    parsed
+        .root()
+        .syntax()
+        .children()
+        .map(|c| c.kind())
+        .collect()
+}
+
 #[test]
 fn test_bare_for() {
-    for code in [
-        ".for\n.endfor\n",
-        ".for  # x\n.endfor\n",
-        ".for \\\n\n.endfor\n",
-    ] {
+    let unknown = (
+        ParseErrorKind::UnknownDirective,
+        "Unknown directive \"for\"",
+        1,
+    );
+    for header in [".for", ".for ", ".for\t", ".for  # x", ".for \\\n"] {
+        let stray_endfor = (
+            ParseErrorKind::ExtraneousEndfor,
+            ".endfor without matching .for",
+            header.matches('\n').count() + 2,
+        );
         for variant in [None, Some(MakefileVariant::BSDMake)] {
-            let parsed = parse(code, variant);
+            // BSD make does not take a bare `.for` as a loop, so a later
+            // `.endfor` has no `.for` to close.
+            let code = format!("{header}\n.endfor\n");
+            let parsed = parse(&code, variant);
             assert_eq!(
-                parsed
-                    .errors
-                    .iter()
-                    .map(|e| (e.kind(), e.message.as_str(), e.line))
-                    .collect::<Vec<_>>(),
-                vec![(
-                    ParseErrorKind::UnknownDirective,
-                    "Unknown directive \"for\"",
-                    1
-                )],
+                errors_with_lines(&parsed),
+                vec![unknown, stray_endfor],
                 "{code:?}"
             );
             assert_eq!(parsed.root().syntax().to_string(), code);
+            assert_eq!(top_level_kinds(&parsed), vec![ERROR, ERROR], "{code:?}");
+
+            let code = format!("{header}\nall:\n\t@:\n");
+            let parsed = parse(&code, variant);
+            assert_eq!(errors_with_lines(&parsed), vec![unknown], "{code:?}");
+            assert_eq!(parsed.root().syntax().to_string(), code);
+            assert_eq!(top_level_kinds(&parsed), vec![ERROR, RULE], "{code:?}");
+            assert_eq!(
+                parsed
+                    .root()
+                    .rules()
+                    .map(|r| r.targets().collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                vec![vec!["all".to_string()]]
+            );
         }
     }
+}
+
+#[test]
+fn test_bare_for_in_conditional() {
+    let code = ".if 1\n.for\n.endif\nall:\n\t@:\n";
+    let parsed = parse(code, Some(MakefileVariant::BSDMake));
+    assert_eq!(
+        errors_with_lines(&parsed),
+        vec![(
+            ParseErrorKind::UnknownDirective,
+            "Unknown directive \"for\"",
+            2
+        )]
+    );
+    assert_eq!(parsed.root().syntax().to_string(), code);
+    assert_eq!(top_level_kinds(&parsed), vec![CONDITIONAL, RULE]);
+}
+
+#[test]
+fn test_bare_for_in_recipe() {
+    // The bare `.for` doesn't open a loop that would hold the recipe line.
+    let code = "all:\n.for\n\t@:\n";
+    let parsed = parse(code, Some(MakefileVariant::BSDMake));
+    assert_eq!(
+        errors_with_lines(&parsed),
+        vec![(
+            ParseErrorKind::UnknownDirective,
+            "Unknown directive \"for\"",
+            2
+        )]
+    );
+    assert_eq!(parsed.root().syntax().to_string(), code);
 }

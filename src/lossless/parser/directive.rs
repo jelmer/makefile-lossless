@@ -593,21 +593,32 @@ impl Parser<'_> {
         }
     }
 
+    /// Whether the line starting at the token at `n - 1` in the token
+    /// stack is a `.for` with nothing but whitespace, line continuations
+    /// and a comment after it. BSD make does not take that as a loop,
+    /// as trailing whitespace and comments are gone by the time it
+    /// requires whitespace after `.for`.
+    pub(super) fn is_bare_bsd_for_at(&self, n: usize) -> bool {
+        let Some(("for", count)) = self.bsd_directive_at(n) else {
+            return false;
+        };
+        let mut rest = self.upcoming_from(n - count).peekable();
+        loop {
+            match rest.next() {
+                None | Some((NEWLINE | COMMENT, _)) => return true,
+                Some((WHITESPACE | INDENT, _)) => {}
+                Some((BACKSLASH, _)) if matches!(rest.peek(), Some((NEWLINE, _))) => {
+                    rest.next();
+                }
+                Some(_) => return false,
+            }
+        }
+    }
+
     /// Parse a BSD `.for VAR... in LIST` ... `.endfor` loop.
     fn parse_bsd_for(&mut self, count: usize) {
-        if self.nesting_depth >= crate::reference::MAX_DEPTH {
-            self.parse_too_deeply_nested_block();
-            return;
-        }
-        self.builder.start_node(FOR_LOOP.into());
-        self.builder.start_node(FOR_HEADER.into());
-        let directive_range = self.current_range();
-        self.bump_n(count);
-        self.skip_ws_and_continuations();
-        // BSD make only takes `.for` followed by whitespace as a loop, and
-        // trailing whitespace and comments are gone by then.
-        let mut valid = !matches!(self.current(), None | Some(NEWLINE | COMMENT));
-        if !valid {
+        if self.is_bare_bsd_for_at(self.tokens.len()) {
+            let directive_range = self.current_range();
             let line = self.line_at(directive_range.start());
             self.push_error(
                 ParseErrorKind::UnknownDirective,
@@ -615,7 +626,20 @@ impl Parser<'_> {
                 directive_range,
                 line,
             );
+            self.builder.start_node(ERROR.into());
+            self.skip_logical_line();
+            self.builder.finish_node();
+            return;
         }
+        if self.nesting_depth >= crate::reference::MAX_DEPTH {
+            self.parse_too_deeply_nested_block();
+            return;
+        }
+        self.builder.start_node(FOR_LOOP.into());
+        self.builder.start_node(FOR_HEADER.into());
+        self.bump_n(count);
+        self.skip_ws_and_continuations();
+        let mut valid = true;
         // Like BSD make, take each word up to `in` as a variable,
         // whatever characters it consists of, as in `.for , in 1`.
         let mut found_variable = false;
