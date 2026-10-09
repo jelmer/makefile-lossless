@@ -225,7 +225,7 @@ impl BsdOperand {
 /// Use this rather than matching on error messages, which are meant for
 /// humans and may change. Unless noted otherwise, make reports these errors
 /// as "Malformed conditional".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BsdConditionErrorKind {
     /// The condition or an operand of `!`, `&&` or `||` is missing.
@@ -240,14 +240,20 @@ pub enum BsdConditionErrorKind {
     UnexpectedOperator,
     /// Text after a complete condition that is not `&&` or `||`.
     UnexpectedText,
-    /// A single `&` or `|` (make: "Unknown operator").
-    UnknownOperator,
-    /// A comparison operator at the end of the condition (make: "Missing
-    /// right-hand side of operator").
-    MissingRightHandSide,
+    /// A single `&` or `|`, which is given (make: "Unknown operator").
+    UnknownOperator(char),
+    /// The given comparison operator at the end of the condition (make:
+    /// "Missing right-hand side of operator").
+    MissingRightHandSide(BsdComparisonOp),
     /// The argument of a function such as `defined` is not followed by `)`
     /// (make: "Missing ')' after argument").
-    UnclosedFunctionCall,
+    UnclosedFunctionCall {
+        /// The function that was called.
+        function: BsdFunction,
+        /// The unexpanded text of the argument up to where it ends, e.g.
+        /// `A` in `defined(A B)`.
+        argument: String,
+    },
     /// A quoted string without its closing `"` (make: "Unfinished string
     /// literal").
     UnfinishedStringLiteral,
@@ -258,8 +264,9 @@ pub enum BsdConditionErrorKind {
     /// a variable reference or a digit.
     UnquotedLeftHandSide,
     /// A variable reference with a modifier that make does not know (make:
-    /// "Unknown modifier").
-    UnknownModifier,
+    /// "Unknown modifier"). This holds the text of the modifier without
+    /// the leading `:`, as far as it could be determined.
+    UnknownModifier(String),
     /// A malformed variable reference.
     Reference(ReferenceSyntaxErrorKind),
     /// Parentheses or `!` are nested more deeply than this crate supports.
@@ -278,8 +285,8 @@ pub struct BsdConditionError {
 
 impl BsdConditionError {
     /// The class of this error.
-    pub fn kind(&self) -> BsdConditionErrorKind {
-        self.kind
+    pub fn kind(&self) -> &BsdConditionErrorKind {
+        &self.kind
     }
 }
 
@@ -511,7 +518,7 @@ impl Parser {
         }
         if self.peek_at(self.pos + 1) != Some(c) {
             return Err(self.error(
-                BsdConditionErrorKind::UnknownOperator,
+                BsdConditionErrorKind::UnknownOperator(c as char),
                 format!("unknown operator \"{}\"", c as char),
             ));
         }
@@ -607,7 +614,7 @@ impl Parser {
             if self.peek() != Some(b')') {
                 return Err(self.error_at(
                     start,
-                    BsdConditionErrorKind::UnclosedFunctionCall,
+                    BsdConditionErrorKind::UnclosedFunctionCall { function, argument },
                     format!("missing \")\" after argument of \"{}\"", function),
                 ));
             }
@@ -701,7 +708,7 @@ impl Parser {
             )),
             Err(ReferenceError::UnknownModifier { offset, modifier }) => Err(self.error_at(
                 start + offset,
-                BsdConditionErrorKind::UnknownModifier,
+                BsdConditionErrorKind::UnknownModifier(modifier.clone()),
                 format!("unknown modifier ':{}'", modifier),
             )),
             Err(e @ ReferenceError::FunctionCall { .. }) => {
@@ -723,7 +730,7 @@ impl Parser {
         // `)` or another operator compares against the empty string.
         if self.peek().is_none() {
             return Err(self.error(
-                BsdConditionErrorKind::MissingRightHandSide,
+                BsdConditionErrorKind::MissingRightHandSide(op),
                 format!("missing right-hand side of operator \"{}\"", op),
             ));
         }
@@ -1339,13 +1346,39 @@ mod tests {
             ("(a", UnclosedParenthesis),
             ("|| a", UnexpectedOperator),
             ("a b", UnexpectedText),
-            ("a & b", UnknownOperator),
-            ("${A} == ", MissingRightHandSide),
-            ("defined(A B)", UnclosedFunctionCall),
+            ("a & b", UnknownOperator('&')),
+            ("a | b", UnknownOperator('|')),
+            ("${A} == ", MissingRightHandSide(BsdComparisonOp::Equal)),
+            (
+                "${A} >= ",
+                MissingRightHandSide(BsdComparisonOp::GreaterOrEqual),
+            ),
+            (
+                "defined(A B)",
+                UnclosedFunctionCall {
+                    function: BsdFunction::Defined,
+                    argument: "A".to_string(),
+                },
+            ),
+            (
+                "make( ${A:S/ /x/} B)",
+                UnclosedFunctionCall {
+                    function: BsdFunction::Make,
+                    argument: "${A:S/ /x/}".to_string(),
+                },
+            ),
+            (
+                "exists(",
+                UnclosedFunctionCall {
+                    function: BsdFunction::Exists,
+                    argument: String::new(),
+                },
+            ),
             ("${A} == \"b", UnfinishedStringLiteral),
             ("${A} == b\\", UnfinishedEscape),
             ("left == right", UnquotedLeftHandSide),
-            ("${A:Z} == x", UnknownModifier),
+            ("${A:Z} == x", UnknownModifier("Z".to_string())),
+            ("${A:Zfoo:Q} == x", UnknownModifier("Zfoo".to_string())),
             (
                 "${A",
                 Reference(ReferenceSyntaxErrorKind::UnclosedExpression),
@@ -1362,7 +1395,7 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(
                 parse_bsd_condition(text).unwrap_err().kind(),
-                expected,
+                &expected,
                 "{}",
                 text
             );
@@ -1528,7 +1561,7 @@ mod tests {
             );
             assert_eq!(
                 parse_bsd_condition(&text).unwrap_err().kind(),
-                BsdConditionErrorKind::TooDeeplyNested
+                &BsdConditionErrorKind::TooDeeplyNested
             );
         }
         assert_eq!(
@@ -1550,7 +1583,7 @@ mod tests {
         let text = format!("({} == 1)", reference(2000));
         assert_eq!(
             parse_bsd_condition(&text).unwrap_err().kind(),
-            BsdConditionErrorKind::Reference(ReferenceSyntaxErrorKind::TooDeeplyNested)
+            &BsdConditionErrorKind::Reference(ReferenceSyntaxErrorKind::TooDeeplyNested)
         );
     }
 }
