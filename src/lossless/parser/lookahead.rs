@@ -127,7 +127,7 @@ impl Parser<'_> {
                 // As in the parser, the rule context after a `.for` loop
                 // is the one at the end of its body, so a `.for` only
                 // needs to be balanced with its `.endfor`.
-                _ if bsd_name == Some("for") && !self.is_bare_bsd_for_at(end) => {
+                _ if bsd_name == Some("for") && self.bsd_for_header_error_at(end).is_none() => {
                     stack.push(ConditionalRuleContext::for_loop())
                 }
                 _ if bsd_name.is_some_and(|n| is_bsd_elif(n) || n == "else") => {

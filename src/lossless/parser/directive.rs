@@ -33,6 +33,25 @@ const BSD_DIRECTIVES: &[&str] = &[
     "info",
 ];
 
+/// Why BSD make rejects the header of a `.for` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForHeaderError {
+    /// Nothing follows `.for`.
+    Bare,
+    /// A variable name contains this character.
+    InvalidCharacter(char),
+    /// There are no variables before `in`.
+    MissingVariables,
+    /// There is no `in` after the variables.
+    MissingIn,
+}
+
+/// The first character in `word` that BSD make does not allow in the name
+/// of a `.for` loop variable.
+fn invalid_for_variable_char(word: &str) -> Option<char> {
+    word.chars().find(|c| "$:\\(){}".contains(*c))
+}
+
 /// Map the keyword of an nmake preprocessing directive, `first` followed by
 /// the next word `second` if any, to the name of the equivalent BSD make
 /// directive, such as `elif` for `ELSEIF`. Also returns whether `second` is
@@ -593,31 +612,59 @@ impl Parser<'_> {
         }
     }
 
-    /// Whether the line starting at the token at `n - 1` in the token
-    /// stack is a `.for` with nothing but whitespace, line continuations
-    /// and a comment after it. BSD make does not take that as a loop,
-    /// as trailing whitespace and comments are gone by the time it
-    /// requires whitespace after `.for`.
-    pub(super) fn is_bare_bsd_for_at(&self, n: usize) -> bool {
+    /// The error in the header of the `.for` line starting at the token at
+    /// `n - 1` in the token stack, if it is one. BSD make ignores a `.for`
+    /// line with such an error rather than opening a loop.
+    pub(super) fn bsd_for_header_error_at(&self, n: usize) -> Option<ForHeaderError> {
         let Some(("for", count)) = self.bsd_directive_at(n) else {
-            return false;
+            return None;
         };
-        let mut rest = self.upcoming_from(n - count).peekable();
+        let tokens = &self.tokens[..n - count];
+        let mut i = tokens.len();
+        let mut found_variable = false;
         loop {
-            match rest.next() {
-                None | Some((NEWLINE | COMMENT, _)) => return true,
-                Some((WHITESPACE | INDENT, _)) => {}
-                Some((BACKSLASH, _)) if matches!(rest.peek(), Some((NEWLINE, _))) => {
-                    rest.next();
+            // Like BSD make, take each word up to `in` as a variable. A
+            // line continuation also ends a word, and trailing comments
+            // are gone by the time BSD make looks at the header.
+            let mut word = String::new();
+            while let Some(next) = i.checked_sub(1) {
+                let kind = tokens[next].kind;
+                if kind == BACKSLASH && next > 0 && tokens[next - 1].kind == NEWLINE {
+                    if !word.is_empty() {
+                        break;
+                    }
+                    i = next - 1;
+                    continue;
                 }
-                Some(_) => return false,
+                match kind {
+                    NEWLINE | COMMENT => break,
+                    WHITESPACE | INDENT if !word.is_empty() => break,
+                    WHITESPACE | INDENT => {}
+                    _ => word.push_str(tokens[next].text),
+                }
+                i = next;
             }
+            if word.is_empty() {
+                return Some(if found_variable {
+                    ForHeaderError::MissingIn
+                } else {
+                    ForHeaderError::Bare
+                });
+            }
+            if word == "in" {
+                return (!found_variable).then_some(ForHeaderError::MissingVariables);
+            }
+            if let Some(c) = invalid_for_variable_char(&word) {
+                return Some(ForHeaderError::InvalidCharacter(c));
+            }
+            found_variable = true;
         }
     }
 
     /// Parse a BSD `.for VAR... in LIST` ... `.endfor` loop.
     fn parse_bsd_for(&mut self, count: usize) {
-        if self.is_bare_bsd_for_at(self.tokens.len()) {
+        let header_error = self.bsd_for_header_error_at(self.tokens.len());
+        if header_error == Some(ForHeaderError::Bare) {
             let directive_range = self.current_range();
             let line = self.line_at(directive_range.start());
             self.push_error(
@@ -631,18 +678,18 @@ impl Parser<'_> {
             self.builder.finish_node();
             return;
         }
-        if self.nesting_depth >= crate::reference::MAX_DEPTH {
+        if header_error.is_none() && self.nesting_depth >= crate::reference::MAX_DEPTH {
             self.parse_too_deeply_nested_block();
             return;
         }
-        self.builder.start_node(FOR_LOOP.into());
-        self.builder.start_node(FOR_HEADER.into());
+        if header_error.is_some() {
+            self.builder.start_node(ERROR.into());
+        } else {
+            self.builder.start_node(FOR_LOOP.into());
+            self.builder.start_node(FOR_HEADER.into());
+        }
         self.bump_n(count);
         self.skip_ws_and_continuations();
-        let mut valid = true;
-        // Like BSD make, take each word up to `in` as a variable,
-        // whatever characters it consists of, as in `.for , in 1`.
-        let mut found_variable = false;
         loop {
             // A line continuation also ends the word.
             let mut word_len = 0;
@@ -655,37 +702,35 @@ impl Parser<'_> {
                 word_len += 1;
             }
             let word = self.next_tokens_text(word_len);
-            if word.is_empty() || word == "in" {
+            if word.is_empty() || word == "in" || invalid_for_variable_char(word).is_some() {
                 break;
             }
-            if let Some(c) = word.chars().find(|c| "$:\\(){}".contains(*c)) {
-                self.record_error(
-                    ParseErrorKind::InvalidForLoop,
-                    format!("Invalid character \"{c}\" in .for loop variable name"),
-                );
-                valid = false;
-                break;
-            }
-            found_variable = true;
             self.bump_merged(IDENTIFIER, word_len);
             self.skip_ws_and_continuations();
         }
-        if valid && !found_variable {
-            self.record_error(
+        match header_error {
+            Some(ForHeaderError::InvalidCharacter(c)) => self.record_error(
+                ParseErrorKind::InvalidForLoop,
+                format!("Invalid character \"{c}\" in .for loop variable name"),
+            ),
+            Some(ForHeaderError::MissingVariables) => self.record_error(
                 ParseErrorKind::MissingForVariables,
                 "expected variable name after .for".to_string(),
-            );
+            ),
+            Some(ForHeaderError::MissingIn) => self.record_error(
+                ParseErrorKind::MissingForIn,
+                "expected 'in' in .for".to_string(),
+            ),
+            Some(ForHeaderError::Bare) | None => {}
         }
         if self.at(IDENTIFIER, "in") {
             self.bump();
-        } else if valid {
-            self.record_error(
-                ParseErrorKind::MissingForIn,
-                "expected 'in' in .for".to_string(),
-            );
         }
         self.parse_directive_argument(None);
         self.builder.finish_node();
+        if header_error.is_some() {
+            return;
+        }
 
         // As in BSD make, the rule context after the loop is the one at
         // the end of its body, which is right unless the loop runs zero

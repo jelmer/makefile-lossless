@@ -658,15 +658,24 @@ fn test_error_kind_bsd_directives() {
     );
     assert_eq!(
         error_kinds(".for x y\n.endfor\n", bsd),
-        vec![ParseErrorKind::MissingForIn]
+        vec![
+            ParseErrorKind::MissingForIn,
+            ParseErrorKind::ExtraneousEndfor
+        ]
     );
     assert_eq!(
         error_kinds(".for in 1\n.endfor\n", bsd),
-        vec![ParseErrorKind::MissingForVariables]
+        vec![
+            ParseErrorKind::MissingForVariables,
+            ParseErrorKind::ExtraneousEndfor
+        ]
     );
     assert_eq!(
         error_kinds(".for $x in 1\n.endfor\n", bsd),
-        vec![ParseErrorKind::InvalidForLoop]
+        vec![
+            ParseErrorKind::InvalidForLoop,
+            ParseErrorKind::ExtraneousEndfor
+        ]
     );
     assert_eq!(
         error_kinds(".for x in a\n", bsd),
@@ -1373,10 +1382,16 @@ fn test_error_position_after_relexed_line() {
             .iter()
             .map(|e| (e.message.as_str(), e.range))
             .collect::<Vec<_>>(),
-        vec![(
-            "expected variable name after .for",
-            rowan::TextRange::new(6.into(), 8.into())
-        )]
+        vec![
+            (
+                "expected variable name after .for",
+                rowan::TextRange::new(6.into(), 8.into())
+            ),
+            (
+                ".endfor without matching .for",
+                rowan::TextRange::new(11.into(), 18.into())
+            )
+        ]
     );
 }
 
@@ -1512,4 +1527,103 @@ fn test_bare_for_in_recipe() {
         )]
     );
     assert_eq!(parsed.root().syntax().to_string(), code);
+}
+
+#[test]
+fn test_malformed_for_header() {
+    let missing_in = (ParseErrorKind::MissingForIn, "expected 'in' in .for");
+    let missing_variables = (
+        ParseErrorKind::MissingForVariables,
+        "expected variable name after .for",
+    );
+    let invalid = (
+        ParseErrorKind::InvalidForLoop,
+        "Invalid character \"$\" in .for loop variable name",
+    );
+    for (header, (kind, message)) in [
+        (".for x", missing_in),
+        (".for x y", missing_in),
+        (".for x # in 1", missing_in),
+        (".for in 1", missing_variables),
+        (".for in", missing_variables),
+        (".for $x in 1", invalid),
+        (".for x $y in 1", invalid),
+    ] {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            // Like a bare `.for`, BSD make ignores a `.for` line whose
+            // header it rejects, so a later `.endfor` has no `.for`.
+            let code = format!("{header}\n.endfor\n");
+            let parsed = parse(&code, variant);
+            assert_eq!(
+                errors_with_lines(&parsed),
+                vec![
+                    (kind, message, 1),
+                    (
+                        ParseErrorKind::ExtraneousEndfor,
+                        ".endfor without matching .for",
+                        2
+                    )
+                ],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+            assert_eq!(top_level_kinds(&parsed), vec![ERROR, ERROR], "{code:?}");
+
+            let code = format!("{header}\nall:\n\t@:\n");
+            let parsed = parse(&code, variant);
+            assert_eq!(
+                errors_with_lines(&parsed),
+                vec![(kind, message, 1)],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+            assert_eq!(top_level_kinds(&parsed), vec![ERROR, RULE], "{code:?}");
+        }
+        for variant in [Some(MakefileVariant::GNUMake), Some(MakefileVariant::NMake)] {
+            let code = format!("{header}\n.endfor\nall:\n\t@:\n");
+            let parsed = parse(&code, variant);
+            assert_eq!(
+                errors_with_lines(&parsed),
+                vec![
+                    (ParseErrorKind::MissingSeparator, "expected ':'", 1),
+                    (ParseErrorKind::MissingSeparator, "expected ':'", 2)
+                ],
+                "{code:?} {variant:?}"
+            );
+            assert_eq!(top_level_kinds(&parsed), vec![RULE, RULE, RULE]);
+        }
+    }
+}
+
+#[test]
+fn test_malformed_for_header_in_conditional() {
+    let code = ".if 1\n.for x\n.endif\nall:\n\t@:\n";
+    let parsed = parse(code, Some(MakefileVariant::BSDMake));
+    assert_eq!(
+        errors_with_lines(&parsed),
+        vec![(ParseErrorKind::MissingForIn, "expected 'in' in .for", 2)]
+    );
+    assert_eq!(parsed.root().syntax().to_string(), code);
+    assert_eq!(top_level_kinds(&parsed), vec![CONDITIONAL, RULE]);
+}
+
+#[test]
+fn test_malformed_for_header_in_recipe() {
+    let code = "all:\n.for in 1\n\t@:\n";
+    let parsed = parse(code, Some(MakefileVariant::BSDMake));
+    assert_eq!(
+        errors_with_lines(&parsed),
+        vec![(
+            ParseErrorKind::MissingForVariables,
+            "expected variable name after .for",
+            2
+        )]
+    );
+    assert_eq!(parsed.root().syntax().to_string(), code);
+    let rules = parsed.root().rules().collect::<Vec<_>>();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0].recipes().collect::<Vec<_>>(),
+        vec!["@:".to_string()]
+    );
 }

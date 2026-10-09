@@ -556,7 +556,7 @@ impl Parser<'_> {
     fn block_delimiter(&self) -> Option<bool> {
         if let Some((name, _)) = self.directive() {
             return match name {
-                "for" if self.is_bare_bsd_for_at(self.tokens.len()) => None,
+                "for" if self.bsd_for_header_error_at(self.tokens.len()).is_some() => None,
                 _ if is_bsd_if(name) || name == "for" => Some(true),
                 "endif" | "endfor" => Some(false),
                 _ => None,
