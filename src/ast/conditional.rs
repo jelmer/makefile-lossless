@@ -699,6 +699,40 @@ impl ConditionalBranch {
         self.header.text_range()
     }
 
+    /// The range of the condition of this branch, after the directive
+    /// keywords, or `None` for a plain `else`.
+    ///
+    /// This is the source of [`Self::condition`]: the variable name of an
+    /// `ifdef` / `ifndef`, or the arguments of an `ifeq` / `ifneq`,
+    /// such as `(a,b)` or `"a" 'b'`, without the whitespace around it or a
+    /// trailing comment. A condition continued onto further lines with a
+    /// backslash covers them all. For a bare `ifdef` without a name, this
+    /// is an empty range after the keyword.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "ifdef A\nelse ifeq (a,b) # c\nelse\nendif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let ranges: Vec<_> = cond.branches().map(|b| b.condition_range()).collect();
+    /// assert_eq!(
+    ///     ranges,
+    ///     vec![
+    ///         Some(TextRange::new(6.into(), 7.into())),
+    ///         Some(TextRange::new(18.into(), 23.into())),
+    ///         None,
+    ///     ]
+    /// );
+    /// ```
+    pub fn condition_range(&self) -> Option<rowan::TextRange> {
+        let expr = self.header.children().find(|it| it.kind() == EXPR)?;
+        let text = expr.text().to_string();
+        let trimmed = text.trim();
+        let start = expr.text_range().start()
+            + rowan::TextSize::of(&text[..text.len() - text.trim_start().len()]);
+        Some(rowan::TextRange::at(start, rowan::TextSize::of(trimmed)))
+    }
+
     /// Whether this branch and `other` are different branches of the same
     /// conditional, so that make never takes both.
     ///
@@ -3469,5 +3503,94 @@ endif
         cond.add_else_item(parsed_item("c:\n"));
         assert_eq!(makefile.to_string(), "ifeq (a,b)\nb:\nelse\nc:\nendif\n");
         assert_matches_reparse(&makefile);
+    }
+
+    /// The condition range of each branch of the first conditional in
+    /// `text`, as parsed for `variant`.
+    fn condition_ranges(text: &str, variant: MakefileVariant) -> Vec<Option<rowan::TextRange>> {
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        let cond = makefile.conditionals().next().unwrap();
+        cond.branches().map(|b| b.condition_range()).collect()
+    }
+
+    fn range(start: u32, end: u32) -> Option<rowan::TextRange> {
+        Some(rowan::TextRange::new(start.into(), end.into()))
+    }
+
+    #[test]
+    fn test_condition_range_ifeq() {
+        let gnu = MakefileVariant::GNUMake;
+        assert_eq!(
+            condition_ranges("ifeq (a,b)\nendif\n", gnu),
+            vec![range(5, 10)]
+        );
+        assert_eq!(
+            condition_ranges("ifneq ($(A), b)  # c\nendif\n", gnu),
+            vec![range(6, 15)]
+        );
+        assert_eq!(
+            condition_ranges("ifeq \"a\" 'b'\nendif\n", gnu),
+            vec![range(5, 12)]
+        );
+        assert_eq!(
+            condition_ranges("ifeq ($(A),a)\r\nendif\r\n", gnu),
+            vec![range(5, 13)]
+        );
+    }
+
+    #[test]
+    fn test_condition_range_ifdef() {
+        let gnu = MakefileVariant::GNUMake;
+        assert_eq!(
+            condition_ranges("ifdef FOO\nendif\n", gnu),
+            vec![range(6, 9)]
+        );
+        assert_eq!(
+            condition_ranges("ifndef  FOO  # c\nendif\n", gnu),
+            vec![range(8, 11)]
+        );
+        assert_eq!(
+            condition_ranges("ifdef  FOO \\\n  BAR\nendif\n", gnu),
+            vec![range(7, 18)]
+        );
+        assert_eq!(condition_ranges("ifdef\nendif\n", gnu), vec![range(5, 5)]);
+    }
+
+    #[test]
+    fn test_condition_range_else() {
+        let gnu = MakefileVariant::GNUMake;
+        assert_eq!(
+            condition_ranges(
+                "ifeq (a,b)\nelse ifdef X\nelse ifneq \"a\" \"b\"\nelse\nendif\n",
+                gnu
+            ),
+            vec![range(5, 10), range(22, 23), range(35, 42), None]
+        );
+        assert_eq!(
+            condition_ranges("ifdef A\nelse # x\nendif\n", gnu),
+            vec![range(6, 7), None]
+        );
+    }
+
+    #[test]
+    fn test_condition_range_bsd() {
+        assert_eq!(
+            condition_ranges(
+                ".if defined(A) # x\n.elif ${B} == 1\n.else\n.endif\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![range(4, 14), range(25, 34), None]
+        );
+    }
+
+    #[test]
+    fn test_condition_range_nmake() {
+        assert_eq!(
+            condition_ranges(
+                "!IF \"$(A)\" == \"1\"\n!ELSE IF 1\n!ELSE\n!ENDIF\n",
+                MakefileVariant::NMake
+            ),
+            vec![range(4, 17), range(27, 28), None]
+        );
     }
 }
