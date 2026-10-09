@@ -303,6 +303,13 @@ impl Parser<'_> {
         self.builder.finish_node();
 
         let green_node = self.builder.finish();
+        crate::lossless::remember_line_starts(
+            &green_node,
+            self.line_starts[1..]
+                .iter()
+                .map(|&start| rowan::TextSize::try_from(start).unwrap())
+                .collect(),
+        );
         for error in &mut self.positioned_errors {
             locate_error_line(&self.line_ends, self.original_text, error);
         }
