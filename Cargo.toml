@@ -2,7 +2,7 @@
 name = "makefile-lossless"
 repository = "https://github.com/jelmer/makefile-lossless"
 description = "Lossless Parser for Makefiles"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
