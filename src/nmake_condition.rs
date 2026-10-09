@@ -322,7 +322,7 @@ pub(crate) fn parse_nmake_condition_defined(
     if parser.pos < text.len() {
         return Err(parser.error(
             NmakeConditionErrorKind::UnexpectedText,
-            format!("Unexpected {:?}", parser.rest()),
+            format!("unexpected {:?}", parser.rest()),
         ));
     }
     Ok((condition, parser.defined))
@@ -357,7 +357,7 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return Err(self.error(
                 NmakeConditionErrorKind::TooDeeplyNested,
-                "Expression nested too deeply".to_string(),
+                "expression nested too deeply".to_string(),
             ));
         }
         Ok(())
@@ -417,7 +417,7 @@ impl<'a> Parser<'a> {
         match rest.chars().next() {
             None => Err(self.error(
                 NmakeConditionErrorKind::MissingOperand,
-                "Missing operand".to_string(),
+                "missing operand".to_string(),
             )),
             Some('(') => {
                 let start = self.pos;
@@ -428,7 +428,7 @@ impl<'a> Parser<'a> {
                     self.pos = start;
                     return Err(self.error(
                         NmakeConditionErrorKind::UnclosedParenthesis,
-                        "Missing ')'".to_string(),
+                        "missing ')'".to_string(),
                     ));
                 }
                 self.pos += 1;
@@ -438,7 +438,7 @@ impl<'a> Parser<'a> {
                 let end = rest[1..].find('"').ok_or_else(|| {
                     self.error(
                         NmakeConditionErrorKind::UnfinishedString,
-                        "Missing closing '\"'".to_string(),
+                        "missing closing '\"'".to_string(),
                     )
                 })?;
                 self.pos += end + 2;
@@ -448,7 +448,7 @@ impl<'a> Parser<'a> {
                 let end = rest.find(']').ok_or_else(|| {
                     self.error(
                         NmakeConditionErrorKind::UnclosedCommand,
-                        "Missing closing ']'".to_string(),
+                        "missing closing ']'".to_string(),
                     )
                 })?;
                 self.pos += end + 1;
@@ -475,7 +475,7 @@ impl<'a> Parser<'a> {
         if word.is_empty() {
             return Err(self.error(
                 NmakeConditionErrorKind::MissingOperand,
-                format!("Expected an operand before {:?}", self.rest()),
+                format!("expected an operand before {:?}", self.rest()),
             ));
         }
         // TODO: Check whether nmake takes `defined` and `exist` in any case,
@@ -512,7 +512,7 @@ impl<'a> Parser<'a> {
     fn macro_end(&self, start: usize) -> Result<usize, NmakeConditionError> {
         let after = &self.text[start + 1..];
         let unclosed = || NmakeConditionError {
-            message: "Missing ')' after macro invocation".to_string(),
+            message: "missing ')' after macro invocation".to_string(),
             offset: start,
             kind: NmakeConditionErrorKind::UnclosedMacro,
         };
@@ -548,7 +548,7 @@ impl<'a> Parser<'a> {
         let invalid = |parser: &Self| {
             parser.error(
                 NmakeConditionErrorKind::InvalidFunctionCall,
-                format!("Expected an argument in parentheses after {name}"),
+                format!("expected an argument in parentheses after {name}"),
             )
         };
         let rest = self.rest();
@@ -565,7 +565,7 @@ impl<'a> Parser<'a> {
                         1 + rest[end + 1..].find('"').ok_or_else(|| {
                             self.error(
                                 NmakeConditionErrorKind::UnfinishedString,
-                                "Missing closing '\"'".to_string(),
+                                "missing closing '\"'".to_string(),
                             )
                         })? + 1
                 }
@@ -819,6 +819,6 @@ mod tests {
         assert_eq!(NmakeBinaryOp::BitXor.to_string(), "^");
         assert_eq!(NmakeUnaryOp::Complement.to_string(), "~");
         let error = parse_nmake_condition("1 +").unwrap_err();
-        assert_eq!(error.to_string(), "Missing operand at offset 3");
+        assert_eq!(error.to_string(), "missing operand at offset 3");
     }
 }
