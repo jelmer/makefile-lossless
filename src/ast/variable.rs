@@ -1094,6 +1094,51 @@ impl VariableDefinition {
         }
     }
 
+    /// The text of the assignment from the start of its name to the end of
+    /// its value, as `variant` reads the logical line, before expansion.
+    ///
+    /// Directive keywords such as `export` or `override` and, for a
+    /// target-specific assignment, the targets before it are not included.
+    /// Line continuations, escapes and comments are handled as in
+    /// [`Self::value_for`]. This is useful where make reads the words of
+    /// the assignment as something else, as BSD make does with the sources
+    /// of `target: VAR = value` if `.MAKE.TARGET_LOCAL_VARIABLES` is false.
+    ///
+    /// Returns `None` for a `define` block, an `undefine` directive and an
+    /// `export` or `unexport` directive without an assignment.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let makefile: Makefile = "all: CFLAGS += -O2 \\\n\t-g # debug\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let var = rule.scoped_assignment().unwrap();
+    /// assert_eq!(
+    ///     var.assignment_text_for(MakefileVariant::BSDMake),
+    ///     Some("CFLAGS += -O2  -g".to_string())
+    /// );
+    /// ```
+    pub fn assignment_text_for(&self, variant: MakefileVariant) -> Option<String> {
+        if self.is_define() || self.is_undefine() {
+            return None;
+        }
+        let value = self.value_expr()?;
+        let start = self.name_range().unwrap_or(value.text_range()).start();
+        let end = value.text_range().end();
+        let tokens = self
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .skip_while(|t| t.text_range().start() < start)
+            .take_while(|t| t.text_range().end() <= end);
+        Some(logical_text(
+            self.syntax(),
+            tokens,
+            LineSyntax::from(variant),
+            true,
+        ))
+    }
+
     /// Get the value of the variable as make sees it
     #[deprecated(since = "0.4.2", note = "use `value_for` instead")]
     pub fn value(&self, variant: MakefileVariant) -> Option<String> {
@@ -1817,6 +1862,54 @@ mod tests {
     use super::*;
     use crate::lossless::{InvalidEdit, Makefile};
     use crate::test_util::expect_invalid_edit;
+
+    fn assignment_texts(text: &str, variant: MakefileVariant) -> Vec<Option<String>> {
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        makefile
+            .variable_definitions()
+            .map(|v| v.assignment_text_for(variant))
+            .collect()
+    }
+
+    #[test]
+    fn test_assignment_text_for() {
+        use MakefileVariant::{BSDMake, GNUMake};
+        let some = |s: &str| vec![Some(s.to_string())];
+        assert_eq!(assignment_texts("X = a b\n", GNUMake), some("X = a b"));
+        assert_eq!(
+            assignment_texts("export override X := a # c\n", GNUMake),
+            some("X := a ")
+        );
+        assert_eq!(
+            assignment_texts("X = a \\\n   b\\#c\n", GNUMake),
+            some("X = a b#c")
+        );
+        assert_eq!(
+            assignment_texts("X = a \\\n   b # c\n", BSDMake),
+            some("X = a  b")
+        );
+        assert_eq!(assignment_texts("X=\n", GNUMake), some("X="));
+        assert_eq!(
+            assignment_texts("X.${Y} ?= ${Z}\n", BSDMake),
+            some("X.${Y} ?= ${Z}")
+        );
+        assert_eq!(
+            assignment_texts("all: X = $(a#b)# c\n", GNUMake),
+            some("X = $(a#b)")
+        );
+        assert_eq!(
+            assignment_texts("all: X = ${a#b}\n", BSDMake),
+            some("X = ${a")
+        );
+        assert_eq!(
+            assignment_texts("prog: .USE src VAR=a \\\n\tb # c\n\techo\n", BSDMake),
+            some("VAR=a  b")
+        );
+        assert_eq!(
+            assignment_texts("define X\na\nendef\nundefine Y\nexport Z\n", GNUMake),
+            vec![None, None, None]
+        );
+    }
 
     #[test]
     fn test_assignment_operator_kind() {
