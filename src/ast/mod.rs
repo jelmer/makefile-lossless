@@ -782,6 +782,21 @@ pub(crate) fn logical_text(
     syntax: LineSyntax,
     comments: bool,
 ) -> String {
+    logical_text_mapped(root, tokens, syntax, comments).0
+}
+
+/// Like [`logical_text`], also returning where parts of the text come from.
+///
+/// Each entry is an offset in the text and, if the text from there up to
+/// the next entry is copied verbatim from the source, where it starts in
+/// the source.
+pub(crate) fn logical_text_mapped(
+    root: &SyntaxNode,
+    tokens: impl IntoIterator<Item = SyntaxToken>,
+    syntax: LineSyntax,
+    comments: bool,
+) -> (String, Vec<(usize, Option<rowan::TextSize>)>) {
+    let mut map: Vec<(usize, Option<rowan::TextSize>)> = Vec::new();
     let halve = |n: usize| if syntax == LineSyntax::Bsd { n } else { n / 2 };
     let mut text = String::new();
     // Backslashes not yet added to `text`, since how many are kept depends
@@ -809,7 +824,9 @@ pub(crate) fn logical_text(
                 backslashes = 0;
                 if kept == 0 && syntax == LineSyntax::Gnu {
                     text.truncate(text.trim_end_matches([' ', '\t']).len());
+                    map.retain(|&(offset, _)| offset <= text.len());
                 }
+                map.push((text.len(), None));
                 text.push_str(&"\\".repeat(kept));
                 text.push(' ');
                 in_continuation = true;
@@ -820,26 +837,30 @@ pub(crate) fn logical_text(
             }
             NEWLINE | INDENT if is_continuation(&token.clone().into()) => {}
             WHITESPACE if in_continuation => {}
-            TEXT if comments && token.text() == "\\#" => match syntax {
-                LineSyntax::NMake => {
-                    text.push_str(&"\\".repeat(backslashes + 1));
-                    backslashes = 0;
-                    break;
+            TEXT if comments && token.text() == "\\#" => {
+                map.push((text.len(), None));
+                match syntax {
+                    LineSyntax::NMake => {
+                        text.push_str(&"\\".repeat(backslashes + 1));
+                        backslashes = 0;
+                        break;
+                    }
+                    LineSyntax::Gnu | LineSyntax::Posix if in_reference(&token, root) => {
+                        text.push_str(&"\\".repeat(backslashes));
+                        text.push_str(token.text());
+                        backslashes = 0;
+                        in_continuation = false;
+                    }
+                    _ => {
+                        text.push_str(&"\\".repeat(halve(backslashes)));
+                        text.push('#');
+                        backslashes = 0;
+                        in_continuation = false;
+                    }
                 }
-                LineSyntax::Gnu | LineSyntax::Posix if in_reference(&token, root) => {
-                    text.push_str(&"\\".repeat(backslashes));
-                    text.push_str(token.text());
-                    backslashes = 0;
-                    in_continuation = false;
-                }
-                _ => {
-                    text.push_str(&"\\".repeat(halve(backslashes)));
-                    text.push('#');
-                    backslashes = 0;
-                    in_continuation = false;
-                }
-            },
+            }
             TEXT if comments && syntax == LineSyntax::NMake && token.text().starts_with('^') => {
+                map.push((text.len(), None));
                 text.push_str(&"\\".repeat(backslashes));
                 backslashes = 0;
                 in_continuation = false;
@@ -854,13 +875,30 @@ pub(crate) fn logical_text(
                 }
             }
             kind => {
+                if backslashes > 0 {
+                    map.push((text.len(), None));
+                }
                 text.push_str(&"\\".repeat(backslashes));
                 if backslashes % 2 == 1 && kind == WHITESPACE {
                     keep = text.len() + 1;
                 }
                 backslashes = 0;
                 in_continuation = false;
-                text.push_str(if kind == NEWLINE { "\n" } else { token.text() });
+                if kind == NEWLINE {
+                    map.push((text.len(), None));
+                    text.push('\n');
+                } else {
+                    let source = token.text_range().start();
+                    let contiguous = map.last().is_some_and(|&(offset, start)| {
+                        start.is_some_and(|start| {
+                            start + rowan::TextSize::from((text.len() - offset) as u32) == source
+                        })
+                    });
+                    if !contiguous {
+                        map.push((text.len(), Some(source)));
+                    }
+                    text.push_str(token.text());
+                }
             }
         }
         last = Some(token);
@@ -872,13 +910,35 @@ pub(crate) fn logical_text(
     if comments && before_comment && syntax != LineSyntax::NMake {
         backslashes = halve(backslashes);
     }
+    map.push((text.len(), None));
     text.push_str(&"\\".repeat(backslashes));
     if syntax == LineSyntax::Bsd {
         // BSD make removes anything `isspace()` accepts.
         let trimmed = text.trim_end_matches([' ', '\t', '\r', '\x0b', '\x0c']);
         text.truncate(trimmed.len().max(keep));
     }
-    text
+    (text, map)
+}
+
+/// The source range of the bytes `range` of a text returned by
+/// [`logical_text_mapped`] with `map`, if they are copied verbatim from
+/// one place in the source.
+pub(crate) fn logical_source_range(
+    map: &[(usize, Option<rowan::TextSize>)],
+    range: std::ops::Range<usize>,
+) -> Option<rowan::TextRange> {
+    let i = map
+        .partition_point(|&(offset, _)| offset <= range.start)
+        .checked_sub(1)?;
+    let (offset, source) = map[i];
+    if map.get(i + 1).is_some_and(|&(next, _)| range.end > next) {
+        return None;
+    }
+    let start = source? + rowan::TextSize::from((range.start - offset) as u32);
+    Some(rowan::TextRange::at(
+        start,
+        rowan::TextSize::from(range.len() as u32),
+    ))
 }
 
 /// Escape each `#` in `path` outside variable references, so that make
