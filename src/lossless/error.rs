@@ -184,9 +184,18 @@ pub enum ParseErrorKind {
     /// An `else` after the final `else` of a conditional (GNU make: "only
     /// one 'else' per conditional").
     DuplicateElse,
-    /// A BSD `.for` loop variable name with a character that BSD make
-    /// does not allow, such as `$` or `:`.
+    /// No longer reported; see [`ParseErrorKind::InvalidForVariableName`],
+    /// [`ParseErrorKind::MissingForVariables`] and
+    /// [`ParseErrorKind::MissingForIn`].
+    #[deprecated(since = "0.4.5", note = "use `InvalidForVariableName` instead")]
     InvalidForLoop,
+    /// A BSD `.for` loop variable name with a character that BSD make
+    /// does not allow, such as `$` or `:` (BSD make: "Invalid character
+    /// \"$\" in .for loop variable name").
+    InvalidForVariableName {
+        /// The first disallowed character in the variable name.
+        character: char,
+    },
     /// A BSD `.for` loop without variables before `in`, as in `.for in 1`
     /// (BSD make: "Missing iteration variables in .for loop").
     MissingForVariables,

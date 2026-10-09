@@ -710,7 +710,7 @@ impl Parser<'_> {
         }
         match header_error {
             Some(ForHeaderError::InvalidCharacter(c)) => self.record_error(
-                ParseErrorKind::InvalidForLoop,
+                ParseErrorKind::InvalidForVariableName { character: c },
                 format!("Invalid character \"{c}\" in .for loop variable name"),
             ),
             Some(ForHeaderError::MissingVariables) => self.record_error(
