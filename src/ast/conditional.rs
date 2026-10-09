@@ -194,6 +194,18 @@ keyword_enum! {
     }
 }
 
+/// The directive starting a [`ConditionalBranch`], as returned by
+/// [`ConditionalBranch::branch_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BranchKind {
+    /// A branch with a condition, such as `ifdef`, `else ifeq` or `.elif`.
+    Conditional(ConditionalKind),
+    /// A plain `else` / `.else` / `!ELSE`, taken when no earlier branch
+    /// was.
+    Else,
+}
+
 /// A single branch of a [`Conditional`]: the initial `if`, an `else if`
 /// (or BSD `.elif`) or the final plain `else`.
 ///
@@ -271,7 +283,8 @@ impl ConditionalBranch {
     ///
     /// Returns `None` for a plain `else` / `.else`, and for a directive
     /// that is missing or not recognized because of a syntax error, which
-    /// is reported as a parse error.
+    /// is reported as a parse error. Use [`Self::branch_kind`] to tell
+    /// these apart.
     ///
     /// # Example
     /// ```
@@ -286,6 +299,34 @@ impl ConditionalBranch {
     /// ```
     pub fn conditional_kind(&self) -> Option<ConditionalKind> {
         self.conditional_type()?.parse().ok()
+    }
+
+    /// The directive starting this branch: a conditional directive, as
+    /// returned by [`Self::conditional_kind`], or a plain `else`.
+    ///
+    /// Returns `None` for a directive that is missing or not recognized
+    /// because of a syntax error, which is reported as a parse error.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{BranchKind, ConditionalKind, Makefile};
+    /// let makefile: Makefile = ".if 1\n.elifdef A\n.else\n.endif\n".parse().unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let kinds: Vec<_> = cond.branches().map(|b| b.branch_kind()).collect();
+    /// assert_eq!(
+    ///     kinds,
+    ///     vec![
+    ///         Some(BranchKind::Conditional(ConditionalKind::BsdIf)),
+    ///         Some(BranchKind::Conditional(ConditionalKind::BsdIfdef)),
+    ///         Some(BranchKind::Else),
+    ///     ]
+    /// );
+    /// ```
+    pub fn branch_kind(&self) -> Option<BranchKind> {
+        if self.is_else() {
+            return Some(BranchKind::Else);
+        }
+        self.conditional_kind().map(BranchKind::Conditional)
     }
 
     /// The source range of the directive keywords starting this branch.
@@ -1362,7 +1403,7 @@ impl Conditional {
 #[cfg(test)]
 mod tests {
 
-    use super::{ConditionalBranch, ConditionalItem, ConditionalKind};
+    use super::{BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind};
     use crate::lossless::Makefile;
     use crate::test_util::{assert_matches_reparse, item_without_newline};
     use crate::{
@@ -1427,6 +1468,51 @@ mod tests {
         );
         let kinds: Vec<_> = cond.branches().map(|b| b.conditional_kind()).collect();
         assert_eq!(kinds, vec![Some(ConditionalKind::NmakeIf), None]);
+        let kinds: Vec<_> = cond.branches().map(|b| b.branch_kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(BranchKind::Conditional(ConditionalKind::NmakeIf)),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branch_kind() {
+        for (variant, text) in [
+            (
+                MakefileVariant::GNUMake,
+                "ifdef A\nelse ifeq (a,b)\nelse\nendif\n",
+            ),
+            (
+                MakefileVariant::BSDMake,
+                ".ifdef A\n.elif 1\n.else\n.endif\n",
+            ),
+            (
+                MakefileVariant::NMake,
+                "!IFDEF A\n!ELSE IF 1\n!ELSE\n!ENDIF\n",
+            ),
+        ] {
+            let parsed = Makefile::parse_with_variant(text, variant);
+            assert_eq!(parsed.errors(), &[], "{text:?}");
+            let cond = parsed.tree().conditionals().next().unwrap();
+            let kinds: Vec<_> = cond.branches().map(|b| b.branch_kind()).collect();
+            let expected = match variant {
+                MakefileVariant::GNUMake => [ConditionalKind::Ifdef, ConditionalKind::Ifeq],
+                MakefileVariant::BSDMake => [ConditionalKind::BsdIfdef, ConditionalKind::BsdIf],
+                _ => [ConditionalKind::NmakeIfdef, ConditionalKind::NmakeIf],
+            };
+            assert_eq!(
+                kinds,
+                vec![
+                    Some(BranchKind::Conditional(expected[0])),
+                    Some(BranchKind::Conditional(expected[1])),
+                    Some(BranchKind::Else),
+                ],
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
