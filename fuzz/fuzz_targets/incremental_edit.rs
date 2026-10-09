@@ -66,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
     // and that text must equal the new source (lossless property must
     // survive incremental edits too).
     let full_parse = variant::parse(&incremental_text, variant);
-    assert_eq!(incremental_parse.variant(), variant);
+    assert_eq!(incremental_parse.variant(), full_parse.variant());
     let incremental_str = incremental_parse.tree().to_string();
     assert_eq!(incremental_str, incremental_text);
     assert_eq!(incremental_str, full_parse.tree().to_string());
