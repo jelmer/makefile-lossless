@@ -76,14 +76,39 @@ fn line_starts(green: &rowan::GreenNodeData) -> Vec<rowan::TextSize> {
     out
 }
 
+/// Number of trees whose line starts are kept per thread, enough to cover
+/// switching between a makefile and the files it includes.
+const LINE_STARTS_CACHE_SIZE: usize = 4;
+
+type LineStartsCache = std::collections::VecDeque<(rowan::GreenNode, Vec<rowan::TextSize>)>;
+
 thread_local! {
-    /// Line starts for the most recently queried tree.
+    /// Line starts for the most recently parsed or queried trees, least
+    /// recently used first.
     ///
     /// Green nodes are immutable and mutating a tree gives its root a new
     /// green node, so the root green node identifies the text. Holding on to
     /// it keeps its address from being reused by another tree.
-    static LINE_STARTS_CACHE: std::cell::RefCell<Option<(rowan::GreenNode, Vec<rowan::TextSize>)>> =
-        const { std::cell::RefCell::new(None) };
+    static LINE_STARTS_CACHE: std::cell::RefCell<LineStartsCache> =
+        const { std::cell::RefCell::new(LineStartsCache::new()) };
+}
+
+fn cache_line_starts(
+    cache: &mut LineStartsCache,
+    green: rowan::GreenNode,
+    starts: Vec<rowan::TextSize>,
+) {
+    if cache.len() == LINE_STARTS_CACHE_SIZE {
+        cache.pop_front();
+    }
+    cache.push_back((green, starts));
+}
+
+/// Record the line starts of a freshly parsed tree, so that looking up line
+/// numbers in it doesn't have to walk the tree to find them again.
+pub(crate) fn remember_line_starts(green: &rowan::GreenNode, starts: Vec<rowan::TextSize>) {
+    debug_assert_eq!(starts, line_starts(green));
+    LINE_STARTS_CACHE.with_borrow_mut(|cache| cache_line_starts(cache, green.clone(), starts));
 }
 
 /// Calculate line and column (both 0-indexed) for the given offset in the tree.
@@ -92,13 +117,20 @@ pub(crate) fn line_col_at_offset(node: &SyntaxNode, offset: rowan::TextSize) -> 
     let root = node.ancestors().last().unwrap_or_else(|| node.clone());
     let green = root.green();
     LINE_STARTS_CACHE.with_borrow_mut(|cache| {
-        let cached = matches!(cache, Some((cached_green, _))
-            if std::ptr::eq::<rowan::GreenNodeData>(&**cached_green, &*green));
-        if !cached {
-            let starts = line_starts(&green);
-            *cache = Some((green.into_owned(), starts));
+        let cached = cache.iter().position(|(cached_green, _)| {
+            std::ptr::eq::<rowan::GreenNodeData>(&**cached_green, &*green)
+        });
+        match cached {
+            Some(i) => {
+                let entry = cache.remove(i).unwrap();
+                cache.push_back(entry);
+            }
+            None => {
+                let starts = line_starts(&green);
+                cache_line_starts(cache, green.into_owned(), starts);
+            }
         }
-        let starts = &cache.as_ref().unwrap().1;
+        let starts = &cache.back().unwrap().1;
         let line = starts.partition_point(|&start| start <= offset);
         let line_start = match line {
             0 => rowan::TextSize::from(0),

@@ -234,6 +234,37 @@ fn test_line_col_multiple_trees() {
 }
 
 #[test]
+fn test_line_col_more_trees_than_cached() {
+    let makefiles: Vec<Makefile> = (0..LINE_STARTS_CACHE_SIZE * 2)
+        .map(|i| format!("{}rule:\n", "\n".repeat(i)).parse().unwrap())
+        .collect();
+    let rules: Vec<_> = makefiles
+        .iter()
+        .map(|m| m.rules().next().unwrap())
+        .collect();
+    for _ in 0..2 {
+        for (i, rule) in rules.iter().enumerate().rev() {
+            assert_eq!(rule.line(), i);
+        }
+    }
+}
+
+#[test]
+fn test_line_starts_remembered_by_parser() {
+    let parsed = Makefile::parse("A = 1\r\nB = a \\\n  b\n\nrule:\n\tcmd");
+    let starts = LINE_STARTS_CACHE.with_borrow(|cache| {
+        let (green, starts) = cache.back().unwrap();
+        assert!(std::ptr::eq::<rowan::GreenNodeData>(
+            &**green,
+            &**parsed.green()
+        ));
+        starts.clone()
+    });
+    let starts: Vec<u32> = starts.into_iter().map(u32::from).collect();
+    assert_eq!(starts, vec![7, 15, 19, 20, 26]);
+}
+
+#[test]
 fn test_nested_conditionals_line_tracking() {
     let text = r#"ifdef OUTER
 VAR1 = value1
