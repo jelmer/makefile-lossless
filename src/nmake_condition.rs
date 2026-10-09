@@ -300,7 +300,23 @@ impl std::error::Error for NmakeConditionError {}
 /// assert!(parse_nmake_condition("$(X) ==").is_err());
 /// ```
 pub fn parse_nmake_condition(text: &str) -> Result<NmakeCondition, NmakeConditionError> {
-    let mut parser = Parser { text, pos: 0 };
+    parse_nmake_condition_defined(text).map(|(condition, _)| condition)
+}
+
+/// The arguments of `DEFINED` in a condition, each with its byte range.
+pub(crate) type DefinedArguments = Vec<(String, std::ops::Range<usize>)>;
+
+/// Parse an nmake condition as [`parse_nmake_condition`] does, also
+/// returning the arguments of `DEFINED` in order, each with its byte range
+/// in `text`.
+pub(crate) fn parse_nmake_condition_defined(
+    text: &str,
+) -> Result<(NmakeCondition, DefinedArguments), NmakeConditionError> {
+    let mut parser = Parser {
+        text,
+        pos: 0,
+        defined: Vec::new(),
+    };
     let condition = parser.parse_binary(0, 0)?;
     parser.skip_whitespace();
     if parser.pos < text.len() {
@@ -309,12 +325,14 @@ pub fn parse_nmake_condition(text: &str) -> Result<NmakeCondition, NmakeConditio
             format!("Unexpected {:?}", parser.rest()),
         ));
     }
-    Ok(condition)
+    Ok((condition, parser.defined))
 }
 
 struct Parser<'a> {
     text: &'a str,
     pos: usize,
+    /// The arguments of `DEFINED` parsed so far.
+    defined: DefinedArguments,
 }
 
 impl<'a> Parser<'a> {
@@ -557,13 +575,23 @@ impl<'a> Parser<'a> {
         if !rest[end..].starts_with(')') {
             return Err(invalid(self));
         }
-        let argument = rest[1..end].trim_matches([' ', '\t']);
-        let argument = argument
-            .strip_prefix('"')
-            .and_then(|a| a.strip_suffix('"'))
-            .unwrap_or(argument);
+        let inside = &rest[1..end];
+        let mut start = 1 + inside.len() - inside.trim_start_matches([' ', '\t']).len();
+        let argument = inside.trim_matches([' ', '\t']);
+        let argument = match argument.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            Some(unquoted) => {
+                start += 1;
+                unquoted
+            }
+            None => argument,
+        };
         if argument.is_empty() {
             return Err(invalid(self));
+        }
+        if name.eq_ignore_ascii_case("DEFINED") {
+            let start = self.pos + start;
+            self.defined
+                .push((argument.to_string(), start..start + argument.len()));
         }
         let argument = argument.to_string();
         self.pos += end + 1;

@@ -1,17 +1,22 @@
 use super::bsd::{keyword_range, keyword_token};
 use super::makefile::MakefileItem;
 use super::{
-    line_ending, logical_text, terminate_line_before, with_recipe_prefix_before,
-    with_trailing_newline, LineSyntax,
+    line_ending, logical_source_range, logical_text, logical_text_mapped, terminate_line_before,
+    with_recipe_prefix_before, with_trailing_newline, LineSyntax,
 };
-use crate::bsd_condition::{parse_bsd_condition, BsdCondition, BsdConditionError};
+use crate::bsd_condition::{
+    parse_bsd_condition, parse_bsd_condition_words, BsdCondition, BsdConditionError, BsdFunction,
+    ConditionWord,
+};
 use crate::lossless::{
     invalid_edit, lf_line_endings, line_col_at_offset, remove_with_preceding_comments, Conditional,
     Error, InvalidEditKind, Lang, Recipe, Rule, VariableDefinition,
 };
-use crate::nmake_condition::{parse_nmake_condition, NmakeCondition, NmakeConditionError};
-use crate::MakefileVariant;
+use crate::nmake_condition::{
+    parse_nmake_condition, parse_nmake_condition_defined, NmakeCondition, NmakeConditionError,
+};
 use crate::SyntaxKind::*;
+use crate::{MakefileVariant, ParsedReference};
 use rowan::ast::AstNode;
 use rowan::{Direction, GreenNodeBuilder, SyntaxNode};
 
@@ -592,6 +597,82 @@ impl ConditionalBranch {
         Some(parse_nmake_condition(&condition))
     }
 
+    /// The variables whose definedness or value the condition of this
+    /// branch tests by name rather than through a variable reference, each
+    /// with the range of its name.
+    ///
+    /// These are the name in a GNU make `ifdef` / `ifndef` or nmake
+    /// `!IFDEF` / `!IFNDEF`, the arguments of BSD make's `defined()` and
+    /// `empty()` (only the variable name, without modifiers) and nmake's
+    /// `DEFINED()`, and bare words in BSD make `.if`, `.ifdef` and
+    /// `.ifndef` conditions. A name with a variable reference in it, such
+    /// as `defined(${X})`, is left out, as are all names in a condition
+    /// that does not parse.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = ".if defined(A) && !empty(B:Mx)\n.elifndef C\n.endif\n"
+    ///     .parse()
+    ///     .unwrap();
+    /// let cond = makefile.conditionals().next().unwrap();
+    /// let names: Vec<_> = cond.branches().flat_map(|b| b.tested_variables()).collect();
+    /// assert_eq!(
+    ///     names,
+    ///     vec![
+    ///         ("A".to_string(), TextRange::new(12.into(), 13.into())),
+    ///         ("B".to_string(), TextRange::new(25.into(), 26.into())),
+    ///         ("C".to_string(), TextRange::new(41.into(), 42.into())),
+    ///     ]
+    /// );
+    /// ```
+    pub fn tested_variables(&self) -> Vec<(String, rowan::TextRange)> {
+        use ConditionalKind::*;
+        let Some(kind) = self.conditional_kind() else {
+            return Vec::new();
+        };
+        let syntax = match kind {
+            Ifdef | Ifndef => LineSyntax::Gnu,
+            BsdIf | BsdIfdef | BsdIfndef | BsdIfmake | BsdIfnmake => LineSyntax::Bsd,
+            NmakeIf | NmakeIfdef | NmakeIfndef => LineSyntax::NMake,
+            Ifeq | Ifneq => return Vec::new(),
+        };
+        let Some(expr) = self.header.children().find(|it| it.kind() == EXPR) else {
+            return Vec::new();
+        };
+        let tokens = expr
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token());
+        let comments = syntax != LineSyntax::Gnu;
+        let (text, map) = logical_text_mapped(&expr, tokens, syntax, comments);
+        let leading = text.len() - text.trim_start().len();
+        let condition = text.trim();
+        let names: Vec<(String, std::ops::Range<usize>)> = match kind {
+            Ifdef | Ifndef | NmakeIfdef | NmakeIfndef => {
+                vec![(condition.to_string(), 0..condition.len())]
+            }
+            NmakeIf => match parse_nmake_condition_defined(condition) {
+                Ok((_, defined)) => defined,
+                Err(_) => Vec::new(),
+            },
+            _ => match parse_bsd_condition_words(condition) {
+                Ok((_, words)) => words
+                    .into_iter()
+                    .filter_map(|word| bsd_tested_variable(kind, word))
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+        };
+        names
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty() && !name.contains(['$', ' ', '\t']))
+            .filter_map(|(name, range)| {
+                let range = logical_source_range(&map, range.start + leading..range.end + leading)?;
+                Some((name, range))
+            })
+            .collect()
+    }
+
     /// The items in this branch in source order, including recipe lines
     /// and nested conditionals.
     ///
@@ -793,6 +874,36 @@ impl ConditionalBranch {
     /// ```
     pub fn is_exclusive_with(&self, other: &ConditionalBranch) -> bool {
         self.header != other.header && self.header.parent() == other.header.parent()
+    }
+}
+
+/// The variable named by `word` of a BSD make condition of `kind`, with
+/// the range of the name in the condition.
+fn bsd_tested_variable(
+    kind: ConditionalKind,
+    word: ConditionWord,
+) -> Option<(String, std::ops::Range<usize>)> {
+    match word.function {
+        // A bare word is passed to `make()` for `.ifmake`.
+        None if matches!(
+            kind,
+            ConditionalKind::BsdIfmake | ConditionalKind::BsdIfnmake
+        ) =>
+        {
+            None
+        }
+        None | Some(BsdFunction::Defined) => Some((word.text, word.range)),
+        // The argument is the inside of a variable reference.
+        Some(BsdFunction::Empty) => {
+            let reference =
+                ParsedReference::parse(&format!("${{{}}}", word.text), MakefileVariant::BSDMake)
+                    .ok()?;
+            word.text.starts_with(&reference.name).then(|| {
+                let start = word.range.start;
+                (reference.name.clone(), start..start + reference.name.len())
+            })
+        }
+        Some(_) => None,
     }
 }
 
@@ -1561,6 +1672,102 @@ mod tests {
         );
     }
     use rowan::ast::AstNode;
+
+    fn tested_variables(makefile: &Makefile) -> Vec<(String, std::ops::Range<u32>)> {
+        makefile
+            .all_conditionals()
+            .flat_map(|c| c.branches().collect::<Vec<_>>())
+            .flat_map(|b| b.tested_variables())
+            .map(|(name, range)| (name, range.start().into()..range.end().into()))
+            .collect()
+    }
+
+    fn named(names: &[(&str, std::ops::Range<u32>)]) -> Vec<(String, std::ops::Range<u32>)> {
+        names
+            .iter()
+            .map(|(name, range)| (name.to_string(), range.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_tested_variables_gnu() {
+        let makefile: Makefile =
+            "ifdef A\nelse ifndef  B \nelse ifdef $(C)\nelse ifeq ($(D),1)\nendif\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            tested_variables(&makefile),
+            named(&[("A", 6..7), ("B", 21..22)])
+        );
+    }
+
+    #[test]
+    fn test_tested_variables_gnu_continuation() {
+        let makefile: Makefile = "ifdef \\\n  A\nendif\n".parse().unwrap();
+        assert_eq!(tested_variables(&makefile), named(&[("A", 10..11)]));
+    }
+
+    #[test]
+    fn test_tested_variables_bsd() {
+        let makefile: Makefile = ".if defined(A) && !empty(B:Mx) || C\n.endif\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            tested_variables(&makefile),
+            named(&[("A", 12..13), ("B", 25..26), ("C", 34..35)])
+        );
+    }
+
+    #[test]
+    fn test_tested_variables_bsd_continuation() {
+        let makefile: Makefile = ".if defined(A) && \\\n    defined( B )\n.endif\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            tested_variables(&makefile),
+            named(&[("A", 12..13), ("B", 33..34)])
+        );
+    }
+
+    #[test]
+    fn test_tested_variables_bsd_directives() {
+        let makefile: Makefile =
+            ".ifdef A || ${B}\n.elifndef C\n.endif\n.ifmake F && defined(G)\n.endif\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            tested_variables(&makefile),
+            named(&[("A", 7..8), ("C", 27..28), ("G", 57..58)])
+        );
+    }
+
+    #[test]
+    fn test_tested_variables_bsd_computed_names() {
+        let makefile: Makefile =
+            ".if defined(${X}) || V${:UA}R || empty(${Y}) || defined(A\\#B)\n.endif\n"
+                .parse()
+                .unwrap();
+        assert_eq!(tested_variables(&makefile), named(&[]));
+    }
+
+    #[test]
+    fn test_tested_variables_bsd_malformed() {
+        let makefile: Makefile = ".if defined(A) &\n.endif\n".parse().unwrap();
+        assert_eq!(tested_variables(&makefile), named(&[]));
+    }
+
+    #[test]
+    fn test_tested_variables_nmake() {
+        let makefile = Makefile::parse_with_variant(
+            "!IFDEF A\n!ELSEIF DEFINED(B) && !DEFINED( \"C\" ) && DEFINED($(D))\n!ENDIF\n",
+            crate::MakefileVariant::NMake,
+        )
+        .tree();
+        assert_eq!(
+            tested_variables(&makefile),
+            named(&[("A", 7..8), ("B", 25..26), ("C", 42..43)])
+        );
+    }
 
     #[test]
     fn test_nmake_condition() {

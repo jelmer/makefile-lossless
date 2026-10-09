@@ -329,11 +329,37 @@ pub fn parse_bsd_condition(text: &str) -> Result<BsdCondition, BsdConditionError
 }
 
 fn parse(text: &str, left_unquoted_ok: bool) -> Result<BsdCondition, BsdConditionError> {
+    parse_with_words(text, left_unquoted_ok).map(|(condition, _)| condition)
+}
+
+/// A bare word or function argument in a BSD make condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConditionWord {
+    /// The function the word is the argument of, or `None` for a bare word.
+    pub(crate) function: Option<BsdFunction>,
+    /// The unexpanded word, as in [`BsdCondition`].
+    pub(crate) text: String,
+    /// The byte range of the word in the condition text.
+    pub(crate) range: std::ops::Range<usize>,
+}
+
+/// Parse a BSD make condition as [`parse_bsd_condition`] does, also
+/// returning its bare words and function arguments in order.
+pub(crate) fn parse_bsd_condition_words(
+    text: &str,
+) -> Result<(BsdCondition, Vec<ConditionWord>), BsdConditionError> {
+    parse_with_words(text, false)
+}
+
+fn parse_with_words(
+    text: &str,
+    left_unquoted_ok: bool,
+) -> Result<(BsdCondition, Vec<ConditionWord>), BsdConditionError> {
     let mut parser = Parser::new(text, left_unquoted_ok);
     let condition = parser.parse_or()?;
     parser.skip_whitespace();
     match parser.peek() {
-        None | Some(b'#') => Ok(condition),
+        None | Some(b'#') => Ok((condition, parser.words)),
         Some(b')') => Err(parser.error(
             BsdConditionErrorKind::UnbalancedParenthesis,
             "unbalanced \")\"",
@@ -415,6 +441,8 @@ struct Parser {
     left_unquoted_ok: bool,
     /// The number of terms being parsed that enclose the position.
     depth: usize,
+    /// The bare words and function arguments parsed so far.
+    words: Vec<ConditionWord>,
 }
 
 impl Parser {
@@ -445,6 +473,7 @@ impl Parser {
             pos: 0,
             left_unquoted_ok,
             depth: 0,
+            words: Vec::new(),
         }
     }
 
@@ -604,12 +633,15 @@ impl Parser {
             let expr = format!("${}", self.slice(open, self.text.len()));
             let close = self.scan_expression(open - 1, &expr)? - 1;
             let argument = self.slice(open + 1, close);
+            self.push_word(Some(function), open + 1, close, &argument);
             self.pos = close + 1;
             argument
         } else {
             self.pos += 1;
             self.skip_whitespace();
+            let argument_start = self.pos;
             let argument = self.scan_word()?;
+            self.push_word(Some(function), argument_start, self.pos, &argument);
             self.skip_whitespace();
             if self.peek() != Some(b')') {
                 return Err(self.error_at(
@@ -638,7 +670,17 @@ impl Parser {
             return self.parse_comparison();
         }
         self.pos = end;
+        self.push_word(None, start, end, &word);
         Ok(BsdCondition::Bare(word))
+    }
+
+    /// Record the word between the positions `start` and `end`.
+    fn push_word(&mut self, function: Option<BsdFunction>, start: usize, end: usize, text: &str) {
+        self.words.push(ConditionWord {
+            function,
+            text: text.to_string(),
+            range: self.offsets[start]..self.offsets[end],
+        });
     }
 
     /// Scan a word as used for function arguments and bare words: up to
