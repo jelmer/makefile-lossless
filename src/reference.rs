@@ -566,6 +566,24 @@ impl FunctionCall {
     /// assert_eq!(args, vec!["$(X)", "a", "b,c"]);
     /// ```
     pub fn parse_prefix(text: &str) -> Result<Option<(Self, usize)>, ReferenceError> {
+        match Self::parse_partial_prefix(text)? {
+            None => Ok(None),
+            Some((call, Some(len))) => Ok(Some((call, len))),
+            Some((_, None)) => {
+                let close = if text.starts_with("${") { '}' } else { ')' };
+                Err(unclosed_reference(text.len(), close))
+            }
+        }
+    }
+
+    /// Like [`Self::parse_prefix`], but for a call that is not closed,
+    /// return the arguments so far, the last running to the end of `text`,
+    /// and no length.
+    ///
+    /// Returns an error if `text` ends within the name of the function.
+    pub(crate) fn parse_partial_prefix(
+        text: &str,
+    ) -> Result<Option<(Self, Option<usize>)>, ReferenceError> {
         let (open, close) = match text.strip_prefix('$').and_then(|t| t.chars().next()) {
             Some('(') => ('(', ')'),
             Some('{') => ('{', '}'),
@@ -604,7 +622,7 @@ impl FunctionCall {
                         name: name.to_string(),
                         arguments,
                     };
-                    return Ok(Some((call, i + 1)));
+                    return Ok(Some((call, Some(i + 1))));
                 }
                 depth -= 1;
             } else if c == ',' && depth == 0 && arguments.len() + 1 < max_args {
@@ -612,7 +630,12 @@ impl FunctionCall {
                 start = i + 1;
             }
         }
-        Err(unclosed_reference(text.len(), close))
+        arguments.push(start..text.len());
+        let call = FunctionCall {
+            name: name.to_string(),
+            arguments,
+        };
+        Ok(Some((call, None)))
     }
 }
 
