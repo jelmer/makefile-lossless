@@ -1385,16 +1385,21 @@ impl Makefile {
 
     /// Get all variable references that overlap with the given text range.
     ///
-    /// Only walks descendants of top-level items that overlap the range,
-    /// rather than scanning the entire tree.
+    /// A reference that merely touches the range does not overlap it. Only
+    /// walks descendants of top-level items that overlap the range, rather
+    /// than scanning the entire tree.
     pub fn variable_references_in_range(
         &self,
         range: rowan::TextRange,
     ) -> impl Iterator<Item = VariableReference> + '_ {
-        self.items_in_range(range).flat_map(|item| {
+        self.items_in_range(range).flat_map(move |item| {
             item.syntax()
                 .descendants()
                 .filter_map(VariableReference::cast)
+                .filter(|r| {
+                    let r = r.syntax().text_range();
+                    r.end() > range.start() && r.start() < range.end()
+                })
                 .collect::<Vec<_>>()
         })
     }
@@ -3202,6 +3207,25 @@ override_dh_auto_configure:
         let refs: Vec<_> = makefile.variable_references_in_range(range).collect();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name(), Some("TARGETS".to_string()));
+    }
+
+    #[test]
+    fn test_variable_references_in_range_within_item() {
+        let makefile: Makefile = "$(P)_FLAGS = $(X) $(Y)\n".parse().unwrap();
+        let names = |start: u32, end: u32| {
+            makefile
+                .variable_references_in_range(rowan::TextRange::new(start.into(), end.into()))
+                .filter_map(|v| v.name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(0, 10), vec!["P".to_string()]);
+        assert_eq!(names(13, 17), vec!["X".to_string()]);
+        assert_eq!(names(5, 13), Vec::<String>::new());
+        // Ranges that only touch a reference do not overlap it.
+        assert_eq!(names(4, 13), Vec::<String>::new());
+        assert_eq!(names(17, 18), Vec::<String>::new());
+        // An empty range inside a reference finds it.
+        assert_eq!(names(15, 15), vec!["X".to_string()]);
     }
 
     #[test]
