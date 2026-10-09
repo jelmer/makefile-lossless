@@ -600,12 +600,24 @@ impl Parser<'_> {
         }
         self.builder.start_node(FOR_LOOP.into());
         self.builder.start_node(FOR_HEADER.into());
+        let directive_range = self.current_range();
         self.bump_n(count);
         self.skip_ws_and_continuations();
+        // BSD make only takes `.for` followed by whitespace as a loop, and
+        // trailing whitespace and comments are gone by then.
+        let mut valid = !matches!(self.current(), None | Some(NEWLINE | COMMENT));
+        if !valid {
+            let line = self.line_at(directive_range.start());
+            self.push_error(
+                ParseErrorKind::UnknownDirective,
+                "Unknown directive \"for\"".to_string(),
+                directive_range,
+                line,
+            );
+        }
         // Like BSD make, take each word up to `in` as a variable,
         // whatever characters it consists of, as in `.for , in 1`.
         let mut found_variable = false;
-        let mut valid = true;
         loop {
             // A line continuation also ends the word.
             let mut word_len = 0;
@@ -635,7 +647,7 @@ impl Parser<'_> {
         }
         if valid && !found_variable {
             self.record_error(
-                ParseErrorKind::InvalidForLoop,
+                ParseErrorKind::MissingForVariables,
                 "expected variable name after .for".to_string(),
             );
         }
@@ -643,7 +655,7 @@ impl Parser<'_> {
             self.bump();
         } else if valid {
             self.record_error(
-                ParseErrorKind::InvalidForLoop,
+                ParseErrorKind::MissingForIn,
                 "expected 'in' in .for".to_string(),
             );
         }

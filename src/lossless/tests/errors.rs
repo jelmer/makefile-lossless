@@ -650,6 +650,14 @@ fn test_error_kind_bsd_directives() {
     );
     assert_eq!(
         error_kinds(".for x y\n.endfor\n", bsd),
+        vec![ParseErrorKind::MissingForIn]
+    );
+    assert_eq!(
+        error_kinds(".for in 1\n.endfor\n", bsd),
+        vec![ParseErrorKind::MissingForVariables]
+    );
+    assert_eq!(
+        error_kinds(".for $x in 1\n.endfor\n", bsd),
         vec![ParseErrorKind::InvalidForLoop]
     );
     assert_eq!(
@@ -1404,4 +1412,31 @@ fn test_invalid_line_reports_one_error() {
     );
     assert_eq!(parsed.root().to_string(), code);
     assert_eq!(parsed.root().variable_definitions().count(), 1);
+}
+
+#[test]
+fn test_bare_for() {
+    for code in [
+        ".for\n.endfor\n",
+        ".for  # x\n.endfor\n",
+        ".for \\\n\n.endfor\n",
+    ] {
+        for variant in [None, Some(MakefileVariant::BSDMake)] {
+            let parsed = parse(code, variant);
+            assert_eq!(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| (e.kind(), e.message.as_str(), e.line))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    ParseErrorKind::UnknownDirective,
+                    "Unknown directive \"for\"",
+                    1
+                )],
+                "{code:?}"
+            );
+            assert_eq!(parsed.root().syntax().to_string(), code);
+        }
+    }
 }
