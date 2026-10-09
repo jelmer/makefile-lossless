@@ -382,6 +382,44 @@ fn test_argument_count_three_args() {
 }
 
 #[test]
+fn test_arguments() {
+    let makefile: Makefile = "X = $(if $(A),b,c,d) ${dir x,y} $(B) $(foo x,y)\n"
+        .parse()
+        .unwrap();
+    let text = makefile.to_string();
+    let args: Vec<Option<Vec<&str>>> = makefile
+        .variable_references()
+        .map(|r| {
+            r.arguments()
+                .unwrap()
+                .map(|ranges| ranges.iter().map(|range| &text[*range]).collect())
+        })
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            Some(vec!["$(A)", "b", "c,d"]),
+            None,
+            Some(vec!["x,y"]),
+            None,
+            None,
+        ]
+    );
+}
+
+#[test]
+fn test_arguments_unclosed() {
+    let makefile =
+        Makefile::parse_with_variant("X = $(info a,b", crate::MakefileVariant::GNUMake).tree();
+    let refs: Vec<_> = makefile.variable_references().collect();
+    assert_eq!(refs[0].to_string(), "$(info a,b");
+    assert_eq!(
+        refs[0].arguments().map_err(|e| e.syntax_kind()),
+        Err(Some(crate::ReferenceSyntaxErrorKind::UnclosedExpression))
+    );
+}
+
+#[test]
 fn test_argument_index_at_offset_subst() {
     let makefile: Makefile = "X = $(subst a,b,text)\n".parse().unwrap();
     let refs: Vec<_> = makefile.variable_references().collect();

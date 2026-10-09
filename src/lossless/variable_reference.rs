@@ -448,6 +448,47 @@ impl VariableReference {
         }
     }
 
+    /// The source ranges of the arguments of a call of a GNU make built-in
+    /// function, split as GNU make does; see
+    /// [`crate::FunctionCall::arguments`].
+    ///
+    /// Returns `Ok(None)` if this is not a call of a built-in function, and
+    /// an error if the call is not closed, with the offset relative to the
+    /// start of the reference. Unlike [`Self::argument_count`], this goes by
+    /// the function: the commas after the last argument that a function
+    /// takes are part of that argument.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile: Makefile = "X = $(subst a,b,c,d)\n".parse().unwrap();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// assert_eq!(
+    ///     refs[0].arguments(),
+    ///     Ok(Some(vec![
+    ///         TextRange::new(12.into(), 13.into()),
+    ///         TextRange::new(14.into(), 15.into()),
+    ///         TextRange::new(16.into(), 19.into()),
+    ///     ]))
+    /// );
+    /// ```
+    pub fn arguments(&self) -> Result<Option<Vec<rowan::TextRange>>, crate::ReferenceError> {
+        let text = self.0.text().to_string();
+        let Some((call, _)) = crate::FunctionCall::parse_prefix(&text)? else {
+            return Ok(None);
+        };
+        let start = self.0.text_range().start();
+        let to_size = |offset: usize| {
+            rowan::TextSize::try_from(offset).expect("offset within a syntax node fits")
+        };
+        Ok(Some(
+            call.arguments
+                .into_iter()
+                .map(|r| rowan::TextRange::new(start + to_size(r.start), start + to_size(r.end)))
+                .collect(),
+        ))
+    }
+
     /// Parse this reference into the variable name and its modifiers.
     ///
     /// The variant determines which modifiers are recognized; see
