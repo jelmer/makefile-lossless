@@ -1008,8 +1008,12 @@ impl Makefile {
 
     /// Parse makefile text, returning a Parse result
     ///
-    /// Both GNU make and BSD make syntax are accepted. Use
-    /// [`Self::parse_with_variant`] to restrict parsing to a single variant.
+    /// Both GNU make and BSD make syntax are accepted. Text with an nmake
+    /// preprocessing directive that GNU make rejects, such as `!IFDEF X`
+    /// or `!ENDIF` at the start of a line, is parsed as nmake instead;
+    /// [`crate::Parse::variant`] then returns [`crate::MakefileVariant::NMake`].
+    /// Use [`Self::parse_with_variant`] to restrict parsing to a single
+    /// variant.
     ///
     /// Variable references end where they do in GNU make, at the matching
     /// closing parenthesis or brace. BSD make instead ends them where their

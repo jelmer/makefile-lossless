@@ -149,12 +149,22 @@ impl Parse<Makefile> {
             return Err(EditError::TextMismatch { expected, actual });
         }
         let new_text = apply_edit_to_text(old_text, edit)?;
+        // Whether the text has nmake directives can depend on any line.
+        if self.variant_detected()
+            && (crate::lossless::may_have_nmake_directives(old_text)
+                || crate::lossless::may_have_nmake_directives(&new_text))
+        {
+            return Ok((Parse::parse_makefile(&new_text), new_text));
+        }
         let new_parse = self.reparse(old_text, &new_text, edit).unwrap_or_else(|| {
             let parsed = crate::lossless::parse(&new_text, self.variant());
             Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
                 .with_variant(self.variant())
         });
-        Ok((new_parse, new_text))
+        Ok((
+            new_parse.with_detected_variant(self.variant_detected()),
+            new_text,
+        ))
     }
 
     /// Reparse the part of `new_text` affected by `edit`, or return `None`

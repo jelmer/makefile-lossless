@@ -87,6 +87,50 @@ pub(super) fn nmake_directive_name(
     Some((name, false))
 }
 
+/// Whether `text` has a line starting with `!`, which may be an nmake
+/// preprocessing directive.
+pub(crate) fn may_have_nmake_directives(text: &str) -> bool {
+    text.starts_with('!') || text.contains("\n!")
+}
+
+/// Whether `root`, a tree parsed for no particular variant, has a line that
+/// is an nmake preprocessing directive and that GNU make rejects.
+///
+/// Such a line is parsed as a BSD make rule without targets. GNU make
+/// rejects it with "missing separator" if it has no `:` or `=`, as long as
+/// there are no variable references that might expand to them.
+pub(crate) fn has_nmake_directive(root: &SyntaxNode) -> bool {
+    root.descendants().filter(|n| n.kind() == RULE).any(|rule| {
+        // `first_token` stops at the empty TARGETS node.
+        let Some(first) = rule
+            .descendants_with_tokens()
+            .find_map(|it| it.into_token())
+        else {
+            return false;
+        };
+        if first.kind() != OPERATOR || first.text() != "!" {
+            return false;
+        }
+        let text = rule.text().to_string();
+        let line = text.split('\n').next().unwrap_or_default();
+        let Some(rest) = line.strip_prefix('!') else {
+            return false;
+        };
+        let rest = rest.trim_start_matches([' ', '\t']);
+        let keyword_len = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let (keyword, rest) = rest.split_at(keyword_len);
+        if nmake_directive_name(keyword, None).is_none()
+            || !(rest.is_empty() || rest.starts_with([' ', '\t', '#']))
+        {
+            return false;
+        }
+        let before_comment = rest.split('#').next().unwrap_or_default();
+        !before_comment.contains([':', '=', '$']) && !line.ends_with('\\')
+    })
+}
+
 impl Parser<'_> {
     pub(super) fn parse_expression_statement(&mut self) {
         self.in_rule = RuleContext::Outside;

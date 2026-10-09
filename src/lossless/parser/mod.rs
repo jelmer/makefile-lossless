@@ -19,6 +19,7 @@ mod reference;
 mod rule;
 mod tokens;
 
+pub(crate) use directive::{has_nmake_directive, may_have_nmake_directives};
 pub(crate) use errors::locate_error_line;
 pub(crate) use reference::bsd_logical_line;
 use tokens::{token_stack, Token};

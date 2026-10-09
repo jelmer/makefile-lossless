@@ -19,6 +19,8 @@ pub struct Parse<T> {
     positioned_errors: Vec<PositionedParseError>,
     /// The make variant the text was parsed for.
     variant: Option<MakefileVariant>,
+    /// Whether the variant was detected from the text, rather than given.
+    detected: bool,
     _ty: PhantomData<fn() -> T>,
 }
 
@@ -34,6 +36,7 @@ impl<T> Parse<T> {
             errors,
             positioned_errors,
             variant: None,
+            detected: false,
             _ty: PhantomData,
         }
     }
@@ -132,9 +135,29 @@ impl<T> Parse<T> {
 
 impl Parse<Makefile> {
     /// Parse makefile text, returning a Parse result
+    ///
+    /// See [`Makefile::parse`] for which variant the text is parsed for.
     pub fn parse_makefile(text: &str) -> Self {
         let parsed = crate::lossless::parse(text, None);
-        Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors)
+        let mut parse = Parse::new(parsed.green_node, parsed.errors, parsed.positioned_errors);
+        if crate::lossless::may_have_nmake_directives(text)
+            && crate::lossless::has_nmake_directive(&parse.syntax_node())
+        {
+            parse = Self::parse_makefile_with_variant(text, MakefileVariant::NMake);
+        }
+        parse.detected = true;
+        parse
+    }
+
+    /// Whether the variant this was parsed for was detected from the
+    /// text, so that edits may change it.
+    pub(crate) fn variant_detected(&self) -> bool {
+        self.detected
+    }
+
+    pub(crate) fn with_detected_variant(mut self, detected: bool) -> Self {
+        self.detected = detected;
+        self
     }
 
     /// Parse makefile text written for a specific make variant
@@ -246,6 +269,107 @@ mod tests {
             SyntaxKind::try_from(SyntaxKind::ALL.len() as u16),
             Err(SyntaxKind::ALL.len() as u16)
         );
+    }
+
+    fn parsed_variant(text: &str) -> Option<MakefileVariant> {
+        Parse::<Makefile>::parse_makefile(text).variant()
+    }
+
+    #[test]
+    fn test_parse_detects_nmake() {
+        let text = "!IFDEF DEBUG\nCFLAGS = /Zi\n!ENDIF\n";
+        let parsed = Parse::<Makefile>::parse_makefile(text);
+        assert_eq!(parsed.variant(), Some(MakefileVariant::NMake));
+        assert_eq!(
+            parsed.green(),
+            Parse::<Makefile>::parse_makefile_with_variant(text, MakefileVariant::NMake).green()
+        );
+        let kinds: Vec<_> = parsed
+            .tree()
+            .conditionals()
+            .flat_map(|c| {
+                c.branches()
+                    .map(|b| b.conditional_kind())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(kinds, vec![Some(crate::ConditionalKind::NmakeIfdef)]);
+    }
+
+    #[test]
+    fn test_parse_detects_nmake_lines() {
+        for text in [
+            "!IF \"$(CFG)\" == \"Debug\"\nX = 1\n!  endif # done\n",
+            "!INCLUDE <win32.mak>\n",
+            "!MESSAGE Building\nall:\n\techo\n",
+            "X = 1\n!UNDEF X\n",
+            "!CMDSWITCHES +D\n",
+            "all:\n!IF 1\n\techo\n!ENDIF\n",
+        ] {
+            assert_eq!(
+                parsed_variant(text),
+                Some(MakefileVariant::NMake),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_does_not_detect_nmake_in_gnu_makefiles() {
+        for text in [
+            "all:\n\techo\n",
+            // Lines GNU make accepts, as a rule or an assignment.
+            "!IFDEF X: y\n",
+            "!IFDEF = 1\n",
+            "!MESSAGE Building: x\n",
+            // GNU make expands the line before looking for a separator.
+            "!IFDEF $(X)\n",
+            // Not at the start of a logical line.
+            "A = b \\\n!ENDIF\n",
+            "# comment \\\n!ENDIF\n",
+            "  !ENDIF\n",
+            "all:\n\t!ENDIF\n",
+            "define X\n!ENDIF\nendef\n",
+            // Not an nmake directive.
+            "!ENDIFX\n",
+            "!FOO\n",
+        ] {
+            assert_eq!(parsed_variant(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_with_variant_does_not_detect() {
+        let text = "!IFDEF DEBUG\n!ENDIF\n";
+        assert_eq!(
+            Parse::<Makefile>::parse_makefile_with_variant(text, MakefileVariant::GNUMake)
+                .variant(),
+            Some(MakefileVariant::GNUMake)
+        );
+    }
+
+    #[test]
+    fn test_apply_edit_detects_nmake() {
+        let old_text = "X = 1\n";
+        let parsed = Parse::<Makefile>::parse_makefile(old_text);
+        assert_eq!(parsed.variant(), None);
+        let edit = crate::TextEdit::new(
+            rowan::TextRange::empty(rowan::TextSize::of(old_text)),
+            "!IFDEF DEBUG\n!ENDIF\n".to_string(),
+        );
+        let (new_parse, new_text) = parsed.apply_edit(old_text, &edit).unwrap();
+        assert_eq!(new_text, "X = 1\n!IFDEF DEBUG\n!ENDIF\n");
+        assert_eq!(new_parse, Parse::parse_makefile(&new_text));
+        assert_eq!(new_parse.variant(), Some(MakefileVariant::NMake));
+
+        let edit = crate::TextEdit::new(
+            rowan::TextRange::new(6.into(), new_text.len().try_into().unwrap()),
+            String::new(),
+        );
+        let (gnu_parse, gnu_text) = new_parse.apply_edit(&new_text, &edit).unwrap();
+        assert_eq!(gnu_text, "X = 1\n");
+        assert_eq!(gnu_parse, Parse::parse_makefile(&gnu_text));
+        assert_eq!(gnu_parse.variant(), None);
     }
 
     #[test]
