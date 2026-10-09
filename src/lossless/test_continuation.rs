@@ -835,3 +835,49 @@ fn test_argument_index_at_offset_unclosed() {
     assert_eq!(refs[0].argument_index_at_offset(14), Some(1));
     assert_eq!(refs[0].argument_index_at_offset(19), Some(2));
 }
+
+#[test]
+fn test_partial_arguments() {
+    let ranges = |text: &str| {
+        let makefile = Makefile::parse(text).tree();
+        let refs: Vec<_> = makefile.variable_references().collect();
+        refs[0].partial_arguments().map(|r| {
+            r.map(|(ranges, closed)| {
+                (
+                    ranges
+                        .iter()
+                        .map(|r| text[*r].to_string())
+                        .collect::<Vec<_>>(),
+                    closed,
+                )
+            })
+        })
+    };
+    assert_eq!(
+        ranges("X = $(subst a,\n"),
+        Ok(Some((vec!["a".to_string(), "".to_string()], false)))
+    );
+    assert_eq!(
+        ranges("X = $(subst a,b"),
+        Ok(Some((vec!["a".to_string(), "b".to_string()], false)))
+    );
+    assert_eq!(
+        ranges("X = $(subst a,$(x),\nY = 1\n"),
+        Ok(Some((
+            vec!["a".to_string(), "$(x)".to_string(), "".to_string()],
+            false
+        )))
+    );
+    assert_eq!(
+        ranges("X = $(subst a,b,c,d)\n"),
+        Ok(Some((
+            vec!["a".to_string(), "b".to_string(), "c,d".to_string()],
+            true
+        )))
+    );
+    assert_eq!(ranges("X = $(CC)\n"), Ok(None));
+    assert_eq!(
+        ranges("X = $(subst\n").map_err(|e| e.syntax_kind()),
+        Err(Some(crate::ReferenceSyntaxErrorKind::UnclosedExpression))
+    );
+}

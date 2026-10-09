@@ -494,16 +494,52 @@ impl VariableReference {
         let Some((call, _)) = crate::FunctionCall::parse_prefix(&text)? else {
             return Ok(None);
         };
+        Ok(Some(self.absolute_ranges(call.arguments)))
+    }
+
+    /// Like [`Self::arguments`], but for a call that is not closed, return
+    /// the source ranges of the arguments typed so far, the last running to
+    /// the end of the reference; see [`crate::FunctionCall::parse_partial_prefix`].
+    ///
+    /// The flag is true if the call is closed. Returns `Ok(None)` if this is
+    /// not a call of a built-in function, and an error if the reference ends
+    /// within the name of the function.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, TextRange};
+    /// let makefile = Makefile::parse("X = $(subst a,\n").tree();
+    /// let refs: Vec<_> = makefile.variable_references().collect();
+    /// assert_eq!(
+    ///     refs[0].partial_arguments(),
+    ///     Ok(Some((
+    ///         vec![
+    ///             TextRange::new(12.into(), 13.into()),
+    ///             TextRange::new(14.into(), 14.into()),
+    ///         ],
+    ///         false
+    ///     )))
+    /// );
+    /// ```
+    pub fn partial_arguments(
+        &self,
+    ) -> Result<Option<(Vec<rowan::TextRange>, bool)>, crate::ReferenceError> {
+        let text = self.0.text().to_string();
+        let Some((call, len)) = crate::FunctionCall::parse_partial_prefix(&text)? else {
+            return Ok(None);
+        };
+        Ok(Some((self.absolute_ranges(call.arguments), len.is_some())))
+    }
+
+    fn absolute_ranges(&self, ranges: Vec<std::ops::Range<usize>>) -> Vec<rowan::TextRange> {
         let start = self.0.text_range().start();
         let to_size = |offset: usize| {
             rowan::TextSize::try_from(offset).expect("offset within a syntax node fits")
         };
-        Ok(Some(
-            call.arguments
-                .into_iter()
-                .map(|r| rowan::TextRange::new(start + to_size(r.start), start + to_size(r.end)))
-                .collect(),
-        ))
+        ranges
+            .into_iter()
+            .map(|r| rowan::TextRange::new(start + to_size(r.start), start + to_size(r.end)))
+            .collect()
     }
 
     /// Parse this reference into the variable name and its modifiers.
