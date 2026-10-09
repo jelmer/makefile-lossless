@@ -673,7 +673,14 @@ fn test_error_kind_bsd_directives() {
     assert_eq!(
         error_kinds(".for $x in 1\n.endfor\n", bsd),
         vec![
-            ParseErrorKind::InvalidForLoop,
+            ParseErrorKind::InvalidForVariableName { character: '$' },
+            ParseErrorKind::ExtraneousEndfor
+        ]
+    );
+    assert_eq!(
+        error_kinds(".for x a:(b) in 1\n.endfor\n", bsd),
+        vec![
+            ParseErrorKind::InvalidForVariableName { character: ':' },
             ParseErrorKind::ExtraneousEndfor
         ]
     );
@@ -1537,7 +1544,7 @@ fn test_malformed_for_header() {
         "expected variable name after .for",
     );
     let invalid = (
-        ParseErrorKind::InvalidForLoop,
+        ParseErrorKind::InvalidForVariableName { character: '$' },
         "Invalid character \"$\" in .for loop variable name",
     );
     for (header, (kind, message)) in [
