@@ -486,6 +486,35 @@ fn test_target_as_dependent() {
 }
 
 #[test]
+fn test_is_target_as_dependent() {
+    let code = "a.obj: $$@.h $@.h $$(@F).c $(@F).c $$$@\n\tcl $@\n";
+    let makefile = parse_nmake(code);
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.is_target_as_dependent()))
+        .collect();
+    assert_eq!(
+        references,
+        vec![
+            ("$@".to_string(), true),
+            ("$@".to_string(), false),
+            ("$(@F)".to_string(), true),
+            ("$(@F)".to_string(), false),
+            ("$@".to_string(), false),
+            ("$@".to_string(), false),
+        ]
+    );
+
+    // GNU make reads `$$$@` as an escaped dollar followed by `$@`.
+    let makefile: Makefile = "a.obj: $$$@.h\n".parse().unwrap();
+    let references: Vec<_> = makefile
+        .variable_references()
+        .map(|r| (r.to_string(), r.is_target_as_dependent()))
+        .collect();
+    assert_eq!(references, vec![("$@".to_string(), false)]);
+}
+
+#[test]
 fn test_backslash_hash_starts_comment() {
     // nmake has no `\#` escape, so the `#` starts a comment, as it does
     // after any other character.
