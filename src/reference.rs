@@ -580,8 +580,26 @@ impl FunctionCall {
     /// return the arguments so far, the last running to the end of `text`,
     /// and no length.
     ///
-    /// Returns an error if `text` ends within the name of the function.
-    pub(crate) fn parse_partial_prefix(
+    /// This is meant for text that is still being typed, such as when
+    /// showing which argument the cursor is in. Returns an error if `text`
+    /// ends within the name of the function, as it is not known yet whether
+    /// it is a call.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::FunctionCall;
+    ///
+    /// let text = "$(subst a,$(X)";
+    /// let (call, len) = FunctionCall::parse_partial_prefix(text).unwrap().unwrap();
+    /// assert_eq!(call.name, "subst");
+    /// assert_eq!(len, None);
+    /// let args: Vec<_> = call.arguments.iter().map(|r| &text[r.clone()]).collect();
+    /// assert_eq!(args, vec!["a", "$(X)"]);
+    ///
+    /// let (_, len) = FunctionCall::parse_partial_prefix("$(info a) b").unwrap().unwrap();
+    /// assert_eq!(len, Some(9));
+    /// ```
+    pub fn parse_partial_prefix(
         text: &str,
     ) -> Result<Option<(Self, Option<usize>)>, ReferenceError> {
         let (open, close) = match text.strip_prefix('$').and_then(|t| t.chars().next()) {
@@ -2693,6 +2711,41 @@ mod tests {
         );
         assert_eq!(
             FunctionCall::parse_prefix("${info").map_err(|e| e.syntax_kind()),
+            Err(Some(ReferenceSyntaxErrorKind::UnclosedExpression))
+        );
+    }
+
+    #[test]
+    fn test_function_call_partial() {
+        let partial = |text| {
+            let (call, len) = FunctionCall::parse_partial_prefix(text).unwrap()?;
+            let args: Vec<_> = call.arguments.iter().map(|r| &text[r.clone()]).collect();
+            Some((call.name, args, len))
+        };
+        assert_eq!(
+            partial("$(subst a,"),
+            Some(("subst".to_string(), vec!["a", ""], None))
+        );
+        assert_eq!(
+            partial("$(subst a,b,c,d"),
+            Some(("subst".to_string(), vec!["a", "b", "c,d"], None))
+        );
+        assert_eq!(
+            partial("${if ${x,y},T"),
+            Some(("if".to_string(), vec!["${x,y}", "T"], None))
+        );
+        assert_eq!(
+            partial("$(info "),
+            Some(("info".to_string(), vec![""], None))
+        );
+        assert_eq!(
+            partial("$(subst a,b,c) x"),
+            Some(("subst".to_string(), vec!["a", "b", "c"], Some(14)))
+        );
+        assert_eq!(partial("$(foo a,"), None);
+        assert_eq!(partial("$X"), None);
+        assert_eq!(
+            FunctionCall::parse_partial_prefix("$(subst").map_err(|e| e.syntax_kind()),
             Err(Some(ReferenceSyntaxErrorKind::UnclosedExpression))
         );
     }
