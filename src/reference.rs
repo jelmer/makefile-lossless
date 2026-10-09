@@ -445,6 +445,7 @@ pub enum ReferenceError {
     },
     /// The reference is a GNU make function call such as
     /// `$(patsubst %.c,%.o,$(SRCS))`, rather than a variable reference.
+    /// [`FunctionCall::parse_prefix`] parses it.
     FunctionCall {
         /// The name of the function.
         name: String,
@@ -481,48 +482,147 @@ impl std::fmt::Display for ReferenceError {
 
 impl std::error::Error for ReferenceError {}
 
-/// The built-in functions of GNU make.
-const GNU_FUNCTIONS: &[&str] = &[
-    "abspath",
-    "addprefix",
-    "addsuffix",
-    "and",
-    "basename",
-    "call",
-    "dir",
-    "error",
-    "eval",
-    "file",
-    "filter",
-    "filter-out",
-    "findstring",
-    "firstword",
-    "flavor",
-    "foreach",
-    "guile",
-    "if",
-    "info",
-    "intcmp",
-    "join",
-    "lastword",
-    "let",
-    "notdir",
-    "or",
-    "origin",
-    "patsubst",
-    "realpath",
-    "shell",
-    "sort",
-    "strip",
-    "subst",
-    "suffix",
-    "value",
-    "warning",
-    "wildcard",
-    "word",
-    "wordlist",
-    "words",
+/// The built-in functions of GNU make, with the maximum number of arguments
+/// they take. Any commas after the last argument are part of it.
+const GNU_FUNCTIONS: &[(&str, usize)] = &[
+    ("abspath", 1),
+    ("addprefix", 2),
+    ("addsuffix", 2),
+    ("and", usize::MAX),
+    ("basename", 1),
+    ("call", usize::MAX),
+    ("dir", 1),
+    ("error", 1),
+    ("eval", 1),
+    ("file", 2),
+    ("filter", 2),
+    ("filter-out", 2),
+    ("findstring", 2),
+    ("firstword", 1),
+    ("flavor", 1),
+    ("foreach", 3),
+    ("guile", 1),
+    ("if", 3),
+    ("info", 1),
+    ("intcmp", 5),
+    ("join", 2),
+    ("lastword", 1),
+    ("let", 3),
+    ("notdir", 1),
+    ("or", usize::MAX),
+    ("origin", 1),
+    ("patsubst", 3),
+    ("realpath", 1),
+    ("shell", 1),
+    ("sort", 1),
+    ("strip", 1),
+    ("subst", 3),
+    ("suffix", 1),
+    ("value", 1),
+    ("warning", 1),
+    ("wildcard", 1),
+    ("word", 2),
+    ("wordlist", 3),
+    ("words", 1),
 ];
+
+/// A call of a GNU make built-in function, such as
+/// `$(patsubst %.c,%.o,$(SRCS))`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct FunctionCall {
+    /// The name of the function.
+    pub name: String,
+    /// The byte ranges of the arguments in the text the call was parsed
+    /// from.
+    ///
+    /// They are split as GNU make does: at commas outside parentheses
+    /// nested in `$(...)`, or braces nested in `${...}`, but no further
+    /// than the number of arguments the function takes, so any further
+    /// commas are part of the last argument. Blanks before the first
+    /// argument are skipped; nothing else is trimmed.
+    pub arguments: Vec<Range<usize>>,
+}
+
+impl FunctionCall {
+    /// Parse the GNU make function call at the start of `text`, returning
+    /// it and the length of its text.
+    ///
+    /// Returns `Ok(None)` if `text` does not start with a reference whose
+    /// name is that of a built-in function followed by a blank, as
+    /// [`ParsedReference::parse_prefix`] then returns something other than
+    /// [`ReferenceError::FunctionCall`]. Returns an error if the reference
+    /// is not closed.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::FunctionCall;
+    ///
+    /// let text = "$(if $(X),a,b,c) rest";
+    /// let (call, len) = FunctionCall::parse_prefix(text).unwrap().unwrap();
+    /// assert_eq!(call.name, "if");
+    /// assert_eq!(len, 16);
+    /// let args: Vec<_> = call.arguments.iter().map(|r| &text[r.clone()]).collect();
+    /// assert_eq!(args, vec!["$(X)", "a", "b,c"]);
+    /// ```
+    pub fn parse_prefix(text: &str) -> Result<Option<(Self, usize)>, ReferenceError> {
+        let (open, close) = match text.strip_prefix('$').and_then(|t| t.chars().next()) {
+            Some('(') => ('(', ')'),
+            Some('{') => ('{', '}'),
+            _ => return Ok(None),
+        };
+        let body_start = 2;
+        let Some(name_end) = text[body_start..]
+            .find([' ', '\t', open, close])
+            .map(|i| body_start + i)
+        else {
+            return Err(unclosed_reference(text.len(), close));
+        };
+        let name = &text[body_start..name_end];
+        let Some(&(_, max_args)) = GNU_FUNCTIONS.iter().find(|(n, _)| *n == name) else {
+            return Ok(None);
+        };
+        if !text[name_end..].starts_with([' ', '\t']) {
+            return Ok(None);
+        }
+        let mut start = text.len() - text[name_end..].trim_start_matches([' ', '\t']).len();
+        let mut arguments = Vec::new();
+        let mut depth = 0usize;
+        // The delimiters are ASCII, so they can't be part of another character.
+        for (i, c) in text
+            .bytes()
+            .enumerate()
+            .skip(start)
+            .map(|(i, b)| (i, char::from(b)))
+        {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                if depth == 0 {
+                    arguments.push(start..i);
+                    let call = FunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                    };
+                    return Ok(Some((call, i + 1)));
+                }
+                depth -= 1;
+            } else if c == ',' && depth == 0 && arguments.len() + 1 < max_args {
+                arguments.push(start..i);
+                start = i + 1;
+            }
+        }
+        Err(unclosed_reference(text.len(), close))
+    }
+}
+
+fn unclosed_reference(offset: usize, close: char) -> ReferenceError {
+    syntax_error(
+        offset,
+        ReferenceSyntaxErrorKind::UnclosedExpression,
+        format!("unclosed reference, expecting '{}'", close),
+    )
+}
 
 impl ParsedReference {
     /// Parse a complete variable reference such as `${FOO:Q}`, `$(FOO)` or
@@ -2230,7 +2330,7 @@ fn parse_simple_body(
 ) -> Result<ParsedReference, ReferenceError> {
     if variant == MakefileVariant::GNUMake {
         if let Some((name, _)) = body.split_once([' ', '\t']) {
-            if GNU_FUNCTIONS.contains(&name) {
+            if GNU_FUNCTIONS.iter().any(|(n, _)| *n == name) {
                 return Err(ReferenceError::FunctionCall {
                     name: name.to_string(),
                 });
@@ -2430,6 +2530,102 @@ mod tests {
                 ('L', "y"),
                 ('R', "${C$(D)}"),
             ]
+        );
+    }
+
+    fn call_args(text: &str) -> Option<(String, Vec<&str>, usize)> {
+        let (call, len) = FunctionCall::parse_prefix(text).unwrap()?;
+        let args = call.arguments.iter().map(|r| &text[r.clone()]).collect();
+        Some((call.name, args, len))
+    }
+
+    #[test]
+    fn test_function_call_arguments() {
+        assert_eq!(
+            call_args("$(patsubst %.c,%.o,$(SRCS)) x"),
+            Some(("patsubst".to_string(), vec!["%.c", "%.o", "$(SRCS)"], 27))
+        );
+        assert_eq!(
+            call_args("${subst a,b,c}"),
+            Some(("subst".to_string(), vec!["a", "b", "c"], 14))
+        );
+        assert_eq!(
+            call_args("$(wildcard \t *.c )"),
+            Some(("wildcard".to_string(), vec!["*.c "], 18))
+        );
+        assert_eq!(
+            call_args("$(info )"),
+            Some(("info".to_string(), vec![""], 8))
+        );
+        assert_eq!(
+            call_args("$(if ,a,)"),
+            Some(("if".to_string(), vec!["", "a", ""], 9))
+        );
+    }
+
+    #[test]
+    fn test_function_call_arguments_max() {
+        // Commas after the last argument a function takes are part of it.
+        assert_eq!(
+            call_args("$(subst a,b,c,d)"),
+            Some(("subst".to_string(), vec!["a", "b", "c,d"], 16))
+        );
+        assert_eq!(
+            call_args("$(info a,b)"),
+            Some(("info".to_string(), vec!["a,b"], 11))
+        );
+        assert_eq!(
+            call_args("$(call f,a,b,c,d)"),
+            Some(("call".to_string(), vec!["f", "a", "b", "c", "d"], 17))
+        );
+    }
+
+    #[test]
+    fn test_function_call_arguments_nesting() {
+        assert_eq!(
+            call_args("$(word 2,$(x,y) (a,b))"),
+            Some(("word".to_string(), vec!["2", "$(x,y) (a,b)"], 22))
+        );
+        // Only the delimiters of the call itself nest, as in GNU make, which
+        // fails on `$(if ${x,y},T,F)` with an unterminated reference.
+        assert_eq!(
+            call_args("$(if ${x,y},T,F)"),
+            Some(("if".to_string(), vec!["${x", "y}", "T,F"], 16))
+        );
+        assert_eq!(
+            call_args("${if $(x,y),T,F}"),
+            Some(("if".to_string(), vec!["$(x", "y)", "T,F"], 16))
+        );
+        assert_eq!(
+            call_args("${if ${x,y},T,F}"),
+            Some(("if".to_string(), vec!["${x,y}", "T", "F"], 16))
+        );
+    }
+
+    #[test]
+    fn test_function_call_not_a_call() {
+        assert_eq!(call_args("$(X)"), None);
+        assert_eq!(call_args("$(info)"), None);
+        assert_eq!(call_args("$(info(x) y)"), None);
+        assert_eq!(call_args("$(foo a,b)"), None);
+        assert_eq!(call_args("$X"), None);
+        assert_eq!(call_args("$$(info a)"), None);
+        assert_eq!(call_args("x"), None);
+    }
+
+    #[test]
+    fn test_function_call_unclosed() {
+        assert_eq!(
+            FunctionCall::parse_prefix("$(subst a,b,$(c)"),
+            Err(syntax_error(
+                16,
+                ReferenceSyntaxErrorKind::UnclosedExpression,
+                "unclosed reference, expecting ')'"
+            ))
+        );
+        assert_eq!(
+            FunctionCall::parse_prefix("${info").map_err(|e| e.syntax_kind()),
+            Err(Some(ReferenceSyntaxErrorKind::UnclosedExpression))
         );
     }
 
