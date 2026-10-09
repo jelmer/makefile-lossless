@@ -182,8 +182,15 @@ pub enum ParseErrorKind {
     /// An `else` after the final `else` of a conditional (GNU make: "only
     /// one 'else' per conditional").
     DuplicateElse,
-    /// A malformed BSD `.for` loop header.
+    /// A BSD `.for` loop variable name with a character that BSD make
+    /// does not allow, such as `$` or `:`.
     InvalidForLoop,
+    /// A BSD `.for` loop without variables before `in`, as in `.for in 1`
+    /// (BSD make: "Missing iteration variables in .for loop").
+    MissingForVariables,
+    /// A BSD `.for` loop without `in` after its variables, as in `.for x`
+    /// (BSD make: "Missing \"in\" in .for loop").
+    MissingForIn,
     /// A BSD `.for` loop that is not closed before the end of the input.
     MissingEndfor,
     /// A BSD `.endfor` without a matching `.for`.
@@ -198,7 +205,8 @@ pub enum ParseErrorKind {
     /// A BSD make `.include` path not delimited by `<...>` or `"..."`.
     UndelimitedIncludePath,
     /// A BSD make line starting with `.` that is neither a known directive
-    /// nor a dependency line or variable assignment, such as `.iff`.
+    /// nor a dependency line or variable assignment, such as `.iff`, or a
+    /// `.for` without anything after it.
     UnknownDirective,
     /// Unexpected text where the end of the line was expected. GNU make
     /// only warns about text after a directive such as `else junk` or
