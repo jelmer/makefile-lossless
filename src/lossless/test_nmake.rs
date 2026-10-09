@@ -240,8 +240,10 @@ fn test_add_else_and_endif() {
 
 #[test]
 fn test_errors() {
-    let parsed =
-        Makefile::parse_with_variant("!ENDIF\n!ELSE\n!IF\n!ENDIF\n", MakefileVariant::NMake);
+    let parsed = Makefile::parse_with_variant(
+        "!ENDIF\n!ELSE\n!ELSEIF 1\n!IF\n!ENDIF\n",
+        MakefileVariant::NMake,
+    );
     assert_eq!(
         parsed
             .errors()
@@ -255,12 +257,19 @@ fn test_errors() {
             ),
             (ParseErrorKind::ElseWithoutIf, "!ELSE without matching !IF"),
             (
+                ParseErrorKind::ElifWithoutIf,
+                "!ELSEIF without matching !IF"
+            ),
+            (
                 ParseErrorKind::InvalidConditional,
                 "expected condition after !IF"
             ),
         ]
     );
-    assert_eq!(parsed.tree().to_string(), "!ENDIF\n!ELSE\n!IF\n!ENDIF\n");
+    assert_eq!(
+        parsed.tree().to_string(),
+        "!ENDIF\n!ELSE\n!ELSEIF 1\n!IF\n!ENDIF\n"
+    );
 }
 
 #[test]

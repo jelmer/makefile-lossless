@@ -638,6 +638,14 @@ fn test_error_kind_bsd_directives() {
     );
     assert_eq!(
         error_kinds(".elif 1\n", bsd),
+        vec![ParseErrorKind::ElifWithoutIf]
+    );
+    assert_eq!(
+        error_kinds(". elifndef X\n", bsd),
+        vec![ParseErrorKind::ElifWithoutIf]
+    );
+    assert_eq!(
+        error_kinds(".else\n", bsd),
         vec![ParseErrorKind::ElseWithoutIf]
     );
     assert_eq!(
