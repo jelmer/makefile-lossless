@@ -143,6 +143,34 @@ impl VariableReference {
         Some(first.cover(last))
     }
 
+    /// Whether this is nmake's target as dependent, the `$@` in `$$@` or the
+    /// `$(@F)` in `$$(@F)` on a dependency line, which stand for the
+    /// current target or a part of it. A plain `$@` is not set there.
+    ///
+    /// The reference covers only the text after the first `$`, so its
+    /// [`text_range`](Self::text_range) starts one byte after that `$`.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let parsed = Makefile::parse_with_variant("a.obj: $$@.h $@.h\n", MakefileVariant::NMake);
+    /// let refs: Vec<_> = parsed
+    ///     .tree()
+    ///     .variable_references()
+    ///     .map(|r| r.is_target_as_dependent())
+    ///     .collect();
+    /// assert_eq!(refs, vec![true, false]);
+    /// ```
+    pub fn is_target_as_dependent(&self) -> bool {
+        // The parser leaves the first `$` as a bare token in the
+        // prerequisite, rather than making `$$` an escape.
+        self.0.parent().is_some_and(|p| p.kind() == PREREQUISITE)
+            && self
+                .0
+                .prev_sibling_or_token()
+                .is_some_and(|it| it.kind() == DOLLAR)
+    }
+
     /// The innermost reference this one is nested in, as the function call
     /// `$(dir $(FILE))` is for `$(FILE)` or `$(FOO.$(BAR))` for `$(BAR)`.
     ///
