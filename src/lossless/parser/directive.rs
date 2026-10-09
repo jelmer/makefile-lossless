@@ -468,7 +468,8 @@ impl Parser<'_> {
                 let (kind, opener) = match name {
                     "endfor" => (ParseErrorKind::ExtraneousEndfor, "for"),
                     "endif" => (ParseErrorKind::ExtraneousEndif, "if"),
-                    _ => (ParseErrorKind::ElseWithoutIf, "if"),
+                    "else" => (ParseErrorKind::ElseWithoutIf, "if"),
+                    _ => (ParseErrorKind::ElifWithoutIf, "if"),
                 };
                 let message = format!(
                     "{} without matching {}",
