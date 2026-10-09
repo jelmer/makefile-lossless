@@ -17,6 +17,13 @@ pub enum ModifierArgPart {
     /// A nested expression such as `${FOO:Q}` or `$X`, as unexpanded text.
     /// It can be parsed with [`ParsedReference::parse`].
     Expr(String),
+    /// `$$` in the pattern of `:M` or `:N`.
+    ///
+    /// make expands the pattern as a whole, so this stands for `$`, except
+    /// when expanding the value of a `:=` assignment with
+    /// `.MAKE.SAVE_DOLLARS` enabled (the NetBSD default), where it stays
+    /// `$$`. In other arguments, `$$` is returned as a literal `$`.
+    EscapedDollar,
 }
 
 /// An argument of a modifier, made up of literal text and nested
@@ -35,6 +42,7 @@ impl ModifierArg {
             match part {
                 ModifierArgPart::Literal(text) => arg.push_str(&text),
                 ModifierArgPart::Expr(text) => arg.push_expr(&text),
+                ModifierArgPart::EscapedDollar => arg.0.push(ModifierArgPart::EscapedDollar),
             }
         }
         arg
@@ -96,6 +104,7 @@ impl ModifierArg {
             match part {
                 ModifierArgPart::Literal(text) => self.push_str(text),
                 ModifierArgPart::Expr(text) => self.push_expr(text),
+                ModifierArgPart::EscapedDollar => self.0.push(ModifierArgPart::EscapedDollar),
             }
         }
     }
@@ -356,9 +365,12 @@ pub enum Modifier {
 ///   is kept, as it is in make.
 /// - `:@`: in the variable name and body, `\@`, `\\` and `\$`.
 ///
-/// In parts that are parsed into a [`ModifierArg`], `$$` is returned as a
-/// literal `$`. NetBSD make instead treats the first `$` as an undefined
-/// expression, and complains about it in strict mode.
+/// In the pattern of `:M` and `:N`, `$$` is returned as
+/// [`ModifierArgPart::EscapedDollar`], since its meaning depends on how the
+/// expression is expanded. In other parts that are parsed into a
+/// [`ModifierArg`], `$$` is returned as a literal `$`. NetBSD make instead
+/// treats the first `$` as an undefined expression, and complains about it
+/// in strict mode.
 ///
 /// # Example
 /// ```
@@ -2022,8 +2034,8 @@ impl<'a> Parser<'a> {
         arg
     }
 
-    /// Split the rest of the text into literal text and the expressions in
-    /// it, with `$$` standing for a literal `$`.
+    /// Split the rest of the text into literal text, the expressions in it
+    /// and `$$`.
     ///
     /// Make reports an error for an invalid expression only when expanding
     /// the text, so the text from there on is kept as one expression. A `$`
@@ -2062,7 +2074,7 @@ impl<'a> Parser<'a> {
             }
             if unclosed.is_none() {
                 match &self.text[dollar..self.pos] {
-                    "$$" => arg.push_char('$'),
+                    "$$" => arg.0.push(ModifierArgPart::EscapedDollar),
                     expr => arg.push_expr(expr),
                 }
             }
@@ -3011,8 +3023,18 @@ mod tests {
                 text("a"),
                 expr("$Y"),
                 expr("${Z}"),
-                text("b$c"),
+                text("b"),
+                ModifierArgPart::EscapedDollar,
+                text("c"),
                 expr("$(W)"),
+            ]))
+        );
+        assert_eq!(
+            one("${X:M$$$$*}"),
+            Modifier::Match(ModifierArg::new([
+                ModifierArgPart::EscapedDollar,
+                ModifierArgPart::EscapedDollar,
+                text("*"),
             ]))
         );
         assert_eq!(
@@ -3076,7 +3098,20 @@ mod tests {
             one("${X:M${:U\\:}\\:}"),
             Modifier::Match(ModifierArg::new([expr("${:U\\:}"), text("\\:")]))
         );
-        assert_eq!(one("${X:N$$\\:}"), Modifier::NoMatch(lit("$\\:")));
+        assert_eq!(
+            one("${X:N$$\\:}"),
+            Modifier::NoMatch(ModifierArg::new([
+                ModifierArgPart::EscapedDollar,
+                text("\\:")
+            ]))
+        );
+        assert_eq!(
+            one("${X:N\\:$$}"),
+            Modifier::NoMatch(ModifierArg::new([
+                text(":"),
+                ModifierArgPart::EscapedDollar
+            ]))
+        );
         // An escaped opening brace keeps its backslash but still enables
         // unescaping.
         assert_eq!(
@@ -4074,6 +4109,12 @@ mod tests {
         }
         assert!(lit("").is_empty());
         assert!(!arg.is_empty());
+        let dollar = ModifierArg::new([text("a"), ModifierArgPart::EscapedDollar, text("b")]);
+        assert_eq!(
+            dollar.parts(),
+            &[text("a"), ModifierArgPart::EscapedDollar, text("b")]
+        );
+        assert_eq!(dollar.as_literal_str(), None);
     }
 
     #[test]
