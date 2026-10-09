@@ -477,7 +477,7 @@ impl VariableReference {
     /// assert_eq!(
     ///     parsed.modifiers,
     ///     vec![
-    ///         Modifier::Match("*.c".to_string()),
+    ///         Modifier::Match(ModifierArg::literal("*.c")),
     ///         Modifier::SysVSubstitute {
     ///             from: ModifierArg::literal(".c"),
     ///             to: ModifierArg::literal(".o"),

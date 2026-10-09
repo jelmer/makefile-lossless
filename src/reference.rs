@@ -178,12 +178,12 @@ pub enum Modifier {
     Root,
     /// `:T`: the last path component of each word.
     Tail,
-    /// `:Mpattern`: the words that match the pattern. The pattern is raw
-    /// text, see [`ParsedReference`].
-    Match(String),
-    /// `:Npattern`: the words that do not match the pattern. The pattern is
-    /// raw text, see [`ParsedReference`].
-    NoMatch(String),
+    /// `:Mpattern`: the words that match the pattern, see
+    /// [`ParsedReference`].
+    Match(ModifierArg),
+    /// `:Npattern`: the words that do not match the pattern, see
+    /// [`ParsedReference`].
+    NoMatch(ModifierArg),
     /// `:S/old/new/[1gW]`, with any delimiter instead of `/`.
     Substitute {
         /// The text to replace, without the anchors.
@@ -327,16 +327,16 @@ pub enum Modifier {
 /// the argument, it is returned either as a [`ModifierArg`] or as a raw
 /// [`String`]:
 ///
-/// - A [`ModifierArg`] is used where make expands nested expressions while
-///   parsing the modifier (`:S`, `:C`, `:U`, `:D`, `:?`, `:!cmd!`, the
-///   assignment modifiers, `:[...]`, `:gmtime=`, `:localtime=` and the SysV
-///   substitution). Escapes are already removed from its literal parts, and
-///   nested expressions are kept as separate parts so that escaped text is
-///   never expanded again.
-/// - A raw [`String`] is used where make expands the argument as a whole
-///   after parsing it (the pattern of `:M` and `:N` and the body of `:@`).
-///   The evaluator should expand it like any other value, so `$$` stands for
-///   a literal `$`.
+/// - A [`ModifierArg`] is used for most arguments (`:M`, `:N`, `:S`, `:C`,
+///   `:U`, `:D`, `:?`, `:!cmd!`, the assignment modifiers, `:[...]`,
+///   `:gmtime=`, `:localtime=` and the SysV substitution). Escapes are
+///   already removed from its literal parts, and nested expressions are kept
+///   as separate parts so that escaped text is never expanded again. The
+///   pattern of `:M` and `:N` keeps the backslashes that make interprets
+///   when matching, such as in `\*`.
+/// - A raw [`String`] is used for the body of `:@`, which make expands as a
+///   whole for each word. The evaluator should expand it like any other
+///   value, so `$$` stands for a literal `$`.
 ///
 /// The escapes that are removed follow NetBSD make:
 ///
@@ -362,12 +362,12 @@ pub enum Modifier {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{MakefileVariant, Modifier, ParsedReference};
+/// use makefile_lossless::{MakefileVariant, Modifier, ModifierArg, ParsedReference};
 /// let parsed = ParsedReference::parse("${SRCS:M*.c:Q}", MakefileVariant::BSDMake).unwrap();
 /// assert_eq!(parsed.name, "SRCS");
 /// assert_eq!(
 ///     parsed.modifiers,
-///     vec![Modifier::Match("*.c".to_string()), Modifier::Quote]
+///     vec![Modifier::Match(ModifierArg::literal("*.c")), Modifier::Quote]
 /// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1006,6 +1006,8 @@ struct Parser<'a> {
     /// The number of times [`MAX_DEPTH`] was reached, including where the
     /// error was not reported.
     depth_limit_reached: usize,
+    /// Whether only the extent of the expression being parsed is needed.
+    skipping: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -1017,6 +1019,7 @@ impl<'a> Parser<'a> {
             depth: 0,
             parsed: ParsedExprs::default(),
             depth_limit_reached: 0,
+            skipping: false,
         }
     }
 
@@ -1031,6 +1034,7 @@ impl<'a> Parser<'a> {
             depth: self.depth,
             parsed: std::mem::take(&mut self.parsed),
             depth_limit_reached: self.depth_limit_reached,
+            skipping: self.skipping,
         }
     }
 
@@ -1093,7 +1097,9 @@ impl<'a> Parser<'a> {
         }
         let spans = self.spans.len();
         let reached = self.depth_limit_reached;
+        let skipping = std::mem::replace(&mut self.skipping, true);
         let result = self.parse_expr().map(|_| ());
+        self.skipping = skipping;
         let parsed = ParsedExpr {
             result: result.clone(),
             end: self.pos,
@@ -1349,8 +1355,15 @@ impl<'a> Parser<'a> {
             'M' | 'N' => {
                 self.bump();
                 let pattern_start = self.pos;
-                let pattern = self.parse_match_pattern(delims);
-                self.record_raw_spans(pattern_start..self.pos);
+                let unescaped = self.parse_match_pattern(delims);
+                let mut pattern = self.record_raw_spans(pattern_start..self.pos);
+                // Parsing the unescaped pattern again when only skipping
+                // would make nested patterns take exponential time.
+                if let Some(unescaped) = unescaped.filter(|_| !self.skipping) {
+                    let mut parser = Parser::new(&unescaped);
+                    parser.depth = self.depth;
+                    pattern = parser.split_raw();
+                }
                 Some(if first == 'M' {
                     Modifier::Match(pattern)
                 } else {
@@ -1793,8 +1806,8 @@ impl<'a> Parser<'a> {
     ///
     /// As in make, escaped delimiters are only unescaped if an escape comes
     /// before the first `$`, and then throughout the pattern, including in
-    /// nested expressions.
-    fn parse_match_pattern(&mut self, delims: Delims) -> String {
+    /// nested expressions. Returns the unescaped pattern if that happened.
+    fn parse_match_pattern(&mut self, delims: Delims) -> Option<String> {
         let start = self.pos;
         let mut unescape = false;
         let mut has_expr = false;
@@ -1826,10 +1839,10 @@ impl<'a> Parser<'a> {
             }
             self.bump();
         }
-        let raw = &self.text[start..self.pos];
         if !unescape {
-            return raw.to_string();
+            return None;
         }
+        let raw = &self.text[start..self.pos];
         let mut pattern = String::with_capacity(raw.len());
         let mut chars = raw.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1842,7 +1855,7 @@ impl<'a> Parser<'a> {
             }
             pattern.push(c);
         }
-        pattern
+        Some(pattern)
     }
 
     /// Parse the value of `:U` or `:D`, up to the next delimiter.
@@ -1899,34 +1912,66 @@ impl<'a> Parser<'a> {
     }
 
     /// Record the expressions in the raw text at `raw`, which make expands
-    /// only after parsing the modifier.
-    fn record_raw_spans(&mut self, raw: Range<usize>) {
+    /// only after parsing the modifier, and split the text into literal
+    /// text and those expressions.
+    fn record_raw_spans(&mut self, raw: Range<usize>) -> ModifierArg {
         let mut parser = self.fork(&self.text[..raw.end], raw.start);
-        while let Some(offset) = parser.rest().find('$') {
-            parser.pos += offset;
-            let dollar = parser.pos;
-            match parser.peek_nth(1) {
-                None => break,
+        let arg = parser.split_raw();
+        self.join(&mut parser);
+        self.spans.extend(parser.spans);
+        arg
+    }
+
+    /// Split the rest of the text into literal text and the expressions in
+    /// it, with `$$` standing for a literal `$`.
+    ///
+    /// Make reports an error for an invalid expression only when expanding
+    /// the text, so the text from there on is kept as one expression. A `$`
+    /// at the end of the text is kept as an expression as well; make
+    /// expands it to nothing.
+    fn split_raw(&mut self) -> ModifierArg {
+        let mut arg = ModifierArg::default();
+        let mut unclosed = None;
+        while let Some(offset) = self.rest().find('$') {
+            if unclosed.is_none() {
+                arg.push_str(&self.rest()[..offset]);
+            }
+            self.pos += offset;
+            let dollar = self.pos;
+            match self.peek_nth(1) {
+                None => {
+                    self.bump();
+                    unclosed.get_or_insert(dollar);
+                }
                 Some('(' | '{') => {
-                    let mut nested = parser.fork(parser.text, dollar);
+                    let mut nested = self.fork(self.text, dollar);
                     let ok = nested.skip_expr().is_ok();
-                    parser.join(&mut nested);
+                    self.join(&mut nested);
                     if ok {
-                        parser.spans.extend(nested.spans);
-                        parser.pos = nested.pos;
+                        self.spans.extend(nested.spans);
+                        self.pos = nested.pos;
                     } else {
-                        // Make reports the error when expanding the text.
-                        parser.bump();
+                        self.bump();
+                        unclosed.get_or_insert(dollar);
                     }
                 }
                 Some(_) => {
-                    parser.bump_n(2);
-                    parser.spans.push(dollar..parser.pos);
+                    self.bump_n(2);
+                    self.spans.push(dollar..self.pos);
+                }
+            }
+            if unclosed.is_none() {
+                match &self.text[dollar..self.pos] {
+                    "$$" => arg.push_char('$'),
+                    expr => arg.push_expr(expr),
                 }
             }
         }
-        self.join(&mut parser);
-        self.spans.extend(parser.spans);
+        match unclosed {
+            Some(start) => arg.push_expr(&self.text[start..]),
+            None => arg.push_str(self.rest()),
+        }
+        arg
     }
 
     /// Parse a part of a modifier up to and including `delim`, where `None`
@@ -2736,27 +2781,79 @@ mod tests {
 
     #[test]
     fn test_match() {
-        assert_eq!(one("${SRCS:M*.c}"), Modifier::Match("*.c".to_string()));
-        assert_eq!(one("${SRCS:N*.c}"), Modifier::NoMatch("*.c".to_string()));
+        assert_eq!(one("${SRCS:M*.c}"), Modifier::Match(lit("*.c")));
+        assert_eq!(one("${SRCS:N*.c}"), Modifier::NoMatch(lit("*.c")));
         assert_eq!(
             bsd("${CPPFLAGS:M-[ID]*}"),
-            reference("CPPFLAGS", vec![Modifier::Match("-[ID]*".to_string())])
+            reference("CPPFLAGS", vec![Modifier::Match(lit("-[ID]*"))])
         );
         // Braces are balanced, so a nested reference may contain colons.
         assert_eq!(
             mods("${X:M${PAT:Q}:Q}"),
-            vec![Modifier::Match("${PAT:Q}".to_string()), Modifier::Quote]
+            vec![
+                Modifier::Match(ModifierArg::new([expr("${PAT:Q}")])),
+                Modifier::Quote
+            ]
         );
-        assert_eq!(one("${X:M{a,b}*}"), Modifier::Match("{a,b}*".to_string()));
+        assert_eq!(one("${X:M{a,b}*}"), Modifier::Match(lit("{a,b}*")));
         // An escaped delimiter loses its backslash, an escaped opening
         // brace does not.
-        assert_eq!(one("${X:Ma\\:b}"), Modifier::Match("a:b".to_string()));
-        assert_eq!(one("${X:Ma\\}b}"), Modifier::Match("a}b".to_string()));
-        assert_eq!(one("${X:Ma\\{b}"), Modifier::Match("a\\{b".to_string()));
-        assert_eq!(one("${X:M\\*}"), Modifier::Match("\\*".to_string()));
-        assert_eq!(one("${X:M}"), Modifier::Match("".to_string()));
+        assert_eq!(one("${X:Ma\\:b}"), Modifier::Match(lit("a:b")));
+        assert_eq!(one("${X:Ma\\}b}"), Modifier::Match(lit("a}b")));
+        assert_eq!(one("${X:Ma\\{b}"), Modifier::Match(lit("a\\{b")));
+        assert_eq!(one("${X:M\\*}"), Modifier::Match(lit("\\*")));
+        assert_eq!(one("${X:M}"), Modifier::Match(lit("")));
         // `=` does not make this a SysV substitution.
-        assert_eq!(one("${X:Ma=b}"), Modifier::Match("a=b".to_string()));
+        assert_eq!(one("${X:Ma=b}"), Modifier::Match(lit("a=b")));
+    }
+
+    #[test]
+    fn test_match_expressions() {
+        assert_eq!(
+            one("${X:Ma$Y${Z}b$$c$(W)}"),
+            Modifier::Match(ModifierArg::new([
+                text("a"),
+                expr("$Y"),
+                expr("${Z}"),
+                text("b$c"),
+                expr("$(W)"),
+            ]))
+        );
+        assert_eq!(
+            one("${X:N*.${EXT:tl}}"),
+            Modifier::NoMatch(ModifierArg::new([text("*."), expr("${EXT:tl}")]))
+        );
+        // Make expands a `$` at the end of the pattern to nothing.
+        assert_eq!(
+            one("${X:Mb$}"),
+            Modifier::Match(ModifierArg::new([text("b"), expr("$")]))
+        );
+        // Make reports an invalid expression only when expanding it.
+        assert_eq!(
+            one("${X:Ma${Y:S}}"),
+            Modifier::Match(ModifierArg::new([text("a"), expr("${Y:S}")]))
+        );
+        // The expressions are found after unescaping.
+        assert_eq!(
+            one("${X:M\\:${:U\\}x}}"),
+            Modifier::Match(ModifierArg::new([text(":"), expr("${:U}"), text("x}")]))
+        );
+    }
+
+    #[test]
+    fn test_match_escapes_nested_deeply() {
+        // Each level unescapes its pattern, which must not parse the levels
+        // below it again for every level above it.
+        let depth = MAX_DEPTH - 1;
+        let nested = format!("{}$X{}", "${X:M\\{".repeat(depth), "}".repeat(depth));
+        let modifiers = bsd(&nested).modifiers;
+        assert_eq!(
+            modifiers,
+            vec![Modifier::Match(ModifierArg::new([
+                text("\\{"),
+                expr(&nested[7..nested.len() - 1]),
+            ]))]
+        );
     }
 
     #[test]
@@ -2765,31 +2862,37 @@ mod tests {
         // then also from the nested expressions.
         assert_eq!(
             one("${W:M${:U\\:}}"),
-            Modifier::Match("${:U\\:}".to_string())
+            Modifier::Match(ModifierArg::new([expr("${:U\\:}")]))
         );
         assert_eq!(
             one("${X:M${:U}\\:}"),
-            Modifier::Match("${:U}\\:".to_string())
+            Modifier::Match(ModifierArg::new([expr("${:U}"), text("\\:")]))
         );
-        assert_eq!(one("${X:M\\:${:U}}"), Modifier::Match(":${:U}".to_string()));
+        assert_eq!(
+            one("${X:M\\:${:U}}"),
+            Modifier::Match(ModifierArg::new([text(":"), expr("${:U}")]))
+        );
         assert_eq!(
             one("${X:M\\:${:U\\:}}"),
-            Modifier::Match(":${:U:}".to_string())
+            Modifier::Match(ModifierArg::new([text(":"), expr("${:U:}")]))
         );
         assert_eq!(
             one("${X:M${:U\\:}\\:}"),
-            Modifier::Match("${:U\\:}\\:".to_string())
+            Modifier::Match(ModifierArg::new([expr("${:U\\:}"), text("\\:")]))
         );
-        assert_eq!(one("${X:N$$\\:}"), Modifier::NoMatch("$$\\:".to_string()));
+        assert_eq!(one("${X:N$$\\:}"), Modifier::NoMatch(lit("$\\:")));
         // An escaped opening brace keeps its backslash but still enables
         // unescaping.
         assert_eq!(
             one("${X:M\\{${:U\\}}}"),
-            Modifier::Match("\\{${:U}}".to_string())
+            Modifier::Match(ModifierArg::new([text("\\{"), expr("${:U}"), text("}")]))
         );
         assert_eq!(
             mods("${X:M${:U\\:}:Q}"),
-            vec![Modifier::Match("${:U\\:}".to_string()), Modifier::Quote]
+            vec![
+                Modifier::Match(ModifierArg::new([expr("${:U\\:}")])),
+                Modifier::Quote
+            ]
         );
     }
 
@@ -2947,10 +3050,7 @@ mod tests {
         assert_eq!(one("${X:a=b:c:Q}"), sysv("a", "b:c:Q"));
         assert_eq!(
             bsd("${SRCS:M*.c:.c=.o}"),
-            reference(
-                "SRCS",
-                vec![Modifier::Match("*.c".to_string()), sysv(".c", ".o")]
-            )
+            reference("SRCS", vec![Modifier::Match(lit("*.c")), sysv(".c", ".o")])
         );
         assert_eq!(
             one("${X:${A}=${B:Q}}"),
@@ -3056,7 +3156,7 @@ mod tests {
             reference(
                 "MKPIC",
                 vec![
-                    Modifier::Match("no".to_string()),
+                    Modifier::Match(lit("no")),
                     Modifier::IfElse {
                         then_branch: lit("yes"),
                         else_branch: lit("no"),
@@ -3265,7 +3365,7 @@ mod tests {
             mods("${MLINKS:${_FLATTEN}M${_dst:${_FLATTEN}Q}:[\\#]}"),
             vec![
                 Modifier::UnseparatedIndirect("${_FLATTEN}".to_string()),
-                Modifier::Match("${_dst:${_FLATTEN}Q}".to_string()),
+                Modifier::Match(ModifierArg::new([expr("${_dst:${_FLATTEN}Q}")])),
                 Modifier::Words(WordSelector::Count),
             ]
         );
@@ -3291,7 +3391,7 @@ mod tests {
             reference(
                 "SRCS",
                 vec![
-                    Modifier::Match("*.c".to_string()),
+                    Modifier::Match(lit("*.c")),
                     subst(".c", ".o", global()),
                     Modifier::Quote,
                 ]
@@ -3521,10 +3621,10 @@ mod tests {
     fn test_escaped_hash() {
         // make replaces `\#` with `#` before parsing a line.
         assert_eq!(one("${X:[\\#]}"), Modifier::Words(WordSelector::Count));
-        assert_eq!(one("${X:M\\#*}"), Modifier::Match("#*".to_string()));
+        assert_eq!(one("${X:M\\#*}"), Modifier::Match(lit("#*")));
         assert_eq!(one("${X:S/\\#/x/}"), subst("#", "x", Default::default()));
         // An escaped backslash does not escape the `#`.
-        assert_eq!(one("${X:M\\\\#}"), Modifier::Match("\\\\#".to_string()));
+        assert_eq!(one("${X:M\\\\#}"), Modifier::Match(lit("\\\\#")));
         assert_eq!(
             ParsedReference::parse_prefix("${X:[\\#]} == 1", BSDMake),
             Ok((
@@ -3541,7 +3641,7 @@ mod tests {
         );
         assert_eq!(
             ParsedReference::parse_body("X:M\\#*", BSDMake),
-            Ok(reference("X", vec![Modifier::Match("#*".to_string())]))
+            Ok(reference("X", vec![Modifier::Match(lit("#*"))]))
         );
         assert_eq!(
             bsd_expr_extent("${A:S/\\#/${B}/:M$C} ${D}"),
@@ -3559,7 +3659,7 @@ mod tests {
             ParsedReference::parse_body("SRCS:M*.c:.c=.o", BSDMake),
             Ok(reference(
                 "SRCS",
-                vec![Modifier::Match("*.c".to_string()), sysv(".c", ".o")]
+                vec![Modifier::Match(lit("*.c")), sysv(".c", ".o")]
             ))
         );
         assert_eq!(
@@ -3702,7 +3802,7 @@ mod tests {
             reference(
                 "SRCS",
                 vec![
-                    Modifier::Match("*.[cly]".to_string()),
+                    Modifier::Match(lit("*.[cly]")),
                     Modifier::Tail,
                     Modifier::Root,
                     Modifier::Substitute {
@@ -3753,7 +3853,7 @@ mod tests {
                 vec![
                     Modifier::Default(lit("no")),
                     Modifier::ToLower,
-                    Modifier::Match("no".to_string()),
+                    Modifier::Match(lit("no")),
                     Modifier::IfElse {
                         then_branch: lit(""),
                         else_branch: lit("-g"),
@@ -3858,7 +3958,9 @@ mod tests {
         let matches = nest("${X:M", "}");
         assert_eq!(
             bsd(&matches).modifiers,
-            vec![Modifier::Match(matches[5..matches.len() - 1].to_string())]
+            vec![Modifier::Match(ModifierArg::new([expr(
+                &matches[5..matches.len() - 1]
+            )]))]
         );
         let unclosed = &matches[..matches.len() - 1];
         assert!(ParsedReference::parse(unclosed, BSDMake).is_err());
