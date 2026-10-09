@@ -1889,7 +1889,7 @@ mod tests {
                 Some(Err(BsdConditionError {
                     message: "missing right-hand side of operator \"==\"".to_string(),
                     offset: 7,
-                    kind: BsdConditionErrorKind::MissingRightHandSide,
+                    kind: BsdConditionErrorKind::MissingRightHandSide(BsdComparisonOp::Equal),
                 })),
                 None,
             ]
