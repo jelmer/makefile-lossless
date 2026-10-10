@@ -51,6 +51,13 @@ pub enum ModifierArgPart {
     /// Substitution references of other make variants have no such parts,
     /// as `$$` always stands for `$` there.
     EscapedDollar,
+    /// An unescaped `&` in the replacement of `:S`, which stands for the
+    /// text to replace.
+    ///
+    /// make replaces it with the expanded text to replace, the same text
+    /// that it matches, so nested expressions in that text are not expanded
+    /// again.
+    Matched,
 }
 
 /// An argument of a modifier, made up of literal text and nested
@@ -69,7 +76,7 @@ impl ModifierArg {
             match part {
                 ModifierArgPart::Literal(text) => arg.push_str(&text),
                 ModifierArgPart::Expr(text) => arg.push_expr(&text),
-                ModifierArgPart::EscapedDollar => arg.0.push(ModifierArgPart::EscapedDollar),
+                part => arg.0.push(part),
             }
         }
         arg
@@ -88,7 +95,7 @@ impl ModifierArg {
     }
 
     /// The text of this argument, if it is only literal text, without
-    /// nested expressions or [`ModifierArgPart::EscapedDollar`].
+    /// nested expressions or other parts.
     pub fn as_literal_str(&self) -> Option<&str> {
         match self.0.as_slice() {
             [] => Some(""),
@@ -125,16 +132,6 @@ impl ModifierArg {
 
     fn push_expr(&mut self, text: &str) {
         self.0.push(ModifierArgPart::Expr(text.to_string()));
-    }
-
-    fn extend(&mut self, other: &ModifierArg) {
-        for part in &other.0 {
-            match part {
-                ModifierArgPart::Literal(text) => self.push_str(text),
-                ModifierArgPart::Expr(text) => self.push_expr(text),
-                ModifierArgPart::EscapedDollar => self.0.push(ModifierArgPart::EscapedDollar),
-            }
-        }
     }
 }
 
@@ -225,7 +222,8 @@ pub enum Modifier {
     Substitute {
         /// The text to replace, without the anchors.
         from: ModifierArg,
-        /// The replacement, with `&` already replaced by `from`.
+        /// The replacement, in which an unescaped `&` is
+        /// [`ModifierArgPart::Matched`].
         to: ModifierArg,
         /// `from` started with `^`: only match at the start of a word.
         anchor_start: bool,
@@ -383,9 +381,9 @@ pub enum Modifier {
 /// - `:S`, `:C`, `:!cmd!`, `:?`, the assignment modifiers, `:[...]` and the
 ///   SysV substitution: `\` followed by the delimiter that ends the part, by
 ///   `\` or by `$` stands for that character. In the replacement of `:S`,
-///   `\&` stands for `&` as well, and an unescaped `&` is replaced with the
-///   (unescaped) text to match. Other backslashes, such as those in regular
-///   expressions for `:C`, are kept.
+///   `\&` stands for `&` as well, and an unescaped `&` is returned as
+///   [`ModifierArgPart::Matched`]. Other backslashes, such as those in
+///   regular expressions for `:C`, are kept.
 /// - `:U`, `:D`, `:gmtime=` and `:localtime=`: `\` followed by `:`, the
 ///   closing brace, `$` or `\`.
 /// - `:M` and `:N`: `\` followed by `:` or the closing brace, but only if
@@ -1485,13 +1483,13 @@ impl<'a> Parser<'a> {
                 Some(Modifier::ShellCommand(self.parse_part(
                     Some('!'),
                     None,
-                    None,
+                    false,
                 )?))
             }
             ':' => self.parse_assign(delims)?,
             '?' => {
                 self.bump();
-                let then_branch = self.parse_part(Some(':'), None, None)?;
+                let then_branch = self.parse_part(Some(':'), None, false)?;
                 let else_branch = self.parse_part_to_end(delims)?;
                 Some(Modifier::IfElse {
                     then_branch,
@@ -1646,7 +1644,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.bump();
         let var = self
-            .parse_part(Some('@'), None, None)?
+            .parse_part(Some('@'), None, false)?
             .as_literal_str()
             .filter(|var| !var.contains('$'))
             .map(str::to_string)
@@ -1666,7 +1664,7 @@ impl<'a> Parser<'a> {
     fn parse_words(&mut self, delims: Delims) -> Result<Modifier, ReferenceError> {
         let start = self.pos;
         self.bump();
-        let arg = self.parse_part(Some(']'), None, None)?;
+        let arg = self.parse_part(Some(']'), None, false)?;
         if !delims.is_delimiter(self.peek()) {
             return Err(self.bad_modifier(start, delims));
         }
@@ -1748,8 +1746,8 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let mut anchor_end = false;
-        let from = self.parse_part(Some(delim), Some(&mut anchor_end), None)?;
-        let to = self.parse_part(Some(delim), None, Some(&from))?;
+        let from = self.parse_part(Some(delim), Some(&mut anchor_end), false)?;
+        let to = self.parse_part(Some(delim), None, true)?;
         let flags = self.parse_pattern_flags();
         Ok(Modifier::Substitute {
             from,
@@ -1762,8 +1760,8 @@ impl<'a> Parser<'a> {
 
     fn parse_regex(&mut self) -> Result<Modifier, ReferenceError> {
         let delim = self.parse_pattern_delimiter('C')?;
-        let regex = self.parse_part(Some(delim), None, None)?;
-        let replacement = self.parse_part(Some(delim), None, None)?;
+        let regex = self.parse_part(Some(delim), None, false)?;
+        let replacement = self.parse_part(Some(delim), None, false)?;
         let flags = self.parse_pattern_flags();
         Ok(Modifier::RegexSubstitute {
             regex,
@@ -1983,7 +1981,7 @@ impl<'a> Parser<'a> {
         if end != delims.endc || !eq_found {
             return Ok(None);
         }
-        let from = self.parse_part(Some('='), None, None)?;
+        let from = self.parse_part(Some('='), None, false)?;
         let to = self.parse_part_to_end(delims)?;
         Ok(Some(Modifier::SysVSubstitute { from, to }))
     }
@@ -2205,13 +2203,13 @@ impl<'a> Parser<'a> {
     /// stands for the end of the text.
     ///
     /// If `anchor_end` is given, a `$` just before the delimiter sets it
-    /// rather than being added to the part. If `subst_from` is given, `&`
-    /// is replaced with it.
+    /// rather than being added to the part. If `matched` is set, as for the
+    /// replacement of `:S`, `&` gives [`ModifierArgPart::Matched`].
     fn parse_part(
         &mut self,
         delim: Option<char>,
         mut anchor_end: Option<&mut bool>,
-        subst_from: Option<&ModifierArg>,
+        matched: bool,
     ) -> Result<ModifierArg, ReferenceError> {
         let mut arg = ModifierArg::default();
         loop {
@@ -2233,7 +2231,7 @@ impl<'a> Parser<'a> {
                     if Some(next) == delim
                         || next == '\\'
                         || next == '$'
-                        || (next == '&' && subst_from.is_some())
+                        || (next == '&' && matched)
                     {
                         arg.push_char(next);
                         self.bump_n(2);
@@ -2242,9 +2240,10 @@ impl<'a> Parser<'a> {
                 }
             }
             if c != '$' {
-                match subst_from {
-                    Some(from) if c == '&' => arg.extend(from),
-                    _ => arg.push_char(c),
+                if matched && c == '&' {
+                    arg.0.push(ModifierArgPart::Matched);
+                } else {
+                    arg.push_char(c);
                 }
                 self.bump();
                 continue;
@@ -2268,7 +2267,7 @@ impl<'a> Parser<'a> {
     /// Parse a part that extends to the closing brace, without consuming the
     /// brace.
     fn parse_part_to_end(&mut self, delims: Delims) -> Result<ModifierArg, ReferenceError> {
-        let arg = self.parse_part(delims.endc, None, None)?;
+        let arg = self.parse_part(delims.endc, None, false)?;
         if let Some(endc) = delims.endc {
             self.pos -= endc.len_utf8();
         }
@@ -3343,11 +3342,12 @@ mod tests {
         // An escaped `$` before the delimiter is not an anchor.
         assert_eq!(one("${X:S/a\\$/b/}"), subst("a$", "b", Default::default()));
         // `&` stands for the text to match, `\&` for itself.
+        let matched = || ModifierArgPart::Matched;
         assert_eq!(
             one("${X:S/^a/&&\\&/}"),
             Modifier::Substitute {
                 from: lit("a"),
-                to: lit("aa&"),
+                to: ModifierArg::new([matched(), matched(), text("&")]),
                 anchor_start: true,
                 anchor_end: false,
                 flags: Default::default(),
@@ -3357,7 +3357,7 @@ mod tests {
             one("${X:S/${A}/[&]/}"),
             Modifier::Substitute {
                 from: ModifierArg::new([expr("${A}")]),
-                to: ModifierArg::new([text("["), expr("${A}"), text("]")]),
+                to: ModifierArg::new([text("["), matched(), text("]")]),
                 anchor_start: false,
                 anchor_end: false,
                 flags: Default::default(),
@@ -3426,6 +3426,38 @@ mod tests {
     #[test]
     fn test_escaped_dollar_in_args() {
         let dollar = || ModifierArgPart::EscapedDollar;
+        let matched = || ModifierArgPart::Matched;
+        // `&` is not replaced with the parts of the text to match, so the
+        // `$$` that anchors it is not followed by other text.
+        assert_eq!(
+            one("${X:S/a$$/[&]/}"),
+            Modifier::Substitute {
+                from: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([text("["), matched(), text("]")]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            one("${X:S/a$$/&Q/}"),
+            Modifier::Substitute {
+                from: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([matched(), text("Q")]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        // In `:C`, make replaces `&` only after expanding the replacement.
+        assert_eq!(
+            one("${X:C/a/&\\&/}"),
+            Modifier::RegexSubstitute {
+                regex: lit("a"),
+                replacement: lit("&\\&"),
+                flags: Default::default(),
+            }
+        );
         assert_eq!(
             one("${X:S/a/$$x/}"),
             Modifier::Substitute {
@@ -3451,7 +3483,7 @@ mod tests {
             one("${X:S/a$$$/&/}"),
             Modifier::Substitute {
                 from: ModifierArg::new([text("a"), dollar()]),
-                to: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([ModifierArgPart::Matched]),
                 anchor_start: false,
                 anchor_end: true,
                 flags: Default::default(),
