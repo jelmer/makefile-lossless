@@ -17,6 +17,11 @@ pub enum ModifierArgPart {
     Literal(String),
     /// A nested expression such as `${FOO:Q}` or `$X`, as unexpanded text.
     /// It can be parsed with [`ParsedReference::parse`].
+    ///
+    /// In BSD make modifiers, it can also be `$` on its own, for a `$`
+    /// followed by `:`, `)`, `}` or the end of the text where that does not
+    /// end the argument, such as in `${:Ua$}`. make skips such a `$`, so it
+    /// expands to nothing (in lint mode, it is an error).
     Expr(String),
     /// `$$` in an argument of a BSD make modifier.
     ///
@@ -2118,12 +2123,11 @@ impl<'a> Parser<'a> {
                 self.spans.push(start..self.pos);
                 arg.0.push(ModifierArgPart::EscapedDollar);
             }
+            // Like make, only skip the '$' since the next character cannot
+            // be a variable name.
             None | Some(':' | ')' | '}') => {
-                return Err(syntax_error(
-                    start,
-                    ReferenceSyntaxErrorKind::MissingVariableName,
-                    "missing variable name after '$'",
-                ));
+                self.bump();
+                arg.push_expr("$");
             }
             Some(_) => {
                 self.bump_n(2);
@@ -3367,6 +3371,59 @@ mod tests {
     }
 
     #[test]
+    fn test_lone_dollar_in_args() {
+        let dollar = || ModifierArgPart::EscapedDollar;
+        assert_eq!(
+            one("${:Ua$}"),
+            Modifier::Default(ModifierArg::new([text("a"), expr("$")]))
+        );
+        assert_eq!(
+            mods("${:Ua$:Q}"),
+            vec![
+                Modifier::Default(ModifierArg::new([text("a"), expr("$")])),
+                Modifier::Quote
+            ]
+        );
+        assert_eq!(
+            one("${W:Da$}"),
+            Modifier::Defined(ModifierArg::new([text("a"), expr("$")]))
+        );
+        assert_eq!(
+            one("${:Ua$$$}"),
+            Modifier::Default(ModifierArg::new([text("a"), dollar(), expr("$")]))
+        );
+        assert_eq!(
+            one("${W:Da$$$}"),
+            Modifier::Defined(ModifierArg::new([text("a"), dollar(), expr("$")]))
+        );
+        assert_eq!(
+            one("$(:Ua$})"),
+            Modifier::Default(ModifierArg::new([text("a"), expr("$"), text("}")]))
+        );
+        assert_eq!(
+            mods("${:U%s:gmtime=1$:Q}"),
+            vec![
+                Modifier::Default(lit("%s")),
+                Modifier::GmTime(Some(ModifierArg::new([text("1"), expr("$")]))),
+                Modifier::Quote
+            ]
+        );
+        // Before the closing brace, the `$` is literal.
+        assert_eq!(one("${X:gmtime=1$}"), Modifier::GmTime(Some(lit("1$"))));
+        assert_eq!(
+            one("${X:S/a$}/b/}"),
+            Modifier::Substitute {
+                from: ModifierArg::new([text("a"), expr("$"), text("}")]),
+                to: lit("b"),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(bsd_expr_extent("${:Ua$} b"), Some((7, vec![])));
+    }
+
+    #[test]
     fn test_escaped_dollar_in_args() {
         let dollar = || ModifierArgPart::EscapedDollar;
         assert_eq!(
@@ -3994,10 +4051,6 @@ mod tests {
         assert_eq!(
             syntax("${X}y"),
             (4, "unexpected text after reference".to_string())
-        );
-        assert_eq!(
-            syntax("${X:U$}"),
-            (5, "missing variable name after '$'".to_string())
         );
     }
 
