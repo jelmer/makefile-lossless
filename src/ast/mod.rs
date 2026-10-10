@@ -51,6 +51,7 @@ macro_rules! keyword_enum {
 pub mod archive;
 pub mod bsd;
 pub mod conditional;
+pub mod default_goal;
 pub mod expression_statement;
 pub mod include;
 pub mod load;
