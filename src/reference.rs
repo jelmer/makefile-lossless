@@ -348,6 +348,12 @@ pub enum Modifier {
     /// The value is parsed as a list of modifiers on its own, as by
     /// [`ParsedReference::parse_body`] with a leading `:`. It may end in a
     /// `:`, so `tl:` has the same effect as `tl`.
+    ///
+    /// The text can also be a lone `$`, as in `${VAR:$}`, which make skips,
+    /// so it expands to nothing. After a modifier that does not check for a
+    /// delimiter itself, such as `:S`, `:L` or `:@`, make also takes a `$`
+    /// as the start of an indirect modifier without a `:` before it, as in
+    /// `${VAR:S/a/b/$}`.
     Indirect(String),
     /// A nested expression used as a list of modifiers like
     /// [`Modifier::Indirect`], that is directly followed by the next
@@ -1431,7 +1437,10 @@ impl<'a> Parser<'a> {
                 Some(':') => {
                     self.bump();
                 }
-                c if unseparated || delims.is_delimiter(c) => {}
+                // Outside of lint mode, make goes on with an indirect
+                // modifier after a modifier that does not check for a
+                // delimiter itself.
+                c if unseparated || c == Some('$') || delims.is_delimiter(c) => {}
                 _ => {
                     return Err(syntax_error(
                         self.pos,
@@ -1477,6 +1486,17 @@ impl<'a> Parser<'a> {
             }
         };
         let modifier = match first {
+            // make skips a `$` that cannot start an expression. As that
+            // expands to nothing, it goes on with the next modifier even
+            // if no delimiter follows.
+            '$' if matches!(self.peek_nth(1), None | Some('$' | ':' | ')' | '}')) => {
+                self.bump();
+                Some(if delims.is_delimiter(self.peek()) {
+                    Modifier::Indirect("$".to_string())
+                } else {
+                    Modifier::UnseparatedIndirect("$".to_string())
+                })
+            }
             '$' => self.parse_indirect(delims)?,
             '!' => {
                 self.bump();
@@ -1935,19 +1955,22 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let start = self.pos;
-        let digits = self.take_digits();
-        if !digits.is_empty() {
-            return Ok(Some(digits.to_string()));
-        }
-        if self.at_word("error", delims) {
+        let mut arg = self.take_digits();
+        if arg.is_empty() && self.rest().starts_with("error") {
             self.bump_n("error".len());
-            return Ok(Some("error".to_string()));
+            arg = "error";
         }
-        Err(syntax_error(
-            start,
-            ReferenceSyntaxErrorKind::InvalidMtimeArgument,
-            format!("invalid argument '{}' for modifier ':mtime'", self.rest()),
-        ))
+        if arg.is_empty() || !delims.is_delimiter(self.peek()) {
+            return Err(syntax_error(
+                start,
+                ReferenceSyntaxErrorKind::InvalidMtimeArgument,
+                format!(
+                    "invalid argument '{}' for modifier ':mtime'",
+                    &self.text[start..]
+                ),
+            ));
+        }
+        Ok(Some(arg.to_string()))
     }
 
     fn take_digits(&mut self) -> &'a str {
@@ -3996,6 +4019,128 @@ mod tests {
         assert_eq!(
             ParsedReference::parse_body(":tl:", BSDMake),
             Ok(reference("", vec![Modifier::ToLower]))
+        );
+        // A lone `$` expands to nothing, so make continues after it in any
+        // case. In `$$x`, it is followed by the indirect modifier `$x`.
+        let indirect = |text: &str| Modifier::Indirect(text.to_string());
+        let unseparated = |text: &str| Modifier::UnseparatedIndirect(text.to_string());
+        assert_eq!(mods("${X:$}"), vec![indirect("$")]);
+        assert_eq!(mods("${X:$:Q}"), vec![indirect("$"), Modifier::Quote]);
+        assert_eq!(mods("${X:$$}"), vec![unseparated("$"), indirect("$")]);
+        assert_eq!(mods("${X:$$x}"), vec![unseparated("$"), indirect("$x")]);
+        assert_eq!(
+            mods("${X:$$x=y}"),
+            vec![
+                unseparated("$"),
+                Modifier::SysVSubstitute {
+                    from: ModifierArg::new([expr("$x")]),
+                    to: lit("y"),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_indirect_after_modifier() {
+        // make takes a `$` after a modifier that does not check for a
+        // delimiter as an indirect modifier, even without a `:`.
+        let indirect = |text: &str| Modifier::Indirect(text.to_string());
+        let a_c = || subst("a", "c", Default::default());
+        assert_eq!(mods("${W:S/a/c/$}"), vec![a_c(), indirect("$")]);
+        assert_eq!(
+            mods("${W:S$a$$$}"),
+            vec![subst("a", "", Default::default()), indirect("$")]
+        );
+        assert_eq!(
+            mods("${W:S/a/c/$:Q}"),
+            vec![a_c(), indirect("$"), Modifier::Quote]
+        );
+        assert_eq!(mods("${W:S/a/c/${M}}"), vec![a_c(), indirect("${M}")]);
+        assert_eq!(
+            mods("${W:S/a/c/${:U}S/B/d/}"),
+            vec![
+                a_c(),
+                Modifier::UnseparatedIndirect("${:U}".to_string()),
+                subst("B", "d", Default::default())
+            ]
+        );
+        assert_eq!(
+            mods("${W:S/a/c/$$x}"),
+            vec![
+                a_c(),
+                Modifier::UnseparatedIndirect("$".to_string()),
+                indirect("$x")
+            ]
+        );
+        assert_eq!(
+            mods("${W:C/a/c/$}"),
+            vec![
+                Modifier::RegexSubstitute {
+                    regex: lit("a"),
+                    replacement: lit("c"),
+                    flags: Default::default(),
+                },
+                indirect("$")
+            ]
+        );
+        assert_eq!(mods("${W:L$}"), vec![Modifier::Literal, indirect("$")]);
+        assert_eq!(mods("${W:P$}"), vec![Modifier::Path, indirect("$")]);
+        assert_eq!(
+            mods("${W:@x@x@$}"),
+            vec![
+                Modifier::Loop {
+                    var: "x".to_string(),
+                    body: "x".to_string()
+                },
+                indirect("$")
+            ]
+        );
+        assert_eq!(
+            mods("${W:!echo!$}"),
+            vec![Modifier::ShellCommand(lit("echo")), indirect("$")]
+        );
+        assert_eq!(
+            mods("${W:range=3$}"),
+            vec![Modifier::Range(Some(3)), indirect("$")]
+        );
+        assert_eq!(
+            mods("${W:ts\\n$}"),
+            vec![Modifier::Separator(Some('\n')), indirect("$")]
+        );
+        // Other modifiers must be followed by a delimiter.
+        let unknown = |text: &str, offset: usize, modifier: &str| {
+            assert_eq!(
+                ParsedReference::parse(text, BSDMake),
+                Err(ReferenceError::UnknownModifier {
+                    offset,
+                    modifier: modifier.to_string()
+                })
+            );
+        };
+        unknown("${W:Q$}", 4, "Q$");
+        unknown("${W:range$}", 4, "range$");
+        let kind = |text: &str| {
+            ParsedReference::parse(text, BSDMake)
+                .unwrap_err()
+                .syntax_kind()
+        };
+        assert_eq!(
+            kind("${W:tl$}"),
+            Some(ReferenceSyntaxErrorKind::BadModifier)
+        );
+        assert_eq!(kind("${W:O$}"), Some(ReferenceSyntaxErrorKind::BadModifier));
+        assert_eq!(
+            kind("${W:[1]$}"),
+            Some(ReferenceSyntaxErrorKind::BadModifier)
+        );
+        assert_eq!(
+            kind("${W:mtime=1$}"),
+            Some(ReferenceSyntaxErrorKind::InvalidMtimeArgument)
+        );
+        assert_eq!(bsd_expr_extent("${W:S/a/c/$} b"), Some((12, vec![])));
+        assert_eq!(
+            bsd_expr_extent("${W:S/a/c/$M$N} b"),
+            Some((15, vec![10..12, 12..14]))
         );
     }
 
