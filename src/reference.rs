@@ -11,18 +11,40 @@ use std::ops::Range;
 
 /// A piece of a [`ModifierArg`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ModifierArgPart {
     /// Literal text, with escapes removed.
     Literal(String),
     /// A nested expression such as `${FOO:Q}` or `$X`, as unexpanded text.
     /// It can be parsed with [`ParsedReference::parse`].
     Expr(String),
-    /// `$$` in the pattern of `:M` or `:N`.
+    /// `$$` in an argument of a BSD make modifier.
     ///
-    /// make expands the pattern as a whole, so this stands for `$`, except
-    /// when expanding the value of a `:=` assignment with
-    /// `.MAKE.SAVE_DOLLARS` enabled (the NetBSD default), where it stays
-    /// `$$`. In other arguments, `$$` is returned as a literal `$`.
+    /// Its meaning depends on the modifier, so it is up to the caller.
+    ///
+    /// In the pattern of `:M` and `:N`, make expands the pattern as a whole,
+    /// so this stands for `$`, except when expanding the value of a `:=`
+    /// assignment with `.MAKE.SAVE_DOLLARS` enabled (the NetBSD default),
+    /// where it stays `$$`.
+    ///
+    /// In all other arguments, make does not take `$$` as an escape. The
+    /// first `$` is an expression without a valid name, which expands to
+    /// nothing (in lint mode with `.MAKE.SAVE_DOLLARS` enabled, it is an
+    /// error). The second `$` starts an expression with the text after it,
+    /// so `$$x` and `$${x}` both give the value of `x`. The parser ends that
+    /// expression where make does, and its text after the `$` is kept
+    /// unchanged at the start of the next part, so `$${x}` gives this
+    /// followed by the literal text `{x}`.
+    ///
+    /// If `$$` ends the argument, the second `$` is a literal `$`, or for the
+    /// text to replace of `:S` it anchors the match at the end of the word,
+    /// as a single `$` would. This does not apply to `:U` and `:D`, nor to
+    /// a `:` that ends the argument of `:gmtime=` or `:localtime=`. Apart
+    /// from that, a second `$` followed by `$`, `:`, `)` or `}` expands to
+    /// nothing.
+    ///
+    /// Substitution references of other make variants have no such parts,
+    /// as `$$` always stands for `$` there.
     EscapedDollar,
 }
 
@@ -60,7 +82,8 @@ impl ModifierArg {
         &self.0
     }
 
-    /// The text of this argument, if it contains no nested expressions.
+    /// The text of this argument, if it is only literal text, without
+    /// nested expressions or [`ModifierArgPart::EscapedDollar`].
     pub fn as_literal_str(&self) -> Option<&str> {
         match self.0.as_slice() {
             [] => Some(""),
@@ -69,7 +92,7 @@ impl ModifierArg {
         }
     }
 
-    /// The text of this argument, if it contains no nested expressions.
+    /// The text of this argument, if it is only literal text.
     #[deprecated(since = "0.4.2", note = "use `as_literal_str` instead")]
     pub fn as_literal(&self) -> Option<String> {
         self.as_literal_str().map(str::to_string)
@@ -201,7 +224,9 @@ pub enum Modifier {
         to: ModifierArg,
         /// `from` started with `^`: only match at the start of a word.
         anchor_start: bool,
-        /// `from` ended with `$`: only match at the end of a word.
+        /// `from` ended with a single `$`: only match at the end of a word.
+        /// make anchors the match for `$$` at the end as well, see
+        /// [`ModifierArgPart::EscapedDollar`].
         anchor_end: bool,
         /// The flags after the last delimiter.
         flags: SubstituteFlags,
@@ -227,7 +252,8 @@ pub enum Modifier {
     SysVSubstitute {
         /// The suffix or pattern to replace.
         from: ModifierArg,
-        /// The replacement.
+        /// The replacement. BSD make expands it again for each word that
+        /// matches.
         to: ModifierArg,
     },
     /// `:@var@body@`: expand the body for each word, with the word assigned
@@ -365,12 +391,10 @@ pub enum Modifier {
 ///   is kept, as it is in make.
 /// - `:@`: in the variable name and body, `\@`, `\\` and `\$`.
 ///
-/// In the pattern of `:M` and `:N`, `$$` is returned as
-/// [`ModifierArgPart::EscapedDollar`], since its meaning depends on how the
-/// expression is expanded. In other parts that are parsed into a
-/// [`ModifierArg`], `$$` is returned as a literal `$`. NetBSD make instead
-/// treats the first `$` as an undefined expression, and complains about it
-/// in strict mode.
+/// `$$` in a [`ModifierArg`] is returned as
+/// [`ModifierArgPart::EscapedDollar`]. It only stands for `$` in the pattern
+/// of `:M` and `:N`; in other arguments, NetBSD make takes the second `$` as
+/// the start of an expression, as described there.
 ///
 /// # Example
 /// ```
@@ -1872,6 +1896,10 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
+            if c == '$' && next == Some('$') {
+                self.parse_escaped_dollar(&mut arg, delims.endc)?;
+                continue;
+            }
             // As in make, a `$` just before the closing brace is literal.
             if c == '$' && next != delims.endc {
                 self.parse_nested_expr(&mut arg)?;
@@ -2025,6 +2053,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            if c == '$' && self.peek_nth(1) == Some('$') {
+                self.parse_escaped_dollar(&mut arg, delims.endc)?;
+                continue;
+            }
             if c == '$' {
                 self.parse_nested_expr(&mut arg)?;
                 continue;
@@ -2033,6 +2065,44 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         Ok(arg)
+    }
+
+    /// Parse `$$` in an argument other than the pattern of `:M` or `:N`,
+    /// where `end` is the delimiter that ends the argument.
+    ///
+    /// make does not take `$$` as an escape there: the first `$` expands to
+    /// nothing, and the second one starts an expression unless it is followed
+    /// by `end`. That expression is skipped as make does, and the text after
+    /// the second `$` is added as literal text, so that `$${x}` gives
+    /// `EscapedDollar` and `{x}`.
+    fn parse_escaped_dollar(
+        &mut self,
+        arg: &mut ModifierArg,
+        end: Option<char>,
+    ) -> Result<(), ReferenceError> {
+        let start = self.pos;
+        self.bump_n(2);
+        self.spans.push(start..self.pos);
+        arg.0.push(ModifierArgPart::EscapedDollar);
+        let next = self.peek();
+        if next == end {
+            return Ok(());
+        }
+        match next {
+            None | Some('$' | ':' | ')' | '}') => {}
+            Some('(' | '{') => {
+                let spans = self.spans.len();
+                self.pos -= 1;
+                self.skip_expr()?;
+                self.spans.truncate(spans);
+                arg.push_str(&self.text[start + 2..self.pos]);
+            }
+            Some(c) => {
+                self.bump();
+                arg.push_char(c);
+            }
+        }
+        Ok(())
     }
 
     /// Parse a nested expression starting at `$`, adding it to `arg`.
@@ -2046,7 +2116,7 @@ impl<'a> Parser<'a> {
             Some('$') => {
                 self.bump_n(2);
                 self.spans.push(start..self.pos);
-                arg.push_char('$');
+                arg.0.push(ModifierArgPart::EscapedDollar);
             }
             None | Some(':' | ')' | '}') => {
                 return Err(syntax_error(
@@ -2181,6 +2251,10 @@ impl<'a> Parser<'a> {
                     None => arg.push_char('$'),
                 }
                 self.bump();
+                continue;
+            }
+            if next == Some('$') {
+                self.parse_escaped_dollar(&mut arg, delim)?;
                 continue;
             }
             self.parse_nested_expr(&mut arg)?;
@@ -2938,6 +3012,11 @@ mod tests {
             Some((32, vec![4..6, 9..13, 14..16, 19..21, 26..30]))
         );
         assert_eq!(bsd_expr_extent("$X:"), Some((2, vec![])));
+        // The expression that make parses after `$$` is part of it.
+        assert_eq!(
+            bsd_expr_extent("${X:a=$${Y:S/${Z}/a/}$W} b"),
+            Some((24, vec![6..8, 21..23]))
+        );
         assert_eq!(bsd_expr_extent("${X:S/a/b"), None);
         assert_eq!(bsd_expr_extent("$$"), None);
     }
@@ -3285,7 +3364,147 @@ mod tests {
             one("${X:S/a\\b/c/}"),
             subst("a\\b", "c", Default::default())
         );
-        assert_eq!(one("${X:S/a/$$/}"), subst("a", "$", Default::default()));
+    }
+
+    #[test]
+    fn test_escaped_dollar_in_args() {
+        let dollar = || ModifierArgPart::EscapedDollar;
+        assert_eq!(
+            one("${X:S/a/$$x/}"),
+            Modifier::Substitute {
+                from: lit("a"),
+                to: ModifierArg::new([dollar(), text("x")]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        // Unlike a single `$`, `$$` before the delimiter does not anchor.
+        assert_eq!(
+            one("${X:S/a$$/b$$/}"),
+            Modifier::Substitute {
+                from: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([text("b"), dollar()]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            one("${X:S/a$$$/&/}"),
+            Modifier::Substitute {
+                from: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([text("a"), dollar()]),
+                anchor_start: false,
+                anchor_end: true,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            one("${X:C/a$$/$${x}/}"),
+            Modifier::RegexSubstitute {
+                regex: ModifierArg::new([text("a"), dollar()]),
+                replacement: ModifierArg::new([dollar(), text("{x}")]),
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            one("${X:a$$=$${x}}"),
+            Modifier::SysVSubstitute {
+                from: ModifierArg::new([text("a"), dollar()]),
+                to: ModifierArg::new([dollar(), text("{x}")]),
+            }
+        );
+        assert_eq!(
+            one("${X:U$$x}"),
+            Modifier::Default(ModifierArg::new([dollar(), text("x")]))
+        );
+        assert_eq!(
+            one("${X:Dz$$}"),
+            Modifier::Defined(ModifierArg::new([text("z"), dollar()]))
+        );
+        assert_eq!(
+            one("${X:?$$x:$$}"),
+            Modifier::IfElse {
+                then_branch: ModifierArg::new([dollar(), text("x")]),
+                else_branch: ModifierArg::new([dollar()]),
+            }
+        );
+        assert_eq!(
+            one("${X:!echo $$$$!}"),
+            Modifier::ShellCommand(ModifierArg::new([text("echo "), dollar(), dollar()]))
+        );
+        assert_eq!(
+            one("${X::=$$x}"),
+            Modifier::Assign {
+                op: AssignOp::Set,
+                value: ModifierArg::new([dollar(), text("x")]),
+            }
+        );
+        assert_eq!(
+            one("${X:[$$x]}"),
+            Modifier::Words(WordSelector::Unexpanded(ModifierArg::new([
+                dollar(),
+                text("x")
+            ])))
+        );
+        assert_eq!(
+            one("${X:gmtime=1$$}"),
+            Modifier::GmTime(Some(ModifierArg::new([text("1"), dollar()])))
+        );
+        // make parses the second `$` as the start of an expression, which
+        // decides where the argument ends.
+        assert_eq!(
+            one("${X:a=$${x}}"),
+            Modifier::SysVSubstitute {
+                from: lit("a"),
+                to: ModifierArg::new([dollar(), text("{x}")]),
+            }
+        );
+        assert_eq!(
+            one("${X:S/a/$${x:S,b,/,}\\//}"),
+            Modifier::Substitute {
+                from: lit("a"),
+                to: ModifierArg::new([dollar(), text("{x:S,b,/,}/")]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            mods("${X:Ua$$\\:Q}"),
+            vec![
+                Modifier::Default(ModifierArg::new([text("a"), dollar(), text("\\")])),
+                Modifier::Quote
+            ]
+        );
+        assert_eq!(
+            syntax("${X:S/a/$$\\//}"),
+            (
+                12,
+                "missing delimiter ':' after modifier ':S/a/$$\\/'".to_string()
+            )
+        );
+        assert_eq!(
+            one("${X:S(a($$(}"),
+            Modifier::Substitute {
+                from: lit("a"),
+                to: ModifierArg::new([dollar()]),
+                anchor_start: false,
+                anchor_end: false,
+                flags: Default::default(),
+            }
+        );
+        assert_eq!(
+            one("${X:?$${x:S,b,:,}:n}"),
+            Modifier::IfElse {
+                then_branch: ModifierArg::new([dollar(), text("{x:S,b,:,}")]),
+                else_branch: lit("n"),
+            }
+        );
+        // An escaped dollar is not literal text.
+        assert_eq!(lit("$").as_literal_str(), Some("$"));
+        assert_eq!(ModifierArg::new([dollar()]).as_literal_str(), None);
     }
 
     #[test]
