@@ -177,7 +177,8 @@ pub enum ParseErrorKind {
     /// An `endif` without a matching conditional (GNU make: "extraneous
     /// 'endif'").
     ExtraneousEndif,
-    /// An `else` without a matching conditional.
+    /// An `else` without a matching conditional (GNU make: "extraneous
+    /// 'else'").
     ElseWithoutIf,
     /// A BSD `.elif` (or nmake `!ELSEIF`) without a matching conditional.
     ElifWithoutIf,
