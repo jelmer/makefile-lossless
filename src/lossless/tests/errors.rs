@@ -1343,11 +1343,76 @@ fn test_error_location_points_at_token() {
     assert_eq!(
         error_locations("X = 1\nendif\n"),
         vec![(
-            "unknown conditional directive: endif".to_string(),
+            "extraneous `endif`".to_string(),
             2,
             "endif".to_string(),
             rowan::TextRange::new(6.into(), 11.into())
         )]
+    );
+}
+
+fn error_messages(text: &str, variant: Option<MakefileVariant>) -> Vec<(ParseErrorKind, String)> {
+    parse(text, variant)
+        .positioned_errors
+        .iter()
+        .map(|e| (e.kind(), e.message.clone()))
+        .collect()
+}
+
+#[test]
+fn test_stray_conditional_messages() {
+    let gnu = Some(MakefileVariant::GNUMake);
+    let bsd = Some(MakefileVariant::BSDMake);
+    let nmake = Some(MakefileVariant::NMake);
+    let error = |kind, message: &str| vec![(kind, message.to_string())];
+    for variant in [None, gnu] {
+        assert_eq!(
+            error_messages("endif\n", variant),
+            error(ParseErrorKind::ExtraneousEndif, "extraneous `endif`")
+        );
+        assert_eq!(
+            error_messages("else\n", variant),
+            error(ParseErrorKind::ElseWithoutIf, "extraneous `else`")
+        );
+        assert_eq!(
+            error_messages("else ifdef X\n", variant),
+            error(ParseErrorKind::ElseWithoutIf, "extraneous `else`")
+        );
+        assert_eq!(
+            error_messages("ifdef X\nendif\nendif\n", variant),
+            error(ParseErrorKind::ExtraneousEndif, "extraneous `endif`")
+        );
+        assert_eq!(
+            error_messages("all:\n\techo\nendif\n", variant),
+            error(ParseErrorKind::ExtraneousEndif, "extraneous `endif`")
+        );
+        // GNU make only recognizes `endef` inside a define.
+        assert_eq!(
+            error_messages("endef\n", variant),
+            error(ParseErrorKind::MissingSeparator, "expected ':'")
+        );
+    }
+    assert_eq!(
+        error_messages(".endif\n", bsd),
+        error(
+            ParseErrorKind::ExtraneousEndif,
+            ".endif without matching .if"
+        )
+    );
+    assert_eq!(
+        error_messages(".else\n", bsd),
+        error(ParseErrorKind::ElseWithoutIf, ".else without matching .if")
+    );
+    assert_eq!(
+        error_messages("!ENDIF\n", nmake),
+        error(
+            ParseErrorKind::ExtraneousEndif,
+            "!ENDIF without matching !IF"
+        )
+    );
+    assert_eq!(
+        error_messages("!ELSE\n", nmake),
+        error(ParseErrorKind::ElseWithoutIf, "!ELSE without matching !IF")
     );
 }
 

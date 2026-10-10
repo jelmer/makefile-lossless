@@ -143,12 +143,21 @@ impl Parser<'_> {
         };
         if !is_gnu_conditional_start(&token) {
             // Reached for an `else` or `endif` outside of a conditional.
-            let kind = match token.as_str() {
-                "else" => ParseErrorKind::ElseWithoutIf,
-                "endif" => ParseErrorKind::ExtraneousEndif,
-                _ => ParseErrorKind::InvalidConditional,
+            let (kind, message) = match token.as_str() {
+                "else" => (
+                    ParseErrorKind::ElseWithoutIf,
+                    "extraneous `else`".to_string(),
+                ),
+                "endif" => (
+                    ParseErrorKind::ExtraneousEndif,
+                    "extraneous `endif`".to_string(),
+                ),
+                _ => (
+                    ParseErrorKind::InvalidConditional,
+                    format!("unknown conditional directive: {token}"),
+                ),
             };
-            self.error(kind, format!("unknown conditional directive: {}", token));
+            self.error(kind, message);
             return None;
         }
 
