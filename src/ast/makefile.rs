@@ -1361,6 +1361,45 @@ impl Makefile {
             .find_map(VariableReference::cast)
     }
 
+    /// Get the character that starts a recipe line on the line containing
+    /// `offset`: a tab, or the one set with GNU make's `.RECIPEPREFIX` on
+    /// the lines before it.
+    ///
+    /// This follows the same `.RECIPEPREFIX` assignments as the parser does
+    /// to find recipe lines. Like GNU make, it takes the first character of
+    /// the value, which is expanded for `:=`, `::=` and `:::=` but not for
+    /// `=`, and an empty value resets the prefix to a tab. A `?=` assignment
+    /// has no effect, as `.RECIPEPREFIX` is always defined, and neither does
+    /// a target-specific one.
+    ///
+    /// Unlike make, which only reads the branch of a conditional that is
+    /// taken, this follows assignments in all branches, in order. It also
+    /// does not know about assignments in included makefiles or on the
+    /// command line.
+    ///
+    /// The makefile does not record the make variant it was parsed for, so
+    /// this assumes GNU make. Other make variants have no `.RECIPEPREFIX` and
+    /// always start recipe lines with a tab.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset` is past the end of the makefile or not at a
+    /// character boundary.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = ".RECIPEPREFIX = >\nall:\n>echo\n".parse().unwrap();
+    /// assert_eq!(makefile.recipe_prefix_at(5.into()), '\t');
+    /// assert_eq!(makefile.recipe_prefix_at(23.into()), '>');
+    /// ```
+    pub fn recipe_prefix_at(&self, offset: rowan::TextSize) -> char {
+        let text = self.syntax().to_string();
+        let before = &text[..usize::from(offset)];
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        crate::lex::recipe_prefix_after(&before[..line_start])
+    }
+
     /// Get all top-level items that overlap with the given text range.
     ///
     /// Since items are stored in document order, this skips items entirely
@@ -3079,6 +3118,113 @@ override_dh_auto_configure:
                 (18, 19, None),
                 (19, 23, some("$(Y)")),
                 (23, 27, None),
+            ]
+        );
+    }
+
+    /// The recipe prefix at each offset of `text`, as runs of
+    /// `(start, end, prefix)`.
+    fn recipe_prefix_runs(text: &str) -> Vec<(usize, usize, char)> {
+        let makefile = Makefile::parse(text).tree();
+        let mut runs: Vec<(usize, usize, char)> = Vec::new();
+        for offset in 0..=text.len() {
+            let prefix = makefile.recipe_prefix_at((offset as u32).into());
+            match runs.last_mut() {
+                Some((_, end, p)) if *p == prefix => *end = offset + 1,
+                _ => runs.push((offset, offset + 1, prefix)),
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_default() {
+        assert_eq!(recipe_prefix_runs("all:\n\techo\n"), vec![(0, 12, '\t')]);
+        assert_eq!(recipe_prefix_runs(""), vec![(0, 1, '\t')]);
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_following_lines() {
+        let text = "A = 1\n.RECIPEPREFIX = >\nall:\n>echo\n";
+        assert_eq!(recipe_prefix_runs(text), vec![(0, 24, '\t'), (24, 36, '>')]);
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_end_without_newline() {
+        assert_eq!(recipe_prefix_runs(".RECIPEPREFIX = >"), vec![(0, 18, '\t')]);
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_continuation() {
+        // The prefix changes after the end of the logical line.
+        let text = ".RECIPEPREFIX = \\\n>\nx\n";
+        assert_eq!(recipe_prefix_runs(text), vec![(0, 20, '\t'), (20, 23, '>')]);
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_reset() {
+        let text = ".RECIPEPREFIX := >\n.RECIPEPREFIX :=\n";
+        assert_eq!(
+            recipe_prefix_runs(text),
+            vec![(0, 19, '\t'), (19, 36, '>'), (36, 37, '\t')]
+        );
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_values() {
+        let at_end = |text: &str| {
+            Makefile::parse(text)
+                .tree()
+                .recipe_prefix_at((text.len() as u32).into())
+        };
+        assert_eq!(at_end(".RECIPEPREFIX := >\n"), '>');
+        assert_eq!(at_end(".RECIPEPREFIX := ab\n"), 'a');
+        assert_eq!(at_end("X = >\n.RECIPEPREFIX := $(X)\n"), '>');
+        assert_eq!(at_end("X = >\n.RECIPEPREFIX = $(X)\n"), '$');
+        assert_eq!(at_end(".RECIPEPREFIX += >\n"), '>');
+        assert_eq!(at_end(".RECIPEPREFIX ?= >\n"), '\t');
+        assert_eq!(at_end("override .RECIPEPREFIX = >\n"), '>');
+        assert_eq!(at_end("define .RECIPEPREFIX\n>\nendef\n"), '>');
+        assert_eq!(at_end("all: .RECIPEPREFIX = >\n"), '\t');
+        assert_eq!(at_end("all:\n\t.RECIPEPREFIX = >\n"), '\t');
+        // Assignments in all branches of a conditional are followed.
+        assert_eq!(at_end("ifdef X\n.RECIPEPREFIX = >\nendif\n"), '>');
+        assert_eq!(
+            at_end("ifdef X\n.RECIPEPREFIX = >\nelse\n.RECIPEPREFIX = <\nendif\n"),
+            '<'
+        );
+    }
+
+    #[test]
+    fn test_recipe_prefix_at_agrees_with_parser() {
+        let text = "\
+all:
+\techo 1
+.RECIPEPREFIX = >
+foo:
+>echo 2
+>echo 3
+ifdef X
+.RECIPEPREFIX = <
+endif
+bar:
+<echo 4
+";
+        let makefile = Makefile::parse(text).tree();
+        let prefixes: Vec<(String, char)> = makefile
+            .recipe_nodes()
+            .map(|recipe| {
+                let start = recipe.syntax().text_range().start();
+                (recipe.text(), makefile.recipe_prefix_at(start))
+            })
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec![
+                ("echo 1".to_string(), '\t'),
+                ("echo 2".to_string(), '>'),
+                ("echo 3".to_string(), '>'),
+                ("echo 4".to_string(), '<'),
             ]
         );
     }
