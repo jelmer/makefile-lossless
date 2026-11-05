@@ -51,7 +51,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@1.86
+    - name: Read MSRV from Cargo.toml
+      id: msrv
+      run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ steps.msrv.outputs.version }}
     - name: Check with the minimum supported Rust version
       run: cargo check --all-targets
       env:
