@@ -51,7 +51,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@1.86
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: '1.86'
     - name: Check with the minimum supported Rust version
       run: cargo check --all-targets
       env:
