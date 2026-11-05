@@ -227,22 +227,28 @@ impl Variables {
                 value: value.replace('$', "$$"),
                 recursive: true,
             }),
-            "+=" => self.known.get(name).and_then(|old| {
-                let value = if old.recursive {
-                    value.to_string()
+            "+=" => {
+                let Some(recursive) = self.known.get(name).map(|old| old.recursive) else {
+                    return;
+                };
+                let value = if recursive {
+                    Some(value.to_string())
                 } else {
-                    self.expand(value, 0)?
+                    self.expand(value, 0)
                 };
-                let value = match (old.value.is_empty(), value.is_empty()) {
-                    (true, _) => value,
-                    (false, true) => old.value.clone(),
-                    (false, false) => format!("{} {value}", old.value),
-                };
-                Some(Variable {
-                    value,
-                    recursive: old.recursive,
-                })
-            }),
+                // Append in place, as copying the old value on every `+=`
+                // makes a long run of them quadratic.
+                if let (Some(value), Some(old)) = (value, self.known.get_mut(name)) {
+                    if !value.is_empty() {
+                        if !old.value.is_empty() {
+                            old.value.push(' ');
+                        }
+                        old.value.push_str(&value);
+                    }
+                    return;
+                }
+                None
+            }
             // A variable from the environment is not changed by `?=`.
             "?=" if self.known.contains_key(name) => return,
             _ => None,
@@ -1980,6 +1986,10 @@ override_dh_auto_clean:
             ("X :=\n.RECIPEPREFIX := $(X)\n", '\t'),
             ("X := $$\n.RECIPEPREFIX := $(X)\n", '$'),
             ("X := >\nX += y\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X :=\nX += >\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X := >\nX +=\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X :=\nX += $(X)\nX += >\n.RECIPEPREFIX := $(X)\n", '>'),
+            ("X = >\nX += $(Y)\nY = <\n.RECIPEPREFIX := $(X)\n", '>'),
             ("override X := >\n.RECIPEPREFIX := $(X)\n", '>'),
             ("X = >\nexport X\n.RECIPEPREFIX := $(X)\n", '>'),
             ("define X\n>\nendef\n.RECIPEPREFIX := $(X)\n", '>'),
