@@ -1357,15 +1357,12 @@ impl Makefile {
 
     /// Get the ranges of all comments in the makefile, in source order.
     ///
-    /// This includes whole-line comments, trailing comments such as the one
-    /// in `FOO = 1 # x`, comments in conditional directive lines and a
-    /// shebang line. It also includes recipe lines and lines in `define`
-    /// bodies that start with `#`, although GNU make expands those and
-    /// passes them on rather than treating them as comments; a range covers
-    /// the references in such a line. A `#` elsewhere in a recipe
-    /// line, as in `echo # x`, is not included. Each range starts at the
-    /// `#` and ends before the line ending, after any lines the comment is
-    /// continued onto with a backslash.
+    /// This includes whole-line and trailing comments, comments in
+    /// directive lines, a shebang line, and recipe or `define` body lines
+    /// that start with `#` (which make itself expands rather than treating
+    /// as comments). A `#` elsewhere in a recipe or `define` body line,
+    /// as in `echo # x`, is not included. Each range covers from the `#`
+    /// to before the line ending, following any backslash continuations.
     ///
     /// # Example
     /// ```
@@ -3618,6 +3615,21 @@ override_dh_auto_configure:
     fn test_comment_ranges_none() {
         let makefile: Makefile = "all:\n\techo '#'\n".parse().unwrap();
         assert_eq!(makefile.comment_ranges().count(), 0);
+    }
+
+    #[test]
+    fn test_comment_ranges_define_body_mid_line_hash() {
+        // A `#` in the middle of a `define` body line is not a comment to
+        // GNU make, which keeps it in the value, so it is not returned as a
+        // comment range. Lines that start with `#`, including after
+        // indentation, are still returned.
+        let text = "define X\n# a\nb # c\n  # d\n\t# e\nf # g $(Y)\nendef\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let comments: Vec<_> = makefile
+            .comment_ranges()
+            .map(|r| &text[r.start().into()..r.end().into()])
+            .collect();
+        assert_eq!(comments, vec!["# a", "# d", "# e"]);
     }
 
     #[test]
