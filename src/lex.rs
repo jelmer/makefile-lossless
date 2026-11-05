@@ -773,7 +773,8 @@ impl<'a> Lexer<'a> {
                 '#' if self.line_type == Some(LineType::Other)
                     && (!self.comments
                         || (self.bsd && after_lbracket)
-                        || (self.hash_in_references && self.reference_depth > 0)) => {}
+                        || (self.hash_in_references && self.reference_depth > 0)
+                        || self.dollars % 2 == 1) => {}
                 // GNU and BSD make pass a `#` at the start of a continuation
                 // line on to the shell with the rest of the command.
                 '#' if self.line_type == Some(LineType::Recipe)
@@ -1339,6 +1340,31 @@ rule: prerequisite
                 (COMMENT, "#b)"),
                 (NEWLINE, "\n"),
             ]
+        );
+    }
+
+    #[test]
+    fn test_hash_after_dollar() {
+        // `$#` is a reference to the variable `#`, not a comment. Make
+        // reads the character after a lone `$` as a one-character name.
+        let expected = vec![
+            (IDENTIFIER, "D"),
+            (WHITESPACE, " "),
+            (OPERATOR, "="),
+            (WHITESPACE, " "),
+            (IDENTIFIER, "a"),
+            (DOLLAR, "$"),
+            (TEXT, "#"),
+            (WHITESPACE, " "),
+            (IDENTIFIER, "b"),
+            (NEWLINE, "\n"),
+        ];
+        assert_eq!(lex("D = a$# b\n", None), expected);
+        assert_eq!(lex("D = a$# b\n", Some(MakefileVariant::GNUMake)), expected);
+        assert_eq!(lex("D = a$# b\n", Some(MakefileVariant::BSDMake)), expected);
+        assert_eq!(
+            lex("D = a$# b\n", Some(MakefileVariant::POSIXMake)),
+            expected
         );
     }
 
