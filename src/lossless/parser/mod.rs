@@ -1,6 +1,6 @@
 use super::*;
 use crate::bsd_condition::BsdConditionErrorKind;
-use crate::lex::{lex, lex_first_non_recipe_line, lex_non_recipe_line};
+use crate::lex::{lex, lex_first_non_recipe_line, lex_non_recipe_line, lex_reference_text};
 use crate::syntax_rules::{
     ends_with_unescaped_backslash, escapes_next, is_assignment_modifier, is_bsd_elif, is_bsd_if,
     is_colons_before_subst, is_gnu_conditional_start, ASSIGNMENT_OPERATORS,

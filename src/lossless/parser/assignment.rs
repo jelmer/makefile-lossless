@@ -312,14 +312,40 @@ impl Parser<'_> {
     /// `# comment` is left as a sibling COMMENT token, not bundled into
     /// the EXPR.
     pub(super) fn parse_assignment_value(&mut self) {
+        self.parse_value(false);
+    }
+
+    /// Parse the value of a GNU make target-specific assignment, which
+    /// make reads as [`Self::parse_assignment_value`] does, except that
+    /// it keeps everything after an unescaped `;`, `#` included.
+    pub(super) fn parse_target_specific_value(&mut self) {
+        self.parse_value(true);
+    }
+
+    fn parse_value(&mut self, hash_after_semicolon: bool) {
         self.builder.start_node(EXPR.into());
-        while self.current().is_some()
-            && self.current() != Some(NEWLINE)
-            && self.current() != Some(COMMENT)
-        {
+        let mut after_semicolon = false;
+        let mut escape_next = false;
+        loop {
+            match self.current_token() {
+                None | Some((NEWLINE, _)) => break,
+                Some((COMMENT, text)) if after_semicolon => {
+                    self.replace_current_token(lex_reference_text(text, self.variant));
+                    self.token_edits += 1;
+                    continue;
+                }
+                Some((COMMENT, _)) => break,
+                _ => {}
+            }
             // The value may continue on the next physical line.
             if self.consume_line_continuation() || self.consume_nmake_caret_newline() {
+                escape_next = false;
                 continue;
+            }
+            let escaped = escape_next;
+            escape_next = escapes_next(self.current() == Some(BACKSLASH), escaped);
+            if hash_after_semicolon && !escaped && self.at_text(";") {
+                after_semicolon = true;
             }
             if self.current() == Some(DOLLAR) {
                 self.parse_variable_reference();

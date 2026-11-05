@@ -85,6 +85,53 @@ fn test_target_specific_assignment_trailing_comment() {
 }
 
 #[test]
+fn test_target_specific_assignment_hash_after_semicolon() {
+    // GNU make keeps everything after an unquoted `;` in the value of a
+    // target-specific variable, `#` included, but not after `\;` or a `;`
+    // in a reference.
+    for (code, value, comments) in [
+        ("lint: N = x;y # value\n", "x;y # value", vec![]),
+        ("lint: N = x;y # $(Z)\n", "x;y # $(Z)", vec![]),
+        (
+            "lint: N = x;y # c \\\n  more\n",
+            "x;y # c \\\n  more",
+            vec![],
+        ),
+        ("lint: N = x # c;y\n", "x ", vec!["# c;y"]),
+        ("lint: N = x\\;y # c\n", "x\\;y ", vec!["# c"]),
+        ("lint: N = $(a;b) # c\n", "$(a;b) ", vec!["# c"]),
+    ] {
+        let parsed = parse(code, Some(MakefileVariant::GNUMake));
+        assert_eq!(parsed.errors, vec![], "{code:?}");
+        let makefile = parsed.root();
+        assert_eq!(code, makefile.to_string());
+        let var = makefile
+            .rules()
+            .next()
+            .unwrap()
+            .scoped_assignment()
+            .unwrap();
+        assert_eq!(Some(value.to_string()), var.raw_value(), "{code:?}");
+        assert_eq!(
+            comments,
+            makefile
+                .comment_ranges()
+                .map(|range| &code[range])
+                .collect::<Vec<_>>(),
+            "{code:?}"
+        );
+    }
+    let makefile = parse("lint: N = x;y # $(Z)\n", None).root();
+    assert_eq!(
+        vec!["Z".to_string()],
+        makefile
+            .variable_references()
+            .filter_map(|r| r.name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn test_target_specific_assignment_with_continuation() {
     let code = "git.o: EXTRA_CPPFLAGS = \\\n\t-DA \\\n\t-DB\n\nall:\n\techo hi\n";
     let makefile: Makefile = code.parse().unwrap();

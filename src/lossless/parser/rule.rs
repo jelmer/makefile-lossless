@@ -711,7 +711,7 @@ impl Parser<'_> {
         }
         // Optional whitespace before the value.
         self.skip_ws();
-        self.parse_assignment_value();
+        self.parse_target_specific_value();
         self.builder.finish_node(); // VARIABLE
     }
 
