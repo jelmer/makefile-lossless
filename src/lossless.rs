@@ -397,9 +397,13 @@ pub(crate) fn lf_line_endings(text: &str) -> String {
 /// bodies, a comment is split into COMMENT tokens around the EXPR nodes of
 /// the references, which all belong to the comment started by the first
 /// token. In a recipe line, a comment also takes in the lines it is
-/// continued onto, up to the end of the line.
+/// continued onto, up to the end of the line. Returns `None` for a `#` in
+/// the middle of a `define` body line, which make keeps in the value.
 pub(crate) fn comment_elements(token: &SyntaxToken) -> Option<Vec<SyntaxElement>> {
     let in_recipe = token.parent().is_some_and(|p| p.kind() == RECIPE);
+    let in_define_body = token
+        .parent()
+        .is_some_and(|p| p.kind() == EXPR && p.parent().is_some_and(|gp| gp.kind() == VARIABLE));
     let mut before = std::iter::successors(token.prev_sibling_or_token(), |it| {
         it.prev_sibling_or_token()
     });
@@ -412,6 +416,16 @@ pub(crate) fn comment_elements(token: &SyntaxToken) -> Option<Vec<SyntaxElement>
     };
     if continues {
         return None;
+    }
+    if in_define_body {
+        let mid_line = std::iter::successors(token.prev_sibling_or_token(), |it| {
+            it.prev_sibling_or_token()
+        })
+        .find(|it| !matches!(it.kind(), EXPR | WHITESPACE | INDENT))
+        .is_some_and(|it| it.kind() != NEWLINE);
+        if mid_line {
+            return None;
+        }
     }
     let mut elements: Vec<_> =
         std::iter::successors(Some(SyntaxElement::Token(token.clone())), |it| {
