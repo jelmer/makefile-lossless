@@ -364,7 +364,7 @@ impl Parser<'_> {
 
     pub(super) fn parse_rule(&mut self) {
         self.in_rule = RuleContext::Outside;
-        self.builder.start_node(RULE.into());
+        let checkpoint = self.builder.checkpoint();
         let tab_indented = self.at_tab_indented_line_start();
         let unknown_directive = self.bsd_unknown_directive_error();
 
@@ -416,6 +416,7 @@ impl Parser<'_> {
                         self.parse_assignment_value();
                         self.builder.finish_node(); // VARIABLE
                     }
+                    self.builder.start_node_at(checkpoint, RULE.into());
                     self.builder.finish_node(); // RULE
                     return;
                 }
@@ -469,6 +470,15 @@ impl Parser<'_> {
             self.parse_rule_recipes();
         }
 
+        // A line without a dependency operator is not a rule make reads.
+        // Wrap it in ERROR so `rules()` skips it, except in BSD make, which
+        // parses recipes under the failed target line as if it were a rule.
+        let node_kind = if has_colon || (has_target && self.is_bsd_make()) {
+            RULE
+        } else {
+            ERROR
+        };
+        self.builder.start_node_at(checkpoint, node_kind.into());
         self.builder.finish_node();
     }
 

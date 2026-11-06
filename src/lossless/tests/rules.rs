@@ -1075,3 +1075,22 @@ fn test_static_pattern_colon_inside_unclosed_nested_reference() {
         assert_eq!(rule.static_pattern(), None);
     }
 }
+
+#[test]
+fn test_rules_skips_lines_without_separator() {
+    // make stops on `a b = 6`, so it never defines targets `a` or `b`.
+    // `rules()` shouldn't return a rule for such a line.
+    let code = "a b = 6\nall: ;@:\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.root().to_string(), code);
+    assert_eq!(
+        error_kinds(code, None),
+        vec![ParseErrorKind::MissingSeparator]
+    );
+    let targets: Vec<Vec<String>> = parsed
+        .root()
+        .rules()
+        .map(|rule| rule.targets().collect())
+        .collect();
+    assert_eq!(targets, vec![vec!["all".to_string()]]);
+}
