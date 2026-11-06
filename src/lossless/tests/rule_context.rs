@@ -1441,11 +1441,20 @@ fn test_space_indented_comment_after_blank_line() {
 }
 
 #[test]
-fn test_space_indented_comment_after_blank_line_in_recipe() {
-    // The recipe continues after the comment.
-    let code = "a:\n\techo a\n\n  # x\n\techo b\n";
+fn test_comment_after_last_recipe_not_in_rule() {
+    // A comment line right after a rule's last recipe line belongs to
+    // whatever comes next, not to the rule. Comments between recipe lines
+    // still stay with the rule.
+    let code = "test:\n\techo test\n# Tools.\nX = 1\n";
     let parsed = parse(code, None);
     assert_eq!(parsed.errors, vec![]);
     let rule = parsed.root().rules().next().unwrap();
-    assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["echo a", "echo b"]);
+    assert_eq!(rule.syntax().to_string(), "test:\n\techo test\n");
+
+    // Comment between recipe lines stays in the rule.
+    let code = "test:\n\techo a\n# between\n\techo b\n";
+    let parsed = parse(code, None);
+    assert_eq!(parsed.errors, vec![]);
+    let rule = parsed.root().rules().next().unwrap();
+    assert_eq!(rule.syntax().to_string(), code);
 }

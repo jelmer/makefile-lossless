@@ -531,9 +531,9 @@ pub(crate) fn move_out_trailing_lines(rule: &SyntaxNode) {
     let tail = &children[start..];
     // Without commands, a target-specific assignment takes no other lines.
     let target_local = children[header_end].kind() == VARIABLE && !children.iter().any(has_recipe);
-    // Follow the parser: blank lines stay in the rule, and so do comments
-    // with no blank line before them, which take their line break along.
-    let mut blank_lines = 0;
+    // Follow the parser: only blank lines and, in BSD make, specific
+    // include lines stay in a rule once no more recipe lines follow.
+    // Comment lines, even those directly after the last recipe, move out.
     let mut i = 0;
     let end = loop {
         if target_local {
@@ -544,27 +544,15 @@ pub(crate) fn move_out_trailing_lines(rule: &SyntaxNode) {
         };
         let next = tail.get(i + 1).map(|e| e.kind());
         match element.kind() {
-            NEWLINE => blank_lines += 1,
+            NEWLINE => {}
             WHITESPACE if matches!(next, None | Some(NEWLINE)) => {}
-            WHITESPACE if next == Some(COMMENT) && blank_lines == 0 => {}
-            COMMENT if blank_lines == 0 => {
-                i += tail[i + 1..]
-                    .iter()
-                    .take_while(|e| e.kind() == WHITESPACE)
-                    .count();
-                if tail.get(i + 1).is_some_and(|e| e.kind() == NEWLINE) {
-                    i += 1;
-                }
-            }
             // Only BSD make puts an include line other than a `.include`
-            // directive in a rule, which it keeps there unless a blank line
-            // comes first.
+            // directive in a rule, which it keeps there.
             INCLUDE
-                if blank_lines == 0
-                    && element
-                        .as_node()
-                        .and_then(|n| n.first_token())
-                        .is_some_and(|t| !t.text().starts_with('.')) => {}
+                if element
+                    .as_node()
+                    .and_then(|n| n.first_token())
+                    .is_some_and(|t| !t.text().starts_with('.')) => {}
             _ => break i,
         }
         i += 1;
