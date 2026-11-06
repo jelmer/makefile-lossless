@@ -918,6 +918,64 @@ impl<T: ExtractFromItem> Iterator for RecursiveItemsIter<T> {
     }
 }
 
+/// A comment in a makefile, as returned by [`Makefile::comments`].
+///
+/// A comment is a `#` through the end of its line, following any backslash
+/// continuation in a recipe comment. A `#` inside a recipe or at the start
+/// of a `define` body line is included too, since the token is lexed as a
+/// comment, but make itself does not read it as one; use [`Self::in_recipe`]
+/// and [`Self::in_define_body`] to tell those apart.
+#[derive(Clone, Debug)]
+pub struct Comment {
+    first: rowan::SyntaxToken<crate::lossless::Lang>,
+    range: rowan::TextRange,
+}
+
+impl Comment {
+    /// Build a [`Comment`] starting at `token`, a COMMENT token, if it
+    /// starts one.
+    fn from_token(token: rowan::SyntaxToken<crate::lossless::Lang>) -> Option<Self> {
+        let elements = crate::lossless::comment_elements(&token)?;
+        let start = elements.first()?.text_range();
+        let end = elements.last()?.text_range();
+        Some(Self {
+            first: token,
+            range: start.cover(end),
+        })
+    }
+
+    /// The range from the `#` to before the line ending, following any
+    /// backslash continuations.
+    pub fn text_range(&self) -> rowan::TextRange {
+        self.range
+    }
+
+    /// The text of the comment, including the leading `#` but excluding the
+    /// terminating line break. CRLF line endings inside a continued recipe
+    /// comment are converted to LF.
+    pub fn text(&self) -> String {
+        let root = self
+            .first
+            .parent_ancestors()
+            .last()
+            .unwrap_or_else(|| self.first.parent().expect("token has a parent"));
+        crate::lossless::lf_line_endings(&root.text().slice(self.range).to_string())
+    }
+
+    /// Whether this `#` is inside a recipe line, which make passes on to
+    /// the shell rather than reading as a comment.
+    pub fn in_recipe(&self) -> bool {
+        crate::lossless::comment_in_recipe(&self.first)
+    }
+
+    /// Whether this `#` is at the start of a line in a `define` body,
+    /// where make keeps it in the value rather than reading it as a
+    /// comment.
+    pub fn in_define_body(&self) -> bool {
+        crate::lossless::comment_in_define_body(&self.first)
+    }
+}
+
 /// Iterator over blocks of consecutive comment lines in a makefile.
 struct CommentBlockIter {
     elements: Vec<rowan::NodeOrToken<SyntaxNode, rowan::SyntaxToken<crate::lossless::Lang>>>,
@@ -1507,6 +1565,37 @@ impl Makefile {
                 let first = elements.first()?.text_range();
                 Some(first.cover(elements.last()?.text_range()))
             })
+    }
+
+    /// Get the comments in the makefile, in source order.
+    ///
+    /// Each [`Comment`] covers one logical comment: the `#` through the
+    /// line end, following any backslash continuation in a recipe comment.
+    /// A caller that wants only the comments make itself reads as such can
+    /// drop the ones with [`Comment::in_recipe`] or
+    /// [`Comment::in_define_body`] set, which make passes on to the shell
+    /// or keeps in the value.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "# a\nall:\n\t# note\n\techo done\n".parse().unwrap();
+    /// // `comments()` includes the recipe line `# note`.
+    /// assert_eq!(makefile.comments().count(), 2);
+    /// // make does not read `# note` as a comment.
+    /// let outside: Vec<_> = makefile
+    ///     .comments()
+    ///     .filter(|c| !c.in_recipe() && !c.in_define_body())
+    ///     .map(|c| c.text())
+    ///     .collect();
+    /// assert_eq!(outside, vec!["# a"]);
+    /// ```
+    pub fn comments(&self) -> impl Iterator<Item = Comment> + '_ {
+        self.syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() == COMMENT)
+            .filter_map(Comment::from_token)
     }
 
     /// Add a new rule to the makefile
@@ -3886,6 +3975,49 @@ bar:
     fn test_comment_ranges_none() {
         let makefile: Makefile = "all:\n\techo '#'\n".parse().unwrap();
         assert_eq!(makefile.comment_ranges().count(), 0);
+    }
+
+    #[test]
+    fn test_comments_in_recipe_and_define_body() {
+        // comments() returns rich values. `in_recipe` and `in_define_body`
+        // mark the `#` lines make does not read as comments.
+        let text = "#!/bin/make\n# a\nFOO = 1 # b\nall: # c\n\t# not a comment\n\techo done\ndefine F\n# not a comment\nendef\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let all: Vec<_> = makefile
+            .comments()
+            .map(|c| (c.text(), c.in_recipe(), c.in_define_body()))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                ("#!/bin/make".to_string(), false, false),
+                ("# a".to_string(), false, false),
+                ("# b".to_string(), false, false),
+                ("# c".to_string(), false, false),
+                ("# not a comment".to_string(), true, false),
+                ("# not a comment".to_string(), false, true),
+            ]
+        );
+        let outside: Vec<_> = makefile
+            .comments()
+            .filter(|c| !c.in_recipe() && !c.in_define_body())
+            .map(|c| c.text())
+            .collect();
+        assert_eq!(outside, vec!["#!/bin/make", "# a", "# b", "# c"]);
+    }
+
+    #[test]
+    fn test_comment_text_range() {
+        let text = "# a\nFOO = 1 # b\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let ranges: Vec<_> = makefile.comments().map(|c| c.text_range()).collect();
+        assert_eq!(
+            ranges,
+            vec![
+                rowan::TextRange::new(0.into(), 3.into()),
+                rowan::TextRange::new(12.into(), 15.into())
+            ]
+        );
     }
 
     #[test]
