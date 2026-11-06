@@ -686,11 +686,17 @@ impl Parser<'_> {
     /// line, if it is an identifier followed by whitespace, a line
     /// continuation or the end of the line. Used to detect
     /// `define`/`endef` in a define body, where make does not strip
-    /// comments first, so `endef#c` is not `endef`.
+    /// comments first, so `endef#c` is not `endef`. Returns `None` for
+    /// lines starting with a tab, which make does not read for
+    /// `define`/`endef` keywords either.
     fn first_token_on_line(&self) -> Option<&str> {
-        let mut tokens = self
-            .upcoming()
-            .skip_while(|(kind, _)| matches!(*kind, WHITESPACE | INDENT));
+        let tokens = self.upcoming();
+        if let Some((INDENT, text)) = tokens.clone().next() {
+            if text.starts_with('\t') {
+                return None;
+            }
+        }
+        let mut tokens = tokens.skip_while(|(kind, _)| matches!(*kind, WHITESPACE | INDENT));
         let (kind, text) = tokens.next()?;
         if kind != IDENTIFIER {
             return None;

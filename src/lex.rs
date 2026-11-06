@@ -716,6 +716,14 @@ impl<'a> Lexer<'a> {
                     self.skip_while(Self::is_whitespace);
                     return Some(SyntaxKind::WHITESPACE);
                 }
+                ('\t', None) if self.define.is_some() && !self.continuation => {
+                    // Inside a `define` body, a tab doesn't start a recipe
+                    // line; the whole body is the value, and backslash-newline
+                    // continues the line as elsewhere.
+                    self.input.next();
+                    self.line_type = Some(LineType::Other);
+                    return Some(SyntaxKind::INDENT);
+                }
                 ('\t', None) if !self.continuation => {
                     self.input.next();
                     self.line_type = Some(LineType::Recipe);
