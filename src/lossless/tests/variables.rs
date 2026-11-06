@@ -28,6 +28,24 @@ fn test_escaped_hash_in_variable_value() {
 }
 
 #[test]
+fn test_hash_after_dollar_in_variable_value() {
+    // `$#` is a reference to the variable `#`, not the start of a comment.
+    let code = "D = a$# b\n";
+    let makefile: Makefile = code.parse().expect("$# should parse");
+    assert_eq!(code, makefile.to_string());
+    assert_eq!(
+        Vec::<&str>::new(),
+        makefile
+            .comment_ranges()
+            .map(|range| &code[range])
+            .collect::<Vec<_>>()
+    );
+    let vars: Vec<_> = makefile.variable_definitions().collect();
+    assert_eq!(1, vars.len());
+    assert_eq!(Some("a$# b".to_string()), vars[0].raw_value());
+}
+
+#[test]
 fn test_assignment_with_tab_continuation() {
     // A variable value continued onto a tab-indented line, as commonly
     // seen in debian/rules. The continuation must not be mistaken for a
