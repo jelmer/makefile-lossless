@@ -150,6 +150,27 @@ fn takes_blank_lines(node: &SyntaxNode) -> bool {
             .is_none_or(|it| it.kind() != VARIABLE)
 }
 
+/// Move the tokens of any BLANK_LINE nodes directly after a rule in `parent`
+/// into the rule, matching the parser's placement.
+fn absorb_trailing_blank_lines(parent: &SyntaxNode) {
+    let mut prev_rule: Option<SyntaxNode> = None;
+    for child in parent.children() {
+        if child.kind() == BLANK_LINE {
+            if let Some(rule) = prev_rule.as_ref() {
+                let tokens: Vec<_> = child.children_with_tokens().collect();
+                for token in &tokens {
+                    token.detach();
+                }
+                let len = rule.children_with_tokens().count();
+                rule.splice_children(len..len, tokens);
+                child.detach();
+                continue;
+            }
+        }
+        prev_rule = Some(child.clone()).filter(takes_blank_lines);
+    }
+}
+
 /// Insert `elements` before child `index` of `parent`. A BLANK_LINE node
 /// directly after a rule goes in the rule instead, where the parser puts
 /// it.
@@ -614,13 +635,15 @@ impl MakefileItem {
     /// assert!(!makefile.to_string().contains("# Comment"));
     /// ```
     pub fn remove_comments(&mut self) -> Result<usize, Error> {
-        self.get_parent_or_error("remove comments from", "MakefileItem::remove_comments")?;
+        let parent =
+            self.get_parent_or_error("remove comments from", "MakefileItem::remove_comments")?;
         let lines: Vec<_> = lines_above(self.syntax())
             .into_iter()
             .filter(|line| line.comment.is_some())
             .collect();
         let count = lines.len();
         detach_tokens(lines.into_iter().flat_map(|line| line.tokens));
+        absorb_trailing_blank_lines(&parent);
         Ok(count)
     }
 
@@ -2648,7 +2671,10 @@ mod tests {
         for (text, expected) in [
             ("a:\n\techo\n# doc\nc:\n", "a:\n\techo\nN = 1\n# doc\nc:\n"),
             ("X = 1\n# doc\nc:\n", "X = 1\nN = 1\n# doc\nc:\n"),
-            ("a:\n\techo\n# a\n\nc:\n", "a:\n\techo\n# a\n\nN = 1\nc:\n"),
+            // A comment separated from the next item by a blank line is
+            // not a doc comment of that item, so the new item goes between
+            // the preceding item and the comment.
+            ("a:\n\techo\n# a\n\nc:\n", "a:\n\techo\nN = 1\n# a\n\nc:\n"),
         ] {
             let makefile: Makefile = text.parse().unwrap();
             let mut item = makefile.items().next().unwrap();

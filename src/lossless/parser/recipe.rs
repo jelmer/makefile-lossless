@@ -220,14 +220,14 @@ impl<'a> Parser<'a> {
                     self.parse_recipe_line();
                 }
                 Some(WHITESPACE) => {
-                    // A space-indented comment or blank line doesn't end the rule
+                    // A space-indented comment belongs to the rule only if
+                    // a recipe line follows it; otherwise it belongs to
+                    // whatever comes next.
                     let next = self.upcoming().nth(1).map(|(kind, _)| kind);
                     match next {
-                        Some(COMMENT) if newline_count == 0 || self.recipe_continues() => {
+                        Some(COMMENT) if self.recipe_continues() => {
                             self.bump();
                         }
-                        // After a blank line, it ends the rule like an
-                        // unindented comment.
                         Some(COMMENT) => break,
                         Some(NEWLINE) | None => self.bump(),
                         _ if self.at_space_indented_recipe() => {
@@ -242,9 +242,10 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 Some(COMMENT) => {
-                    // Comments after blank lines should not be part of the
-                    // rule, unless the recipe continues after them
-                    if newline_count >= 1 && !self.recipe_continues() {
+                    // A comment line belongs to the rule only if a recipe
+                    // line follows it; otherwise it belongs to whatever
+                    // comes next.
+                    if !self.recipe_continues() {
                         break;
                     }
                     newline_count = 0;
