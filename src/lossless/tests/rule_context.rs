@@ -1419,7 +1419,7 @@ fn test_space_indented_line_outside_rule_not_recovered() {
     let parsed = parse(code, None);
     assert_eq!(
         node_kinds(&parsed.syntax()),
-        "VARIABLE\n  EXPR\nRULE\n  TARGETS\n  ERROR\n"
+        "VARIABLE\n  EXPR\nERROR\n  TARGETS\n  ERROR\n"
     );
 }
 

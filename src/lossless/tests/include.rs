@@ -14,10 +14,12 @@ fn test_include_directive() {
 #[test]
 fn test_vpath_gnu_only() {
     let text = "vpath %.c src\nvpath\n";
-    for variant in [
-        MakefileVariant::POSIXMake,
-        MakefileVariant::NMake,
-        MakefileVariant::BSDMake,
+    // BSD make parses commands under a line it rejects as a rule as if
+    // the line were a rule, so the top-level node stays a RULE.
+    for (variant, kinds) in [
+        (MakefileVariant::POSIXMake, vec![ERROR, ERROR]),
+        (MakefileVariant::NMake, vec![ERROR, ERROR]),
+        (MakefileVariant::BSDMake, vec![RULE, RULE]),
     ] {
         let parsed = parse(text, Some(variant));
         assert_eq!(
@@ -31,7 +33,7 @@ fn test_vpath_gnu_only() {
         );
         assert_eq!(
             top_level_kinds(parsed.root().syntax()),
-            vec![RULE, RULE],
+            kinds,
             "{variant:?}"
         );
         assert_eq!(parsed.root().to_string(), text);
@@ -188,11 +190,16 @@ fn test_include_keywords_per_variant() {
             vec![INCLUDE, INCLUDE],
             0,
         ),
-        (MakefileVariant::POSIXMake, "sinclude c.mk\n", vec![RULE], 1),
+        (
+            MakefileVariant::POSIXMake,
+            "sinclude c.mk\n",
+            vec![ERROR],
+            1,
+        ),
         (
             MakefileVariant::NMake,
             "include a.mk\n-include b.mk\nsinclude c.mk\n",
-            vec![RULE, RULE, RULE],
+            vec![ERROR, ERROR, ERROR],
             3,
         ),
     ] {

@@ -1662,7 +1662,7 @@ fn test_malformed_for_header() {
                 ],
                 "{code:?} {variant:?}"
             );
-            assert_eq!(top_level_kinds(&parsed), vec![RULE, RULE, RULE]);
+            assert_eq!(top_level_kinds(&parsed), vec![ERROR, ERROR, RULE]);
         }
     }
 }
