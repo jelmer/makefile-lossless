@@ -780,7 +780,7 @@ pub enum ReferenceLocation {
 
 /// Whether `name` is the name of one of `variant`'s automatic variables, as
 /// documented on [`VariableReference::is_automatic_for`].
-fn is_automatic_name(name: &str, variant: crate::MakefileVariant) -> bool {
+pub(crate) fn is_automatic_name(name: &str, variant: crate::MakefileVariant) -> bool {
     use crate::MakefileVariant::*;
     let (bases, modifiers): (&[&str], &[char]) = match variant {
         GNUMake if name == "|" => return true,
