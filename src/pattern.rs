@@ -115,9 +115,7 @@ impl PatternMatch<'_> {
 /// directory. The stem may only be empty if there is a directory. Patterns
 /// that contain variable references never match.
 pub(crate) fn pattern_match<'a>(pattern: &str, target: &'a str) -> Option<PatternMatch<'a>> {
-    let (prefix, suffix) = split_pattern(pattern)?;
-    let prefix = literal_text(&prefix)?;
-    let suffix = literal_text(suffix)?;
+    let (prefix, suffix) = literal_pattern(pattern)?;
     let (dir, name) = match target.strip_suffix('/').unwrap_or(target).rfind('/') {
         Some(i) if !prefix.contains('/') && !suffix.contains('/') => target.split_at(i + 1),
         _ => ("", target),
@@ -129,6 +127,24 @@ pub(crate) fn pattern_match<'a>(pattern: &str, target: &'a str) -> Option<Patter
         return None;
     }
     Some(PatternMatch { dir, stem })
+}
+
+/// How GNU make matches a target of a static pattern rule against its
+/// target pattern: unlike [`pattern_match`], the directory is part of the
+/// comparison, and the stem may be empty.
+pub(crate) fn static_pattern_match<'a>(pattern: &str, target: &'a str) -> Option<PatternMatch<'a>> {
+    let (prefix, suffix) = literal_pattern(pattern)?;
+    let stem = target
+        .strip_prefix(prefix.as_str())?
+        .strip_suffix(suffix.as_str())?;
+    Some(PatternMatch { dir: "", stem })
+}
+
+/// The text before and after the pattern `%` of `pattern`, or `None` if it
+/// has none or contains a variable reference.
+fn literal_pattern(pattern: &str) -> Option<(String, String)> {
+    let (prefix, suffix) = split_pattern(pattern)?;
+    Some((literal_text(&prefix)?, literal_text(suffix)?))
 }
 
 /// The stem with which GNU make matches the pattern rule target `pattern`
@@ -249,6 +265,15 @@ mod tests {
         // make does not count a `/` at the end as the end of the directory.
         assert_eq!(pattern_stem("x%", "a/xb/"), Some("a/b/".to_string()));
         assert_eq!(pattern_stem("x%", "xb/"), Some("b/".to_string()));
+    }
+
+    #[test]
+    fn test_static_pattern_match() {
+        let stem = |p, t| static_pattern_match(p, t).map(|m| m.full_stem());
+        assert_eq!(stem("%.o", "d/a.o"), Some("d/a".to_string()));
+        assert_eq!(stem("x%.o", "d/xa.o"), None);
+        assert_eq!(stem("%.o", ".o"), Some(String::new()));
+        assert_eq!(stem("a%a", "a"), None);
     }
 
     #[test]
