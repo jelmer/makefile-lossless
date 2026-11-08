@@ -1,5 +1,4 @@
 use super::*;
-use crate::pattern::matches_pattern;
 
 #[test]
 fn test_wildcard_target() {
@@ -763,57 +762,27 @@ fn test_makefile1_phony_pattern() {
 }
 
 #[test]
-fn test_matches_pattern_exact() {
-    assert!(matches_pattern("foo.o", "foo.o"));
-    assert!(!matches_pattern("foo.o", "bar.o"));
-}
-
-#[test]
-fn test_matches_pattern_suffix() {
-    assert!(matches_pattern("%.o", "foo.o"));
-    assert!(matches_pattern("%.o", "bar.o"));
-    assert!(matches_pattern("%.o", "baz/qux.o"));
-    assert!(!matches_pattern("%.o", "foo.c"));
-}
-
-#[test]
-fn test_matches_pattern_prefix() {
-    assert!(matches_pattern("lib%.a", "libfoo.a"));
-    assert!(matches_pattern("lib%.a", "libbar.a"));
-    assert!(!matches_pattern("lib%.a", "foo.a"));
-    assert!(!matches_pattern("lib%.a", "lib.a"));
-}
-
-#[test]
-fn test_matches_pattern_middle() {
-    assert!(matches_pattern("lib%_debug.a", "libfoo_debug.a"));
-    assert!(matches_pattern("lib%_debug.a", "libbar_debug.a"));
-    assert!(!matches_pattern("lib%_debug.a", "libfoo.a"));
-    assert!(!matches_pattern("lib%_debug.a", "foo_debug.a"));
-}
-
-#[test]
-fn test_matches_pattern_wildcard_only() {
-    assert!(matches_pattern("%", "anything"));
-    assert!(matches_pattern("%", "foo.o"));
-    // GNU make: stem must be non-empty, so "%" does NOT match ""
-    assert!(!matches_pattern("%", ""));
-}
-
-#[test]
-fn test_matches_pattern_empty_stem() {
-    // GNU make: stem must be non-empty
-    assert!(!matches_pattern("%.o", ".o")); // stem would be empty
-    assert!(!matches_pattern("lib%", "lib")); // stem would be empty
-    assert!(!matches_pattern("lib%.a", "lib.a")); // stem would be empty
-}
-
-#[test]
-fn test_matches_pattern_multiple_wildcards_not_supported() {
-    // GNU make does NOT support multiple % in pattern rules
-    // These should not match (fall back to exact match)
-    assert!(!matches_pattern("%foo%bar", "xfooybarz"));
-    assert!(!matches_pattern("lib%.so.%", "libfoo.so.1"));
+fn test_rules_by_target_pattern_like_make() {
+    let makefile: Makefile = "%.x%:\n\techo\nlib%.a:\n\techo\na\\%b:\n\techo\n$(X:%=y):\n\techo\nfoo.o:\n\techo\nexplicit %.w:\n\techo\n"
+        .parse()
+        .unwrap();
+    let matching = |target| {
+        makefile
+            .rules_by_target_pattern(target)
+            .flat_map(|r| r.targets().collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(matching("a.x%"), vec!["%.x%"]);
+    // Without a `/` in the pattern, the directory is left out.
+    assert_eq!(matching("dir/libfoo.a"), vec!["lib%.a"]);
+    // `\%` is a literal `%`.
+    assert_eq!(matching("a\\Xb"), Vec::<String>::new());
+    // A `%` inside a variable reference is not the pattern.
+    assert_eq!(matching("$(X:abc=y)"), Vec::<String>::new());
+    assert_eq!(matching("foo.o"), vec!["foo.o"]);
+    // make reads a rule whose first target is explicit as an explicit rule.
+    assert_eq!(matching("foo.w"), Vec::<String>::new());
+    assert_eq!(matching("%.w"), vec!["explicit", "%.w"]);
 }
 
 #[test]
