@@ -9,7 +9,6 @@ use crate::lossless::{
     ExpressionStatement, ForLoop, Include, InvalidEditKind, Load, Makefile, ParseError, Recipe,
     Rule, SyntaxNode, VariableDefinition, VariableReference, Vpath,
 };
-use crate::pattern::matches_pattern;
 use crate::syntax_rules::{is_bsd_if, is_gnu_conditional_start};
 use crate::MakefileVariant;
 use crate::SyntaxKind::*;
@@ -1982,8 +1981,7 @@ impl Makefile {
     /// assert!(rule.is_some());
     /// ```
     pub fn find_rule_by_target_pattern(&self, target: &str) -> Option<Rule> {
-        self.rules()
-            .find(|rule| rule.targets().any(|t| matches_pattern(&t, target)))
+        self.rules_by_target_pattern(target).next()
     }
 
     /// Find all rules whose targets match the given pattern
@@ -2003,7 +2001,7 @@ impl Makefile {
         target: &'a str,
     ) -> impl Iterator<Item = Rule> + 'a {
         self.rules()
-            .filter(move |rule| rule.targets().any(|t| matches_pattern(&t, target)))
+            .filter(move |rule| rule.has_target(target) || rule.stem(target).is_some())
     }
 
     /// Find all rules whose targets match the given pattern
