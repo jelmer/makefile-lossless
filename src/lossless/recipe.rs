@@ -708,6 +708,45 @@ impl Recipe {
         self.has_prefix_flag('-', Some(variant))
     }
 
+    /// Check if this recipe has the always-run prefix (+), which makes it
+    /// run even under `make -n`
+    ///
+    /// This follows GNU make, which also reads modifiers after spaces or
+    /// tabs, as in `@ +make`; see [`Recipe::is_always_run_for`] for other
+    /// variants.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    ///
+    /// let makefile: Makefile = "all:\n\t+$(MAKE) -C sub\n\techo done\n".parse().unwrap();
+    /// let rule = makefile.rules().next().unwrap();
+    /// let recipes: Vec<_> = rule.recipe_nodes().collect();
+    /// assert!(recipes[0].is_always_run());
+    /// assert!(!recipes[1].is_always_run());
+    /// ```
+    pub fn is_always_run(&self) -> bool {
+        self.has_prefix_flag('+', None)
+    }
+
+    /// Check if this recipe has the always-run prefix (+), as `variant`
+    /// reads the command modifiers, like [`Recipe::is_silent_for`]
+    ///
+    /// nmake has no `+` modifier, so this is always false for it.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    ///
+    /// let makefile: Makefile = "all:\n\t@ +$(MAKE)\n".parse().unwrap();
+    /// let recipe = makefile.rules().next().unwrap().recipe_nodes().next().unwrap();
+    /// assert!(recipe.is_always_run_for(MakefileVariant::GNUMake));
+    /// assert!(!recipe.is_always_run_for(MakefileVariant::BSDMake));
+    /// ```
+    pub fn is_always_run_for(&self, variant: crate::MakefileVariant) -> bool {
+        self.has_prefix_flag('+', Some(variant))
+    }
+
     /// Set the command prefix for this recipe
     ///
     /// The prefix can contain `@` (silent), `-` (ignore errors), and/or `+` (always execute).
@@ -2102,23 +2141,35 @@ mod tests {
                 Some(variant) => (
                     recipe.is_silent_for(variant),
                     recipe.is_ignore_errors_for(variant),
+                    recipe.is_always_run_for(variant),
                 ),
-                None => (recipe.is_silent(), recipe.is_ignore_errors()),
+                None => (
+                    recipe.is_silent(),
+                    recipe.is_ignore_errors(),
+                    recipe.is_always_run(),
+                ),
             }
         };
         for (code, variant, expected) in [
-            ("all:\n\t@ -false\n", None, (true, true)),
-            ("all:\n\t@ -false\n", Some(GNUMake), (true, true)),
-            ("all:\n\t@ -false\n", Some(POSIXMake), (true, true)),
-            ("all:\n\t@ -false\n", Some(BSDMake), (true, false)),
-            ("all:\n\t- @echo\n", None, (true, true)),
-            ("all:\n\t- @echo\n", Some(BSDMake), (false, true)),
-            ("all:\n\t @echo\n", None, (true, false)),
-            ("all:\n\t @echo\n", Some(BSDMake), (true, false)),
-            ("all:\n\t@\t+-echo\n", Some(GNUMake), (true, true)),
-            ("all:\n\techo -@\n", None, (false, false)),
-            ("all:\n\t-3 ! @echo\n", Some(NMake), (true, true)),
-            ("all:\n\t!echo -@\n", Some(NMake), (false, false)),
+            ("all:\n\t@ -false\n", None, (true, true, false)),
+            ("all:\n\t@ -false\n", Some(GNUMake), (true, true, false)),
+            ("all:\n\t@ -false\n", Some(POSIXMake), (true, true, false)),
+            ("all:\n\t@ -false\n", Some(BSDMake), (true, false, false)),
+            ("all:\n\t- @echo\n", None, (true, true, false)),
+            ("all:\n\t- @echo\n", Some(BSDMake), (false, true, false)),
+            ("all:\n\t @echo\n", None, (true, false, false)),
+            ("all:\n\t @echo\n", Some(BSDMake), (true, false, false)),
+            ("all:\n\t@\t+-echo\n", Some(GNUMake), (true, true, true)),
+            ("all:\n\techo -@\n", None, (false, false, false)),
+            ("all:\n\t-3 ! @echo\n", Some(NMake), (true, true, false)),
+            ("all:\n\t!echo -@\n", Some(NMake), (false, false, false)),
+            ("all:\n\t+echo\n", None, (false, false, true)),
+            ("all:\n\t@ +echo\n", Some(GNUMake), (true, false, true)),
+            ("all:\n\t@ +echo\n", Some(BSDMake), (true, false, false)),
+            ("all:\n\t+@echo\n", Some(BSDMake), (true, false, true)),
+            ("all:\n\techo a+b\n", None, (false, false, false)),
+            ("all:\n\t+echo\n", Some(NMake), (false, false, false)),
+            ("all:\n\t@+echo\n", Some(NMake), (true, false, false)),
         ] {
             assert_eq!(flags(code, variant), expected, "{code:?} {variant:?}");
         }
