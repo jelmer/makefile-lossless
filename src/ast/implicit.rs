@@ -1,8 +1,9 @@
 //! Pattern rules, suffix rules and implicit rule search.
 
-use crate::lossless::{Makefile, Rule};
+use crate::lossless::{Makefile, Rule, Vpath};
 use crate::pattern::{
-    pattern_match, split_pattern, static_pattern_match, substitute_stem, PatternMatch,
+    pattern_match, split_pattern, static_pattern_match, substitute_stem, unescape_percent,
+    whole_pattern_match, PatternMatch,
 };
 use crate::MakefileVariant;
 use rowan::ast::AstNode;
@@ -334,8 +335,14 @@ impl Makefile {
     /// as with `make -r`; but the known suffixes include make's default
     /// ones, as [`Self::suffixes`] says. Names are not expanded, so a
     /// pattern rule with a variable reference in a target or prerequisite
-    /// is not used. Rules in every branch of a conditional are read, and
-    /// `vpath` and `.SECONDEXPANSION` are not taken into account.
+    /// is not used. Rules and `vpath` directives in every branch of a
+    /// conditional are read. Prerequisites are also looked for in the
+    /// directories `vpath` directives give, but not yet in those of
+    /// `VPATH`, and `.SECONDEXPANSION` is not taken into account.
+    ///
+    /// For an archive member such as `lib.a(foo.o)`, rules for the whole
+    /// name are tried first, then rules for the member, such as the
+    /// `(%.o): %.c` rule that `.c.a:` gives.
     ///
     /// # Example
     /// ```
@@ -349,9 +356,8 @@ impl Makefile {
     /// assert_eq!(m.chain()[0].target(), "src/foo.c");
     /// assert_eq!(m.chain()[0].prerequisites(), ["src/foo.y"]);
     /// ```
-    // TODO: follow conditionals, as default_goal_candidates does; pass the
-    // directories `vpath` and `VPATH` give to `exists`; and support
-    // `.SECONDEXPANSION`.
+    // TODO: follow conditionals, as default_goal_candidates does, and
+    // support `.SECONDEXPANSION`.
     pub fn implicit_rule(
         &self,
         target: &str,
@@ -420,13 +426,27 @@ impl Makefile {
             targets,
             mentioned,
             impossible: HashSet::new(),
+            vpaths: self.vpath_entries(variant),
         };
-        if let Some(found) = search.search(target, 0, &explicit, false) {
+        if let Some(found) = search.search(target, 0, &explicit, false, false) {
             return Some(found);
+        }
+        // For an archive member such as `lib.a(foo.o)`, make then searches
+        // for `(foo.o)`.
+        if let Some(member) = archive_member(target) {
+            if let Some(found) = search.search(member, 0, &explicit, false, true) {
+                return Some(ImplicitMatch {
+                    target: target.to_string(),
+                    ..found
+                });
+            }
         }
         // make only uses `.DEFAULT` for a file that has no rule and does
         // not exist.
-        if search.targets.contains(target) || (search.exists)(target) {
+        if search.targets.contains(target)
+            || (search.exists)(target)
+            || search.found_in_vpath(target)
+        {
             return None;
         }
         Some(ImplicitMatch {
@@ -437,6 +457,46 @@ impl Makefile {
             order_only_prerequisites: vec![],
             chain: vec![],
         })
+    }
+
+    /// The `vpath` directives in effect after reading the makefile, in the
+    /// order make searches them.
+    // TODO: also search the directories in `VPATH`, once its value can be
+    // worked out (see #118).
+    fn vpath_entries(&self, variant: MakefileVariant) -> Vec<VpathEntry> {
+        let mut entries: Vec<VpathEntry> = Vec::new();
+        if variant != MakefileVariant::GNUMake {
+            return entries;
+        }
+        for vpath in self.syntax().descendants().filter_map(Vpath::cast) {
+            let Some(pattern) = vpath.pattern() else {
+                entries.clear();
+                continue;
+            };
+            let Some(directories) = vpath.directories_text_for(variant) else {
+                entries.retain(|e| e.pattern != pattern);
+                continue;
+            };
+            // TODO: expand variable references in vpath directives.
+            if pattern.contains('$') || directories.contains('$') {
+                continue;
+            }
+            let directories: Vec<String> = directories
+                .split(|c: char| c == ':' || c.is_whitespace())
+                .filter(|d| !d.is_empty() && *d != ".")
+                .map(|d| match d.strip_suffix('/') {
+                    Some(stripped) if !stripped.is_empty() => stripped.to_string(),
+                    _ => d.to_string(),
+                })
+                .collect();
+            if !directories.is_empty() {
+                entries.push(VpathEntry {
+                    pattern,
+                    directories,
+                });
+            }
+        }
+        entries
     }
 
     /// The `.DEFAULT` rule whose recipe make uses: the last one with a
@@ -524,13 +584,26 @@ impl Makefile {
                     false,
                 );
             }
-            // TODO: GNU make also turns `.X.a:` into the archive member
-            // rule `(%.o): %.X`.
             for target in suffixes.iter().filter(|t| *t != source) {
                 let name = format!("{source}{target}");
                 let Some(rule) = recipe_rule(&name) else {
                     continue;
                 };
+                // `.X.a:` also gives the archive member rule `(%.o): %.X`.
+                if target == ".a" {
+                    add_candidate(
+                        &mut candidates,
+                        Candidate {
+                            rule: Some(rule.clone()),
+                            targets: vec!["(%.o)".to_string()],
+                            prerequisites: vec![format!("%{source}")],
+                            order_only: vec![],
+                            has_recipe: true,
+                            terminal: false,
+                        },
+                        false,
+                    );
+                }
                 add_candidate(
                     &mut candidates,
                     Candidate {
@@ -640,6 +713,41 @@ fn add_candidate(candidates: &mut Vec<Candidate>, new: Candidate, replace: bool)
     candidates.push(new);
 }
 
+/// A `vpath` directive: the directories to search for names matching
+/// `pattern`.
+struct VpathEntry {
+    pattern: String,
+    directories: Vec<String>,
+}
+
+impl VpathEntry {
+    /// Whether `name` matches the pattern, which is matched against the
+    /// whole name.
+    fn matches(&self, name: &str) -> bool {
+        match split_pattern(&self.pattern) {
+            Some(_) => static_pattern_match(&self.pattern, name).is_some(),
+            None => unescape_percent(&self.pattern) == name,
+        }
+    }
+}
+
+/// The member part of the archive member reference `name`, such as
+/// `(foo.o)` for `lib.a(foo.o)`, as GNU make's `ar_name` finds it.
+fn archive_member(name: &str) -> Option<&str> {
+    let open = name.find('(')?;
+    let member = &name[open..];
+    // `((symbol))` refers to an archive symbol, which make does not
+    // support.
+    if open == 0
+        || member.len() < 3
+        || !member.ends_with(')')
+        || (member.starts_with("((") && member.ends_with("))"))
+    {
+        return None;
+    }
+    Some(member)
+}
+
 /// The prerequisites a static pattern rule with target pattern `pattern`
 /// gives `target`: none if `target` does not match it.
 fn static_prerequisites(pattern: &str, target: &str, prerequisites: &[String]) -> Vec<String> {
@@ -673,21 +781,43 @@ struct Search<'a, F> {
     mentioned: HashSet<String>,
     in_use: Vec<bool>,
     impossible: HashSet<String>,
+    vpaths: Vec<VpathEntry>,
 }
 
 impl<F: Fn(&str) -> bool> Search<'_, F> {
+    /// Whether `name` is found in a directory that a `vpath` directive
+    /// gives for it: as a file that exists or that the makefile mentions.
+    fn found_in_vpath(&self, name: &str) -> bool {
+        if name.starts_with('/') {
+            return false;
+        }
+        self.vpaths
+            .iter()
+            .filter(|v| v.matches(name))
+            .flat_map(|v| &v.directories)
+            .map(|dir| match dir.as_str() {
+                "/" => format!("/{name}"),
+                dir => format!("{dir}/{name}"),
+            })
+            .any(|path| self.mentioned.contains(&path) || (self.exists)(&path))
+    }
+
     /// GNU make's `pattern_search`: find a rule for `name`, with
     /// `recursions` rules above it in the chain. `explicit` are the
     /// prerequisites the makefile gives for `name`. With `compat`, a
     /// prerequisite mentioned anywhere in the makefile ought to exist.
+    /// With `whole`, or if `name` is an archive member, patterns are
+    /// matched against all of `name`, without the directory rule.
     fn search(
         &mut self,
         name: &str,
         recursions: usize,
         explicit: &[String],
         compat: bool,
+        whole: bool,
     ) -> Option<ImplicitMatch> {
         let candidates = self.candidates;
+        let whole = whole || archive_member(name).is_some();
         let mut tries = Vec::new();
         let mut specific_rule_matched = false;
         for (i, candidate) in candidates.iter().enumerate() {
@@ -701,7 +831,12 @@ impl<F: Fn(&str) -> bool> Search<'_, F> {
                 if recursions > 0 && target == "%" && !candidate.terminal {
                     continue;
                 }
-                let Some(m) = pattern_match(target, name) else {
+                let m = if whole {
+                    whole_pattern_match(target, name)
+                } else {
+                    pattern_match(target, name)
+                };
+                let Some(m) = m else {
                     continue;
                 };
                 if target != "%" {
@@ -789,7 +924,7 @@ impl<F: Fn(&str) -> bool> Search<'_, F> {
             }
         }
         if found_compat_rule && !compat {
-            return self.search(name, recursions, explicit, true);
+            return self.search(name, recursions, explicit, true, whole);
         }
         None
     }
@@ -818,10 +953,13 @@ impl<F: Fn(&str) -> bool> Search<'_, F> {
         // to exist, but makes make search again allowing it if nothing else
         // is found.
         *found_compat_rule |= mentioned;
+        if self.found_in_vpath(name) {
+            return Prerequisite::Available;
+        }
         if !intermediates_ok {
             return Prerequisite::Missing;
         }
-        if let Some(m) = self.search(name, recursions + 1, &[], compat) {
+        if let Some(m) = self.search(name, recursions + 1, &[], compat, false) {
             return Prerequisite::Intermediate(m);
         }
         if !mentioned {
@@ -1111,6 +1249,131 @@ mod tests {
         assert_eq!(
             find(".DEFAULT:\n\tfirst\n.DEFAULT: ;\n", "x", &[]),
             some(": x <- ")
+        );
+    }
+
+    #[test]
+    fn test_vpath() {
+        let rule = "%.o: %.c\n\tc\n";
+        let vpath = |directives: &str, target, files: &[&str]| {
+            find(&format!("{directives}\n{rule}"), target, files)
+        };
+        assert_eq!(
+            vpath("vpath %.c src", "foo.o", &["src/foo.c"]),
+            some("c: foo.o <- foo.c")
+        );
+        // The directory of the name is kept under the vpath directory.
+        assert_eq!(
+            vpath("vpath %.c src", "lib/foo.o", &["src/lib/foo.c"]),
+            some("c: lib/foo.o <- lib/foo.c")
+        );
+        // The pattern is matched against the whole name.
+        assert_eq!(
+            vpath("vpath foo%.c src", "lib/foo.o", &["src/lib/foo.c"]),
+            None
+        );
+        // `vpath PATTERN` and `vpath` remove directories again.
+        assert_eq!(
+            vpath("vpath %.c src\nvpath %.c", "foo.o", &["src/foo.c"]),
+            None
+        );
+        assert_eq!(vpath("vpath %.c src\nvpath", "foo.o", &["src/foo.c"]), None);
+        assert_eq!(
+            vpath(
+                "vpath %.c\nvpath %.c src\nvpath %.h other",
+                "foo.o",
+                &["src/foo.c"]
+            ),
+            some("c: foo.o <- foo.c")
+        );
+        // A file in a vpath directory that the makefile mentions counts.
+        assert_eq!(
+            vpath("vpath %.c src\nx: src/foo.c", "foo.o", &[]),
+            some("c: foo.o <- foo.c")
+        );
+        // `.` is skipped, and directories can be separated by `:`, with a
+        // trailing `/`.
+        assert_eq!(
+            vpath("vpath %.c . nope:src/", "foo.o", &["src/foo.c"]),
+            some("c: foo.o <- foo.c")
+        );
+        assert_eq!(
+            find(
+                "vpath %.c src\n%.o: /abs/%.c\n\tc\n",
+                "foo.o",
+                &["src/abs/foo.c"]
+            ),
+            None
+        );
+        // A file found through vpath exists, so `.DEFAULT` is not used.
+        let default = ".DEFAULT:\n\tdefault\n";
+        assert_eq!(
+            find(&format!("vpath % src\n{default}"), "x", &["src/x"]),
+            None
+        );
+        assert_eq!(
+            find(&format!("vpath % src\n{default}"), "x", &[]),
+            some("default: x <- ")
+        );
+    }
+
+    #[test]
+    fn test_archive_member() {
+        assert_eq!(archive_member("lib.a(foo.o)"), Some("(foo.o)"));
+        assert_eq!(archive_member("d/lib.a(a b)"), Some("(a b)"));
+        assert_eq!(archive_member("(foo.o)"), None);
+        assert_eq!(archive_member("lib.a()"), None);
+        assert_eq!(archive_member("lib.a(foo.o"), None);
+        assert_eq!(archive_member("lib.a((sym))"), None);
+        assert_eq!(archive_member("foo.o"), None);
+    }
+
+    #[test]
+    fn test_archive_members() {
+        let suffix = ".SUFFIXES: .c .a\n.c.a:\n\tmember\n";
+        // `.c.a:` also gives `(%.o): %.c`, which is tried for the member.
+        assert_eq!(
+            find(suffix, "lib.a(foo.o)", &["foo.c"]),
+            some("member: lib.a(foo.o) <- foo.c")
+        );
+        assert_eq!(
+            find(suffix, "d/lib.a(foo.o)", &["foo.c"]),
+            some("member: d/lib.a(foo.o) <- foo.c")
+        );
+        let m = suffix
+            .parse::<Makefile>()
+            .unwrap()
+            .implicit_rule("lib.a(foo.o)", |f| f == "foo.c")
+            .unwrap();
+        assert_eq!(m.stem(), "foo");
+        // A rule for the whole name comes first.
+        let member = "(%.o): %.c\n\tmember\n";
+        assert_eq!(
+            find(
+                &format!("lib.a(%.o): %.c\n\tfull\n{member}"),
+                "lib.a(foo.o)",
+                &["foo.c"]
+            ),
+            some("full: lib.a(foo.o) <- foo.c")
+        );
+        // Without the directory rule.
+        assert_eq!(
+            find("lib%: %.c\n\tfull\n", "d/lib.a(foo.o)", &["d/.a(foo.o).c"]),
+            None
+        );
+        // `(foo.o)` and `lib.a()` are not archive members.
+        assert_eq!(
+            find(member, "(foo.o)", &["foo.c"]),
+            some("member: (foo.o) <- foo.c")
+        );
+        assert_eq!(find(member, "lib.a()", &["foo.c"]), None);
+        assert_eq!(
+            find(
+                &format!("{member}%.c: %.y\n\tyacc\n"),
+                "lib.a(foo.o)",
+                &["foo.y"]
+            ),
+            some("member: lib.a(foo.o) <- foo.c (yacc: foo.c <- foo.y)")
         );
     }
 
