@@ -1136,3 +1136,104 @@ fn test_bsd_reference_nested_closing_brace_after() {
         assert!(reference.parse(MakefileVariant::BSDMake).is_ok());
     }
 }
+
+fn automatic_references(text: &str, variant: MakefileVariant) -> Vec<(String, bool)> {
+    Makefile::parse_with_variant(text, variant)
+        .tree()
+        .variable_references()
+        .map(|r| (r.to_string(), r.is_automatic_for(variant)))
+        .collect()
+}
+
+fn owned(expected: &[(&str, bool)]) -> Vec<(String, bool)> {
+    expected.iter().map(|(t, a)| (t.to_string(), *a)).collect()
+}
+
+#[test]
+fn test_is_automatic_gnu() {
+    let text = "all:\n\techo $@ $(@) ${@} $(@D) ${<F} $(^F:.c=.o) $| $(|D) $(@X) $(@DF) $> $(FOO) $(dir $<) $(.TARGET)\n";
+    let expected = owned(&[
+        ("$@", true),
+        ("$(@)", true),
+        ("${@}", true),
+        ("$(@D)", true),
+        ("${<F}", true),
+        ("$(^F:.c=.o)", true),
+        ("$|", true),
+        ("$(|D)", false),
+        ("$(@X)", false),
+        ("$(@DF)", false),
+        ("$>", false),
+        ("$(FOO)", false),
+        ("$(dir $<)", false),
+        ("$<", true),
+        ("$(.TARGET)", false),
+    ]);
+    assert_eq!(
+        automatic_references(text, MakefileVariant::GNUMake),
+        expected
+    );
+    let makefile: Makefile = text.parse().unwrap();
+    assert_eq!(
+        makefile
+            .variable_references()
+            .map(|r| r.is_automatic())
+            .collect::<Vec<_>>(),
+        expected.iter().map(|(_, a)| *a).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_is_automatic_bsd() {
+    let text = "all:\n\techo $> $! ${.ALLSRC:M*.o} ${.TARGET} $(>D) ${*F} $^ $+ $| ${.CURDIR} ${.TARGETD}\n";
+    assert_eq!(
+        automatic_references(text, MakefileVariant::BSDMake),
+        owned(&[
+            ("$>", true),
+            ("$!", true),
+            ("${.ALLSRC:M*.o}", true),
+            ("${.TARGET}", true),
+            ("$(>D)", true),
+            ("${*F}", true),
+            ("$^", false),
+            ("$+", false),
+            ("$|", false),
+            ("${.CURDIR}", false),
+            ("${.TARGETD}", false),
+        ])
+    );
+}
+
+#[test]
+fn test_is_automatic_nmake() {
+    let text = "a.obj: $$@.h\n\techo $** $(**D) $(@B) $(<R) $? $^ $(@X)\n";
+    assert_eq!(
+        automatic_references(text, MakefileVariant::NMake),
+        owned(&[
+            ("$@", true),
+            ("$**", true),
+            ("$(**D)", true),
+            ("$(@B)", true),
+            ("$(<R)", true),
+            ("$?", true),
+            ("$^", false),
+            ("$(@X)", false),
+        ])
+    );
+}
+
+#[test]
+fn test_is_automatic_posix() {
+    let text = "all:\n\techo $% $(%D) $^ $+ $| $(@B)\n";
+    assert_eq!(
+        automatic_references(text, MakefileVariant::POSIXMake),
+        owned(&[
+            ("$%", true),
+            ("$(%D)", true),
+            ("$^", true),
+            ("$+", true),
+            ("$|", false),
+            ("$(@B)", false),
+        ])
+    );
+}
