@@ -36,7 +36,8 @@ fn node_name_text(node: &SyntaxNode, syntax: LineSyntax) -> String {
 }
 
 /// `name` escaped so that GNU make reads it back as a target or
-/// prerequisite name, as [`Rule::targets`] returns it.
+/// prerequisite name, as [`Rule::targets`] returns it. `%` is not escaped,
+/// so that callers can write pattern targets.
 fn escape_name(name: &str, before_comment: bool) -> String {
     escape_hashes(name, false, before_comment)
 }
@@ -511,6 +512,10 @@ impl Rule {
     /// which GNU make reads as `a b`. Line continuations are collapsed as
     /// GNU make does; see [`Self::targets_for`] for other variants.
     ///
+    /// In a rule that is not a pattern rule, `\%` is read as `%`, so `a\%b`
+    /// is the target `a%b`. The targets of a pattern rule are returned as
+    /// written, so the pattern `%` can be told apart from a literal one.
+    ///
     /// [`VariableDefinition::value`]: crate::VariableDefinition::value
     ///
     /// # Example
@@ -524,7 +529,7 @@ impl Rule {
     /// assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["a#b"]);
     /// ```
     pub fn targets(&self) -> impl Iterator<Item = String> + '_ {
-        self.targets_with(LineSyntax::Gnu)
+        self.targets_for(MakefileVariant::GNUMake)
     }
 
     /// Targets of this rule, with line continuations collapsed and `\#`
@@ -552,7 +557,18 @@ impl Rule {
     /// );
     /// ```
     pub fn targets_for(&self, variant: MakefileVariant) -> impl Iterator<Item = String> + '_ {
-        self.targets_with(variant.into())
+        let targets = self.targets_with(variant.into());
+        if !matches!(
+            variant,
+            MakefileVariant::GNUMake | MakefileVariant::POSIXMake
+        ) || self.is_pattern_for(variant)
+        {
+            return targets;
+        }
+        targets
+            .map(|t| crate::pattern::unescape_percent(&t))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn targets_with(&self, syntax: LineSyntax) -> std::vec::IntoIter<String> {
@@ -967,7 +983,7 @@ impl Rule {
             MakefileVariant::GNUMake | MakefileVariant::POSIXMake
         ) && self.static_pattern_for(variant).is_none()
             && self
-                .targets_for(variant)
+                .targets_with(variant.into())
                 .next()
                 .is_some_and(|t| crate::pattern::split_pattern(&t).is_some())
     }
@@ -1011,7 +1027,7 @@ impl Rule {
         if !self.is_pattern_for(variant) {
             return None;
         }
-        self.targets_for(variant)
+        self.targets_with(variant.into())
             .find_map(|pattern| crate::pattern::pattern_stem(&pattern, target))
     }
 
@@ -1734,6 +1750,8 @@ impl Rule {
     /// The targets are taken as [`Rule::targets`] returns them, and `#` is
     /// escaped. Returns an error if a target can not be written so that it
     /// reads back the same, such as one containing whitespace or a `:`.
+    /// `%` is written as is, so that `%.o` makes a pattern rule; pass `\%`
+    /// for a literal `%`.
     ///
     /// As for [`Rule::set_prerequisites`], the targets at the start and end
     /// that do not change are kept as written.
@@ -2511,6 +2529,54 @@ mod tests {
         );
         assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["$(CC) -c $<"]);
         assert_eq!(rule.to_string(), "$(OBJS): %.o: %.c | dir\n\t$(CC) -c $<\n");
+    }
+
+    #[test]
+    fn test_targets_unescape_percent() {
+        // GNU make reads `\%` in an explicit target as `%`, halving the
+        // backslashes before it, up to the first unquoted `%`.
+        let cases: [(&str, &[&str]); 6] = [
+            (r"a\%b:", &["a%b"]),
+            (r"a\\\%b c\%d\%e x\y\%z:", &[r"a\%b", "c%d%e", r"x\y%z"]),
+            (r"a\%b.o c.o: %.o: %.c", &["a%b.o", "c.o"]),
+            (r"explicit x\\%y\%z w\%v:", &["explicit", r"x\%y\%z", "w%v"]),
+            // Pattern targets are kept as written, so the pattern `%` can
+            // still be told apart from a literal one.
+            (r"q\%r%.y: %.z", &[r"q\%r%.y"]),
+            (r"a\b:", &[r"a\b"]),
+        ];
+        for (text, expected) in cases {
+            let rule: Rule = format!("{text}\n").parse().unwrap();
+            assert_eq!(rule.targets().collect::<Vec<_>>(), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_targets_for_unescape_percent() {
+        let rule: Rule = "a\\%b:\n".parse().unwrap();
+        let targets = |variant| rule.targets_for(variant).collect::<Vec<_>>();
+        assert_eq!(targets(MakefileVariant::GNUMake), vec!["a%b"]);
+        assert_eq!(targets(MakefileVariant::POSIXMake), vec!["a%b"]);
+        assert_eq!(targets(MakefileVariant::BSDMake), vec!["a\\%b"]);
+        assert_eq!(targets(MakefileVariant::NMake), vec!["a\\%b"]);
+    }
+
+    #[test]
+    fn test_prerequisites_keep_escaped_percent() {
+        // make does not unescape `\%` in prerequisites.
+        let rule: Rule = "x: a\\%b\n".parse().unwrap();
+        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["a\\%b"]);
+    }
+
+    #[test]
+    fn test_find_rule_by_unescaped_percent_target() {
+        let makefile: Makefile = "a\\%b c:\n\techo\n".parse().unwrap();
+        let rule = makefile.find_rule_by_target("a%b").unwrap();
+        assert!(rule.has_target("a%b"));
+        assert!(!rule.is_pattern());
+        let mut rule = rule;
+        assert!(rule.rename_target("c", "d").unwrap());
+        assert_eq!(makefile.to_string(), "a\\%b d:\n\techo\n");
     }
 
     #[test]
