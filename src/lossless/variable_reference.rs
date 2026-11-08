@@ -171,6 +171,52 @@ impl VariableReference {
                 .is_some_and(|it| it.kind() == DOLLAR)
     }
 
+    /// Whether this references one of GNU make's automatic variables, such
+    /// as `$@`, `$(<)` or `${@D}`, which make sets for each rule's recipe.
+    ///
+    /// See [`Self::is_automatic_for`] for other variants.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::Makefile;
+    /// let makefile: Makefile = "all:\n\t$(CC) -o $@ $^ $(@D) $(X)\n".parse().unwrap();
+    /// let automatic: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| r.is_automatic())
+    ///     .collect();
+    /// assert_eq!(automatic, vec![false, true, true, true, false]);
+    /// ```
+    pub fn is_automatic(&self) -> bool {
+        self.is_automatic_for(crate::MakefileVariant::GNUMake)
+    }
+
+    /// Whether this references one of `variant`'s automatic variables.
+    ///
+    /// - GNU make: `@ % < ? ^ + | *`, and the `D` and `F` forms of all but
+    ///   `|`, as in `$(@D)`.
+    /// - BSD make: `@ > ! < % ? *` and their `D` and `F` forms, and the
+    ///   long names `.TARGET`, `.ALLSRC`, `.ARCHIVE`, `.IMPSRC`, `.MEMBER`,
+    ///   `.OODATE` and `.PREFIX`.
+    /// - nmake: `@ * ** ? <` and their `D`, `B`, `F` and `R` forms. The `$@`
+    ///   in nmake's `$$@` counts too; see [`Self::is_target_as_dependent`].
+    /// - POSIX make: `@ % ? < * ^ +` and their `D` and `F` forms.
+    ///
+    /// # Example
+    /// ```
+    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// let text = "all:\n\techo $> ${.TARGET} $^\n";
+    /// let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+    /// let automatic: Vec<_> = makefile
+    ///     .variable_references()
+    ///     .map(|r| r.is_automatic_for(MakefileVariant::BSDMake))
+    ///     .collect();
+    /// assert_eq!(automatic, vec![true, true, false]);
+    /// ```
+    pub fn is_automatic_for(&self, variant: crate::MakefileVariant) -> bool {
+        self.name()
+            .is_some_and(|name| is_automatic_name(&name, variant))
+    }
+
     /// The innermost reference this one is nested in, as the function call
     /// `$(dir $(FILE))` is for `$(FILE)` or `$(FOO.$(BAR))` for `$(BAR)`.
     ///
@@ -730,6 +776,37 @@ pub enum ReferenceLocation {
     Directive(Directive),
     /// Anywhere else, such as text the parser could not make sense of.
     Other,
+}
+
+/// Whether `name` is the name of one of `variant`'s automatic variables, as
+/// documented on [`VariableReference::is_automatic_for`].
+fn is_automatic_name(name: &str, variant: crate::MakefileVariant) -> bool {
+    use crate::MakefileVariant::*;
+    let (bases, modifiers): (&[&str], &[char]) = match variant {
+        GNUMake if name == "|" => return true,
+        GNUMake => (&["@", "%", "<", "?", "^", "+", "*"], &['D', 'F']),
+        BSDMake
+            if matches!(
+                name,
+                ".TARGET" | ".ALLSRC" | ".ARCHIVE" | ".IMPSRC" | ".MEMBER" | ".OODATE" | ".PREFIX"
+            ) =>
+        {
+            return true
+        }
+        BSDMake => (&["@", ">", "!", "<", "%", "?", "*"], &['D', 'F']),
+        NMake => (&["@", "*", "**", "?", "<"], &['D', 'B', 'F', 'R']),
+        POSIXMake => (&["@", "%", "?", "<", "*", "^", "+"], &['D', 'F']),
+    };
+    bases.iter().any(|base| {
+        let Some(rest) = name.strip_prefix(base) else {
+            return false;
+        };
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            Some(m) => modifiers.contains(&m) && chars.next().is_none(),
+        }
+    })
 }
 
 impl core::fmt::Display for VariableReference {
