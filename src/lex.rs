@@ -333,6 +333,16 @@ pub(crate) const NMAKE_ESCAPABLE: &[char] = &[
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str, variant: Option<MakefileVariant>) -> Self {
+        let mut lexer = Self::without_variables(input, variant);
+        if input.contains(".RECIPEPREFIX") {
+            lexer.variables = Some(Variables::default());
+        }
+        lexer
+    }
+
+    /// As [`Self::new`], but without tracking variables for expanding the
+    /// value of `.RECIPEPREFIX`.
+    fn without_variables(input: &'a str, variant: Option<MakefileVariant>) -> Self {
         Lexer {
             input: Input(input.chars()),
             continuation: false,
@@ -352,7 +362,7 @@ impl<'a> Lexer<'a> {
             dollars: 0,
             recipe_prefix: '\t',
             recipe_prefix_recursive: false,
-            variables: input.contains(".RECIPEPREFIX").then(Variables::default),
+            variables: None,
             line: Some(String::new()),
             line_checked: false,
             raw_line: String::new(),
@@ -1064,7 +1074,10 @@ pub(crate) fn lex_first_non_recipe_line(
     input: &str,
     variant: Option<MakefileVariant>,
 ) -> Vec<(SyntaxKind, &str)> {
-    let mut lexer = Lexer::new(input, variant);
+    // Tracked variables only affect the lines after the first, and looking
+    // for `.RECIPEPREFIX` in the rest of the input would make relexing each
+    // line take time linear in the size of the input.
+    let mut lexer = Lexer::without_variables(input, variant);
     lexer.line_type = Some(LineType::Other);
     let mut tokens = vec![];
     while let Some(token) = lexer.next() {
