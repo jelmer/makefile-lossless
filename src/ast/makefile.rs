@@ -1968,7 +1968,8 @@ impl Makefile {
         self.rules_by_target(target)
     }
 
-    /// Add a target to .PHONY (creates .PHONY rule if it doesn't exist)
+    /// Add a target to `.PHONY`; see
+    /// [`Self::add_special_target_prerequisite`].
     ///
     /// # Example
     /// ```
@@ -1978,24 +1979,14 @@ impl Makefile {
     /// assert!(makefile.is_phony("clean"));
     /// ```
     pub fn add_phony_target(&mut self, target: &str) -> Result<(), Error> {
-        // Find existing .PHONY rule
-        if let Some(mut phony_rule) = self.find_rule_by_target(".PHONY") {
-            // Check if target is already in prerequisites
-            if !phony_rule.prerequisites().any(|p| p == target) {
-                phony_rule.add_prerequisite(target)?;
-            }
-        } else {
-            // Create new .PHONY rule
-            let mut phony_rule = self.add_rule(".PHONY");
-            phony_rule.add_prerequisite(target)?;
-        }
-        Ok(())
+        self.add_special_target_prerequisite(".PHONY", target)
     }
 
-    /// Remove a target from .PHONY (removes .PHONY rule if it becomes empty)
+    /// Remove a target from `.PHONY`, removing the `.PHONY` rules it was
+    /// the last prerequisite of; see
+    /// [`Self::remove_special_target_prerequisite`].
     ///
-    /// Returns `true` if the target was found and removed, `false` if it wasn't in .PHONY.
-    /// If there are multiple .PHONY rules, it removes the target from the first rule that contains it.
+    /// Returns `true` if the target was found and removed, `false` if it wasn't in `.PHONY`.
     ///
     /// # Example
     /// ```
@@ -2006,29 +1997,7 @@ impl Makefile {
     /// assert!(makefile.is_phony("test"));
     /// ```
     pub fn remove_phony_target(&mut self, target: &str) -> Result<bool, Error> {
-        // Find the first .PHONY rule that contains the target
-        let mut phony_rule = None;
-        for rule in self.rules_by_target(".PHONY") {
-            if rule.prerequisites().any(|p| p == target) {
-                phony_rule = Some(rule);
-                break;
-            }
-        }
-
-        let mut phony_rule = match phony_rule {
-            Some(rule) => rule,
-            None => return Ok(false),
-        };
-
-        phony_rule.remove_prerequisite(target)?;
-
-        // Remove the rule if that was its last prerequisite, which may have
-        // been listed more than once.
-        if phony_rule.prerequisites().next().is_none() {
-            phony_rule.remove()?;
-        }
-
-        Ok(true)
+        self.remove_special_target_prerequisite(".PHONY", target)
     }
 
     /// Check if a target is marked as phony
@@ -4738,6 +4707,33 @@ VAR3 = value3
         assert!(!makefile.is_phony("clean"));
         // .PHONY rule should be removed entirely
         assert!(makefile.find_rule_by_target(".PHONY").is_none());
+    }
+
+    #[test]
+    fn test_makefile_remove_phony_target_several_rules() {
+        let mut makefile: Makefile = ".PHONY: clean\nall:\n.PHONY: clean\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").unwrap());
+        assert!(!makefile.is_phony("clean"));
+        assert_eq!(makefile.to_string(), "all:\n");
+    }
+
+    #[test]
+    fn test_makefile_phony_target_other_targets() {
+        // The other target of the rule must keep its prerequisites.
+        let mut makefile: Makefile = ".PHONY .SILENT: clean\n".parse().unwrap();
+        assert!(makefile.remove_phony_target("clean").is_err());
+        assert_eq!(makefile.to_string(), ".PHONY .SILENT: clean\n");
+        makefile.add_phony_target("all").unwrap();
+        assert_eq!(
+            makefile.to_string(),
+            ".PHONY .SILENT: clean\n\n.PHONY: all\n"
+        );
+        assert_eq!(
+            makefile
+                .special_target_prerequisites(".SILENT")
+                .collect::<Vec<_>>(),
+            vec!["clean"]
+        );
     }
 
     #[test]
