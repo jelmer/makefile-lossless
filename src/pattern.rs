@@ -115,9 +115,25 @@ impl PatternMatch<'_> {
 /// directory. The stem may only be empty if there is a directory. Patterns
 /// that contain variable references never match.
 pub(crate) fn pattern_match<'a>(pattern: &str, target: &'a str) -> Option<PatternMatch<'a>> {
+    pattern_match_with(pattern, target, true)
+}
+
+/// As [`pattern_match`], but matching the whole of `target`, as GNU make
+/// does for archive member names such as `lib.a(foo.o)`.
+pub(crate) fn whole_pattern_match<'a>(pattern: &str, target: &'a str) -> Option<PatternMatch<'a>> {
+    pattern_match_with(pattern, target, false)
+}
+
+fn pattern_match_with<'a>(
+    pattern: &str,
+    target: &'a str,
+    directory_rule: bool,
+) -> Option<PatternMatch<'a>> {
     let (prefix, suffix) = literal_pattern(pattern)?;
     let (dir, name) = match target.strip_suffix('/').unwrap_or(target).rfind('/') {
-        Some(i) if !prefix.contains('/') && !suffix.contains('/') => target.split_at(i + 1),
+        Some(i) if directory_rule && !prefix.contains('/') && !suffix.contains('/') => {
+            target.split_at(i + 1)
+        }
         _ => ("", target),
     };
     let stem = name
