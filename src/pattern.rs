@@ -89,18 +89,36 @@ fn literal_text(text: &str) -> Option<String> {
     Some(result)
 }
 
-/// The stem with which GNU make matches the pattern rule target `pattern`
-/// against `target`, or `None` if it does not match.
+/// How `target` matches a pattern rule target, as [`pattern_match`] finds.
+pub(crate) struct PatternMatch<'a> {
+    /// The directory of `target` that was left out of the comparison, with
+    /// its trailing `/`, or empty.
+    pub(crate) dir: &'a str,
+    /// The part of `target` that `%` matched, without `dir`.
+    pub(crate) stem: &'a str,
+}
+
+impl PatternMatch<'_> {
+    /// The stem as make sets `$*`: [`Self::stem`] with [`Self::dir`] in
+    /// front.
+    pub(crate) fn full_stem(&self) -> String {
+        format!("{}{}", self.dir, self.stem)
+    }
+}
+
+/// How GNU make matches the pattern rule target `pattern` against `target`,
+/// or `None` if it does not match.
 ///
 /// If `pattern` has no `/`, the directory part of `target` is left out of
-/// the comparison and put in front of the stem, so `lib%.a` matches
-/// `dir/libfoo.a` with stem `dir/foo`. The stem may not be empty. Patterns
+/// the comparison, so `lib%.a` matches `dir/libfoo.a` with directory `dir/`
+/// and stem `foo`. A `/` at the very end of `target` does not end the
+/// directory. The stem may only be empty if there is a directory. Patterns
 /// that contain variable references never match.
-pub(crate) fn pattern_stem(pattern: &str, target: &str) -> Option<String> {
+pub(crate) fn pattern_match<'a>(pattern: &str, target: &'a str) -> Option<PatternMatch<'a>> {
     let (prefix, suffix) = split_pattern(pattern)?;
     let prefix = literal_text(&prefix)?;
     let suffix = literal_text(suffix)?;
-    let (dir, name) = match target.rfind('/') {
+    let (dir, name) = match target.strip_suffix('/').unwrap_or(target).rfind('/') {
         Some(i) if !prefix.contains('/') && !suffix.contains('/') => target.split_at(i + 1),
         _ => ("", target),
     };
@@ -110,7 +128,31 @@ pub(crate) fn pattern_stem(pattern: &str, target: &str) -> Option<String> {
     if dir.is_empty() && stem.is_empty() {
         return None;
     }
-    Some(format!("{dir}{stem}"))
+    Some(PatternMatch { dir, stem })
+}
+
+/// The stem with which GNU make matches the pattern rule target `pattern`
+/// against `target`, with the directory of [`pattern_match`] in front, or
+/// `None` if it does not match.
+pub(crate) fn pattern_stem(pattern: &str, target: &str) -> Option<String> {
+    pattern_match(pattern, target).map(|m| m.full_stem())
+}
+
+/// `prerequisite` of a pattern rule with its first `%` replaced by the
+/// stem of `m`, and the directory of `m` in front, as GNU make does. A
+/// prerequisite without `%` is used as is. Returns `None` if it contains a
+/// variable reference, whose value is not known.
+pub(crate) fn substitute_stem(prerequisite: &str, m: &PatternMatch) -> Option<String> {
+    match split_pattern(prerequisite) {
+        Some((prefix, rest)) => Some(format!(
+            "{}{}{}{}",
+            m.dir,
+            literal_text(&prefix)?,
+            m.stem,
+            literal_text(rest)?
+        )),
+        None => literal_text(prerequisite),
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +242,26 @@ mod tests {
         );
         assert_eq!(pattern_stem("src/%.c", "x/src/foo.c"), None);
         assert_eq!(pattern_stem("%/x.z", "a/b/x.z"), Some("a/b".to_string()));
+    }
+
+    #[test]
+    fn test_pattern_stem_trailing_slash() {
+        // make does not count a `/` at the end as the end of the directory.
+        assert_eq!(pattern_stem("x%", "a/xb/"), Some("a/b/".to_string()));
+        assert_eq!(pattern_stem("x%", "xb/"), Some("b/".to_string()));
+    }
+
+    #[test]
+    fn test_substitute_stem() {
+        let m = pattern_match("%.o", "d/foo.o").unwrap();
+        assert_eq!(substitute_stem("%.c", &m), Some("d/foo.c".to_string()));
+        assert_eq!(
+            substitute_stem("common.h", &m),
+            Some("common.h".to_string())
+        );
+        assert_eq!(substitute_stem("%.x%", &m), Some("d/foo.x%".to_string()));
+        assert_eq!(substitute_stem("$(DIR)/%.c", &m), None);
+        assert_eq!(substitute_stem("$$%.c", &m), Some("d/$foo.c".to_string()));
     }
 
     #[test]

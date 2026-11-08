@@ -53,6 +53,7 @@ pub mod bsd;
 pub mod conditional;
 pub mod default_goal;
 pub mod expression_statement;
+pub mod implicit;
 pub mod include;
 pub mod load;
 pub mod makefile;

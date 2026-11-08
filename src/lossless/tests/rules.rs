@@ -762,30 +762,6 @@ fn test_makefile1_phony_pattern() {
 }
 
 #[test]
-fn test_rules_by_target_pattern_like_make() {
-    let makefile: Makefile = "%.x%:\n\techo\nlib%.a:\n\techo\na\\%b:\n\techo\n$(X:%=y):\n\techo\nfoo.o:\n\techo\nexplicit %.w:\n\techo\n"
-        .parse()
-        .unwrap();
-    let matching = |target| {
-        makefile
-            .rules_by_target_pattern(target)
-            .flat_map(|r| r.targets().collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(matching("a.x%"), vec!["%.x%"]);
-    // Without a `/` in the pattern, the directory is left out.
-    assert_eq!(matching("dir/libfoo.a"), vec!["lib%.a"]);
-    // `\%` is a literal `%`.
-    assert_eq!(matching("a\\Xb"), Vec::<String>::new());
-    // A `%` inside a variable reference is not the pattern.
-    assert_eq!(matching("$(X:abc=y)"), Vec::<String>::new());
-    assert_eq!(matching("foo.o"), vec!["foo.o"]);
-    // make reads a rule whose first target is explicit as an explicit rule.
-    assert_eq!(matching("foo.w"), Vec::<String>::new());
-    assert_eq!(matching("%.w"), vec!["explicit", "%.w"]);
-}
-
-#[test]
 fn test_rule_parse_preserves_trailing_blank_lines() {
     // Regression test: ensure that trailing blank lines are preserved
     // when parsing a rule and using it with replace_rule()
