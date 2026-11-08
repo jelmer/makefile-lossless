@@ -20,79 +20,43 @@ use crate::{MakefileVariant, ParsedReference};
 use rowan::ast::AstNode;
 use rowan::{Direction, GreenNodeBuilder, SyntaxNode};
 
-/// Split `s` at the first top-level comma. A comma is "top-level" when it
-/// is not inside a `$(...)` / `${...}` group. Returns `None` if no such
-/// comma exists.
-fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
-    let bytes = s.as_bytes();
-    let mut paren = 0usize;
-    let mut brace = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'$' if i + 1 < bytes.len() => {
-                let next = bytes[i + 1];
-                if next == b'(' {
-                    paren += 1;
-                    i += 2;
-                    continue;
-                }
-                if next == b'{' {
-                    brace += 1;
-                    i += 2;
-                    continue;
-                }
-                // $$ or $X — skip both.
-                i += 2;
-                continue;
-            }
-            b'(' => paren += 1,
-            b')' => paren = paren.saturating_sub(1),
-            b'{' => brace += 1,
-            b'}' => brace = brace.saturating_sub(1),
-            b',' if paren == 0 && brace == 0 => {
-                return Some((&s[..i], &s[i + 1..]));
-            }
-            _ => {}
+/// The position of the first byte of `text` matching `stop` outside
+/// parentheses, counting them as GNU make 4.4.1 does for `ifeq`.
+fn find_outside_parens(text: &str, stop: u8) -> Option<usize> {
+    let mut depth = 0isize;
+    text.bytes().position(|b| {
+        match b {
+            b'(' => depth += 1,
+            b')' if stop == b')' && depth <= 0 => return true,
+            b')' => depth -= 1,
+            _ => return b == stop && depth <= 0,
         }
-        i += 1;
-    }
-    None
+        false
+    })
 }
 
-/// Extract two quoted strings from `s`, in the form `"a" "b"` or `'a' 'b'`.
-/// Returns `None` if fewer than two quoted strings are present. Surrounding
-/// quote characters are stripped from each result.
-fn quoted_pair(s: &str) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    let mut iter = s.chars().peekable();
-    while iter.peek().is_some() {
-        // Skip leading whitespace between args.
-        while let Some(&c) = iter.peek() {
-            if c.is_ascii_whitespace() {
-                iter.next();
-            } else {
-                break;
-            }
-        }
-        let opener = match iter.next() {
-            Some(c @ ('"' | '\'')) => c,
-            _ => break,
-        };
-        let mut buf = String::new();
-        for c in iter.by_ref() {
-            if c == opener {
-                out.push(buf);
-                break;
-            }
-            buf.push(c);
-        }
+/// The two strings of an `ifeq` or `ifneq` condition, unexpanded, as GNU
+/// make 4.4.1's `conditional_line` splits them: in the `(a,b)` form, the
+/// blanks before the comma and those before the second string are dropped,
+/// but not those at the start of the first string or at the end of the
+/// second.
+fn split_ifeq(line: &str) -> Option<(&str, &str)> {
+    let blanks = [' ', '\t'];
+    if let Some(rest) = line.strip_prefix('(') {
+        let comma = find_outside_parens(rest, b',')?;
+        let second = rest[comma + 1..].trim_start_matches(blanks);
+        let close = find_outside_parens(second, b')')?;
+        return Some((rest[..comma].trim_end_matches(blanks), &second[..close]));
     }
-    if out.len() >= 2 {
-        Some(out)
-    } else {
-        None
-    }
+    let (first, rest) = quoted(line)?;
+    let (second, _) = quoted(rest.trim_start_matches(blanks))?;
+    Some((first, second))
+}
+
+/// Split a string quoted with `"` or `'` off the start of `text`.
+fn quoted(text: &str) -> Option<(&str, &str)> {
+    let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    text[1..].split_once(quote)
 }
 
 /// An item in a branch of a [`Conditional`], in the body of a
@@ -500,22 +464,8 @@ impl ConditionalBranch {
             return None;
         }
         let text = self.condition_with(syntax)?;
-        // Form 1: parenthesised `(a, b)`. Split at the top-level comma,
-        // ignoring commas inside nested `$(...)` / `${...}`.
-        if let Some(inner) = text
-            .strip_prefix('(')
-            .and_then(|s| s.trim_end().strip_suffix(')'))
-        {
-            if let Some((a, b)) = split_top_level_comma(inner) {
-                return Some((a.trim().to_string(), b.trim().to_string()));
-            }
-        }
-
-        // Form 2: quoted `"a" "b"` or `'a' 'b'`.
-        let mut parts = quoted_pair(&text)?;
-        let b = parts.pop()?;
-        let a = parts.pop()?;
-        Some((a, b))
+        let (a, b) = split_ifeq(&text)?;
+        Some((a.to_string(), b.to_string()))
     }
 
     /// For a BSD make branch (`.if`, `.elif`, `.ifdef`, ...), parse its
@@ -2559,6 +2509,30 @@ endif
         let makefile: Makefile = code.parse().unwrap();
         let cond = makefile.conditionals().next().unwrap();
         assert_eq!(cond.ifeq_args(), Some(("a$".to_string(), "a".to_string())));
+    }
+
+    #[test]
+    fn test_ifeq_args_whitespace() {
+        // GNU make 4.4.1 keeps the blanks at the start of the first string
+        // and at the end of the second, so neither of the first two is equal.
+        for (code, args) in [
+            ("ifeq ( x , x)\nendif\n", (" x", "x")),
+            ("ifeq (x, x )\nendif\n", ("x", "x ")),
+            ("ifeq (x\t,\tx)\nendif\n", ("x", "x")),
+            ("ifeq (x,(y))\nendif\n", ("x", "(y)")),
+            ("ifeq ((a,b),(a,b))\nendif\n", ("(a,b)", "(a,b)")),
+            // Only parentheses count, so this is split at the comma.
+            ("ifeq (${a,b},x)\nendif\n", ("${a", "b},x")),
+            ("ifeq \" a\" ' a'\nendif\n", (" a", " a")),
+        ] {
+            let makefile = Makefile::parse(code).tree();
+            let cond = makefile.conditionals().next().unwrap();
+            assert_eq!(
+                cond.ifeq_args(),
+                Some((args.0.to_string(), args.1.to_string())),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
