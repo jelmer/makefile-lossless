@@ -1,7 +1,9 @@
 //! Pattern rules, suffix rules and implicit rule search.
 
 use crate::lossless::{Makefile, Rule};
-use crate::pattern::{pattern_match, split_pattern, substitute_stem, PatternMatch};
+use crate::pattern::{
+    pattern_match, split_pattern, static_pattern_match, substitute_stem, PatternMatch,
+};
 use crate::MakefileVariant;
 use rowan::ast::AstNode;
 use std::collections::HashSet;
@@ -324,15 +326,16 @@ impl Makefile {
     /// [`ImplicitMatch::chain`]).
     ///
     /// There is no implicit rule for a phony target, or one with a recipe
-    /// in the makefile.
+    /// in the makefile. If no rule applies to a file that does not exist
+    /// and has no rule in the makefile, the `.DEFAULT` rule is returned,
+    /// with no stem or prerequisites.
     ///
     /// Only the rules in this makefile are used, not make's built-in rules,
     /// as with `make -r`; but the known suffixes include make's default
     /// ones, as [`Self::suffixes`] says. Names are not expanded, so a
     /// pattern rule with a variable reference in a target or prerequisite
     /// is not used. Rules in every branch of a conditional are read, and
-    /// `vpath`, `.SECONDEXPANSION` and `.DEFAULT` are not taken into
-    /// account.
+    /// `vpath` and `.SECONDEXPANSION` are not taken into account.
     ///
     /// # Example
     /// ```
@@ -346,7 +349,9 @@ impl Makefile {
     /// assert_eq!(m.chain()[0].target(), "src/foo.c");
     /// assert_eq!(m.chain()[0].prerequisites(), ["src/foo.y"]);
     /// ```
-    // TODO: use the .DEFAULT rule when no implicit rule is found.
+    // TODO: follow conditionals, as default_goal_candidates does; pass the
+    // directories `vpath` and `VPATH` give to `exists`; and support
+    // `.SECONDEXPANSION`.
     pub fn implicit_rule(
         &self,
         target: &str,
@@ -384,23 +389,24 @@ impl Makefile {
         let mut explicit = Vec::new();
         for rule in self.rules().filter(|r| !r.is_pattern_for(variant)) {
             let rule_targets: Vec<String> = rule.targets_for(variant).collect();
-            let is_static = rule.static_pattern_for(variant).is_some();
-            // TODO: count the prerequisites of static pattern rules as
-            // mentioned, with the stem of each target substituted.
-            let prerequisites: Vec<String> = if is_static {
-                vec![]
-            } else {
-                rule.prerequisites_for(variant)
-                    .chain(rule.order_only_prerequisites_for(variant))
-                    .collect()
-            };
-            if rule_targets.iter().any(|t| t == target) {
-                if has_recipe(&rule) {
-                    return None;
+            let static_pattern = rule.static_pattern_for(variant);
+            let prerequisites: Vec<String> = rule
+                .prerequisites_for(variant)
+                .chain(rule.order_only_prerequisites_for(variant))
+                .collect();
+            for rule_target in &rule_targets {
+                let names = match &static_pattern {
+                    Some(pattern) => static_prerequisites(pattern, rule_target, &prerequisites),
+                    None => prerequisites.clone(),
+                };
+                if rule_target == target {
+                    if has_recipe(&rule) {
+                        return None;
+                    }
+                    explicit.extend(names.iter().cloned());
                 }
-                explicit.extend(prerequisites.iter().cloned());
+                mentioned.extend(names);
             }
-            mentioned.extend(prerequisites);
             targets.extend(rule_targets);
         }
         targets.extend(self.special_target_prerequisites_for(".PHONY", variant));
@@ -415,7 +421,42 @@ impl Makefile {
             mentioned,
             impossible: HashSet::new(),
         };
-        search.search(target, 0, &explicit, false)
+        if let Some(found) = search.search(target, 0, &explicit, false) {
+            return Some(found);
+        }
+        // make only uses `.DEFAULT` for a file that has no rule and does
+        // not exist.
+        if search.targets.contains(target) || (search.exists)(target) {
+            return None;
+        }
+        Some(ImplicitMatch {
+            rule: self.default_rule(variant)?,
+            target: target.to_string(),
+            stem: String::new(),
+            prerequisites: vec![],
+            order_only_prerequisites: vec![],
+            chain: vec![],
+        })
+    }
+
+    /// The `.DEFAULT` rule whose recipe make uses: the last one with a
+    /// recipe, unless a later one with neither a recipe nor prerequisites
+    /// clears it.
+    fn default_rule(&self, variant: MakefileVariant) -> Option<Rule> {
+        let mut default = None;
+        for rule in self
+            .rules()
+            .filter(|r| r.targets_for(variant).any(|t| t == ".DEFAULT"))
+        {
+            if has_recipe(&rule) {
+                default = Some(rule);
+            } else if rule.prerequisites_for(variant).next().is_none()
+                && rule.order_only_prerequisites_for(variant).next().is_none()
+            {
+                default = None;
+            }
+        }
+        default
     }
 
     /// The pattern rules GNU make tries, in order: those in the makefile,
@@ -521,7 +562,8 @@ pub struct ImplicitMatch {
 }
 
 impl ImplicitMatch {
-    /// The pattern rule, or the suffix rule such as `.c.o:`.
+    /// The pattern rule, the suffix rule such as `.c.o:`, or the `.DEFAULT`
+    /// rule.
     pub fn rule(&self) -> &Rule {
         &self.rule
     }
@@ -596,6 +638,19 @@ fn add_candidate(candidates: &mut Vec<Candidate>, new: Candidate, replace: bool)
         None => {}
     }
     candidates.push(new);
+}
+
+/// The prerequisites a static pattern rule with target pattern `pattern`
+/// gives `target`: none if `target` does not match it.
+fn static_prerequisites(pattern: &str, target: &str, prerequisites: &[String]) -> Vec<String> {
+    let Some(m) = static_pattern_match(pattern, target) else {
+        return vec![];
+    };
+    // Names with variable references can not be known, so are left out.
+    prerequisites
+        .iter()
+        .filter_map(|p| substitute_stem(p, &m))
+        .collect()
 }
 
 fn has_recipe(rule: &Rule) -> bool {
@@ -985,6 +1040,78 @@ mod tests {
                 "{extra:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_static_pattern_prerequisites() {
+        let rule = "%.o: %.c\n\tc\n";
+        // A static pattern rule gives each target its prerequisites, with
+        // the stem substituted, as an explicit rule does.
+        assert_eq!(
+            find(&format!("a.o: %.o: %.c\n{rule}"), "a.o", &[]),
+            some("c: a.o <- a.c")
+        );
+        // They are mentioned, for the second search.
+        assert_eq!(
+            find(&format!("d.o: %.o: c.c\n\t@:\n{rule}"), "c.o", &[]),
+            some("c: c.o <- c.c")
+        );
+        assert_eq!(find(rule, "c.o", &[]), None);
+        // A target that does not match the target pattern gets no
+        // prerequisites, and the directory is part of the match.
+        assert_eq!(
+            find(
+                &format!("other d/xa.o: x%.o: %.c a.c\n\t@:\n{rule}"),
+                "a.o",
+                &[]
+            ),
+            None
+        );
+        // The stem of a static pattern rule may be empty.
+        let needs_dot_c = "%.z: .c\n\tz\n";
+        assert_eq!(
+            find(&format!(".o: %.o: %.c\n\t@:\n{needs_dot_c}"), "a.z", &[]),
+            some("z: a.z <- .c")
+        );
+        assert_eq!(find(needs_dot_c, "a.z", &[]), None);
+    }
+
+    #[test]
+    fn test_default_rule() {
+        let default = ".DEFAULT: ignored\n\tdefault\n";
+        // `.DEFAULT` is used when there is no rule, with no stem or
+        // prerequisites.
+        assert_eq!(find(default, "x", &[]), some("default: x <- "));
+        let m = format!("{default}%.o: %.c\n\tc\n")
+            .parse::<Makefile>()
+            .unwrap()
+            .implicit_rule("a.o", |_| false)
+            .unwrap();
+        assert_eq!(m.rule().targets().collect::<Vec<_>>(), vec![".DEFAULT"]);
+        assert_eq!(m.stem(), "");
+        assert_eq!(m.prerequisites(), &[] as &[String]);
+        // Not for a file that exists, a target with a rule, or a phony
+        // target.
+        assert_eq!(find(default, "x", &["x"]), None);
+        assert_eq!(find(&format!("{default}y: z\n"), "y", &[]), None);
+        assert_eq!(
+            find(&format!("{default}y: z\n"), "z", &[]),
+            some("default: z <- ")
+        );
+        assert_eq!(find(&format!("{default}.PHONY: p\n"), "p", &[]), None);
+        // The last recipe is used, and `.DEFAULT:` without a recipe or
+        // prerequisites clears it.
+        let two = ".DEFAULT:\n\tfirst\n.DEFAULT:\n\tsecond\n";
+        assert_eq!(find(two, "x", &[]), some("second: x <- "));
+        assert_eq!(find(".DEFAULT:\n\tfirst\n.DEFAULT:\n", "x", &[]), None);
+        assert_eq!(
+            find(".DEFAULT:\n\tfirst\n.DEFAULT: foo\n", "x", &[]),
+            some("first: x <- ")
+        );
+        assert_eq!(
+            find(".DEFAULT:\n\tfirst\n.DEFAULT: ;\n", "x", &[]),
+            some(": x <- ")
+        );
     }
 
     #[test]
