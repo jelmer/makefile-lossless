@@ -2,7 +2,7 @@ use super::rule::build_targets_node;
 use super::{
     detach_tokens, doc_comment_lines, hoist_doc_comment, index_before_doc_comment, line_ending,
     lines_above, terminate_line_before, with_recipe_prefix, with_recipe_prefix_before,
-    with_trailing_newline, LineSyntax,
+    with_trailing_newline,
 };
 use crate::lossless::{
     invalid_edit, line_col_at_offset, parse, Conditional, Directive, Error, ErrorInfo,
@@ -2104,9 +2104,7 @@ impl Makefile {
     /// assert_eq!(phony_targets, vec!["clean", "test", "build"]);
     /// ```
     pub fn phony_targets(&self) -> impl Iterator<Item = String> + '_ {
-        // Collect from all .PHONY rules since there can be multiple
-        self.rules_by_target(".PHONY")
-            .flat_map(|rule| rule.prerequisite_lists(LineSyntax::Gnu).0)
+        self.special_target_prerequisites(".PHONY")
     }
 
     /// Add a new include directive at the beginning of the makefile
