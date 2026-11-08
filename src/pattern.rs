@@ -6,6 +6,24 @@
 /// text after the pattern `%` is kept as is. A `%` inside a variable
 /// reference does not count, since make only sees it after expansion.
 pub(crate) fn split_pattern(pattern: &str) -> Option<(String, &str)> {
+    let (prefix, rest) = scan_percent(pattern);
+    Some((prefix, rest?))
+}
+
+/// `name` with each `\%` read as `%`, as GNU make reads an explicit target:
+/// as [`split_pattern`] does up to the first unquoted `%`, which is kept
+/// along with the text after it.
+pub(crate) fn unescape_percent(name: &str) -> String {
+    match scan_percent(name) {
+        (prefix, Some(rest)) => format!("{prefix}%{rest}"),
+        (prefix, None) => prefix,
+    }
+}
+
+/// The text before the first unquoted `%` in `pattern`, unescaped as
+/// described for [`split_pattern`], and the text after that `%` if there is
+/// one.
+fn scan_percent(pattern: &str) -> (String, Option<&str>) {
     let mut prefix = String::new();
     let mut backslashes = 0;
     let mut chars = pattern.char_indices();
@@ -19,7 +37,7 @@ pub(crate) fn split_pattern(pattern: &str) -> Option<(String, &str)> {
             '%' => {
                 prefix.truncate(prefix.len() - (backslashes - backslashes / 2));
                 if backslashes % 2 == 0 {
-                    return Some((prefix, &pattern[i + 1..]));
+                    return (prefix, Some(&pattern[i + 1..]));
                 }
                 prefix.push(c);
             }
@@ -54,7 +72,7 @@ pub(crate) fn split_pattern(pattern: &str) -> Option<(String, &str)> {
         }
         backslashes = 0;
     }
-    None
+    (prefix, None)
 }
 
 /// `text` with `$$` read as `$`, or `None` if it contains a variable
@@ -117,6 +135,18 @@ mod tests {
         assert_eq!(split_pattern("e\\f%g"), Some(("e\\f".to_string(), "g")));
         // Backslashes after the pattern `%` are kept.
         assert_eq!(split_pattern("%.x\\%"), Some((String::new(), ".x\\%")));
+    }
+
+    #[test]
+    fn test_unescape_percent() {
+        assert_eq!(unescape_percent("foo.o"), "foo.o");
+        assert_eq!(unescape_percent("a\\%b"), "a%b");
+        assert_eq!(unescape_percent("c\\%d\\%e"), "c%d%e");
+        assert_eq!(unescape_percent("a\\\\\\%b"), "a\\%b");
+        assert_eq!(unescape_percent("x\\y\\%z"), "x\\y%z");
+        // Only up to the first unquoted `%`.
+        assert_eq!(unescape_percent("x\\\\%y\\%z"), "x\\%y\\%z");
+        assert_eq!(unescape_percent("$(f \\%)\\%"), "$(f \\%)%");
     }
 
     #[test]
