@@ -1240,74 +1240,6 @@ fn contains_eval(text: &str) -> bool {
     })
 }
 
-/// The position after the reference whose `(`, `{` or name starts at `i`
-/// in `text`, as GNU make's `skip_reference` finds it.
-fn skip_reference(text: &str, i: usize) -> usize {
-    match text[i..].chars().next() {
-        Some(open @ ('(' | '{')) => {
-            let close = if open == '(' { ')' } else { '}' };
-            matching_close(text, i + 1, open, close).map_or(text.len(), |end| end + 1)
-        }
-        Some(c) => i + c.len_utf8(),
-        None => i,
-    }
-}
-
-/// The two strings of an `ifeq` or `ifneq` condition, unexpanded, as GNU
-/// make's `conditional_line` splits them: in the `(a,b)` form, the blanks
-/// before the comma and those before the second string are dropped.
-fn split_ifeq(line: &str) -> Option<(&str, &str)> {
-    let bytes = line.as_bytes();
-    let first_end = match bytes.first()? {
-        b'(' => b',',
-        quote @ (b'"' | b'\'') => *quote,
-        _ => return None,
-    };
-    let mut i = 1;
-    while i < bytes.len() && bytes[i] != first_end {
-        i = if bytes[i] == b'$' {
-            skip_reference(line, i + 1)
-        } else {
-            i + 1
-        };
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    let first = if first_end == b',' {
-        line[1..i].trim_end_matches([' ', '\t'])
-    } else {
-        &line[1..i]
-    };
-    i += 1;
-    while i < bytes.len() && is_space(bytes[i]) {
-        i += 1;
-    }
-    let second = if first_end == b',' {
-        let start = i;
-        let mut depth = 0usize;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' if depth == 0 => break,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return None;
-        }
-        &line[start..i]
-    } else {
-        let quote = *bytes.get(i).filter(|b| matches!(b, b'"' | b'\''))?;
-        let start = i + 1;
-        let end = start + line[start..].find(quote as char)?;
-        &line[start..end]
-    };
-    Some((first, second))
-}
-
 fn branch_items(branch: &ConditionalBranch) -> impl Iterator<Item = MakefileItem> {
     branch.items().filter_map(|item| match item {
         ConditionalItem::Item(item) => Some(item),
@@ -1766,9 +1698,9 @@ impl<'a> Walker<'a> {
                 Some(defined == (kind == ConditionalKind::Ifdef))
             }
             ConditionalKind::Ifeq | ConditionalKind::Ifneq => {
-                let (first, second) = split_ifeq(&text)?;
-                let first = self.expand_now(first).text()?;
-                let second = self.expand_now(second).text()?;
+                let (first, second) = branch.ifeq_args_for(self.variant)?;
+                let first = self.expand_now(&first).text()?;
+                let second = self.expand_now(&second).text()?;
                 Some((first == second) == (kind == ConditionalKind::Ifeq))
             }
             _ => None,
@@ -2148,6 +2080,9 @@ mod tests {
         assert_eq!(at_end(chain, "$(R)"), "x");
         let nested = "X = x\nifdef X\n  ifeq ($(X),x)\n    R = nested\n  endif\nendif\n";
         assert_eq!(at_end(nested, "$(R)"), "nested");
+        // GNU make 4.4.1 does not skip `$,` when looking for the comma.
+        let comma = "ifeq ($,x,$,x)\nR := equal\nelse\nR := not equal\nendif\n";
+        assert_eq!(at_end(comma, "$(R)"), "not equal");
     }
 
     #[test]
@@ -2506,14 +2441,5 @@ mod tests {
                 ))
             );
         }
-    }
-
-    #[test]
-    fn test_split_ifeq() {
-        assert_eq!(split_ifeq("(a ,  b c )"), Some(("a", "b c ")));
-        assert_eq!(split_ifeq("($(f a,b),c)"), Some(("$(f a,b)", "c")));
-        assert_eq!(split_ifeq("\"a\"  'b'"), Some(("a", "b")));
-        assert_eq!(split_ifeq("(a(b),c)"), Some(("a(b)", "c")));
-        assert_eq!(split_ifeq("a b"), None);
     }
 }
