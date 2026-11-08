@@ -57,6 +57,7 @@ pub mod include;
 pub mod load;
 pub mod makefile;
 pub mod rule;
+pub mod special_target;
 pub mod variable;
 pub mod vpath;
 mod word_list;

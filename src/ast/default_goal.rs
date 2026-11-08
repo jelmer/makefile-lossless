@@ -1,5 +1,6 @@
 //! Finding the default goal of a makefile.
 
+use super::special_target::is_special_target;
 use crate::lossless::{Makefile, Rule, VariableDefinition};
 use crate::MakefileVariant;
 use rowan::ast::AstNode;
@@ -78,54 +79,6 @@ struct State {
     main: Option<DefaultGoal>,
 }
 
-/// Targets that BSD make treats specially in a dependency line; a line
-/// starting with one never provides the default goal.
-const BSD_SPECIAL_TARGETS: &[&str] = &[
-    ".BEGIN",
-    ".DEFAULT",
-    ".DELETE_ON_ERROR",
-    ".END",
-    ".ERROR",
-    ".EXEC",
-    ".IGNORE",
-    ".INCLUDES",
-    ".INTERRUPT",
-    ".INVISIBLE",
-    ".JOIN",
-    ".LIBS",
-    ".MADE",
-    ".MAIN",
-    ".MAKE",
-    ".MAKEFLAGS",
-    ".META",
-    ".MFLAGS",
-    ".NOMETA",
-    ".NOMETA_CMP",
-    ".NOPATH",
-    ".NOREADONLY",
-    ".NOTMAIN",
-    ".NOTPARALLEL",
-    ".NO_PARALLEL",
-    ".NULL",
-    ".OBJDIR",
-    ".OPTIONAL",
-    ".ORDER",
-    ".PARALLEL",
-    ".PATH",
-    ".PHONY",
-    ".POSIX",
-    ".PRECIOUS",
-    ".READONLY",
-    ".RECURSIVE",
-    ".SHELL",
-    ".SILENT",
-    ".SINGLESHELL",
-    ".STALE",
-    ".SUFFIXES",
-    ".USE",
-    ".USEBEFORE",
-];
-
 /// Whether `name` looks like a suffix transformation rule, such as `.c.o`
 /// or `.c`.
 fn is_transformation(name: &str) -> bool {
@@ -145,7 +98,7 @@ fn first_target(rule: &Rule, variant: MakefileVariant) -> Option<String> {
         MakefileVariant::BSDMake => {
             let targets: Vec<String> = targets.collect();
             let first = targets.first()?;
-            if BSD_SPECIAL_TARGETS.contains(&first.as_str()) || first.starts_with(".PATH.") {
+            if is_special_target(first, variant) {
                 return None;
             }
             if rule
