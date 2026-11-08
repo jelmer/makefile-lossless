@@ -571,7 +571,7 @@ impl Rule {
             .into_iter()
     }
 
-    fn targets_with(&self, syntax: LineSyntax) -> std::vec::IntoIter<String> {
+    pub(crate) fn targets_with(&self, syntax: LineSyntax) -> std::vec::IntoIter<String> {
         // First check if there's a TARGETS node
         for child in self.syntax().children_with_tokens() {
             if let Some(node) = child.as_node() {
@@ -939,96 +939,6 @@ impl Rule {
             .children()
             .find(|n| n.kind() == TARGET_PATTERN)
             .map(|n| node_name_text(&n, syntax).trim().to_string())
-    }
-
-    /// Check whether this is a pattern rule, such as `%.o: %.c`
-    ///
-    /// GNU make reads a rule as a pattern rule when its first target has a
-    /// `%` that is not quoted with a backslash. A static pattern rule is
-    /// not one, as its targets are explicit. Variable references are not
-    /// expanded, so a `%` that only comes from one is not seen. See
-    /// [`Self::is_pattern_for`] for other variants.
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::Rule;
-    /// let rule: Rule = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
-    /// assert!(rule.is_pattern());
-    ///
-    /// let rule: Rule = "100\\%.txt:\n".parse().unwrap();
-    /// assert!(!rule.is_pattern());
-    ///
-    /// let rule: Rule = "a.o b.o: %.o: %.c\n".parse().unwrap();
-    /// assert!(!rule.is_pattern());
-    /// ```
-    pub fn is_pattern(&self) -> bool {
-        self.is_pattern_for(MakefileVariant::GNUMake)
-    }
-
-    /// Check whether this is a pattern rule, as `variant` reads it
-    ///
-    /// BSD make and nmake have no pattern rules, so this is always false
-    /// for them. POSIX make is read like GNU make.
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
-    /// let rule: Rule = "%.o: %.c\n".parse().unwrap();
-    /// assert!(rule.is_pattern_for(MakefileVariant::GNUMake));
-    /// assert!(!rule.is_pattern_for(MakefileVariant::BSDMake));
-    /// ```
-    pub fn is_pattern_for(&self, variant: MakefileVariant) -> bool {
-        matches!(
-            variant,
-            MakefileVariant::GNUMake | MakefileVariant::POSIXMake
-        ) && self.static_pattern_for(variant).is_none()
-            && self
-                .targets_with(variant.into())
-                .next()
-                .is_some_and(|t| crate::pattern::split_pattern(&t).is_some())
-    }
-
-    /// Get the stem with which this pattern rule matches `target`
-    ///
-    /// The stem is what the `%` matches, and what `$*` expands to in the
-    /// recipe. The first of the rule's targets that matches is used. As in
-    /// GNU make, a pattern without a `/` is matched against the file name
-    /// only, and the directory is put back in front of the stem. Returns
-    /// `None` if this is not a pattern rule, or none of its targets match.
-    /// Targets with variable references never match. See
-    /// [`Self::stem_for`] for other variants.
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::Rule;
-    /// let rule: Rule = "lib%.a: %.o\n".parse().unwrap();
-    /// assert_eq!(rule.stem("libfoo.a"), Some("foo".to_string()));
-    /// assert_eq!(rule.stem("src/libfoo.a"), Some("src/foo".to_string()));
-    /// assert_eq!(rule.stem("foo.a"), None);
-    /// ```
-    pub fn stem(&self, target: &str) -> Option<String> {
-        self.stem_for(target, MakefileVariant::GNUMake)
-    }
-
-    /// Get the stem with which this pattern rule matches `target`, as
-    /// `variant` reads the rule; see [`Self::is_pattern_for`].
-    ///
-    /// # Example
-    /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
-    /// let rule: Rule = "%.o: %.c\n".parse().unwrap();
-    /// assert_eq!(
-    ///     rule.stem_for("foo.o", MakefileVariant::GNUMake),
-    ///     Some("foo".to_string())
-    /// );
-    /// assert_eq!(rule.stem_for("foo.o", MakefileVariant::BSDMake), None);
-    /// ```
-    pub fn stem_for(&self, target: &str, variant: MakefileVariant) -> Option<String> {
-        if !self.is_pattern_for(variant) {
-            return None;
-        }
-        self.targets_with(variant.into())
-            .find_map(|pattern| crate::pattern::pattern_stem(&pattern, target))
     }
 
     /// Get the commands in the rule
@@ -2577,65 +2487,6 @@ mod tests {
         let mut rule = rule;
         assert!(rule.rename_target("c", "d").unwrap());
         assert_eq!(makefile.to_string(), "a\\%b d:\n\techo\n");
-    }
-
-    #[test]
-    fn test_is_pattern() {
-        let cases = [
-            ("%.o: %.c\n", true),
-            ("%.tab.c %.tab.h: %.y\n", true),
-            ("%:: %.in\n", true),
-            ("$(DIR)/%.o: %.c\n", true),
-            ("foo.o: foo.c\n", false),
-            ("a\\%b:\n", false),
-            ("a\\\\%b:\n", true),
-            // make reads a rule whose first target is explicit as an
-            // explicit rule, with a warning.
-            ("explicit %.w:\n", false),
-            ("$(patsubst %.c,%.o,x.c):\n", false),
-            ("s1.v s2.v: %.v: %.u\n", false),
-        ];
-        for (text, expected) in cases {
-            let rule: Rule = text.parse().unwrap();
-            assert_eq!(rule.is_pattern(), expected, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn test_is_pattern_for() {
-        let rule: Rule = "%.o: %.c\n".parse().unwrap();
-        let results: Vec<_> = [
-            MakefileVariant::GNUMake,
-            MakefileVariant::BSDMake,
-            MakefileVariant::NMake,
-            MakefileVariant::POSIXMake,
-        ]
-        .into_iter()
-        .map(|v| rule.is_pattern_for(v))
-        .collect();
-        assert_eq!(results, vec![true, false, false, true]);
-    }
-
-    #[test]
-    fn test_stem() {
-        let rule: Rule = "%.tab.c %.tab.h: %.y\n\tbison $<\n".parse().unwrap();
-        assert_eq!(rule.stem("parse.tab.c"), Some("parse".to_string()));
-        assert_eq!(rule.stem("parse.tab.h"), Some("parse".to_string()));
-        assert_eq!(rule.stem("src/parse.tab.h"), Some("src/parse".to_string()));
-        assert_eq!(rule.stem("parse.c"), None);
-
-        let rule: Rule = "foo.o: foo.c\n".parse().unwrap();
-        assert_eq!(rule.stem("foo.o"), None);
-
-        let rule: Rule = "a.o b.o: %.o: %.c\n".parse().unwrap();
-        assert_eq!(rule.stem("a.o"), None);
-
-        let rule: Rule = "%.o: %.c\n".parse().unwrap();
-        assert_eq!(rule.stem_for("foo.o", MakefileVariant::BSDMake), None);
-        assert_eq!(
-            rule.stem_for("foo.o", MakefileVariant::POSIXMake),
-            Some("foo".to_string())
-        );
     }
 
     #[test]
