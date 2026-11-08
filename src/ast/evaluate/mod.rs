@@ -2,7 +2,7 @@
 //! when reading a makefile.
 
 use crate::lossless::{Makefile, VariableReference};
-use crate::{MakefileVariant, TextSize};
+use crate::{ConditionalBranch, MakefileVariant, TextSize};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -337,6 +337,14 @@ impl Evaluation {
             }
         }
     }
+
+    /// Whether make reads `branch`, or `None` if that is not known.
+    pub fn branch_taken(&self, branch: &ConditionalBranch) -> Option<bool> {
+        match &self.engine {
+            Engine::Gnu(engine) => engine.branch_taken(branch),
+            Engine::Unsupported(_) => None,
+        }
+    }
 }
 
 fn unsupported(text: &str, variant: MakefileVariant) -> Expansion {
@@ -363,12 +371,13 @@ impl Makefile {
     /// Follow the variables of this makefile as `variant` reads it.
     ///
     /// For GNU make, assignments, `define`, `undefine` and `override` are
-    /// followed; a variable set in a conditional branch is unknown
-    /// afterwards. After an `include` or `load` directive, a call of `eval`
-    /// or a line whose expansion make reads as makefile text, every variable
-    /// is unknown until it is set again. Of the functions, only `value`,
-    /// `flavor` and `origin` are evaluated. Variables given on the command
-    /// line are not taken into account.
+    /// followed, and conditionals whose condition is known: a variable set
+    /// in a branch that may or may not be read is unknown afterwards. After
+    /// an `include` or `load` directive, a call of `eval` or a line whose
+    /// expansion make reads as makefile text, every variable is unknown
+    /// until it is set again. Of the functions, only `value`, `flavor` and
+    /// `origin` are evaluated. Variables given on the command line are not
+    /// taken into account.
     ///
     /// POSIX make is read like GNU make without its functions. For BSD
     /// make and nmake, everything is unknown.
