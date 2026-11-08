@@ -4,6 +4,7 @@
 use super::{Environment, Expansion, ExpansionPart, UnknownReason};
 use crate::lossless::{Conditional, Makefile, VariableDefinition, VariableReference};
 use crate::pattern::find_percent;
+use crate::reference::is_gnu_function;
 use crate::{
     AssignmentOperator, BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind,
     FunctionCall, MakefileItem, MakefileVariant, ReferenceLocation, TextSize,
@@ -229,11 +230,174 @@ fn substitution_reference(value: &str, pattern: &str, replacement: &str) -> Stri
     }
 }
 
+/// GNU make's `parse_numeric`, with make's message for `error`.
+fn parse_number(text: &str, error: &str) -> Result<i64, UnknownReason> {
+    let stripped = strip(text);
+    stripped
+        .parse()
+        .map_err(|_| UnknownReason::Error(format!("{error}: '{stripped}'")))
+}
+
+/// Join `items` with single spaces.
+fn join_words<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
+    items.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+/// The name of each GNU make function that is evaluated, with the minimum
+/// number of arguments it takes.
+const EVALUATED_FUNCTIONS: &[(&str, usize)] = &[
+    ("addprefix", 2),
+    ("addsuffix", 2),
+    ("and", 1),
+    ("basename", 0),
+    ("call", 1),
+    ("dir", 0),
+    ("filter", 2),
+    ("filter-out", 2),
+    ("findstring", 2),
+    ("firstword", 0),
+    ("flavor", 0),
+    ("foreach", 3),
+    ("if", 2),
+    ("join", 2),
+    ("lastword", 0),
+    ("notdir", 0),
+    ("or", 1),
+    ("origin", 0),
+    ("patsubst", 3),
+    ("sort", 0),
+    ("strip", 0),
+    ("subst", 3),
+    ("suffix", 0),
+    ("value", 0),
+    ("word", 2),
+    ("wordlist", 3),
+    ("words", 0),
+];
+
+/// Evaluate the text function `name` on its expanded arguments.
+fn text_function(name: &str, args: &[String]) -> Result<String, UnknownReason> {
+    let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_default();
+    Ok(match name {
+        "subst" => subst_expand(arg(2), arg(0), arg(1), false),
+        "patsubst" => patsubst(arg(2), arg(0), arg(1)),
+        "strip" => join_words(words(arg(0))),
+        "findstring" => {
+            if arg(1).contains(arg(0)) {
+                arg(0).to_string()
+            } else {
+                String::new()
+            }
+        }
+        "filter" | "filter-out" => {
+            let keep = name == "filter";
+            let patterns: Vec<(String, Option<usize>)> = words(arg(0)).map(find_percent).collect();
+            join_words(words(arg(1)).filter(|word| {
+                let matched = patterns.iter().any(|(pattern, percent)| match percent {
+                    Some(percent) => matches_percent(pattern, *percent, word),
+                    None => pattern == word,
+                });
+                matched == keep
+            }))
+        }
+        "sort" => {
+            let mut sorted: Vec<&str> = words(arg(0)).collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            join_words(sorted)
+        }
+        "word" => {
+            let n = parse_number(arg(0), "invalid first argument to 'word' function")?;
+            if n < 1 {
+                return Err(UnknownReason::Error(
+                    "first argument to 'word' function must be greater than 0".to_string(),
+                ));
+            }
+            words(arg(1))
+                .nth((n - 1) as usize)
+                .unwrap_or_default()
+                .to_string()
+        }
+        "wordlist" => {
+            let start = parse_number(arg(0), "invalid first argument to 'wordlist' function")?;
+            if start < 1 {
+                return Err(UnknownReason::Error(format!(
+                    "invalid first argument to 'wordlist' function: '{start}'"
+                )));
+            }
+            let stop = parse_number(arg(1), "invalid second argument to 'wordlist' function")?;
+            if stop < 0 {
+                return Err(UnknownReason::Error(format!(
+                    "invalid second argument to 'wordlist' function: '{stop}'"
+                )));
+            }
+            let ranges = word_ranges(arg(2));
+            let first = (start - 1) as usize;
+            match ranges.get(first) {
+                Some(&(begin, _)) if stop >= start => {
+                    let last = ranges.len().min(stop as usize) - 1;
+                    arg(2)[begin..ranges[last].1].to_string()
+                }
+                _ => String::new(),
+            }
+        }
+        "words" => words(arg(0)).count().to_string(),
+        "firstword" => words(arg(0)).next().unwrap_or_default().to_string(),
+        "lastword" => words(arg(0)).last().unwrap_or_default().to_string(),
+        "dir" => join_words(words(arg(0)).map(|word| match word.rfind('/') {
+            Some(i) => &word[..=i],
+            None => "./",
+        })),
+        "notdir" => join_words(words(arg(0)).map(|word| match word.rfind('/') {
+            Some(i) => &word[i + 1..],
+            None => word,
+        })),
+        "suffix" => join_words(words(arg(0)).filter_map(|word| {
+            let i = word.rfind(['/', '.'])?;
+            word[i..].starts_with('.').then(|| &word[i..])
+        })),
+        "basename" => join_words(words(arg(0)).map(|word| match word.rfind(['/', '.']) {
+            Some(i) if word[i..].starts_with('.') => &word[..i],
+            _ => word,
+        })),
+        "addsuffix" => {
+            let suffix = arg(0);
+            words(arg(1))
+                .map(|word| format!("{word}{suffix}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        "addprefix" => {
+            let prefix = arg(0);
+            words(arg(1))
+                .map(|word| format!("{prefix}{word}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        "join" => {
+            let (first, second): (Vec<&str>, Vec<&str>) =
+                (words(arg(0)).collect(), words(arg(1)).collect());
+            (0..first.len().max(second.len()))
+                .map(|i| {
+                    format!(
+                        "{}{}",
+                        first.get(i).unwrap_or(&""),
+                        second.get(i).unwrap_or(&"")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => return Err(UnknownReason::UnsupportedFunction(name.to_string())),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Environment,
     File,
     Override,
+    Automatic,
 }
 
 #[derive(Debug, Clone)]
@@ -341,9 +505,13 @@ struct Expander<'a> {
     deferred: bool,
     /// Whether target-specific values may apply.
     target_context: bool,
+    /// The variables `call` and `foreach` set.
+    scopes: Vec<HashMap<String, Var>>,
     /// The recursively expanded variables being expanded.
     expanding: Vec<String>,
     depth: usize,
+    /// The number of arguments of the `call` being expanded.
+    call_args: usize,
     /// Whether `eval` would be called.
     saw_eval: bool,
 }
@@ -356,13 +524,18 @@ impl<'a> Expander<'a> {
             variant,
             deferred: false,
             target_context: false,
+            scopes: Vec::new(),
             expanding: Vec::new(),
             depth: 0,
+            call_args: 0,
             saw_eval: false,
         }
     }
 
     fn binding(&self, name: &str) -> Binding {
+        if let Some(var) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+            return Binding::Set(var.clone());
+        }
         if self.target_context
             && (self.state.target_specific_unknown || self.state.target_specific.contains(name))
         {
@@ -389,7 +562,7 @@ impl<'a> Expander<'a> {
                 '(' | '{' => self.expand_parenthesised(text, dollar, &mut out),
                 c => {
                     let end = dollar + 1 + c.len_utf8();
-                    let value = self.value_of(&text[dollar + 1..end], &text[dollar..end]);
+                    let value = self.value_of(&text[dollar + 1..end], &text[dollar..end], false);
                     out.extend(value);
                     end
                 }
@@ -460,14 +633,16 @@ impl<'a> Expander<'a> {
                 &name[equals + 1..],
                 reference,
             ),
-            None => self.value_of(&name, reference),
+            None => self.value_of(&name, reference, false),
         };
         out.extend(value);
         end + 1
     }
 
-    /// The value of the variable `name`, referenced as `reference`.
-    fn value_of(&mut self, name: &str, reference: &str) -> Expansion {
+    /// The value of the variable `name`, referenced as `reference`. With
+    /// `call`, a variable that is being expanded may be expanded again, as
+    /// `call` allows.
+    fn value_of(&mut self, name: &str, reference: &str, call: bool) -> Expansion {
         let var = match self.binding(name) {
             Binding::Set(var) => var,
             Binding::Undefined => return Expansion::default(),
@@ -476,7 +651,7 @@ impl<'a> Expander<'a> {
         if !var.recursive {
             return var.value;
         }
-        if self.expanding.iter().any(|n| n == name) {
+        if !call && self.expanding.iter().any(|n| n == name) {
             return Expansion::unknown(reference, UnknownReason::Recursion(name.to_string()));
         }
         if self.depth >= MAX_DEPTH {
@@ -513,7 +688,7 @@ impl<'a> Expander<'a> {
         replacement: &str,
         reference: &str,
     ) -> Expansion {
-        let value = self.value_of(name, reference);
+        let value = self.value_of(name, reference, false);
         match value.text() {
             Some(text) if text.is_empty() => Expansion::default(),
             Some(text) => Expansion::known(&substitution_reference(&text, pattern, replacement)),
@@ -526,30 +701,54 @@ impl<'a> Expander<'a> {
 
     /// Evaluate the function call `text`.
     fn function(&mut self, text: &str, call: &FunctionCall) -> Expansion {
+        let raw: Vec<&str> = call.arguments.iter().map(|r| &text[r.clone()]).collect();
         let name = call.name.as_str();
         if contains_eval(text) {
             self.saw_eval = true;
         }
-        // TODO: evaluate the text functions, and those that expand their
-        // arguments themselves, such as `if` and `foreach`.
-        if !matches!(name, "value" | "flavor" | "origin") {
+        let Some(&(_, min_args)) = EVALUATED_FUNCTIONS.iter().find(|(n, _)| *n == name) else {
             return Expansion::unknown(text, UnknownReason::UnsupportedFunction(name.to_string()));
+        };
+        if raw.len() < min_args {
+            return Expansion::unknown(
+                text,
+                UnknownReason::Error(format!(
+                    "insufficient number of arguments ({}) to function '{name}'",
+                    raw.len()
+                )),
+            );
         }
         if self.depth >= MAX_DEPTH {
             return Expansion::unknown(text, UnknownReason::DepthLimit);
         }
         self.depth += 1;
-        let args: Vec<Expansion> = call
-            .arguments
-            .iter()
-            .map(|range| self.expand(&text[range.clone()]))
-            .collect();
+        let result = match name {
+            "if" => self.function_if(text, &raw),
+            "or" => self.function_or(text, &raw),
+            "and" => self.function_and(text, &raw),
+            "foreach" => self.function_foreach(text, &raw),
+            _ => {
+                let mut args = Vec::new();
+                let mut unknown = None;
+                for arg in &raw {
+                    let expanded = self.expand(arg);
+                    if unknown.is_none() {
+                        unknown = expanded.unknown_reason().cloned();
+                    }
+                    args.push(expanded);
+                }
+                match (name, unknown) {
+                    ("call", _) => self.function_call(text, args),
+                    (_, Some(reason)) => Expansion::unknown(text, reason),
+                    _ => {
+                        let args: Vec<String> = args.iter().filter_map(Expansion::text).collect();
+                        self.known_function(text, name, &args)
+                    }
+                }
+            }
+        };
         self.depth -= 1;
-        if let Some(reason) = args.iter().find_map(Expansion::unknown_reason) {
-            return Expansion::unknown(text, reason.clone());
-        }
-        let args: Vec<String> = args.iter().filter_map(Expansion::text).collect();
-        self.known_function(text, name, &args)
+        result
     }
 
     /// Evaluate a function whose arguments are all known.
@@ -573,13 +772,176 @@ impl<'a> Expander<'a> {
                         Origin::Environment => "environment",
                         Origin::File => "file",
                         Origin::Override => "override",
+                        Origin::Automatic => "automatic",
                     }
                 }),
                 Binding::Undefined => Expansion::known("undefined"),
                 Binding::Unknown(reason) => Expansion::unknown(text, reason),
             },
-            _ => Expansion::unknown(text, UnknownReason::UnsupportedFunction(name.to_string())),
+            _ => match text_function(name, args) {
+                Ok(result) => Expansion::known(&result),
+                Err(reason) => Expansion::unknown(text, reason),
+            },
         }
+    }
+
+    /// Expand `arg` stripped of whitespace, as `if`, `or` and `and` do with
+    /// their conditions.
+    fn condition(&mut self, arg: &str) -> Expansion {
+        self.expand(strip(arg))
+    }
+
+    fn function_if(&mut self, text: &str, raw: &[&str]) -> Expansion {
+        let condition = self.condition(raw[0]);
+        let Some(condition) = condition.text() else {
+            return Expansion::unknown(text, condition.unknown_reason().cloned().expect("unknown"));
+        };
+        let branch = if condition.is_empty() { 2 } else { 1 };
+        raw.get(branch)
+            .map(|arg| self.expand(arg))
+            .unwrap_or_default()
+    }
+
+    fn function_or(&mut self, text: &str, raw: &[&str]) -> Expansion {
+        for arg in raw {
+            let value = self.condition(arg);
+            match value.is_empty_known() {
+                Some(true) => continue,
+                Some(false) if value.is_known() => return value,
+                _ => {
+                    return Expansion::unknown(
+                        text,
+                        value.unknown_reason().cloned().expect("unknown"),
+                    )
+                }
+            }
+        }
+        Expansion::default()
+    }
+
+    fn function_and(&mut self, text: &str, raw: &[&str]) -> Expansion {
+        let mut last = Expansion::default();
+        for arg in raw {
+            last = self.condition(arg);
+            if !last.is_known() {
+                return Expansion::unknown(text, last.unknown_reason().cloned().expect("unknown"));
+            }
+            if last.is_empty_known() == Some(true) {
+                return Expansion::default();
+            }
+        }
+        last
+    }
+
+    fn function_foreach(&mut self, text: &str, raw: &[&str]) -> Expansion {
+        let (name, list) = (self.expand(raw[0]), self.expand(raw[1]));
+        let (Some(name), Some(list)) = (name.text(), list.text()) else {
+            let reason = name
+                .unknown_reason()
+                .or(list.unknown_reason())
+                .cloned()
+                .expect("unknown");
+            return Expansion::unknown(text, reason);
+        };
+        let name = words(&name).next().unwrap_or_default().to_string();
+        let mut out = Expansion::default();
+        for (i, word) in words(&list).enumerate() {
+            if i > 0 {
+                out.push_str(" ");
+            }
+            let var = Var {
+                recursive: false,
+                value: Expansion::known(word),
+                origin: Origin::Automatic,
+            };
+            self.scopes.push(HashMap::from([(name.clone(), var)]));
+            let body = self.expand(raw[2]);
+            self.scopes.pop();
+            out.extend(body);
+        }
+        out
+    }
+
+    /// A built-in function called through `call`, with its arguments
+    /// already expanded.
+    fn call_builtin(&mut self, text: &str, name: &str, args: &[Expansion]) -> Expansion {
+        let Some(&(_, min_args)) = EVALUATED_FUNCTIONS.iter().find(|(n, _)| *n == name) else {
+            return Expansion::unknown(text, UnknownReason::UnsupportedFunction(name.to_string()));
+        };
+        // TODO: support the functions that expand their arguments
+        // themselves, which make expands again when called this way.
+        if matches!(name, "if" | "or" | "and" | "foreach" | "call") {
+            return Expansion::unknown(text, UnknownReason::UnsupportedFunction(name.to_string()));
+        }
+        if args.len() < min_args {
+            return Expansion::unknown(
+                text,
+                UnknownReason::Error(format!(
+                    "insufficient number of arguments ({}) to function '{name}'",
+                    args.len()
+                )),
+            );
+        }
+        if let Some(reason) = args.iter().find_map(Expansion::unknown_reason) {
+            return Expansion::unknown(text, reason.clone());
+        }
+        let args: Vec<String> = args.iter().filter_map(Expansion::text).collect();
+        self.known_function(text, name, &args)
+    }
+
+    fn function_call(&mut self, text: &str, args: Vec<Expansion>) -> Expansion {
+        let Some(function) = args[0].text() else {
+            return Expansion::unknown(text, args[0].unknown_reason().cloned().expect("unknown"));
+        };
+        let Some(function) = words(&function).next().map(str::to_string) else {
+            return Expansion::default();
+        };
+        if is_gnu_function(&function) {
+            return self.call_builtin(text, &function, &args[1..]);
+        }
+        match self.binding(&function) {
+            Binding::Set(var) if var.value.is_empty_known() == Some(true) => {
+                return Expansion::default()
+            }
+            Binding::Set(_) => {}
+            Binding::Undefined => return Expansion::default(),
+            Binding::Unknown(reason) => return Expansion::unknown(text, reason),
+        }
+        let mut scope = HashMap::new();
+        let count = args.len();
+        for (i, value) in args.into_iter().enumerate() {
+            let value = if i == 0 {
+                Expansion::known(&function)
+            } else {
+                value
+            };
+            scope.insert(
+                i.to_string(),
+                Var {
+                    recursive: false,
+                    value,
+                    origin: Origin::Automatic,
+                },
+            );
+        }
+        // Hide the arguments of an enclosing call with more of them.
+        for i in count..self.call_args {
+            scope.insert(
+                i.to_string(),
+                Var {
+                    recursive: false,
+                    value: Expansion::default(),
+                    origin: Origin::Automatic,
+                },
+            );
+        }
+        let saved = self.call_args;
+        self.call_args = count.max(saved);
+        self.scopes.push(scope);
+        let value = self.value_of(&function, text, true);
+        self.scopes.pop();
+        self.call_args = saved;
+        value
     }
 }
 
@@ -1012,7 +1374,7 @@ impl Engine {
             Binding::Set(_) => {
                 let mut expander = self.expander(&self.state);
                 expander.deferred = true;
-                Some(expander.value_of(name, &reference))
+                Some(expander.value_of(name, &reference, false))
             }
         }
     }
@@ -1187,7 +1549,7 @@ mod tests {
             (text, "[$(D2)] [$(flavor D2)]", "[x b1] [simple]"),
             (text, "[$(D3)] [$(flavor D3)]", "[y b2] [recursive]"),
             (text, "[$(D4)] [$(D5)]", "[d4 more] [five]"),
-            (text, "[$(E)]", "[]"),
+            (text, "[$(E)] [$(words $(E))]", "[] [0]"),
         ]);
     }
 
@@ -1222,6 +1584,9 @@ mod tests {
                 "{text:?}"
             );
         }
+        // `call` may expand a variable while it is being expanded.
+        let text = "f = $(if $(1),$(call f,$(wordlist 2,9,$(1)))$(firstword $(1)))\n";
+        assert_eq!(at_end(text, "$(call f,a b c)"), "cba");
     }
 
     #[test]
@@ -1238,6 +1603,7 @@ mod tests {
             ("ifeq \"a b\" 'a b'", true),
             ("ifneq ($(X),y)", true),
             ("ifndef UNDEFINED", true),
+            ("ifeq (,$(filter x,$(X)))", false),
         ];
         for (condition, expected) in cases {
             let full = format!("{text}{condition}\nR = yes\nelse\nR = no\nendif\n");
@@ -1297,6 +1663,118 @@ mod tests {
             evaluation.variable("S"),
             Some(Expansion::unknown("$(S)", UnknownReason::Conditional))
         );
+    }
+
+    #[test]
+    fn test_functions() {
+        let text = "L =   a.c  b.c\tc.h  \nf = [$(0)|$(1)|$(2)|$(3)]\ng = $(call f,$(2),$(1))\n\
+                    V = $(L) x\nS := s\n";
+        check(&[
+            (
+                text,
+                "[$(subst .c,.o,$(L))] [$(subst ,X,ab)] [$(subst a, ,a a)]",
+                "[a.o  b.o\tc.h  ] [abX] [   ]",
+            ),
+            (
+                text,
+                "[$(patsubst %.c,%.o,$(L))] [$(patsubst .c,.o,a.c  .c x.c)] [$(patsubst %.c,,a.c b.h)] [$(patsubst %,%,)] [$(patsubst a\\%%,x%,a%b c)]",
+                "[a.o b.o c.h] [a.c  .o x.c] [b.h] [] [xb c]",
+            ),
+            (
+                text,
+                "[$(strip $(L))] [$(strip )] [$(findstring b.c,$(L))] [$(findstring z,$(L))]",
+                "[a.c b.c c.h] [] [b.c] []",
+            ),
+            (
+                text,
+                "[$(filter %.c,$(L))] [$(filter-out %.c,$(L))] [$(filter a.c %.h,$(L))] [$(filter ,a)]",
+                "[a.c b.c] [c.h] [a.c c.h] []",
+            ),
+            (
+                text,
+                "[$(sort c b a b  c)] [$(sort )] [$(words $(L))] [$(words )] [$(word 2,$(L))] [$(word 9,$(L))]",
+                "[a b c] [] [3] [0] [b.c] []",
+            ),
+            (
+                text,
+                "[$(wordlist 2,3,$(L))] [$(wordlist 3,2,$(L))] [$(wordlist 2,9,$(L))] [$(firstword $(L))] [$(lastword $(L))] [$(firstword )]",
+                "[b.c\tc.h] [] [b.c\tc.h] [a.c] [c.h] []",
+            ),
+            (
+                text,
+                "[$(dir src/a.c b.c /x/ c/)] [$(notdir src/a.c b.c /x/)] [$(suffix src/a.c b d.x/y .z)] [$(basename src/a.c b d.x/y .z a.b.c)]",
+                "[src/ ./ /x/ c/] [a.c b.c ] [.c .z] [src/a b d.x/y  a.b]",
+            ),
+            (
+                text,
+                "[$(addsuffix .o,a  b)] [$(addprefix p/,a b)] [$(addprefix p/,)] [$(join a b c,1 2)] [$(join ,x)]",
+                "[a.o b.o] [p/a p/b] [] [a1 b2 c] [x]",
+            ),
+            (
+                text,
+                "[$(if  ,yes,no)] [$(if $(L),yes,no)] [$(if x,yes)] [$(if ,yes)] [$(if x , y , z )]",
+                "[no] [yes] [yes] [] [ y ]",
+            ),
+            (
+                text,
+                "[$(or ,, b ,c)] [$(or ,)] [$(and a, b ,c )] [$(and a,,c)] [$(and a, )]",
+                "[b] [] [c] [] []",
+            ),
+            (
+                text,
+                "[$(foreach v,a b  c,<$(v)>)] [$(foreach v,,x)] [$(foreach  v ,a,$(v))]",
+                "[<a> <b> <c>] [] [a]",
+            ),
+            (
+                text,
+                "[$(call f,a,b)] [$(call g,a,b)] [$(call  f , a ,b)] [$(call undefined,a)] [$(call strip, a  b )]",
+                "[[f|a|b|]] [[f|b|a|]] [[f| a |b|]] [] [a b]",
+            ),
+            (
+                text,
+                "[$(value V)] [$(flavor V)] [$(flavor S)] [$(flavor NOPE)] [$(origin V)] [$(origin NOPE)] [$(foreach o,1,$(origin o))]",
+                "[$(L) x] [recursive] [simple] [undefined] [file] [undefined] [automatic]",
+            ),
+            (text, "[$(subst a,b,a,a)] [$(addsuffix x,a,b)]", "[b,b] [a,bx]"),
+        ]);
+    }
+
+    #[test]
+    fn test_function_errors() {
+        let evaluation = evaluate("", empty_env());
+        let reason = |expr: &str| {
+            evaluation
+                .expand_at(expr, TextSize::from(0))
+                .unknown_reason()
+                .cloned()
+        };
+        let error = |message: &str| Some(UnknownReason::Error(message.to_string()));
+        assert_eq!(
+            reason("$(word 0,a)"),
+            error("first argument to 'word' function must be greater than 0")
+        );
+        assert_eq!(
+            reason("$(word x,a)"),
+            error("invalid first argument to 'word' function: 'x'")
+        );
+        assert_eq!(
+            reason("$(subst a,b)"),
+            error("insufficient number of arguments (2) to function 'subst'")
+        );
+        assert_eq!(
+            reason("$(info [$(X)"),
+            error("unterminated call to function 'info': missing ')'")
+        );
+        for function in [
+            "shell", "wildcard", "realpath", "abspath", "info", "let", "intcmp",
+        ] {
+            let expr = format!("$({function} x,y,z)");
+            assert_eq!(
+                reason(&expr),
+                Some(UnknownReason::UnsupportedFunction(function.to_string())),
+                "{function}"
+            );
+        }
     }
 
     #[test]
