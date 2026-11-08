@@ -2,6 +2,7 @@
 //! when reading a makefile.
 
 use crate::lossless::{Conditional, Makefile, VariableDefinition, VariableReference};
+use crate::pattern::find_percent;
 use crate::reference::is_gnu_function;
 use crate::{
     AssignmentOperator, BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind,
@@ -371,15 +372,6 @@ const BUILTIN_VARIABLES: &[&str] = &[
     "YACC.y",
 ];
 
-/// Whether `name` is that of an automatic variable, such as `@` or `<D`.
-fn is_automatic(name: &str) -> bool {
-    let mut chars = name.chars();
-    let (Some(first), rest) = (chars.next(), chars.as_str()) else {
-        return false;
-    };
-    "@%<?^+|*".contains(first) && matches!(rest, "" | "D" | "F")
-}
-
 /// Whether `b` is a space as C's `isspace` takes it, as GNU make splits
 /// words.
 fn is_space(b: u8) -> bool {
@@ -412,35 +404,6 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
 
 fn strip(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
-}
-
-/// GNU make's `find_percent`: `text` with the backslashes before each `%`
-/// up to the first unquoted one halved, and the position of that `%`.
-fn find_percent(text: &str) -> (String, Option<usize>) {
-    let mut out = String::new();
-    let mut backslashes = 0;
-    for (i, c) in text.char_indices() {
-        match c {
-            '\\' => {
-                backslashes += 1;
-                out.push(c);
-                continue;
-            }
-            '%' => {
-                out.truncate(out.len() - (backslashes - backslashes / 2));
-                if backslashes % 2 == 0 {
-                    let percent = out.len();
-                    out.push('%');
-                    out.push_str(&text[i + 1..]);
-                    return (out, Some(percent));
-                }
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-        backslashes = 0;
-    }
-    (out, None)
 }
 
 /// Whether `word` matches `pattern`, which has a `%` at `percent`.
@@ -762,7 +725,7 @@ impl State {
         if let Some(reason) = &self.others_unknown {
             return Binding::Unknown(reason.clone());
         }
-        if is_automatic(name) {
+        if crate::lossless::is_automatic_name(name, MakefileVariant::GNUMake) {
             return if deferred {
                 Binding::Unknown(UnknownReason::AutomaticVariable(name.to_string()))
             } else {
@@ -2468,6 +2431,26 @@ mod tests {
             .map(|r| evaluation.expand_reference(&r).to_string())
             .collect();
         assert_eq!(expanded, vec!["1", "2", "1", "2", "$@"]);
+    }
+
+    #[test]
+    fn test_automatic_variables_in_recipes() {
+        let makefile: Makefile = "all:\n\techo $(@D) $(|D)\n".parse().unwrap();
+        let evaluation = makefile.evaluate(empty_env());
+        let recipe: Vec<_> = makefile
+            .syntax()
+            .descendants()
+            .filter_map(VariableReference::cast)
+            .map(|r| evaluation.expand_reference(&r))
+            .collect();
+        // GNU make has no `$(|D)`, so it is an ordinary undefined variable.
+        assert_eq!(
+            recipe,
+            vec![
+                Expansion::unknown("$(@D)", UnknownReason::AutomaticVariable("@D".to_string())),
+                Expansion::known(""),
+            ]
+        );
     }
 
     #[test]

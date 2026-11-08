@@ -6,7 +6,7 @@
 /// text after the pattern `%` is kept as is. A `%` inside a variable
 /// reference does not count, since make only sees it after expansion.
 pub(crate) fn split_pattern(pattern: &str) -> Option<(String, &str)> {
-    let (prefix, rest) = scan_percent(pattern);
+    let (prefix, rest) = scan_percent(pattern, true);
     Some((prefix, rest?))
 }
 
@@ -14,16 +14,29 @@ pub(crate) fn split_pattern(pattern: &str) -> Option<(String, &str)> {
 /// as [`split_pattern`] does up to the first unquoted `%`, which is kept
 /// along with the text after it.
 pub(crate) fn unescape_percent(name: &str) -> String {
-    match scan_percent(name) {
+    match scan_percent(name, true) {
         (prefix, Some(rest)) => format!("{prefix}%{rest}"),
         (prefix, None) => prefix,
+    }
+}
+
+/// GNU make's `find_percent` on text that has already been expanded:
+/// `text` with the backslashes before each `%` up to the first unquoted
+/// one halved, and the byte position of that `%`.
+pub(crate) fn find_percent(text: &str) -> (String, Option<usize>) {
+    match scan_percent(text, false) {
+        (prefix, Some(rest)) => {
+            let percent = prefix.len();
+            (format!("{prefix}%{rest}"), Some(percent))
+        }
+        (prefix, None) => (prefix, None),
     }
 }
 
 /// The text before the first unquoted `%` in `pattern`, unescaped as
 /// described for [`split_pattern`], and the text after that `%` if there is
 /// one.
-fn scan_percent(pattern: &str) -> (String, Option<&str>) {
+fn scan_percent(pattern: &str, skip_references: bool) -> (String, Option<&str>) {
     let mut prefix = String::new();
     let mut backslashes = 0;
     let mut chars = pattern.char_indices();
@@ -41,7 +54,7 @@ fn scan_percent(pattern: &str) -> (String, Option<&str>) {
                 }
                 prefix.push(c);
             }
-            '$' => {
+            '$' if skip_references => {
                 prefix.push(c);
                 let Some((_, open)) = chars.next() else {
                     break;
