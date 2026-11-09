@@ -391,6 +391,19 @@ pub(crate) fn lf_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
+/// Whether `token`, a COMMENT token, is inside a RECIPE node.
+pub(crate) fn comment_in_recipe(token: &SyntaxToken) -> bool {
+    token.parent().is_some_and(|p| p.kind() == RECIPE)
+}
+
+/// Whether `token`, a COMMENT token, is at the start of a line in a
+/// `define` body.
+pub(crate) fn comment_in_define_body(token: &SyntaxToken) -> bool {
+    token
+        .parent()
+        .is_some_and(|p| p.kind() == EXPR && p.parent().is_some_and(|gp| gp.kind() == VARIABLE))
+}
+
 /// The comment that starts at `token`, a COMMENT token, if it starts one.
 ///
 /// Where references are parsed in comments, in recipe lines and `define`
