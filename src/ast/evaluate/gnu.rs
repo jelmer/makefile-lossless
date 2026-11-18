@@ -1,7 +1,7 @@
 //! Expansion as GNU make does it, following its `expand.c` and `read.c`.
 //! POSIX make is read with this too, without GNU make's functions.
 
-use super::{Environment, Expansion, ExpansionPart, UnknownReason};
+use super::{Environment, Expansion, ExpansionPart, ReadRule, ReadVpath, UnknownReason};
 use crate::lossless::{Conditional, Makefile, VariableDefinition, VariableReference};
 use crate::pattern::find_percent;
 use crate::reference::is_gnu_function;
@@ -1009,6 +1009,10 @@ struct Walker<'a> {
     stop: Option<TextSize>,
     /// Whether the current line calls `eval`.
     pending_eval: bool,
+    /// The rules make reads or may read, in order.
+    rules: Vec<ReadRule>,
+    /// The `vpath` directives make reads or may read, in order.
+    vpaths: Vec<ReadVpath>,
 }
 
 impl<'a> Walker<'a> {
@@ -1025,6 +1029,8 @@ impl<'a> Walker<'a> {
             branches: HashMap::new(),
             stop,
             pending_eval: false,
+            rules: Vec::new(),
+            vpaths: Vec::new(),
         };
         walker.walk(makefile.items());
         walker
@@ -1075,8 +1081,10 @@ impl<'a> Walker<'a> {
                 if let Some(definition) = rule.scoped_assignment() {
                     self.target_specific(&definition);
                 }
+                self.read_rule(rule);
                 self.walk(rule_items(rule));
             }
+            MakefileItem::Vpath(vpath) => self.read_vpath(vpath),
             MakefileItem::Include(_) => self.state.forget_all(UnknownReason::Include),
             MakefileItem::Load(_) => self.state.forget_all(UnknownReason::Load),
             MakefileItem::Conditional(conditional) => {
@@ -1092,6 +1100,68 @@ impl<'a> Walker<'a> {
             }
             _ => {}
         }
+    }
+
+    /// `names` with their variable references expanded, where that is
+    /// known. An expansion can give several names; `$` in it is escaped
+    /// again. A name whose expansion is not known is kept as written.
+    fn expand_names(&mut self, names: impl Iterator<Item = String>) -> Vec<String> {
+        let mut expanded = Vec::new();
+        for name in names {
+            if !name.contains('$') {
+                expanded.push(name);
+                continue;
+            }
+            match self.expand_now(&name).text() {
+                Some(text) => expanded.extend(words(&text).map(|w| w.replace('$', "$$"))),
+                None => expanded.push(name),
+            }
+        }
+        expanded
+    }
+
+    fn read_rule(&mut self, rule: &crate::Rule) {
+        let targets = self.expand_names(rule.targets_with(self.variant.into()));
+        let prerequisites = self.expand_names(rule.prerequisites_for(self.variant));
+        let order_only = self.expand_names(rule.order_only_prerequisites_for(self.variant));
+        let static_pattern = rule
+            .static_pattern_for(self.variant)
+            .map(|pattern| self.expand_names(std::iter::once(pattern)).join(" "));
+        self.rules.push(ReadRule {
+            rule: rule.clone(),
+            targets,
+            prerequisites,
+            order_only,
+            static_pattern,
+        });
+    }
+
+    fn read_vpath(&mut self, vpath: &crate::Vpath) {
+        let expand = |walker: &mut Self, text: String| {
+            if text.contains('$') {
+                walker.expand_now(&text).text()
+            } else {
+                Some(text)
+            }
+        };
+        let Some(pattern) = vpath.pattern() else {
+            self.vpaths.push(ReadVpath::Clear);
+            return;
+        };
+        let Some(pattern) = expand(self, pattern).map(|p| strip(&p).to_string()) else {
+            return;
+        };
+        let directive = match vpath.directories_text_for(self.variant) {
+            None => ReadVpath::ClearPattern(pattern),
+            Some(directories) => match expand(self, directories) {
+                Some(directories) => ReadVpath::Add {
+                    pattern,
+                    directories,
+                },
+                None => return,
+            },
+        };
+        self.vpaths.push(directive);
     }
 
     /// The name `definition` assigns to, `Some(None)` if that is not known.
@@ -1269,8 +1339,10 @@ impl<'a> Walker<'a> {
                     if let Some(definition) = rule.scoped_assignment() {
                         self.target_specific(&definition);
                     }
+                    self.read_rule(rule);
                     self.skip(rule_items(rule), taken);
                 }
+                MakefileItem::Vpath(vpath) => self.read_vpath(vpath),
                 MakefileItem::Variable(definition) => self.forget_assignment(definition),
                 MakefileItem::Include(_) | MakefileItem::Load(_) => {
                     self.state.forget_all(UnknownReason::Conditional)
@@ -1347,18 +1419,23 @@ pub(super) struct Engine {
     env: Environment,
     state: State,
     branches: HashMap<TextSize, Option<bool>>,
+    rules: Vec<ReadRule>,
+    vpaths: Vec<ReadVpath>,
 }
 
 impl Engine {
     pub(super) fn new(makefile: &Makefile, variant: MakefileVariant, env: Environment) -> Self {
         let walker = Walker::run(makefile, &env, variant, None);
-        let (state, branches) = (walker.state, walker.branches);
+        let (state, branches, rules, vpaths) =
+            (walker.state, walker.branches, walker.rules, walker.vpaths);
         Engine {
             makefile: makefile.clone(),
             variant,
             env,
             state,
             branches,
+            rules,
+            vpaths,
         }
     }
 
@@ -1434,6 +1511,14 @@ impl Engine {
             }
             Some(_) => false,
         }
+    }
+
+    pub(super) fn read_rules(&self) -> &[ReadRule] {
+        &self.rules
+    }
+
+    pub(super) fn read_vpaths(&self) -> &[ReadVpath] {
+        &self.vpaths
     }
 
     pub(super) fn branch_taken(&self, branch: &ConditionalBranch) -> Option<bool> {

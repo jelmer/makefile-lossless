@@ -278,6 +278,33 @@ impl fmt::Display for Expansion {
     }
 }
 
+/// A rule as make reads it, with the variable references in its names
+/// expanded where they are known.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadRule {
+    pub(crate) rule: crate::Rule,
+    /// The targets, with `\%` kept as written.
+    pub(crate) targets: Vec<String>,
+    pub(crate) prerequisites: Vec<String>,
+    pub(crate) order_only: Vec<String>,
+    pub(crate) static_pattern: Option<String>,
+}
+
+/// A `vpath` directive as make reads it, with its pattern and directories
+/// expanded.
+#[derive(Debug, Clone)]
+pub(crate) enum ReadVpath {
+    /// `vpath` on its own.
+    Clear,
+    /// `vpath PATTERN`.
+    ClearPattern(String),
+    /// `vpath PATTERN DIRECTORIES`.
+    Add {
+        pattern: String,
+        directories: String,
+    },
+}
+
 /// The variables of a makefile, as make knows them while reading it; see
 /// [`Makefile::evaluate`].
 #[derive(Debug, Clone)]
@@ -335,6 +362,23 @@ impl Evaluation {
             Engine::Unsupported(variant) => {
                 unsupported(&reference.syntax().text().to_string(), *variant)
             }
+        }
+    }
+
+    /// The rules make reads or may read, in order, with their names
+    /// expanded where that is known.
+    pub(crate) fn read_rules(&self) -> &[ReadRule] {
+        match &self.engine {
+            Engine::Gnu(engine) => engine.read_rules(),
+            Engine::Unsupported(_) => &[],
+        }
+    }
+
+    /// The `vpath` directives make reads or may read, in order.
+    pub(crate) fn read_vpaths(&self) -> &[ReadVpath] {
+        match &self.engine {
+            Engine::Gnu(engine) => engine.read_vpaths(),
+            Engine::Unsupported(_) => &[],
         }
     }
 

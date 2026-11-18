@@ -1,6 +1,7 @@
 //! Pattern rules, suffix rules and implicit rule search.
 
-use crate::lossless::{Makefile, Rule, Vpath};
+use super::evaluate::{Environment, Evaluation, ReadRule, ReadVpath};
+use crate::lossless::{Makefile, Rule};
 use crate::pattern::{
     pattern_match, split_pattern, static_pattern_match, substitute_stem, unescape_percent,
     whole_pattern_match, PatternMatch,
@@ -39,8 +40,8 @@ fn default_suffixes(variant: MakefileVariant) -> &'static [&'static str] {
 
 /// The known suffixes after the `.SUFFIXES` rules of `makefile` that start
 /// before `before`, or after all of them.
-// TODO: follow conditionals the way default_goal_candidates does, rather
-// than reading the rules in every branch.
+// TODO: skip the `.SUFFIXES` rules in conditional branches make does not
+// read, as implicit_rule does with Evaluation::branch_taken.
 fn known_suffixes(
     makefile: &Makefile,
     variant: MakefileVariant,
@@ -333,12 +334,14 @@ impl Makefile {
     ///
     /// Only the rules in this makefile are used, not make's built-in rules,
     /// as with `make -r`; but the known suffixes include make's default
-    /// ones, as [`Self::suffixes`] says. Names are not expanded, so a
-    /// pattern rule with a variable reference in a target or prerequisite
-    /// is not used. Rules and `vpath` directives in every branch of a
-    /// conditional are read. Prerequisites are also looked for in the
-    /// directories `vpath` directives give, but not yet in those of
-    /// `VPATH`, and `.SECONDEXPANSION` is not taken into account.
+    /// ones, as [`Self::suffixes`] says. Variable references in the names
+    /// of rules and in `vpath` directives are expanded as
+    /// [`Self::evaluate`] does with an unknown environment; a pattern rule
+    /// with a name that can not be expanded is not used. Rules and `vpath`
+    /// directives in conditional branches make does not read are skipped,
+    /// and those in branches it may read are used. Prerequisites are also
+    /// looked for in the directories of `vpath` directives and `VPATH`.
+    /// `.SECONDEXPANSION` is not taken into account.
     ///
     /// For an archive member such as `lib.a(foo.o)`, rules for the whole
     /// name are tried first, then rules for the member, such as the
@@ -356,8 +359,7 @@ impl Makefile {
     /// assert_eq!(m.chain()[0].target(), "src/foo.c");
     /// assert_eq!(m.chain()[0].prerequisites(), ["src/foo.y"]);
     /// ```
-    // TODO: follow conditionals, as default_goal_candidates does, and
-    // support `.SECONDEXPANSION`.
+    // TODO: support `.SECONDEXPANSION`.
     pub fn implicit_rule(
         &self,
         target: &str,
@@ -384,29 +386,34 @@ impl Makefile {
         ) {
             return None;
         }
-        if self
-            .special_target_prerequisites_for(".PHONY", variant)
-            .any(|p| p == target)
-        {
+        let evaluation = self.evaluate_for(variant, Environment::Unknown);
+        let rules = evaluation.read_rules();
+        let phony: Vec<&String> = rules
+            .iter()
+            .filter(|r| !is_pattern_rule(r) && explicit_targets(r).iter().any(|t| t == ".PHONY"))
+            .flat_map(|r| &r.prerequisites)
+            .collect();
+        if phony.iter().any(|p| *p == target) {
             return None;
         }
         let mut targets = HashSet::new();
         let mut mentioned = HashSet::new();
         let mut explicit = Vec::new();
-        for rule in self.rules().filter(|r| !r.is_pattern_for(variant)) {
-            let rule_targets: Vec<String> = rule.targets_for(variant).collect();
-            let static_pattern = rule.static_pattern_for(variant);
-            let prerequisites: Vec<String> = rule
-                .prerequisites_for(variant)
-                .chain(rule.order_only_prerequisites_for(variant))
+        for read in rules.iter().filter(|r| !is_pattern_rule(r)) {
+            let rule_targets = explicit_targets(read);
+            let prerequisites: Vec<String> = read
+                .prerequisites
+                .iter()
+                .chain(&read.order_only)
+                .cloned()
                 .collect();
             for rule_target in &rule_targets {
-                let names = match &static_pattern {
+                let names = match &read.static_pattern {
                     Some(pattern) => static_prerequisites(pattern, rule_target, &prerequisites),
                     None => prerequisites.clone(),
                 };
                 if rule_target == target {
-                    if has_recipe(&rule) {
+                    if has_recipe(&read.rule) {
                         return None;
                     }
                     explicit.extend(names.iter().cloned());
@@ -415,10 +422,10 @@ impl Makefile {
             }
             targets.extend(rule_targets);
         }
-        targets.extend(self.special_target_prerequisites_for(".PHONY", variant));
+        targets.extend(phony.into_iter().cloned());
         mentioned.extend(targets.iter().cloned());
 
-        let candidates = self.implicit_rule_candidates(variant);
+        let candidates = self.implicit_rule_candidates(&evaluation, variant);
         let mut search = Search {
             in_use: vec![false; candidates.len()],
             candidates: &candidates,
@@ -426,7 +433,7 @@ impl Makefile {
             targets,
             mentioned,
             impossible: HashSet::new(),
-            vpaths: self.vpath_entries(variant),
+            vpaths: vpath_entries(&evaluation, variant),
         };
         if let Some(found) = search.search(target, 0, &explicit, false, false) {
             return Some(found);
@@ -450,7 +457,7 @@ impl Makefile {
             return None;
         }
         Some(ImplicitMatch {
-            rule: self.default_rule(variant)?,
+            rule: default_rule(rules)?,
             target: target.to_string(),
             stem: String::new(),
             prerequisites: vec![],
@@ -459,94 +466,40 @@ impl Makefile {
         })
     }
 
-    /// The `vpath` directives in effect after reading the makefile, in the
-    /// order make searches them.
-    // TODO: also search the directories in `VPATH`, once its value can be
-    // worked out (see #118).
-    fn vpath_entries(&self, variant: MakefileVariant) -> Vec<VpathEntry> {
-        let mut entries: Vec<VpathEntry> = Vec::new();
-        if variant != MakefileVariant::GNUMake {
-            return entries;
-        }
-        for vpath in self.syntax().descendants().filter_map(Vpath::cast) {
-            let Some(pattern) = vpath.pattern() else {
-                entries.clear();
-                continue;
-            };
-            let Some(directories) = vpath.directories_text_for(variant) else {
-                entries.retain(|e| e.pattern != pattern);
-                continue;
-            };
-            // TODO: expand variable references in vpath directives.
-            if pattern.contains('$') || directories.contains('$') {
-                continue;
-            }
-            let directories: Vec<String> = directories
-                .split(|c: char| c == ':' || c.is_whitespace())
-                .filter(|d| !d.is_empty() && *d != ".")
-                .map(|d| match d.strip_suffix('/') {
-                    Some(stripped) if !stripped.is_empty() => stripped.to_string(),
-                    _ => d.to_string(),
-                })
-                .collect();
-            if !directories.is_empty() {
-                entries.push(VpathEntry {
-                    pattern,
-                    directories,
-                });
-            }
-        }
-        entries
-    }
-
-    /// The `.DEFAULT` rule whose recipe make uses: the last one with a
-    /// recipe, unless a later one with neither a recipe nor prerequisites
-    /// clears it.
-    fn default_rule(&self, variant: MakefileVariant) -> Option<Rule> {
-        let mut default = None;
-        for rule in self
-            .rules()
-            .filter(|r| r.targets_for(variant).any(|t| t == ".DEFAULT"))
-        {
-            if has_recipe(&rule) {
-                default = Some(rule);
-            } else if rule.prerequisites_for(variant).next().is_none()
-                && rule.order_only_prerequisites_for(variant).next().is_none()
-            {
-                default = None;
-            }
-        }
-        default
-    }
-
     /// The pattern rules GNU make tries, in order: those in the makefile,
     /// then those converted from suffix rules.
-    fn implicit_rule_candidates(&self, variant: MakefileVariant) -> Vec<Candidate> {
+    fn implicit_rule_candidates(
+        &self,
+        evaluation: &Evaluation,
+        variant: MakefileVariant,
+    ) -> Vec<Candidate> {
         let mut candidates = Vec::new();
-        for rule in self.rules() {
-            if !rule.is_pattern_for(variant) {
-                continue;
-            }
-            let targets: Vec<String> = rule.targets_for(variant).collect();
+        for read in evaluation
+            .read_rules()
+            .iter()
+            .filter(|r| is_pattern_rule(r))
+        {
             // make rejects a pattern rule with a target that is not a
             // pattern.
-            if targets.iter().any(|t| split_pattern(t).is_none()) {
+            if read.targets.iter().any(|t| split_pattern(t).is_none()) {
                 continue;
             }
             let candidate = Candidate {
-                targets,
-                prerequisites: rule.prerequisites_for(variant).collect(),
-                order_only: rule.order_only_prerequisites_for(variant).collect(),
-                has_recipe: has_recipe(&rule),
-                terminal: rule.is_double_colon(),
-                rule: Some(rule),
+                targets: read.targets.clone(),
+                prerequisites: read.prerequisites.clone(),
+                order_only: read.order_only.clone(),
+                has_recipe: has_recipe(&read.rule),
+                terminal: read.rule.is_double_colon(),
+                rule: Some(read.rule.clone()),
             };
             add_candidate(&mut candidates, candidate, true);
         }
 
         // make uses the last recipe given for a file.
-        let suffix_rules: Vec<Rule> = self
-            .rules()
+        let suffix_rules: Vec<Rule> = evaluation
+            .read_rules()
+            .iter()
+            .map(|r| r.rule.clone())
             .filter(|r| has_recipe(r) && r.is_suffix_rule_for(variant))
             .collect();
         let recipe_rule = |name: &str| {
@@ -713,6 +666,90 @@ fn add_candidate(candidates: &mut Vec<Candidate>, new: Candidate, replace: bool)
     candidates.push(new);
 }
 
+/// Whether make reads `rule` as a pattern rule: one whose first target,
+/// once expanded, has a `%`, and which is not a static pattern rule.
+fn is_pattern_rule(rule: &ReadRule) -> bool {
+    rule.static_pattern.is_none()
+        && rule
+            .targets
+            .first()
+            .is_some_and(|t| split_pattern(t).is_some())
+}
+
+/// The targets of a rule that is not a pattern rule, with `\%` read as `%`.
+fn explicit_targets(rule: &ReadRule) -> Vec<String> {
+    rule.targets.iter().map(|t| unescape_percent(t)).collect()
+}
+
+/// The `.DEFAULT` rule whose recipe make uses: the last one with a recipe,
+/// unless a later one with neither a recipe nor prerequisites clears it.
+fn default_rule(rules: &[ReadRule]) -> Option<Rule> {
+    let mut default = None;
+    for read in rules
+        .iter()
+        .filter(|r| !is_pattern_rule(r) && explicit_targets(r).iter().any(|t| t == ".DEFAULT"))
+    {
+        if has_recipe(&read.rule) {
+            default = Some(read.rule.clone());
+        } else if read.prerequisites.is_empty() && read.order_only.is_empty() {
+            default = None;
+        }
+    }
+    default
+}
+
+/// The directories in a `vpath` directive or `VPATH`, as GNU make splits
+/// them.
+fn vpath_directories(text: &str) -> Vec<String> {
+    text.split(|c: char| c == ':' || c.is_whitespace())
+        .filter(|d| !d.is_empty() && *d != ".")
+        .map(|d| match d.strip_suffix('/') {
+            Some(stripped) if !stripped.is_empty() => stripped.to_string(),
+            _ => d.to_string(),
+        })
+        .collect()
+}
+
+/// The `vpath` directives in effect after reading the makefile, in the
+/// order make searches them, followed by the directories of `VPATH`.
+fn vpath_entries(evaluation: &Evaluation, variant: MakefileVariant) -> Vec<VpathEntry> {
+    let mut entries: Vec<VpathEntry> = Vec::new();
+    if variant != MakefileVariant::GNUMake {
+        return entries;
+    }
+    for directive in evaluation.read_vpaths() {
+        match directive {
+            ReadVpath::Clear => entries.clear(),
+            ReadVpath::ClearPattern(pattern) => entries.retain(|e| e.pattern != *pattern),
+            ReadVpath::Add {
+                pattern,
+                directories,
+            } => {
+                let directories = vpath_directories(directories);
+                if !directories.is_empty() {
+                    entries.push(VpathEntry {
+                        pattern: pattern.clone(),
+                        directories,
+                    });
+                }
+            }
+        }
+    }
+    // make reads `VPATH` once it has read the makefile.
+    let general = evaluation
+        .variable("VPATH")
+        .and_then(|value| value.text())
+        .map(|value| vpath_directories(&value))
+        .unwrap_or_default();
+    if !general.is_empty() {
+        entries.push(VpathEntry {
+            pattern: "%".to_string(),
+            directories: general,
+        });
+    }
+    entries
+}
+
 /// A `vpath` directive: the directories to search for names matching
 /// `pattern`.
 struct VpathEntry {
@@ -872,8 +909,8 @@ impl<F: Fn(&str) -> bool> Search<'_, F> {
                 let substitute = |names: &[String]| -> Option<Vec<String>> {
                     names.iter().map(|p| substitute_stem(p, &t.m)).collect()
                 };
-                // TODO: expand variable references in prerequisites;
-                // until then a rule that needs it is not used.
+                // References left in prerequisites could not be expanded,
+                // so a rule that needs them is not used.
                 let (Some(prerequisites), Some(order_only)) = (
                     substitute(&candidate.prerequisites),
                     substitute(&candidate.order_only),
@@ -1375,6 +1412,69 @@ mod tests {
             ),
             some("member: lib.a(foo.o) <- foo.c (yacc: foo.c <- foo.y)")
         );
+    }
+
+    #[test]
+    fn test_expanded_names() {
+        assert_eq!(
+            find(
+                "HDRS := a.h\n%.o: %.c $(HDRS)\n\tc\n",
+                "x.o",
+                &["x.c", "a.h"]
+            ),
+            some("c: x.o <- x.c a.h")
+        );
+        assert_eq!(
+            find("PAT = %.o\n$(PAT): %.c\n\tc\n", "x.o", &["x.c"]),
+            some("c: x.o <- x.c")
+        );
+        // A name that can not be expanded is not used.
+        assert_eq!(find("%.o: %.c $(shell echo)\n\tc\n", "x.o", &["x.c"]), None);
+        assert_eq!(
+            find("PH = x.o\n.PHONY: $(PH)\n%.o: %.c\n\tc\n", "x.o", &["x.c"]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_vpath_variable() {
+        let rule = "%.o: %.c\n\tc\n";
+        assert_eq!(
+            find(
+                &format!("VPATH = nope:src other\n{rule}"),
+                "x.o",
+                &["src/x.c"]
+            ),
+            some("c: x.o <- x.c")
+        );
+        assert_eq!(
+            find(
+                &format!("SRC = src\nvpath %.c $(SRC)\n{rule}"),
+                "x.o",
+                &["src/x.c"]
+            ),
+            some("c: x.o <- x.c")
+        );
+        // `vpath` directives are searched before `VPATH`.
+        let text = format!("VPATH = src\nvpath %.c other\n{rule}");
+        let makefile: Makefile = text.parse().unwrap();
+        let found = std::cell::RefCell::new(Vec::new());
+        makefile.implicit_rule("x.o", |f| {
+            found.borrow_mut().push(f.to_string());
+            f == "src/x.c" || f == "other/x.c"
+        });
+        assert_eq!(found.into_inner(), vec!["x.c", "other/x.c"]);
+    }
+
+    #[test]
+    fn test_conditionals_followed() {
+        let text = "X = n\nifeq ($(X),y)\n%.o: %.c\n\tyes\nelse\n%.o: %.q\n\telse\nendif\n";
+        assert_eq!(find(text, "x.o", &["x.c", "x.q"]), some("else: x.o <- x.q"));
+        let text = "X = n\nifeq ($(X),y)\nvpath %.c src\nendif\n%.o: %.c\n\tc\n";
+        assert_eq!(find(text, "x.o", &["src/x.c"]), None);
+        // A branch that may be read is still used.
+        let text = "ifdef FROM_ENV\n%.o: %.c\n\tc\nendif\n";
+        assert_eq!(find(text, "x.o", &["x.c"]), some("c: x.o <- x.c"));
     }
 
     #[test]
