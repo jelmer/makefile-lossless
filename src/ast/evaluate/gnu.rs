@@ -5,8 +5,8 @@ use super::{Environment, Expansion, ExpansionPart, UnknownReason};
 use crate::lossless::{Conditional, Makefile, VariableDefinition, VariableReference};
 use crate::pattern::find_percent;
 use crate::{
-    AssignmentOperator, ConditionalBranch, ConditionalItem, FunctionCall, MakefileItem,
-    MakefileVariant, ReferenceLocation, TextSize,
+    AssignmentOperator, BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind,
+    FunctionCall, MakefileItem, MakefileVariant, ReferenceLocation, TextSize,
 };
 use rowan::ast::AstNode;
 use std::collections::{HashMap, HashSet};
@@ -642,6 +642,7 @@ struct Walker<'a> {
     env: &'a Environment,
     variant: MakefileVariant,
     state: State,
+    branches: HashMap<TextSize, Option<bool>>,
     /// Where to stop reading, if not at the end.
     stop: Option<TextSize>,
     /// Whether the current line calls `eval`.
@@ -659,6 +660,7 @@ impl<'a> Walker<'a> {
             env,
             variant,
             state: State::new(env),
+            branches: HashMap::new(),
             stop,
             pending_eval: false,
         };
@@ -852,14 +854,19 @@ impl<'a> Walker<'a> {
 
     /// Read a conditional, returning whether reading stopped in it.
     fn conditional(&mut self, conditional: &Conditional) -> bool {
-        // TODO: follow the branches whose condition is known.
+        // Whether an earlier branch was taken.
+        let mut earlier = Some(false);
         for branch in conditional.branches() {
-            if self
-                .stop
-                .is_some_and(|stop| stop < branch.directive_range().end())
-            {
+            let header = branch.directive_range();
+            if self.stop.is_some_and(|stop| stop < header.end()) {
                 return true;
             }
+            let taken = match earlier {
+                Some(true) => Some(false),
+                Some(false) => self.condition(&branch),
+                None => None,
+            };
+            self.branches.insert(header.start(), taken);
             if self
                 .stop
                 .is_some_and(|stop| stop < branch.text_range().end())
@@ -867,26 +874,40 @@ impl<'a> Walker<'a> {
                 self.walk(branch_items(&branch));
                 return true;
             }
-            self.skip(branch_items(&branch));
+            match taken {
+                Some(true) => {
+                    self.walk(branch_items(&branch));
+                    earlier = Some(true);
+                }
+                Some(false) => self.skip(branch_items(&branch), Some(false)),
+                None => {
+                    self.skip(branch_items(&branch), None);
+                    earlier = None;
+                }
+            }
         }
         false
     }
 
-    /// Note `items`, of a conditional branch that make may or may not read:
-    /// the variables they may set become unknown.
-    fn skip(&mut self, items: impl Iterator<Item = MakefileItem>) {
+    /// Note the conditional branches in `items`, which make does not read
+    /// (`Some(false)`) or may read (`None`). For the latter, the variables
+    /// they may set become unknown.
+    fn skip(&mut self, items: impl Iterator<Item = MakefileItem>, taken: Option<bool>) {
         for item in items {
             match &item {
                 MakefileItem::Conditional(conditional) => {
                     for branch in conditional.branches() {
-                        self.skip(branch_items(&branch));
+                        self.branches
+                            .insert(branch.directive_range().start(), taken);
+                        self.skip(branch_items(&branch), taken);
                     }
                 }
+                _ if taken == Some(false) => {}
                 MakefileItem::Rule(rule) => {
                     if let Some(definition) = rule.scoped_assignment() {
                         self.target_specific(&definition);
                     }
-                    self.skip(rule_items(rule));
+                    self.skip(rule_items(rule), taken);
                 }
                 MakefileItem::Variable(definition) => self.forget_assignment(definition),
                 MakefileItem::Include(_) | MakefileItem::Load(_) => {
@@ -923,6 +944,37 @@ impl<'a> Walker<'a> {
                 .insert(name, Binding::Unknown(UnknownReason::Conditional));
         }
     }
+
+    /// Whether make takes `branch`, if that is known.
+    fn condition(&mut self, branch: &ConditionalBranch) -> Option<bool> {
+        let kind = match branch.branch_kind()? {
+            BranchKind::Else => return Some(true),
+            BranchKind::Conditional(kind) => kind,
+        };
+        let text = branch.condition_for(self.variant)?;
+        match kind {
+            ConditionalKind::Ifdef | ConditionalKind::Ifndef => {
+                let name = self.expand_now(&text).text()?;
+                let mut names = words(&name);
+                let (Some(name), None) = (names.next(), names.next()) else {
+                    return None;
+                };
+                let defined = match self.state.binding(name, self.env, false) {
+                    Binding::Set(var) => !var.value.is_empty_known()?,
+                    Binding::Undefined => false,
+                    Binding::Unknown(_) => return None,
+                };
+                Some(defined == (kind == ConditionalKind::Ifdef))
+            }
+            ConditionalKind::Ifeq | ConditionalKind::Ifneq => {
+                let (first, second) = branch.ifeq_args_for(self.variant)?;
+                let first = self.expand_now(&first).text()?;
+                let second = self.expand_now(&second).text()?;
+                Some((first == second) == (kind == ConditionalKind::Ifeq))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The variables of a makefile as GNU make reads it.
@@ -932,16 +984,19 @@ pub(super) struct Engine {
     variant: MakefileVariant,
     env: Environment,
     state: State,
+    branches: HashMap<TextSize, Option<bool>>,
 }
 
 impl Engine {
     pub(super) fn new(makefile: &Makefile, variant: MakefileVariant, env: Environment) -> Self {
-        let state = Walker::run(makefile, &env, variant, None).state;
+        let walker = Walker::run(makefile, &env, variant, None);
+        let (state, branches) = (walker.state, walker.branches);
         Engine {
             makefile: makefile.clone(),
             variant,
             env,
             state,
+            branches,
         }
     }
 
@@ -1017,6 +1072,13 @@ impl Engine {
             }
             Some(_) => false,
         }
+    }
+
+    pub(super) fn branch_taken(&self, branch: &ConditionalBranch) -> Option<bool> {
+        self.branches
+            .get(&branch.directive_range().start())
+            .copied()
+            .flatten()
     }
 }
 
@@ -1160,6 +1222,60 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_conditionals() {
+        let text = "EMPTY =\nE2 = $(EMPTY)\nSP = $(EMPTY) $(EMPTY)\nX = x\nNAME = X\n";
+        let cases = [
+            ("ifdef E2", true),
+            ("ifdef EMPTY", false),
+            ("ifdef $(NAME)", true),
+            ("ifeq ( x , x)", false),
+            ("ifeq (x ,x)", true),
+            ("ifeq (x, x )", false),
+            ("ifeq ($(SP),)", false),
+            ("ifeq \"a b\" 'a b'", true),
+            ("ifneq ($(X),y)", true),
+            ("ifndef UNDEFINED", true),
+        ];
+        for (condition, expected) in cases {
+            let full = format!("{text}{condition}\nR = yes\nelse\nR = no\nendif\n");
+            assert_eq!(
+                at_end(&full, "$(R)"),
+                if expected { "yes" } else { "no" },
+                "{condition}"
+            );
+        }
+        let chain =
+            "X = x\nifeq ($(X),a)\nR = a\nelse ifeq ($(X),x)\nR = x\nelse\nR = else\nendif\n";
+        assert_eq!(at_end(chain, "$(R)"), "x");
+        let nested = "X = x\nifdef X\n  ifeq ($(X),x)\n    R = nested\n  endif\nendif\n";
+        assert_eq!(at_end(nested, "$(R)"), "nested");
+        // GNU make 4.4.1 does not skip `$,` when looking for the comma.
+        let comma = "ifeq ($,x,$,x)\nR := equal\nelse\nR := not equal\nendif\n";
+        assert_eq!(at_end(comma, "$(R)"), "not equal");
+    }
+
+    #[test]
+    fn test_branch_taken() {
+        let text = "X = x\nifeq ($(X),a)\nelse ifeq ($(Y),y)\nelse\nendif\nifdef X\nifdef Y\nendif\nendif\n";
+        let makefile: Makefile = text.parse().unwrap();
+        let evaluation = makefile.evaluate(Environment::Unknown);
+        let taken: Vec<_> = makefile
+            .conditionals()
+            .flat_map(|c| c.branches().collect::<Vec<_>>())
+            .map(|b| evaluation.branch_taken(&b))
+            .collect();
+        assert_eq!(taken, vec![Some(false), None, None, Some(true)]);
+        let nested = makefile
+            .syntax()
+            .descendants()
+            .filter_map(Conditional::cast)
+            .nth(2)
+            .unwrap();
+        let branch = nested.branches().next().unwrap();
+        assert_eq!(evaluation.branch_taken(&branch), None);
     }
 
     #[test]
