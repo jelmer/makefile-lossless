@@ -52,6 +52,7 @@ pub mod archive;
 pub mod bsd;
 pub mod conditional;
 pub mod default_goal;
+pub mod evaluate;
 pub mod expression_statement;
 pub mod implicit;
 pub mod include;

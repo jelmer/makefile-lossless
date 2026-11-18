@@ -117,6 +117,7 @@ struct ReadmeDoctests;
 pub use ast::bsd::DirectiveKind;
 pub use ast::conditional::{BranchKind, ConditionalBranch, ConditionalItem, ConditionalKind};
 pub use ast::default_goal::DefaultGoal;
+pub use ast::evaluate::{Environment, Evaluation, Expansion, ExpansionPart, UnknownReason};
 pub use ast::implicit::ImplicitMatch;
 pub use ast::include::IncludeKind;
 pub use ast::makefile::MakefileItem;
