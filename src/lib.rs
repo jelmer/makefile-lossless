@@ -119,7 +119,7 @@ pub use ast::conditional::{BranchKind, ConditionalBranch, ConditionalItem, Condi
 pub use ast::default_goal::DefaultGoal;
 pub use ast::implicit::ImplicitMatch;
 pub use ast::include::IncludeKind;
-pub use ast::makefile::MakefileItem;
+pub use ast::makefile::{Comment, MakefileItem};
 pub use ast::rule::{RuleItem, RuleOperator};
 pub use ast::variable::{AssignmentOperator, ExportState};
 pub use bsd_condition::{
