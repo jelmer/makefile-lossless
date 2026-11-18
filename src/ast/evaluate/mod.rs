@@ -375,9 +375,9 @@ impl Makefile {
     /// in a branch that may or may not be read is unknown afterwards. After
     /// an `include` or `load` directive, a call of `eval` or a line whose
     /// expansion make reads as makefile text, every variable is unknown
-    /// until it is set again. Of the functions, only `value`, `flavor` and
-    /// `origin` are evaluated. Variables given on the command line are not
-    /// taken into account.
+    /// until it is set again. The pure text functions are evaluated;
+    /// others, such as `shell` and `wildcard`, are unknown. Variables given
+    /// on the command line are not taken into account.
     ///
     /// POSIX make is read like GNU make without its functions. For BSD
     /// make and nmake, everything is unknown.

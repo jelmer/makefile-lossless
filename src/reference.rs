@@ -571,6 +571,11 @@ const GNU_FUNCTIONS: &[(&str, usize)] = &[
     ("words", 1),
 ];
 
+/// Whether `name` is the name of a GNU make built-in function.
+pub(crate) fn is_gnu_function(name: &str) -> bool {
+    GNU_FUNCTIONS.iter().any(|(n, _)| *n == name)
+}
+
 /// A call of a GNU make built-in function, such as
 /// `$(patsubst %.c,%.o,$(SRCS))`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
