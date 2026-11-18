@@ -1084,3 +1084,20 @@ fn test_undefine_names() {
     assert_eq!(vars[0].names().collect::<Vec<_>>(), vec!["FOO"]);
     assert_eq!(vars[1].names().collect::<Vec<_>>(), vec!["BAR"]);
 }
+
+#[test]
+fn test_define_body_tab_line_continuation() {
+    // Inside a define body, make joins a line ending in `\` to the next
+    // one. Tab-indented lines are not recipe lines there, so the
+    // backslash continues the line just like anywhere else.
+    let code = "define X\n\ta \\\n\tb\nendef\n";
+    let makefile: Makefile = code
+        .parse()
+        .expect("tab continuation in define should parse");
+    assert_eq!(code, makefile.to_string());
+    let var = makefile.variable_definitions().next().unwrap();
+    assert_eq!(
+        Some("\ta b".to_string()),
+        var.value_for(MakefileVariant::GNUMake)
+    );
+}

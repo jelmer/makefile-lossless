@@ -134,7 +134,7 @@ fn single_line_value_expr(
 
 /// The number of `define` blocks opened in the body of a `define` block
 /// and not closed again, counted the way the parser does: by the first word
-/// of each logical line.
+/// of each logical line, ignoring lines that start with the recipe prefix.
 fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
     let tokens: Vec<_> = body
         .descendants_with_tokens()
@@ -143,6 +143,15 @@ fn open_nested_defines(body: &crate::lossless::SyntaxNode) -> usize {
     let lines = tokens.split(|t| t.kind() == NEWLINE && !is_continuation(&t.clone().into()));
     let mut depth = 0usize;
     for line in lines {
+        // Like make, skip lines that start with a tab: they can't open or
+        // close a `define`, only continue a recipe-style body line.
+        if line
+            .iter()
+            .next()
+            .is_some_and(|t| t.kind() == INDENT && t.text().starts_with('\t'))
+        {
+            continue;
+        }
         let mut words = line
             .iter()
             .skip_while(|t| matches!(t.kind(), WHITESPACE | INDENT));
