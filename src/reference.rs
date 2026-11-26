@@ -407,7 +407,7 @@ pub enum Modifier {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{MakefileVariant, Modifier, ModifierArg, ParsedReference};
+/// use makefile_edit::{MakefileVariant, Modifier, ModifierArg, ParsedReference};
 /// let parsed = ParsedReference::parse("${SRCS:M*.c:Q}", MakefileVariant::BSDMake).unwrap();
 /// assert_eq!(parsed.name, "SRCS");
 /// assert_eq!(
@@ -601,7 +601,7 @@ impl FunctionCall {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::FunctionCall;
+    /// use makefile_edit::FunctionCall;
     ///
     /// let text = "$(if $(X),a,b,c) rest";
     /// let (call, len) = FunctionCall::parse_prefix(text).unwrap().unwrap();
@@ -632,7 +632,7 @@ impl FunctionCall {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::FunctionCall;
+    /// use makefile_edit::FunctionCall;
     ///
     /// let text = "$(subst a,$(X)";
     /// let (call, len) = FunctionCall::parse_partial_prefix(text).unwrap().unwrap();
@@ -873,7 +873,7 @@ impl TextPart {
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{split_references, MakefileVariant, TextPart};
+/// use makefile_edit::{split_references, MakefileVariant, TextPart};
 ///
 /// let parts = split_references("cp $(SRC) $$HOME/$@", MakefileVariant::GNUMake);
 /// assert_eq!(

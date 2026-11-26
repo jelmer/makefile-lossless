@@ -11,7 +11,7 @@ syntax are supported. By default the parser accepts any of them; use
 `Makefile::parse_with_variant` to restrict parsing to one:
 
 ```rust
-use makefile_lossless::{Makefile, MakefileVariant};
+use makefile_edit::{Makefile, MakefileVariant};
 
 let parsed = Makefile::parse_with_variant("!IF 1\nX = 1\n!ENDIF\n", MakefileVariant::NMake);
 assert!(parsed.is_ok());
@@ -24,7 +24,7 @@ Parsing
 -------
 
 ```rust
-use makefile_lossless::Makefile;
+use makefile_edit::Makefile;
 
 let contents = r#"PYTHON = python3
 
@@ -48,7 +48,7 @@ You can also read from any `std::io::Read`:
 
 ```rust,no_run
 use std::fs::File;
-use makefile_lossless::Makefile;
+use makefile_edit::Makefile;
 
 let makefile = Makefile::from_reader(File::open("Makefile").unwrap()).unwrap();
 ```
@@ -64,7 +64,7 @@ The tree is mutable. Changes are applied in place and the rest of the file is
 left untouched:
 
 ```rust
-use makefile_lossless::Makefile;
+use makefile_edit::Makefile;
 
 let mut makefile: Makefile = "all:\n".parse().unwrap();
 let mut rule = makefile.add_rule("build");

@@ -3,7 +3,7 @@
 mod variant;
 
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::{split_references, ParsedReference, TextPart};
+use makefile_edit::{split_references, ParsedReference, TextPart};
 
 fuzz_target!(|data: &[u8]| {
     let Some((variant, text)) = variant::variant_and_text(data) else {

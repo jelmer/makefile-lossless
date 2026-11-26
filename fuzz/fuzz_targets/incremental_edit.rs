@@ -3,7 +3,7 @@
 mod variant;
 
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::{apply_edit_to_text, TextEdit, TextRange};
+use makefile_edit::{apply_edit_to_text, TextEdit, TextRange};
 
 // Input layout:
 //   u8 make variant, as for the parse target

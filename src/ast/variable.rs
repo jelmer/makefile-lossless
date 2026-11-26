@@ -293,7 +293,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "override define X\nx\nendef\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(
@@ -513,7 +513,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "export quiet Q KBUILD_VERBOSE\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(
@@ -535,7 +535,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "export A $(B)\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// let ranges: Vec<_> = var
@@ -586,7 +586,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "export FOO := bar\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// let range = var.name_range().unwrap();
@@ -628,7 +628,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "define A\nx\nendef\n".parse().unwrap();
     /// assert!(makefile.variable_definitions().next().unwrap().has_endef());
     /// let (makefile, _) = Makefile::from_str_relaxed("define A\nx\n");
@@ -661,7 +661,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let (makefile, _) = Makefile::from_str_relaxed("define A\ndefine B\nx");
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.add_endef().unwrap());
@@ -743,7 +743,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "define E\n$(FOO) $$(BAR) ${BAZ:a=b}\nendef\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// let names: Vec<_> = var
@@ -777,7 +777,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "override undefine CC\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.is_undefine());
@@ -813,7 +813,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "unexport CC\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.is_unexport());
@@ -837,7 +837,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{ExportState, Makefile};
+    /// use makefile_edit::{ExportState, Makefile};
     /// let makefile: Makefile = "export unexport X = 1\nunexport export Y = 2\nZ = 3\n"
     ///     .parse()
     ///     .unwrap();
@@ -874,7 +874,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "override CC = clang\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.is_override());
@@ -893,7 +893,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "all: private CFLAGS = -O2\n".parse().unwrap();
     /// let var = rule.scoped_assignment().unwrap();
     /// assert!(var.is_private());
@@ -917,7 +917,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "all: X = 1\nall:\nifdef D\n\techo\nY = 1\nendif\n"
     ///     .parse()
     ///     .unwrap();
@@ -942,7 +942,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "VAR := value\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(var.assignment_operator(), Some(":=".to_string()));
@@ -957,7 +957,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{AssignmentOperator, Makefile};
+    /// use makefile_edit::{AssignmentOperator, Makefile};
     /// let makefile: Makefile = "VAR := value\nX += y\n".parse().unwrap();
     /// let ops: Vec<_> = makefile
     ///     .variable_definitions()
@@ -1005,7 +1005,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "X := a $(B) # c\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(var.value_range(), Some(TextRange::new(5.into(), 12.into())));
@@ -1026,7 +1026,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "X.$(A) = $(B) $(addprefix -I,$(C))\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// let names: Vec<_> = var.value_references().filter_map(|r| r.name()).collect();
@@ -1068,7 +1068,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = "X := a\\#b \\\n    c # comment\n".parse().unwrap();
     /// let var = makefile.variable_definitions().next().unwrap();
     /// assert_eq!(var.raw_value(), Some("a\\#b \\\n    c ".to_string()));
@@ -1109,7 +1109,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = "all: CFLAGS += -O2 \\\n\t-g # debug\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
     /// let var = rule.scoped_assignment().unwrap();
@@ -1152,7 +1152,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     ///
     /// let makefile: Makefile = r#"ifdef DEBUG
     /// VAR = value
@@ -1161,7 +1161,7 @@ impl VariableDefinition {
     /// let cond = makefile.conditionals().next().unwrap();
     /// let var = cond.if_items().next().unwrap();
     /// // Variable's parent is the conditional
-    /// assert!(matches!(var, makefile_lossless::MakefileItem::Variable(_)));
+    /// assert!(matches!(var, makefile_edit::MakefileItem::Variable(_)));
     /// ```
     pub fn parent(&self) -> Option<MakefileItem> {
         self.syntax().parent().and_then(MakefileItem::cast)
@@ -1176,7 +1176,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR = value\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.remove();
@@ -1204,7 +1204,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR := value\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_assignment_operator("?=");
@@ -1226,7 +1226,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR := value\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_assignment_operator("bogus").is_err());
@@ -1261,7 +1261,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant("VAR = cmd\n", MakefileVariant::BSDMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_assignment_operator_for(":sh=", MakefileVariant::BSDMake);
@@ -1282,7 +1282,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant("VAR = value\n", MakefileVariant::NMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_assignment_operator_for(":=", MakefileVariant::NMake).is_err());
@@ -1380,7 +1380,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "export FOO := bar\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_name("BAZ");
@@ -1408,7 +1408,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "FOO := bar\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_name("A\nB").is_err());
@@ -1476,7 +1476,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR = value  \n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.trim_trailing_value_whitespace());
@@ -1512,7 +1512,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, TextRange};
+    /// use makefile_edit::{Makefile, TextRange};
     /// let makefile: Makefile = "X = a  # c\nY = b\n".parse().unwrap();
     /// let ranges: Vec<_> = makefile
     ///     .variable_definitions()
@@ -1552,7 +1552,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "export VAR := old_value\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_value("new_value");
@@ -1580,7 +1580,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let mut makefile: Makefile = "VAR = old\n".parse().unwrap();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_value("a\nb").is_err());
@@ -1612,7 +1612,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// var.set_value_for("${A:S/a/#/}", MakefileVariant::BSDMake);
@@ -1634,7 +1634,7 @@ impl VariableDefinition {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile = Makefile::parse_with_variant("X = old\n", MakefileVariant::BSDMake).tree();
     /// let mut var = makefile.variable_definitions().next().unwrap();
     /// assert!(var.try_set_value_for("a ", MakefileVariant::BSDMake).is_err());

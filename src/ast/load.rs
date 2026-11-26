@@ -18,7 +18,7 @@ impl Load {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem};
+    /// use makefile_edit::{Makefile, MakefileItem};
     /// let makefile: Makefile = "load foo.so ./bar.so(init) $(OBJ)\n".parse().unwrap();
     /// let Some(MakefileItem::Load(load)) = makefile.items().next() else {
     ///     panic!("expected a load directive");
@@ -68,7 +68,7 @@ impl Load {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileItem, TextRange};
+    /// use makefile_edit::{Makefile, MakefileItem, TextRange};
     /// let makefile: Makefile = "-load foo.so\n".parse().unwrap();
     /// let Some(MakefileItem::Load(load)) = makefile.items().next() else { panic!() };
     /// assert_eq!(load.keyword_range(), Some(TextRange::new(0.into(), 5.into())));

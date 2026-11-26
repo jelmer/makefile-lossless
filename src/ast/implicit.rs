@@ -95,7 +95,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
     /// assert!(rule.is_pattern());
     ///
@@ -116,7 +116,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = "%.o: %.c\n".parse().unwrap();
     /// assert!(rule.is_pattern_for(MakefileVariant::GNUMake));
     /// assert!(!rule.is_pattern_for(MakefileVariant::BSDMake));
@@ -144,7 +144,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Rule;
+    /// use makefile_edit::Rule;
     /// let rule: Rule = "lib%.a: %.o\n".parse().unwrap();
     /// assert_eq!(rule.stem("libfoo.a"), Some("foo".to_string()));
     /// assert_eq!(rule.stem("src/libfoo.a"), Some("src/foo".to_string()));
@@ -159,7 +159,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{MakefileVariant, Rule};
+    /// use makefile_edit::{MakefileVariant, Rule};
     /// let rule: Rule = "%.o: %.c\n".parse().unwrap();
     /// assert_eq!(
     ///     rule.stem_for("foo.o", MakefileVariant::GNUMake),
@@ -180,7 +180,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".SUFFIXES: .c .o\n.c.o:\n\tcc -c $<\n.x.y:\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.rules().collect();
     /// assert!(rules[1].is_suffix_rule());
@@ -206,7 +206,7 @@ impl Rule {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".c.o:\n\tcc -c $<\n.SUFFIXES: .c .o\n".parse().unwrap();
     /// let rule = makefile.rules().next().unwrap();
     /// assert!(rule.is_suffix_rule_for(MakefileVariant::GNUMake));
@@ -246,7 +246,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = ".SUFFIXES:\n.SUFFIXES: .c .o\n".parse().unwrap();
     /// assert_eq!(makefile.suffixes(), vec![".c", ".o"]);
     /// ```
@@ -263,7 +263,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".SUFFIXES: .c .o\n".parse().unwrap();
     /// assert_eq!(makefile.suffixes_for(MakefileVariant::BSDMake), vec![".c", ".o"]);
     /// ```
@@ -278,7 +278,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n".parse().unwrap();
     /// let rule = makefile.find_rule_by_target_pattern("foo.o");
     /// assert!(rule.is_some());
@@ -294,7 +294,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.o: %.s\n\t$(AS) -o $@ $<\n".parse().unwrap();
     /// let rules: Vec<_> = makefile.rules_by_target_pattern("foo.o").collect();
     /// assert_eq!(rules.len(), 2);
@@ -346,7 +346,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::Makefile;
+    /// use makefile_edit::Makefile;
     /// let makefile: Makefile = "%.o: %.c\n\t$(CC) -c $<\n%.c: %.y\n\tyacc $<\n"
     ///     .parse()
     ///     .unwrap();

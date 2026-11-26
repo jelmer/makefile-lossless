@@ -3,7 +3,7 @@
 mod variant;
 
 use libfuzzer_sys::fuzz_target;
-use makefile_lossless::{ParsedReference, ReferenceError};
+use makefile_edit::{ParsedReference, ReferenceError};
 
 /// Check that the offset of `error` is a position in `text`.
 fn check_error(text: &str, error: &ReferenceError) {

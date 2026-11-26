@@ -39,7 +39,7 @@ impl DefaultGoal {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{Makefile, MakefileVariant};
+    /// use makefile_edit::{Makefile, MakefileVariant};
     /// let makefile: Makefile = ".DEFAULT_GOAL := all\nclean:\n".parse().unwrap();
     /// let goals = makefile.default_goal_candidates(MakefileVariant::GNUMake);
     /// assert_eq!(goals[0].names(), vec!["all".to_string()]);
@@ -287,7 +287,7 @@ impl Makefile {
     ///
     /// # Example
     /// ```
-    /// use makefile_lossless::{DefaultGoal, Makefile, MakefileVariant};
+    /// use makefile_edit::{DefaultGoal, Makefile, MakefileVariant};
     /// let makefile: Makefile = ".PHONY: all\nifdef X\nx:\nendif\nall: x\n".parse().unwrap();
     /// let names: Vec<_> = makefile
     ///     .default_goal_candidates(MakefileVariant::GNUMake)

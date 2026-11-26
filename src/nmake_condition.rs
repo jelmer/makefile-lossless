@@ -29,7 +29,7 @@ use std::str::FromStr;
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{parse_nmake_condition, NmakeBinaryOp, NmakeCondition};
+/// use makefile_edit::{parse_nmake_condition, NmakeBinaryOp, NmakeCondition};
 /// assert_eq!(
 ///     parse_nmake_condition(r#"DEFINED(CFG) && "$(CFG)" == "Release""#).unwrap(),
 ///     NmakeCondition::Binary {
@@ -289,7 +289,7 @@ impl std::error::Error for NmakeConditionError {}
 ///
 /// # Example
 /// ```
-/// use makefile_lossless::{parse_nmake_condition, NmakeCondition, NmakeUnaryOp};
+/// use makefile_edit::{parse_nmake_condition, NmakeCondition, NmakeUnaryOp};
 /// assert_eq!(
 ///     parse_nmake_condition("!EXIST(\"out dir\")").unwrap(),
 ///     NmakeCondition::Unary {

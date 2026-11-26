@@ -1,4 +1,4 @@
-use makefile_lossless::MakefileVariant;
+use makefile_edit::MakefileVariant;
 
 const VARIANTS: [MakefileVariant; 4] = [
     MakefileVariant::GNUMake,
@@ -38,9 +38,9 @@ pub fn variant_and_text(data: &[u8]) -> Option<(MakefileVariant, &str)> {
 pub fn parse(
     text: &str,
     variant: Option<MakefileVariant>,
-) -> makefile_lossless::Parse<makefile_lossless::Makefile> {
+) -> makefile_edit::Parse<makefile_edit::Makefile> {
     match variant {
-        Some(variant) => makefile_lossless::Makefile::parse_with_variant(text, variant),
-        None => makefile_lossless::Makefile::parse(text),
+        Some(variant) => makefile_edit::Makefile::parse_with_variant(text, variant),
+        None => makefile_edit::Makefile::parse(text),
     }
 }
